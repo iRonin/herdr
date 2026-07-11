@@ -318,6 +318,7 @@ pane_borders = true
 pane_gaps = true
 show_agent_labels_on_pane_borders = false
 hide_tab_bar_when_single_tab = false
+tab_bar_wrap = false
 agent_panel_sort = "spaces"
 accent = "cyan"
 ```
@@ -347,6 +348,8 @@ Set `pane_borders = false` to remove split pane borders. Set `pane_gaps = false`
 Set `show_agent_labels_on_pane_borders = true` if you want detected agent labels in split pane borders when no manual pane label is set.
 
 Set `hide_tab_bar_when_single_tab = true` to hide the tab row when the active workspace has exactly one tab. New tabs can still be created with the configured keybinding. When a second tab appears, Herdr restores the tab row and resizes panes to make room for it.
+
+Set `tab_bar_wrap = true` to wrap the tabs onto multiple rows so every tab stays visible, instead of the default single scrollable row with `<`/`>` buttons. The tab bar grows downward as needed (up to half the pane height) and the pane area below shrinks to make room. The default is `false`, which keeps the single-line scrollable tab row.
 
 ## Notifications
 
