@@ -821,6 +821,8 @@ pub struct UiConfig {
     /// column is not reserved or drawn, freeing it for pane text so copied
     /// text does not include the `▕` glyph. Default: true.
     pub show_scrollbar: bool,
+    /// Show the highest-attention agent status dot on each top tab. Default: false.
+    pub tab_agent_status: bool,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
     /// Agent sidebar scope. Saved values are "all" or "current"; "current_workspace"
@@ -1019,6 +1021,7 @@ impl Default for UiConfig {
             hide_tab_bar_when_single_tab: false,
             tab_bar_wrap: false,
             show_scrollbar: true,
+            tab_agent_status: false,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             agent_panel_scope: AgentPanelScopeConfig::All,
             accent: "cyan".into(),
@@ -1263,6 +1266,7 @@ agent_panel_scope = "all"
         assert!(!default_config.ui.hide_tab_bar_when_single_tab);
         assert!(!default_config.ui.tab_bar_wrap);
         assert!(default_config.ui.show_scrollbar);
+        assert!(!default_config.ui.tab_agent_status);
 
         let toml = r#"
 [ui]
@@ -1272,6 +1276,7 @@ show_agent_labels_on_pane_borders = true
 hide_tab_bar_when_single_tab = true
 tab_bar_wrap = true
 show_scrollbar = false
+tab_agent_status = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.pane_borders);
@@ -1280,6 +1285,7 @@ show_scrollbar = false
         assert!(config.ui.hide_tab_bar_when_single_tab);
         assert!(config.ui.tab_bar_wrap);
         assert!(!config.ui.show_scrollbar);
+        assert!(config.ui.tab_agent_status);
     }
 
     #[test]

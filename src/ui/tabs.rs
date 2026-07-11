@@ -1,13 +1,20 @@
+use std::collections::HashMap;
+
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
+    text::{Line, Span},
     widgets::Paragraph,
     Frame,
 };
 
+use super::sidebar::workspace_attention_priority;
+use super::status::state_dot;
 use super::text::display_width_u16;
 use super::widgets::panel_contrast_fg;
 use crate::app::AppState;
+use crate::detect::AgentState;
+use crate::terminal::{TerminalId, TerminalState};
 
 const MIN_TAB_WIDTH: u16 = 8;
 const NEW_TAB_WIDTH: u16 = 3;
@@ -39,7 +46,42 @@ fn tab_chrome_label(ws: &crate::workspace::Workspace, tab_idx: usize) -> String 
     }
 }
 
-fn layout_tab_hit_areas(ws: &crate::workspace::Workspace, area: Rect, scroll: usize) -> Vec<Rect> {
+fn tab_agent_state(
+    ws: &crate::workspace::Workspace,
+    terminals: &HashMap<TerminalId, TerminalState>,
+    tab_idx: usize,
+) -> Option<(AgentState, bool)> {
+    let tab = ws.tabs.get(tab_idx)?;
+    tab.layout
+        .pane_ids()
+        .iter()
+        .filter_map(|pane_id| {
+            let pane = tab.panes.get(pane_id)?;
+            let terminal = terminals.get(&pane.attached_terminal_id)?;
+            terminal.detected_agent?;
+            Some((terminal.state, pane.seen))
+        })
+        .max_by_key(|(state, seen)| workspace_attention_priority(*state, *seen))
+}
+
+fn tab_layout_width(
+    ws: &crate::workspace::Workspace,
+    terminals: &HashMap<TerminalId, TerminalState>,
+    tab_agent_status: bool,
+    tab_idx: usize,
+) -> u16 {
+    tab_width(ws, tab_idx).saturating_add(
+        u16::from(tab_agent_status && tab_agent_state(ws, terminals, tab_idx).is_some()) * 2,
+    )
+}
+
+fn layout_tab_hit_areas(
+    ws: &crate::workspace::Workspace,
+    terminals: &HashMap<TerminalId, TerminalState>,
+    tab_agent_status: bool,
+    area: Rect,
+    scroll: usize,
+) -> Vec<Rect> {
     let mut rects = vec![Rect::default(); ws.tabs.len()];
     if area.width == 0 || area.height == 0 {
         return rects;
@@ -51,7 +93,7 @@ fn layout_tab_hit_areas(ws: &crate::workspace::Workspace, area: Rect, scroll: us
         if x >= right {
             break;
         }
-        let desired = tab_width(ws, idx);
+        let desired = tab_layout_width(ws, terminals, tab_agent_status, idx);
         let remaining = right.saturating_sub(x);
         let width = desired.min(remaining).max(1);
         *rect = Rect::new(x, area.y, width, 1);
@@ -86,6 +128,8 @@ fn wrap_flow(item_widths: impl Iterator<Item = u16>, width: u16) -> Vec<(u16, u1
 /// height matches what [`layout_tab_hit_areas_wrapped`] lays out.
 pub(super) fn tab_bar_wrapped_rows(
     ws: &crate::workspace::Workspace,
+    terminals: &HashMap<TerminalId, TerminalState>,
+    tab_agent_status: bool,
     width: u16,
     with_new_tab: bool,
 ) -> u16 {
@@ -93,7 +137,7 @@ pub(super) fn tab_bar_wrapped_rows(
         return 1;
     }
     let widths = (0..ws.tabs.len())
-        .map(|idx| tab_width(ws, idx))
+        .map(|idx| tab_layout_width(ws, terminals, tab_agent_status, idx))
         .chain(with_new_tab.then_some(NEW_TAB_WIDTH));
     wrap_flow(widths, width)
         .last()
@@ -112,6 +156,8 @@ pub(super) fn tab_bar_wrapped_rows(
 /// selecting them, which re-centers the window on the new active row).
 fn layout_tab_hit_areas_wrapped(
     ws: &crate::workspace::Workspace,
+    terminals: &HashMap<TerminalId, TerminalState>,
+    tab_agent_status: bool,
     area: Rect,
     with_new_tab: bool,
 ) -> (Vec<Rect>, Rect) {
@@ -121,7 +167,7 @@ fn layout_tab_hit_areas_wrapped(
         return (rects, new_tab);
     }
     let widths = (0..ws.tabs.len())
-        .map(|idx| tab_width(ws, idx))
+        .map(|idx| tab_layout_width(ws, terminals, tab_agent_status, idx))
         .chain(with_new_tab.then_some(NEW_TAB_WIDTH));
     let flow = wrap_flow(widths, area.width);
     let total_rows = flow.last().map(|(_, y, _)| y + 1).unwrap_or(0);
@@ -158,13 +204,16 @@ fn layout_tab_hit_areas_wrapped(
 /// trailing new-tab (`+`) control is included when `mouse_chrome` is set.
 pub(crate) fn compute_wrapped_tab_bar_view(
     ws: &crate::workspace::Workspace,
+    terminals: &HashMap<TerminalId, TerminalState>,
+    tab_agent_status: bool,
     area: Rect,
     mouse_chrome: bool,
 ) -> TabBarView {
     if area.width == 0 || area.height == 0 {
         return TabBarView::default();
     }
-    let (tab_hit_areas, new_tab_hit_area) = layout_tab_hit_areas_wrapped(ws, area, mouse_chrome);
+    let (tab_hit_areas, new_tab_hit_area) =
+        layout_tab_hit_areas_wrapped(ws, terminals, tab_agent_status, area, mouse_chrome);
     TabBarView {
         scroll: 0,
         tab_hit_areas,
@@ -174,13 +223,18 @@ pub(crate) fn compute_wrapped_tab_bar_view(
     }
 }
 
-fn centered_tab_scroll(ws: &crate::workspace::Workspace, area: Rect) -> usize {
+fn centered_tab_scroll(
+    ws: &crate::workspace::Workspace,
+    terminals: &HashMap<TerminalId, TerminalState>,
+    tab_agent_status: bool,
+    area: Rect,
+) -> usize {
     let mut best_scroll = ws.active_tab;
     let mut best_distance = u16::MAX;
     let viewport_center = area.x.saturating_mul(2).saturating_add(area.width);
 
     for scroll in 0..=ws.active_tab {
-        let rects = layout_tab_hit_areas(ws, area, scroll);
+        let rects = layout_tab_hit_areas(ws, terminals, tab_agent_status, area, scroll);
         let Some(active_rect) = rects.get(ws.active_tab).copied() else {
             continue;
         };
@@ -211,10 +265,15 @@ fn trailing_tab_controls_x(tab_hit_areas: &[Rect], fallback_x: u16) -> u16 {
         .unwrap_or(fallback_x)
 }
 
-fn max_tab_scroll(ws: &crate::workspace::Workspace, area: Rect) -> usize {
+fn max_tab_scroll(
+    ws: &crate::workspace::Workspace,
+    terminals: &HashMap<TerminalId, TerminalState>,
+    tab_agent_status: bool,
+    area: Rect,
+) -> usize {
     (0..ws.tabs.len())
         .find(|&scroll| {
-            layout_tab_hit_areas(ws, area, scroll)
+            layout_tab_hit_areas(ws, terminals, tab_agent_status, area, scroll)
                 .last()
                 .is_some_and(|rect| rect.width > 0)
         })
@@ -223,6 +282,8 @@ fn max_tab_scroll(ws: &crate::workspace::Workspace, area: Rect) -> usize {
 
 pub(crate) fn compute_tab_bar_view(
     ws: &crate::workspace::Workspace,
+    terminals: &HashMap<TerminalId, TerminalState>,
+    tab_agent_status: bool,
     area: Rect,
     current_scroll: usize,
     follow_active: bool,
@@ -233,15 +294,15 @@ pub(crate) fn compute_tab_bar_view(
     }
 
     if !mouse_chrome {
-        let max_scroll = max_tab_scroll(ws, area);
+        let max_scroll = max_tab_scroll(ws, terminals, tab_agent_status, area);
         let scroll = if follow_active {
-            centered_tab_scroll(ws, area).min(max_scroll)
+            centered_tab_scroll(ws, terminals, tab_agent_status, area).min(max_scroll)
         } else {
             current_scroll.min(max_scroll)
         };
         return TabBarView {
             scroll,
-            tab_hit_areas: layout_tab_hit_areas(ws, area, scroll),
+            tab_hit_areas: layout_tab_hit_areas(ws, terminals, tab_agent_status, area, scroll),
             scroll_left_hit_area: Rect::default(),
             scroll_right_hit_area: Rect::default(),
             new_tab_hit_area: Rect::default(),
@@ -255,7 +316,7 @@ pub(crate) fn compute_tab_bar_view(
         area.width.saturating_sub(NEW_TAB_WIDTH),
         area.height,
     );
-    let all_tabs = layout_tab_hit_areas(ws, all_tabs_area, 0);
+    let all_tabs = layout_tab_hit_areas(ws, terminals, tab_agent_status, all_tabs_area, 0);
     let overflow = all_tabs.iter().any(|rect| rect.width == 0);
     if !overflow {
         let new_tab_x = trailing_tab_controls_x(&all_tabs, area.x);
@@ -285,13 +346,13 @@ pub(crate) fn compute_tab_bar_view(
         area.height,
     );
 
-    let max_scroll = max_tab_scroll(ws, tab_area);
+    let max_scroll = max_tab_scroll(ws, terminals, tab_agent_status, tab_area);
     let scroll = if follow_active {
-        centered_tab_scroll(ws, tab_area).min(max_scroll)
+        centered_tab_scroll(ws, terminals, tab_agent_status, tab_area).min(max_scroll)
     } else {
         current_scroll.min(max_scroll)
     };
-    let tab_hit_areas = layout_tab_hit_areas(ws, tab_area, scroll);
+    let tab_hit_areas = layout_tab_hit_areas(ws, terminals, tab_agent_status, tab_area, scroll);
     let trailing_x = trailing_tab_controls_x(&tab_hit_areas, tab_area_x).min(tab_area_right);
     let right_hit_area = Rect::new(
         trailing_x,
@@ -454,8 +515,26 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
         };
         let width = rect.width as usize;
         let name = tab_chrome_label(ws, idx);
-        let text = format!(" {:width$}", name, width = width.saturating_sub(1));
-        frame.render_widget(Paragraph::new(text).style(style), rect);
+        if let Some((state, seen)) = app
+            .tab_agent_status
+            .then(|| tab_agent_state(ws, &app.terminals, idx))
+            .flatten()
+        {
+            let (dot, dot_style) = state_dot(state, seen, p);
+            let label = format!(" {:width$}", name, width = width.saturating_sub(3));
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(dot, dot_style),
+                    Span::raw(label),
+                ]))
+                .style(style),
+                rect,
+            );
+        } else {
+            let text = format!(" {:width$}", name, width = width.saturating_sub(1));
+            frame.render_widget(Paragraph::new(text).style(style), rect);
+        }
     }
 
     if let Some(crate::app::state::DragState {
@@ -513,8 +592,9 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
 mod tests {
     use super::*;
     use crate::app::state::AppState;
+    use crate::detect::{Agent, AgentState};
     use crate::workspace::Workspace;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{backend::TestBackend, layout::Direction, Terminal};
 
     fn buffer_row_text(buffer: &ratatui::buffer::Buffer, area: Rect, row: u16) -> String {
         (area.x..area.x + area.width)
@@ -535,7 +615,15 @@ mod tests {
         app.workspaces = vec![ws];
         app.active = Some(0);
         app.view.tab_bar_rect = Rect::new(0, 0, 30, 1);
-        let view = compute_tab_bar_view(&app.workspaces[0], app.view.tab_bar_rect, 0, true, false);
+        let view = compute_tab_bar_view(
+            &app.workspaces[0],
+            &app.terminals,
+            app.tab_agent_status,
+            app.view.tab_bar_rect,
+            0,
+            true,
+            false,
+        );
         app.view.tab_hit_areas = view.tab_hit_areas;
 
         let backend = TestBackend::new(30, 1);
@@ -562,7 +650,15 @@ mod tests {
         app.workspaces = vec![ws];
         app.active = Some(0);
         app.view.tab_bar_rect = Rect::new(0, 0, 30, 1);
-        let view = compute_tab_bar_view(&app.workspaces[0], app.view.tab_bar_rect, 0, true, false);
+        let view = compute_tab_bar_view(
+            &app.workspaces[0],
+            &app.terminals,
+            app.tab_agent_status,
+            app.view.tab_bar_rect,
+            0,
+            true,
+            false,
+        );
         app.view.tab_hit_areas = view.tab_hit_areas;
 
         let backend = TestBackend::new(30, 1);
@@ -608,7 +704,15 @@ mod tests {
         app.active = Some(0);
         app.workspaces = vec![ws];
         app.view.tab_bar_rect = Rect::new(0, 0, 30, 1);
-        let view = compute_tab_bar_view(&app.workspaces[0], app.view.tab_bar_rect, 0, true, false);
+        let view = compute_tab_bar_view(
+            &app.workspaces[0],
+            &app.terminals,
+            app.tab_agent_status,
+            app.view.tab_bar_rect,
+            0,
+            true,
+            false,
+        );
         app.view.tab_hit_areas = view.tab_hit_areas;
 
         let backend = TestBackend::new(30, 1);
@@ -635,7 +739,8 @@ mod tests {
         // width 30 and the 4th wraps to the next row.
         let ws = workspace_with_tabs(7);
         let area = Rect::new(0, 0, 30, 5);
-        let (rects, _new_tab) = layout_tab_hit_areas_wrapped(&ws, area, false);
+        let (rects, _new_tab) =
+            layout_tab_hit_areas_wrapped(&ws, &HashMap::new(), false, area, false);
 
         assert_eq!(rects.len(), 7);
         assert!(
@@ -661,9 +766,10 @@ mod tests {
         let ws = workspace_with_tabs(10);
         for &width in &[20u16, 30, 45, 80] {
             for with_new_tab in [false, true] {
-                let rows = tab_bar_wrapped_rows(&ws, width, with_new_tab);
+                let rows = tab_bar_wrapped_rows(&ws, &HashMap::new(), false, width, with_new_tab);
                 let area = Rect::new(0, 0, width, u16::from(u8::MAX));
-                let (rects, new_tab) = layout_tab_hit_areas_wrapped(&ws, area, with_new_tab);
+                let (rects, new_tab) =
+                    layout_tab_hit_areas_wrapped(&ws, &HashMap::new(), false, area, with_new_tab);
                 let mut ys: std::collections::BTreeSet<u16> =
                     rects.iter().filter(|r| r.width > 0).map(|r| r.y).collect();
                 if with_new_tab {
@@ -676,6 +782,33 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_layout_accounts_for_agent_status_width() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![workspace_with_tabs(2)];
+        app.ensure_test_terminals();
+        let pane_id = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let pane_terminal = app.terminals.get_mut(&terminal_id).unwrap();
+        pane_terminal.detected_agent = Some(Agent::Claude);
+        pane_terminal.state = AgentState::Blocked;
+
+        let area = Rect::new(0, 0, 18, 2);
+        let (without_status, _) =
+            layout_tab_hit_areas_wrapped(&app.workspaces[0], &app.terminals, false, area, false);
+        let (with_status, _) =
+            layout_tab_hit_areas_wrapped(&app.workspaces[0], &app.terminals, true, area, false);
+
+        assert_eq!(without_status[0].y, without_status[1].y);
+        assert!(with_status[1].y > with_status[0].y);
+        assert_eq!(
+            tab_bar_wrapped_rows(&app.workspaces[0], &app.terminals, true, area.width, false),
+            2
+        );
+    }
+
+    #[test]
     fn wrap_mode_renders_every_tab_without_scroll_chrome() {
         let mut app = AppState::test_new();
         app.tab_bar_wrap = true;
@@ -683,10 +816,22 @@ mod tests {
         app.workspaces = vec![workspace_with_tabs(7)];
         app.active = Some(0);
 
-        let rows = tab_bar_wrapped_rows(&app.workspaces[0], 30, true);
+        let rows = tab_bar_wrapped_rows(
+            &app.workspaces[0],
+            &app.terminals,
+            app.tab_agent_status,
+            30,
+            true,
+        );
         assert!(rows > 1, "seven tabs should need multiple rows, got {rows}");
         app.view.tab_bar_rect = Rect::new(0, 0, 30, rows);
-        let view = compute_wrapped_tab_bar_view(&app.workspaces[0], app.view.tab_bar_rect, true);
+        let view = compute_wrapped_tab_bar_view(
+            &app.workspaces[0],
+            &app.terminals,
+            app.tab_agent_status,
+            app.view.tab_bar_rect,
+            true,
+        );
         app.view.tab_hit_areas = view.tab_hit_areas;
         app.view.new_tab_hit_area = view.new_tab_hit_area;
         // Wrap mode never uses scroll buttons.
@@ -722,7 +867,7 @@ mod tests {
     fn wrap_mode_hit_testing_selects_tabs_on_lower_rows() {
         let ws = workspace_with_tabs(7);
         let area = Rect::new(0, 0, 30, 5);
-        let (rects, _) = layout_tab_hit_areas_wrapped(&ws, area, true);
+        let (rects, _) = layout_tab_hit_areas_wrapped(&ws, &HashMap::new(), false, area, true);
 
         // A tab that wrapped onto a lower row carries the correct y. Mirror the
         // row-aware point-in-rect test the mouse layer (`AppState::tab_at`) uses
@@ -762,7 +907,8 @@ mod tests {
         ws.active_tab = 35;
         let area = Rect::new(0, 0, 30, 3);
 
-        let (rects, _new_tab) = layout_tab_hit_areas_wrapped(&ws, area, true);
+        let (rects, _new_tab) =
+            layout_tab_hit_areas_wrapped(&ws, &HashMap::new(), false, area, true);
         assert_eq!(rects.len(), 40);
 
         let active = rects[ws.active_tab];
@@ -785,5 +931,86 @@ mod tests {
                 "column in area: {r:?}"
             );
         }
+    }
+
+    #[test]
+    fn tab_agent_status_renders_blocked_dot_only_when_enabled() {
+        let mut app = AppState::test_new();
+        let ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let pane_terminal = app.terminals.get_mut(&terminal_id).unwrap();
+        pane_terminal.detected_agent = Some(Agent::Claude);
+        pane_terminal.state = AgentState::Blocked;
+        app.active = Some(0);
+        app.selected = 0;
+
+        app.tab_agent_status = true;
+        crate::ui::compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+        let enabled_tab_rect = app.view.tab_hit_areas[0];
+        let dot_cell = &terminal.backend().buffer()[(enabled_tab_rect.x + 1, enabled_tab_rect.y)];
+        assert_eq!(dot_cell.symbol(), "●");
+        assert_eq!(dot_cell.style().fg, Some(app.palette.red));
+        assert_eq!(dot_cell.style().bg, Some(app.palette.accent));
+        assert_eq!(enabled_tab_rect.width, tab_width(&app.workspaces[0], 0) + 2);
+        assert_eq!(
+            terminal.backend().buffer()[(enabled_tab_rect.x + 3, enabled_tab_rect.y)].symbol(),
+            "1"
+        );
+
+        app.tab_agent_status = false;
+        crate::ui::compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+        let disabled_tab_rect = app.view.tab_hit_areas[0];
+        let leading_label_cell =
+            &terminal.backend().buffer()[(disabled_tab_rect.x + 1, disabled_tab_rect.y)];
+        assert_ne!(leading_label_cell.symbol(), "●");
+        assert_eq!(disabled_tab_rect.width, tab_width(&app.workspaces[0], 0));
+    }
+
+    #[test]
+    fn tab_agent_status_uses_highest_attention_pane() {
+        let mut app = AppState::test_new();
+        let mut ws = Workspace::test_new("test");
+        let working_pane = ws.tabs[0].root_pane;
+        let blocked_pane = ws.test_split(Direction::Horizontal);
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+
+        for (pane_id, state) in [
+            (working_pane, AgentState::Working),
+            (blocked_pane, AgentState::Blocked),
+        ] {
+            let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let pane_terminal = app.terminals.get_mut(&terminal_id).unwrap();
+            pane_terminal.detected_agent = Some(Agent::Claude);
+            pane_terminal.state = state;
+        }
+        app.active = Some(0);
+        app.selected = 0;
+        app.tab_agent_status = true;
+
+        crate::ui::compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+
+        let dot_cell = &terminal.backend().buffer()
+            [(app.view.tab_hit_areas[0].x + 1, app.view.tab_hit_areas[0].y)];
+        assert_eq!(dot_cell.symbol(), "●");
+        assert_eq!(dot_cell.style().fg, Some(app.palette.red));
     }
 }

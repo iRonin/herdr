@@ -1524,10 +1524,18 @@ impl AppState {
         };
 
         let layout = if self.tab_bar_wrap {
-            crate::ui::compute_wrapped_tab_bar_view(ws, area, self.mouse_capture)
+            crate::ui::compute_wrapped_tab_bar_view(
+                ws,
+                &self.terminals,
+                self.tab_agent_status,
+                area,
+                self.mouse_capture,
+            )
         } else {
             crate::ui::compute_tab_bar_view(
                 ws,
+                &self.terminals,
+                self.tab_agent_status,
                 area,
                 self.tab_scroll,
                 self.tab_scroll_follow_active,
