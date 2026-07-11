@@ -421,7 +421,11 @@ impl AppState {
             self.view.sidebar_rect,
             self.sidebar_section_split,
         );
-        let rect = crate::ui::agent_panel_toggle_rect(detail_area, self.agent_panel_sort);
+        let rect = crate::ui::agent_panel_toggle_rect(
+            detail_area,
+            self.agent_panel_sort,
+            self.agent_panel_scope,
+        );
         rect.width > 0
             && col >= rect.x
             && col < rect.x + rect.width
@@ -692,27 +696,54 @@ mod tests {
     }
 
     #[test]
-    fn clicking_agent_panel_toggle_switches_sort() {
+    fn clicking_agent_panel_toggle_cycles_priority_grouped_space() {
+        use crate::app::state::AgentPanelScope;
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("test")];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
+        // start in priority mode (all workspaces, attention order)
+        app.state.agent_panel_sort = AgentPanelSort::Priority;
+        app.state.agent_panel_scope = AgentPanelScope::All;
         app.state.agent_panel_scroll = 3;
 
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            app.state.view.sidebar_rect,
-            app.state.sidebar_section_split,
-        );
-        let toggle = crate::ui::agent_panel_toggle_rect(detail_area, app.state.agent_panel_sort);
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            toggle.x,
-            toggle.y,
-        ));
+        macro_rules! click_toggle {
+            () => {{
+                let (_, detail_area) = crate::ui::expanded_sidebar_sections(
+                    app.state.view.sidebar_rect,
+                    app.state.sidebar_section_split,
+                );
+                let toggle = crate::ui::agent_panel_toggle_rect(
+                    detail_area,
+                    app.state.agent_panel_sort,
+                    app.state.agent_panel_scope,
+                );
+                app.handle_mouse(mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    toggle.x,
+                    toggle.y,
+                ));
+            }};
+        }
 
-        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
+        // priority -> grouped
+        click_toggle!();
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Spaces);
+        assert_eq!(app.state.agent_panel_scope, AgentPanelScope::All);
         assert_eq!(app.state.agent_panel_scroll, 0);
+
+        // grouped -> space (limited to the active workspace)
+        app.state.agent_panel_scroll = 3;
+        click_toggle!();
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
+        assert_eq!(app.state.agent_panel_scope, AgentPanelScope::Current);
+        assert_eq!(app.state.agent_panel_scroll, 0);
+
+        // space -> priority
+        click_toggle!();
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
+        assert_eq!(app.state.agent_panel_scope, AgentPanelScope::All);
     }
 
     #[test]
