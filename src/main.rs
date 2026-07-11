@@ -295,6 +295,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # New tabs can still be created with the configured keybinding.
 # hide_tab_bar_when_single_tab = false
 
+# Render the main pane scrollback scrollbar. Set to false so the scrollbar
+# column is freed for text and copied output does not include the bar glyph.
+# show_scrollbar = true
+
 # Agent panel ordering: "spaces" (grouped by space) or "priority" (attention queue).
 # "workspaces" is accepted as an alias for "spaces".
 # agent_panel_sort = "spaces"

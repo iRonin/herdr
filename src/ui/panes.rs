@@ -30,8 +30,8 @@ fn pane_border_title(label: &str, pane_width: u16, _focused: bool) -> Option<Str
     Some(format!(" {} ", truncate_end(label, max_label_width)))
 }
 
-fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
-    if pane_inner.width <= 4 {
+fn stable_terminal_inner_rect(pane_inner: Rect, show_scrollbar: bool) -> Rect {
+    if !show_scrollbar || pane_inner.width <= 4 {
         return pane_inner;
     }
 
@@ -142,8 +142,12 @@ fn runtime_for_tab_pane<'a>(
         .map(|runtime| (terminal_id, runtime))
 }
 
-fn stable_scrollbar_gutter(rt: &TerminalRuntime, pane_inner: Rect) -> (Rect, Option<Rect>) {
-    let inner_rect = stable_terminal_inner_rect(pane_inner);
+fn stable_scrollbar_gutter(
+    rt: &TerminalRuntime,
+    pane_inner: Rect,
+    show_scrollbar: bool,
+) -> (Rect, Option<Rect>) {
+    let inner_rect = stable_terminal_inner_rect(pane_inner, show_scrollbar);
     if inner_rect == pane_inner {
         return (inner_rect, None);
     }
@@ -180,7 +184,7 @@ pub(super) fn resize_tab_panes(
                 Borders::NONE
             };
             let pane_inner = pane_inner_rect(area, borders);
-            let inner_rect = stable_terminal_inner_rect(pane_inner);
+            let inner_rect = stable_terminal_inner_rect(pane_inner, app.show_scrollbar);
             if !app.direct_attach_resize_locks.contains(terminal_id) {
                 rt.resize(
                     inner_rect.height,
@@ -197,7 +201,7 @@ pub(super) fn resize_tab_panes(
         let pane_inner = pane_inner_rect(info.rect, info.borders);
 
         if let Some((terminal_id, rt)) = runtime_for_tab_pane(terminal_runtimes, tab, info.id) {
-            let inner_rect = stable_terminal_inner_rect(pane_inner);
+            let inner_rect = stable_terminal_inner_rect(pane_inner, app.show_scrollbar);
             if !app.direct_attach_resize_locks.contains(terminal_id) {
                 rt.resize(
                     inner_rect.height,
@@ -238,7 +242,8 @@ pub(super) fn compute_pane_infos(
         let mut inner_rect = pane_inner;
         let mut scrollbar_rect = None;
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, focused_id) {
-            (inner_rect, scrollbar_rect) = stable_scrollbar_gutter(rt, pane_inner);
+            (inner_rect, scrollbar_rect) =
+                stable_scrollbar_gutter(rt, pane_inner, app.show_scrollbar);
             if resize_panes
                 && ws.terminal_id(focused_id).is_some_and(|terminal_id| {
                     !app.direct_attach_resize_locks.contains(terminal_id)
@@ -270,7 +275,8 @@ pub(super) fn compute_pane_infos(
         let mut inner_rect = pane_inner;
         let mut scrollbar_rect = None;
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
-            (inner_rect, scrollbar_rect) = stable_scrollbar_gutter(rt, pane_inner);
+            (inner_rect, scrollbar_rect) =
+                stable_scrollbar_gutter(rt, pane_inner, app.show_scrollbar);
             if resize_panes
                 && ws.terminal_id(info.id).is_some_and(|terminal_id| {
                     !app.direct_attach_resize_locks.contains(terminal_id)
@@ -1313,6 +1319,107 @@ mod tests {
         assert_eq!(info.rect, area);
         assert_eq!(info.scrollbar_rect, Some(Rect::new(49, 3, 1, 8)));
         assert_eq!(info.inner_rect, Rect::new(10, 3, 39, 8));
+    }
+
+    #[tokio::test]
+    async fn disabled_scrollbar_frees_gutter_column_for_pane_text() {
+        let mut app = AppState::test_new();
+        app.show_scrollbar = false;
+        let mut workspace = Workspace::test_new("test");
+        let root_pane = workspace.tabs[0].root_pane;
+        workspace.tabs[0].runtimes.insert(
+            root_pane,
+            TerminalRuntime::test_with_scrollback_bytes(
+                40,
+                8,
+                1024,
+                b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
+            ),
+        );
+        app.workspaces = vec![workspace];
+        app.active = Some(0);
+
+        let area = Rect::new(10, 3, 40, 8);
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        let infos = compute_pane_infos(
+            &app,
+            &terminal_runtimes,
+            area,
+            false,
+            crate::kitty_graphics::HostCellSize::default(),
+        );
+        let info = &infos[0];
+
+        // Even though scrollback exists (see the enabled sibling test above),
+        // no gutter column is reserved and the pane text spans the full width.
+        assert_eq!(info.rect, area);
+        assert_eq!(info.scrollbar_rect, None);
+        assert_eq!(info.inner_rect, area);
+    }
+
+    #[tokio::test]
+    async fn scrollbar_glyph_present_when_enabled_and_absent_when_disabled() {
+        fn scrollbar_glyph_count(show_scrollbar: bool) -> usize {
+            let mut app = AppState::test_new();
+            app.show_scrollbar = show_scrollbar;
+            let mut workspace = Workspace::test_new("test");
+            let root_pane = workspace.tabs[0].root_pane;
+            workspace.tabs[0].runtimes.insert(
+                root_pane,
+                TerminalRuntime::test_with_scrollback_bytes(
+                    40,
+                    8,
+                    1024,
+                    b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
+                ),
+            );
+            app.workspaces = vec![workspace];
+            app.active = Some(0);
+
+            let area = Rect::new(0, 0, 40, 8);
+            let terminal_runtimes = TerminalRuntimeRegistry::new();
+            let infos = compute_pane_infos(
+                &app,
+                &terminal_runtimes,
+                area,
+                false,
+                crate::kitty_graphics::HostCellSize::default(),
+            );
+            let info = infos.into_iter().next().expect("pane info");
+            let ws = &app.workspaces[0];
+            let rt = ws.tabs[0]
+                .runtimes
+                .get(&root_pane)
+                .expect("runtime for pane");
+
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+            terminal
+                .draw(|frame| render_pane_scrollbar(&app, frame, &info, rt))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut count = 0;
+            for y in 0..8 {
+                for x in 0..40 {
+                    if matches!(buffer[(x, y)].symbol(), "\u{2595}" | "\u{2590}") {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
+
+        // Enabled: the scrollbar track/thumb glyphs are drawn onto the pane.
+        assert!(
+            scrollbar_glyph_count(true) > 0,
+            "scrollbar glyph should be rendered when show_scrollbar is true"
+        );
+        // Disabled: no scrollbar glyph lands in the pane, so copied text is clean.
+        assert_eq!(
+            scrollbar_glyph_count(false),
+            0,
+            "scrollbar glyph must not be rendered when show_scrollbar is false"
+        );
     }
 
     #[test]

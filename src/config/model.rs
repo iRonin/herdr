@@ -808,6 +808,10 @@ pub struct UiConfig {
     pub hide_tab_bar_when_single_tab: bool,
     /// Wrap tabs onto multiple rows instead of a single scrollable row. Default: false.
     pub tab_bar_wrap: bool,
+    /// Render the main pane scrollback scrollbar. When false, the scrollbar
+    /// column is not reserved or drawn, freeing it for pane text so copied
+    /// text does not include the `▕` glyph. Default: true.
+    pub show_scrollbar: bool,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
     /// Accent color for highlights, borders, and navigation UI.
@@ -1002,6 +1006,7 @@ impl Default for UiConfig {
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
             tab_bar_wrap: false,
+            show_scrollbar: true,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             accent: "cyan".into(),
             toast: ToastConfig::default(),
@@ -1215,6 +1220,7 @@ agent_panel_scope = "current"
         assert!(!default_config.ui.show_agent_labels_on_pane_borders);
         assert!(!default_config.ui.hide_tab_bar_when_single_tab);
         assert!(!default_config.ui.tab_bar_wrap);
+        assert!(default_config.ui.show_scrollbar);
 
         let toml = r#"
 [ui]
@@ -1223,6 +1229,7 @@ pane_gaps = true
 show_agent_labels_on_pane_borders = true
 hide_tab_bar_when_single_tab = true
 tab_bar_wrap = true
+show_scrollbar = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.pane_borders);
@@ -1230,6 +1237,7 @@ tab_bar_wrap = true
         assert!(config.ui.show_agent_labels_on_pane_borders);
         assert!(config.ui.hide_tab_bar_when_single_tab);
         assert!(config.ui.tab_bar_wrap);
+        assert!(!config.ui.show_scrollbar);
     }
 
     #[test]
