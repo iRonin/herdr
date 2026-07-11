@@ -196,6 +196,147 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
     })
 }
 
+/// Build a resume command that REPLAYS the pane's recorded launch command,
+/// appending the agent's canonical resume selector.
+///
+/// When a pane recorded the exact argv for a custom or forked agent harness —
+/// for example, a fork of the `pi` harness launched as
+/// `pi-fork --session <path> --model opus` — resuming should preserve those
+/// original flags instead of rebuilding a minimal `<agent> --resume <id>`. The
+/// recorded program (`argv[0]`, e.g. `pi-fork`) is kept, so a wrapper, fork, or
+/// alias resumes through that exact program rather than the canonical agent
+/// name. Any stale session selector already present in the recorded command is
+/// stripped first so the replayed command never carries two conflicting
+/// selectors.
+///
+/// Falls back to the minimal recipe from [`plan`] when there is no recorded
+/// launch command (e.g. a hand-typed shell agent).
+///
+/// Only session selectors are rewritten. One-shot / print flags (e.g. `-p`,
+/// `--prompt`, `--print`) are intentionally NOT stripped: such panes are
+/// non-interactive and are already excluded from auto-resume upstream, so
+/// handling them here is outside this function's resume-selector replay
+/// contract.
+pub fn plan_replaying_launch_argv(
+    source: &str,
+    agent: &str,
+    session_ref: &AgentSessionRef,
+    launch_argv: Option<&[String]>,
+) -> Option<AgentResumePlan> {
+    let base = plan(source, agent, session_ref)?;
+    let Some(launch_argv) = launch_argv.filter(|argv| !argv.is_empty()) else {
+        return Some(base);
+    };
+
+    // The recipe argv is `[<canonical-bin>, <selector-tokens...>]`. Replay keeps
+    // the pane's original program plus its extra flags, drops any stale session
+    // selector, then re-appends the canonical selector tokens.
+    let selector = &base.argv[1..];
+    let recipe_flag = selector.first().map(|token| selector_flag_name(token));
+    let mut argv = strip_session_selectors(agent, launch_argv, recipe_flag);
+    argv.extend(selector.iter().cloned());
+
+    Some(AgentResumePlan {
+        agent: base.agent,
+        argv,
+        dedupe_key: base.dedupe_key,
+    })
+}
+
+/// Remove any session selector the recorded launch command already carries,
+/// while preserving `argv[0]` (the launched program) and every non-selector
+/// flag. See [`plan_replaying_launch_argv`] for the surrounding contract.
+fn strip_session_selectors(
+    agent: &str,
+    launch_argv: &[String],
+    recipe_flag: Option<&str>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(launch_argv.len());
+    let mut idx = 0usize;
+
+    // Always keep the program itself; only selectors are rewritten.
+    if let Some(program) = launch_argv.first() {
+        out.push(program.clone());
+        idx = 1;
+    }
+
+    while idx < launch_argv.len() {
+        let token = &launch_argv[idx];
+        idx += 1;
+        let name = selector_flag_name(token);
+
+        // codex resumes via a `resume <id>` subcommand rather than a flag.
+        if agent == "codex" && token == "resume" {
+            // Drop a following session-id value when present (skip flags).
+            if launch_argv
+                .get(idx)
+                .is_some_and(|next| !next.starts_with('-'))
+            {
+                idx += 1;
+            }
+            continue;
+        }
+
+        if is_value_session_flag(agent, name, recipe_flag) {
+            // `--flag=value` carries its value inline; `--flag value` consumes
+            // the following token when it is not itself a flag.
+            if !token.contains('=')
+                && launch_argv
+                    .get(idx)
+                    .is_some_and(|next| !next.starts_with('-'))
+            {
+                idx += 1;
+            }
+            continue;
+        }
+
+        if is_bare_session_flag(agent, name) {
+            continue;
+        }
+
+        out.push(token.clone());
+    }
+
+    out
+}
+
+/// Session selectors that consume a following value. `--resume`/`-r` are the
+/// cross-agent resume flags; each agent's own canonical selector (e.g.
+/// `--session`, `--thread`) is derived from its recipe so replay never doubles
+/// it. codex's selector is a subcommand (handled separately), and codex's `-c`
+/// is `--config`, never a selector.
+fn is_value_session_flag(agent: &str, name: &str, recipe_flag: Option<&str>) -> bool {
+    if matches!(name, "--resume" | "-r") {
+        return true;
+    }
+    if agent != "codex" {
+        if let Some(recipe_flag) = recipe_flag {
+            if recipe_flag.starts_with('-') && name == recipe_flag {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Session selectors with no value. `--continue`/`-c` resume the most recent
+/// session. codex's `-c` is `--config` (a value override) and is preserved.
+fn is_bare_session_flag(agent: &str, name: &str) -> bool {
+    match name {
+        "--continue" => true,
+        "-c" => agent != "codex",
+        _ => false,
+    }
+}
+
+/// The flag name portion of a token, splitting an inline `--flag=value`.
+fn selector_flag_name(token: &str) -> &str {
+    match token.split_once('=') {
+        Some((name, _)) => name,
+        None => token,
+    }
+}
+
 pub fn dedupe_key(source: &str, agent: &str, session_ref: &AgentSessionRef) -> String {
     format!(
         "{source}\u{0}{agent}\u{0}{:?}\u{0}{}",
@@ -661,5 +802,373 @@ mod tests {
             "devin-session"
         )
         .is_some());
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn replay_without_launch_argv_matches_minimal_plan() {
+        // No recorded launch command: fall back to today's minimal recipe,
+        // byte-for-byte identical to plan().
+        for (source, agent, session) in [
+            ("herdr:claude", "claude", "claude-session"),
+            ("herdr:codex", "codex", "codex-session"),
+            ("herdr:copilot", "copilot", "copilot-session"),
+            ("herdr:cursor", "cursor", "cursor-session"),
+        ] {
+            let session_ref = AgentSessionRef::id(session).unwrap();
+            let base = plan(source, agent, &session_ref).unwrap();
+            assert_eq!(
+                plan_replaying_launch_argv(source, agent, &session_ref, None).unwrap(),
+                base,
+                "{agent}: None launch_argv should equal minimal plan()"
+            );
+            assert_eq!(
+                plan_replaying_launch_argv(source, agent, &session_ref, Some(&[])).unwrap(),
+                base,
+                "{agent}: empty launch_argv should equal minimal plan()"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_unsupported_agent_is_none_even_with_launch_argv() {
+        let launch = argv(&["claude", "--model", "opus"]);
+        assert!(plan_replaying_launch_argv(
+            "custom:claude",
+            "claude",
+            &AgentSessionRef::id("session").unwrap(),
+            Some(&launch),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn replay_preserves_extra_flags_and_appends_single_selector() {
+        // claude launched with extra flags, no stale selector.
+        let launch = argv(&[
+            "claude",
+            "--dangerously-skip-permissions",
+            "--model",
+            "opus",
+        ]);
+        let resume = plan_replaying_launch_argv(
+            "herdr:claude",
+            "claude",
+            &AgentSessionRef::id("sess-1").unwrap(),
+            Some(&launch),
+        )
+        .unwrap();
+        assert_eq!(
+            resume.argv,
+            argv(&[
+                "claude",
+                "--dangerously-skip-permissions",
+                "--model",
+                "opus",
+                "--resume",
+                "sess-1",
+            ])
+        );
+        // Agent + dedupe_key stay tied to the canonical recipe, not launch_argv.
+        assert_eq!(resume.agent, "claude");
+        assert_eq!(
+            resume.dedupe_key,
+            dedupe_key(
+                "herdr:claude",
+                "claude",
+                &AgentSessionRef::id("sess-1").unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn replay_strips_stale_claude_resume_and_r_and_continue() {
+        // Stale `--resume <old>` is stripped, then the fresh selector appended.
+        let with_resume = argv(&["claude", "--resume", "old-id", "--model", "opus"]);
+        assert_eq!(
+            plan_replaying_launch_argv(
+                "herdr:claude",
+                "claude",
+                &AgentSessionRef::id("new-id").unwrap(),
+                Some(&with_resume),
+            )
+            .unwrap()
+            .argv,
+            argv(&["claude", "--model", "opus", "--resume", "new-id"])
+        );
+
+        // Short `-r <old>` form.
+        let with_r = argv(&["claude", "-r", "old-id", "--model", "opus"]);
+        assert_eq!(
+            plan_replaying_launch_argv(
+                "herdr:claude",
+                "claude",
+                &AgentSessionRef::id("new-id").unwrap(),
+                Some(&with_r),
+            )
+            .unwrap()
+            .argv,
+            argv(&["claude", "--model", "opus", "--resume", "new-id"])
+        );
+
+        // Bare `--continue` / `-c` (no value) is stripped.
+        let with_continue = argv(&["claude", "--continue", "--model", "opus"]);
+        assert_eq!(
+            plan_replaying_launch_argv(
+                "herdr:claude",
+                "claude",
+                &AgentSessionRef::id("new-id").unwrap(),
+                Some(&with_continue),
+            )
+            .unwrap()
+            .argv,
+            argv(&["claude", "--model", "opus", "--resume", "new-id"])
+        );
+        let with_c = argv(&["claude", "-c", "--model", "opus"]);
+        assert_eq!(
+            plan_replaying_launch_argv(
+                "herdr:claude",
+                "claude",
+                &AgentSessionRef::id("new-id").unwrap(),
+                Some(&with_c),
+            )
+            .unwrap()
+            .argv,
+            argv(&["claude", "--model", "opus", "--resume", "new-id"])
+        );
+    }
+
+    #[test]
+    fn replay_handles_bare_resume_without_value() {
+        // `--resume` with no following id (next token is a flag) drops only the
+        // flag, keeping the trailing option intact.
+        let launch = argv(&["claude", "--resume", "--model", "opus"]);
+        assert_eq!(
+            plan_replaying_launch_argv(
+                "herdr:claude",
+                "claude",
+                &AgentSessionRef::id("new-id").unwrap(),
+                Some(&launch),
+            )
+            .unwrap()
+            .argv,
+            argv(&["claude", "--model", "opus", "--resume", "new-id"])
+        );
+    }
+
+    #[test]
+    fn replay_codex_strips_resume_subcommand_but_preserves_config() {
+        // codex's `resume <old>` subcommand is stripped; `-c key=value`
+        // (--config) is intentionally preserved.
+        let launch = argv(&["codex", "-c", "model=o3", "resume", "old-id"]);
+        assert_eq!(
+            plan_replaying_launch_argv(
+                "herdr:codex",
+                "codex",
+                &AgentSessionRef::id("new-id").unwrap(),
+                Some(&launch),
+            )
+            .unwrap()
+            .argv,
+            argv(&["codex", "-c", "model=o3", "resume", "new-id"])
+        );
+
+        // `--config=key=value` inline form is also preserved.
+        let launch_long = argv(&["codex", "--config=model=o3", "--dangerously-bypass"]);
+        assert_eq!(
+            plan_replaying_launch_argv(
+                "herdr:codex",
+                "codex",
+                &AgentSessionRef::id("new-id").unwrap(),
+                Some(&launch_long),
+            )
+            .unwrap()
+            .argv,
+            argv(&[
+                "codex",
+                "--config=model=o3",
+                "--dangerously-bypass",
+                "resume",
+                "new-id",
+            ])
+        );
+    }
+
+    #[test]
+    fn replay_pi_keeps_forked_binary_and_avoids_double_session() {
+        // A custom or forked agent harness — for example, a fork of the `pi`
+        // harness launched as `pi-fork` — may carry a stale `--session <old>`.
+        // Replay must preserve that exact program, strip the stale selector,
+        // and append exactly one fresh `--session <new>`.
+        let new_path = absolute_test_path("pi-new-session.jsonl");
+        let old_path = absolute_test_path("pi-old-session.jsonl");
+        let launch = argv(&["pi-fork", "--session", &old_path, "--model", "opus"]);
+        let resume = plan_replaying_launch_argv(
+            "herdr:pi",
+            "pi",
+            &AgentSessionRef::path(&new_path).unwrap(),
+            Some(&launch),
+        )
+        .unwrap();
+        assert_eq!(
+            resume.argv,
+            argv(&["pi-fork", "--model", "opus", "--session", &new_path])
+        );
+        // Exactly one `--session` selector survives.
+        assert_eq!(resume.argv.iter().filter(|t| *t == "--session").count(), 1);
+        // agent stays `pi` so detection/labeling is unchanged.
+        assert_eq!(resume.agent, "pi");
+    }
+
+    #[test]
+    fn replay_copilot_inline_resume_is_deduped() {
+        // copilot's recipe uses the inline `--resume=<id>` form; a stale inline
+        // selector must be dropped, not doubled.
+        let launch = argv(&["copilot", "--resume=old-id", "--banner"]);
+        assert_eq!(
+            plan_replaying_launch_argv(
+                "herdr:copilot",
+                "copilot",
+                &AgentSessionRef::id("new-id").unwrap(),
+                Some(&launch),
+            )
+            .unwrap()
+            .argv,
+            argv(&["copilot", "--banner", "--resume=new-id"])
+        );
+    }
+
+    #[test]
+    fn replay_omp_strips_stale_resume_inline() {
+        let new_path = absolute_test_path("omp-new.jsonl");
+        let launch = argv(&["omp", "--resume=old-value", "--flag"]);
+        assert_eq!(
+            plan_replaying_launch_argv(
+                "herdr:omp",
+                "omp",
+                &AgentSessionRef::path(&new_path).unwrap(),
+                Some(&launch),
+            )
+            .unwrap()
+            .argv,
+            argv(&["omp", "--flag", &format!("--resume={new_path}")])
+        );
+    }
+
+    #[test]
+    fn replay_survives_repeated_restarts() {
+        // The carried-forward launch_argv is the ORIGINAL user launch. Each
+        // restart recomputes the selector from the current session_ref, so the
+        // extra flags survive indefinitely with exactly one selector every time.
+        let original = argv(&["claude", "--model", "opus"]);
+        for session in ["sess-1", "sess-2", "sess-3", "sess-4"] {
+            let resume = plan_replaying_launch_argv(
+                "herdr:claude",
+                "claude",
+                &AgentSessionRef::id(session).unwrap(),
+                Some(&original),
+            )
+            .unwrap();
+            assert_eq!(
+                resume.argv,
+                argv(&["claude", "--model", "opus", "--resume", session]),
+                "cycle {session}: flags preserved, exactly one fresh selector"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_is_idempotent_when_previous_output_is_fed_back() {
+        // Stronger idempotence: even if a restart carried forward the REPLAYED
+        // argv (which already ends in `--resume <old>`) instead of the original,
+        // re-planning must strip the stale selector and re-append a single fresh
+        // one. Chaining the output back as input for 4 cycles proves no
+        // selector/flag accumulation and a stable, bounded argv.
+        let mut carried = argv(&["claude", "--model", "opus"]);
+        let base_len = carried.len();
+        for session in ["sess-1", "sess-2", "sess-3", "sess-4"] {
+            let resume = plan_replaying_launch_argv(
+                "herdr:claude",
+                "claude",
+                &AgentSessionRef::id(session).unwrap(),
+                Some(&carried),
+            )
+            .unwrap();
+            assert_eq!(
+                resume.argv,
+                argv(&["claude", "--model", "opus", "--resume", session]),
+                "cycle {session}: stale selector stripped, single fresh one appended"
+            );
+            assert_eq!(
+                resume.argv.iter().filter(|t| *t == "--resume").count(),
+                1,
+                "cycle {session}: no `--resume` accumulation"
+            );
+            // argv length stays bounded at base flags + one `--resume <id>`.
+            assert_eq!(resume.argv.len(), base_len + 2);
+            carried = resume.argv;
+        }
+    }
+
+    #[test]
+    fn replay_pi_is_idempotent_across_repeated_restarts() {
+        // A custom or forked agent harness may carry a `--session` selector in
+        // the ORIGINAL launch. Chaining the replayed argv back through 4 cycles
+        // must keep the exact `pi-fork` program, preserve `--model opus`, and
+        // never accumulate a second `--session`.
+        let paths = [
+            absolute_test_path("pi-s1.jsonl"),
+            absolute_test_path("pi-s2.jsonl"),
+            absolute_test_path("pi-s3.jsonl"),
+            absolute_test_path("pi-s4.jsonl"),
+        ];
+        let mut carried = argv(&[
+            "pi-fork",
+            "--session",
+            &absolute_test_path("pi-original.jsonl"),
+            "--model",
+            "opus",
+        ]);
+        for path in &paths {
+            let resume = plan_replaying_launch_argv(
+                "herdr:pi",
+                "pi",
+                &AgentSessionRef::path(path).unwrap(),
+                Some(&carried),
+            )
+            .unwrap();
+            assert_eq!(
+                resume.argv,
+                argv(&["pi-fork", "--model", "opus", "--session", path])
+            );
+            assert_eq!(
+                resume.argv.iter().filter(|t| *t == "--session").count(),
+                1,
+                "no `--session` accumulation for {path}"
+            );
+            assert_eq!(resume.argv.first().map(String::as_str), Some("pi-fork"));
+            carried = resume.argv;
+        }
+    }
+
+    #[test]
+    fn replay_keeps_wrapper_program_and_env_prefix() {
+        // A wrapped launch (env prefix) is replayed verbatim with the selector
+        // appended; the resume still targets the recorded program chain.
+        let launch = argv(&["env", "FOO=bar", "claude", "--model", "opus"]);
+        assert_eq!(
+            plan_replaying_launch_argv(
+                "herdr:claude",
+                "claude",
+                &AgentSessionRef::id("sess-1").unwrap(),
+                Some(&launch),
+            )
+            .unwrap()
+            .argv,
+            argv(&["env", "FOO=bar", "claude", "--model", "opus", "--resume", "sess-1"])
+        );
     }
 }
