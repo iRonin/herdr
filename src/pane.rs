@@ -267,6 +267,7 @@ fn foreground_member_cwd_different_from_shell(
 enum ForegroundShellAgentAction {
     ObserveProbe,
     ReportProcessExit,
+    ReportAgentRestart,
     ClearAgent,
 }
 
@@ -276,12 +277,22 @@ fn foreground_shell_agent_action(
     foreground_is_pane_shell: bool,
     process_exit_reported: bool,
 ) -> ForegroundShellAgentAction {
-    if previous_agent.is_none() || new_agent.is_some() {
+    if previous_agent.is_none() {
         return ForegroundShellAgentAction::ObserveProbe;
     }
 
     if process_exit_reported {
-        return ForegroundShellAgentAction::ClearAgent;
+        return if new_agent.is_some() {
+            // The next process can reuse the same Agent enum before the detector's
+            // post-exit clear pass, so it still needs a fresh state publication.
+            ForegroundShellAgentAction::ReportAgentRestart
+        } else {
+            ForegroundShellAgentAction::ClearAgent
+        };
+    }
+
+    if new_agent.is_some() {
+        return ForegroundShellAgentAction::ObserveProbe;
     }
 
     if foreground_is_pane_shell {
@@ -657,15 +668,23 @@ fn spawn_basic_detection_task(
                     }
                 }
                 let previous_agent = agent_presence.current_agent();
-                let changed = match foreground_shell_agent_action(
+                let action = foreground_shell_agent_action(
                     previous_agent,
                     new_agent,
                     foreground_is_pane_shell,
                     foreground_shell_exit_reported,
-                ) {
+                );
+                let agent_restarted = action == ForegroundShellAgentAction::ReportAgentRestart;
+                let changed = match action {
                     ForegroundShellAgentAction::ReportProcessExit => {
                         pending_foreground_shell_clear = true;
                         false
+                    }
+                    ForegroundShellAgentAction::ReportAgentRestart => {
+                        pending_foreground_shell_clear = false;
+                        foreground_shell_exit_reported = false;
+                        agent_presence.observe_process_probe(new_agent);
+                        true
                     }
                     ForegroundShellAgentAction::ClearAgent => {
                         pending_foreground_shell_clear = false;
@@ -692,7 +711,7 @@ fn spawn_basic_detection_task(
                 }
                 if changed {
                     agent = agent_presence.current_agent();
-                    agent_changed = previous_agent != agent;
+                    agent_changed = agent_restarted || previous_agent != agent;
                     if agent_changed {
                         pending_idle.clear();
                         last_screen_scan_detection_content_seq = None;
@@ -2062,15 +2081,24 @@ impl PaneRuntime {
                             }
 
                             let previous_agent = agent_presence.current_agent();
-                            let changed = match foreground_shell_agent_action(
+                            let action = foreground_shell_agent_action(
                                 previous_agent,
                                 new_agent,
                                 foreground_is_pane_shell,
                                 foreground_shell_exit_reported,
-                            ) {
+                            );
+                            let agent_restarted =
+                                action == ForegroundShellAgentAction::ReportAgentRestart;
+                            let changed = match action {
                                 ForegroundShellAgentAction::ReportProcessExit => {
                                     pending_foreground_shell_clear = true;
                                     false
+                                }
+                                ForegroundShellAgentAction::ReportAgentRestart => {
+                                    pending_foreground_shell_clear = false;
+                                    foreground_shell_exit_reported = false;
+                                    agent_presence.observe_process_probe(new_agent);
+                                    true
                                 }
                                 ForegroundShellAgentAction::ClearAgent => {
                                     pending_foreground_shell_clear = false;
@@ -2099,7 +2127,7 @@ impl PaneRuntime {
                             }
                             if changed {
                                 agent = agent_presence.current_agent();
-                                if agent != previous_agent {
+                                if agent_restarted || agent != previous_agent {
                                     pending_idle.clear();
                                     last_screen_scan_detection_content_seq = None;
                                     // A new foreground agent must not inherit OSC
@@ -3261,6 +3289,15 @@ mod tests {
         assert_eq!(
             foreground_shell_agent_action(Some(Agent::Claude), None, false, true),
             ForegroundShellAgentAction::ClearAgent
+        );
+    }
+
+    #[test]
+    fn reported_process_exit_distinguishes_same_agent_restart() {
+        assert_eq!(
+            foreground_shell_agent_action(Some(Agent::Pi), Some(Agent::Pi), false, true),
+            ForegroundShellAgentAction::ReportAgentRestart,
+            "the next Pi process must publish fresh generation evidence"
         );
     }
 

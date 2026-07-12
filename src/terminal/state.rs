@@ -269,8 +269,11 @@ impl TerminalState {
                 .hook_authority
                 .as_ref()
                 .map(|authority| authority.source.clone());
-            self.suppress_current_full_lifecycle_hook_authority(
+            // Use detector time so a later queued process observation is not
+            // mistaken for stale evidence merely because this event was handled late.
+            self.suppress_current_full_lifecycle_hook_authority_at(
                 FullLifecycleHookSuppressionReason::ProcessExit,
+                now,
             );
             if let Some(source) = cleared_source {
                 self.hook_report_sequences.remove(&source);
@@ -536,6 +539,14 @@ impl TerminalState {
         &mut self,
         reason: FullLifecycleHookSuppressionReason,
     ) {
+        self.suppress_current_full_lifecycle_hook_authority_at(reason, Instant::now());
+    }
+
+    fn suppress_current_full_lifecycle_hook_authority_at(
+        &mut self,
+        reason: FullLifecycleHookSuppressionReason,
+        observed_at: Instant,
+    ) {
         if let Some((source, agent_label, session_ref)) =
             self.hook_authority.as_ref().and_then(|authority| {
                 crate::detect::full_lifecycle_hook_authority(
@@ -551,11 +562,12 @@ impl TerminalState {
                 })
             })
         {
-            self.suppress_full_lifecycle_hook_report_with_session_ref(
+            self.suppress_full_lifecycle_hook_report_with_session_ref_at(
                 source,
                 agent_label,
                 session_ref,
                 reason,
+                observed_at,
             );
         }
     }
@@ -587,12 +599,29 @@ impl TerminalState {
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
         reason: FullLifecycleHookSuppressionReason,
     ) {
+        self.suppress_full_lifecycle_hook_report_with_session_ref_at(
+            source,
+            agent_label,
+            session_ref,
+            reason,
+            Instant::now(),
+        );
+    }
+
+    fn suppress_full_lifecycle_hook_report_with_session_ref_at(
+        &mut self,
+        source: String,
+        agent_label: String,
+        session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        reason: FullLifecycleHookSuppressionReason,
+        observed_at: Instant,
+    ) {
         self.suppressed_full_lifecycle_hook_reports.insert(
             source,
             SuppressedFullLifecycleHookReport {
                 agent_label,
                 session_ref,
-                observed_at: Instant::now(),
+                observed_at,
                 reason,
             },
         );
@@ -741,7 +770,18 @@ impl TerminalState {
         let Some(detected_agent) = detected_agent else {
             return;
         };
-        if previous_detected_agent == Some(detected_agent) {
+        // Process exit keeps the detected agent long enough to attribute completion.
+        // Fresh process evidence can therefore repeat the label without being the same run.
+        if previous_detected_agent == Some(detected_agent)
+            && !self
+                .suppressed_full_lifecycle_hook_reports
+                .values()
+                .any(|suppressed| {
+                    suppressed.reason == FullLifecycleHookSuppressionReason::ProcessExit
+                        && crate::detect::parse_agent_label(&suppressed.agent_label)
+                            == Some(detected_agent)
+                })
+        {
             return;
         }
         let detected_label = crate::detect::agent_label(detected_agent);
@@ -2206,6 +2246,113 @@ mod tests {
         assert!(fresh.is_some());
         assert!(terminal.hook_authority.is_some());
         assert_eq!(terminal.state, AgentState::Working);
+    }
+
+    #[test]
+    fn next_hook_agent_in_live_shell_replaces_process_exit_generation() {
+        for (next_agent, next_source, next_label) in [
+            (Agent::Omp, "herdr:omp", "omp"),
+            (Agent::Pi, "herdr:pi", "pi"),
+        ] {
+            let mut terminal = test_terminal();
+            let now = Instant::now();
+            let old_session = crate::agent_resume::AgentSessionRef::id("pi-old");
+            terminal.set_detected_state_with_screen_signals_at(
+                Some(Agent::Pi),
+                AgentState::Idle,
+                false,
+                true,
+                false,
+                false,
+                now - Duration::from_secs(3),
+            );
+            terminal
+                .set_hook_authority_with_custom_status_at(
+                    "herdr:pi".into(),
+                    "pi".into(),
+                    AgentState::Working,
+                    None,
+                    None,
+                    old_session.clone(),
+                    Some(1000),
+                    now - Duration::from_secs(2),
+                )
+                .expect("the first agent should establish hook authority");
+
+            terminal.set_detected_state_with_screen_signals_at(
+                Some(Agent::Pi),
+                AgentState::Idle,
+                false,
+                true,
+                false,
+                true,
+                now - Duration::from_secs(1),
+            );
+
+            assert!(terminal.hook_authority.is_none());
+            let stale = terminal.set_hook_authority_with_custom_status_at(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                Some("late from exited process".into()),
+                old_session.clone(),
+                Some(1001),
+                now - Duration::from_millis(750),
+            );
+            assert!(stale.is_none(), "the exited agent must stay suppressed");
+
+            terminal.set_detected_state_with_screen_signals_at(
+                Some(next_agent),
+                AgentState::Idle,
+                false,
+                true,
+                false,
+                false,
+                now - Duration::from_millis(500),
+            );
+            let new_session = crate::agent_resume::AgentSessionRef::id(format!("{next_label}-new"));
+            let fresh = terminal.set_hook_authority_with_custom_status_at(
+                next_source.into(),
+                next_label.into(),
+                AgentState::Working,
+                None,
+                None,
+                new_session.clone(),
+                Some(500),
+                now,
+            );
+
+            assert!(
+                fresh.is_some(),
+                "a fresh {next_label} process should establish hook authority in the reused shell"
+            );
+            assert_eq!(terminal.detected_agent, Some(next_agent));
+            assert_eq!(terminal.effective_agent_label(), Some(next_label));
+            assert!(terminal.is_agent_terminal());
+            assert_eq!(
+                terminal
+                    .hook_authority
+                    .as_ref()
+                    .and_then(|authority| authority.session_ref.clone()),
+                new_session
+            );
+
+            let late_old = terminal.set_hook_authority_with_custom_status_at(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                Some("zombie".into()),
+                old_session,
+                Some(1002),
+                now + Duration::from_secs(1),
+            );
+            assert!(
+                late_old.is_none(),
+                "the exited generation must not reacquire authority"
+            );
+        }
     }
 
     #[test]

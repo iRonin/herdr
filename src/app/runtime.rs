@@ -255,6 +255,8 @@ impl App {
             changed = true;
         }
 
+        changed |= self.state.expire_scrollbar_auto_hide(now);
+
         if self
             .selection_autoscroll_deadline
             .is_some_and(|deadline| now >= deadline)
@@ -556,6 +558,7 @@ impl App {
             self.state.next_pending_agent_notification_deadline(),
             self.copy_feedback_deadline,
             self.next_animation_tick,
+            self.state.next_scrollbar_auto_hide_deadline(now),
             include_git_refresh
                 .then(|| self.git_refresh_deadline())
                 .flatten(),

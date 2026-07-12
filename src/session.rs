@@ -11,7 +11,8 @@ pub const SESSION_ENV_VAR: &str = "HERDR_SESSION";
 pub const DEFAULT_SESSION_NAME: &str = "default";
 
 const MAX_SESSION_NAME_LEN: usize = 64;
-const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const STOP_WAIT_TIMEOUT: Duration =
+    Duration::from_millis(crate::config::DEFAULT_STOP_WAIT_TIMEOUT_MS);
 const STOP_WAIT_POLL: Duration = Duration::from_millis(25);
 const MIN_SOCKET_TIMEOUT: Duration = Duration::from_millis(1);
 
@@ -233,13 +234,13 @@ pub fn stop_session(name: Option<&str>) -> Result<SessionInfo, String> {
     stop_session_with_timeout(name, STOP_WAIT_TIMEOUT)
 }
 
-pub(crate) fn stop_active_server() -> Result<(), String> {
+pub(crate) fn stop_active_server(timeout: Duration) -> Result<(), String> {
     let socket_path = active_api_socket_path();
     let client_socket_path = crate::server::socket_paths::client_socket_path();
     stop_socket_with_timeout(
         socket_path.clone(),
         vec![socket_path, client_socket_path],
-        STOP_WAIT_TIMEOUT,
+        timeout,
         "server",
     )
 }
@@ -263,7 +264,12 @@ fn stop_socket_with_timeout(
     timeout: Duration,
     label: &str,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
+    if timeout.is_zero() {
+        return Err("stop timeout must be greater than zero".to_string());
+    }
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "stop timeout is too large for this platform".to_string())?;
     let request = serde_json::json!({
         "id": "cli:session:stop",
         "method": "server.stop",
@@ -534,6 +540,37 @@ mod tests {
             socket_timeout_from_remaining(Duration::from_millis(10)),
             Some(Duration::from_millis(10))
         );
+    }
+
+    #[test]
+    fn zero_stop_timeout_returns_error_before_connecting() {
+        let socket_path = std::env::temp_dir().join("herdr-zero-stop-timeout.sock");
+        let error = stop_socket_with_timeout(
+            socket_path.clone(),
+            vec![socket_path],
+            Duration::ZERO,
+            "server",
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("stop timeout must be greater than zero"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn oversized_stop_timeout_returns_error_instead_of_panicking() {
+        let socket_path = std::env::temp_dir().join("herdr-oversized-stop-timeout.sock");
+        let error = stop_socket_with_timeout(
+            socket_path.clone(),
+            vec![socket_path],
+            Duration::MAX,
+            "server",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("stop timeout is too large"), "{error}");
     }
 
     #[cfg(unix)]

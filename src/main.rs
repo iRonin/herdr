@@ -295,9 +295,23 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # New tabs can still be created with the configured keybinding.
 # hide_tab_bar_when_single_tab = false
 
+# Show the highest-attention agent status on each top tab.
+# Uses the same working/blocked/done/unknown glyphs as the agents panel.
+# tab_agent_status = false
+
+# Main pane scrollbar: "always" reserves a column, "auto" briefly overlays
+# the last text column after scrolling, and "never" leaves copied text clean.
+# Boolean true/false remains accepted as "always"/"never" for compatibility.
+# show_scrollbar = "always"
+
 # Agent panel ordering: "spaces" (grouped by space) or "priority" (attention queue).
 # "workspaces" is accepted as an alias for "spaces".
 # agent_panel_sort = "spaces"
+
+# Modes cycled by clicking the agent-panel mode label, in order.
+# Values: "priority", "grouped", and "space". Unknown and duplicate entries are ignored.
+# An empty or invalid-only list falls back to all three modes in this default order.
+# agent_panel_modes = ["priority", "grouped", "space"]
 
 # Accent color for highlights, borders, and navigation UI.
 # Accepts: hex (#89b4fa), named colors (cyan, blue, magenta), or rgb(r,g,b)
@@ -336,6 +350,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Resume supported AI-agent panes into their native conversation sessions after
 # a Herdr server restart. Requires official integrations that report session refs.
 # resume_agents_on_restore = true
+
+# Maximum time in milliseconds for `herdr server stop` to wait for shutdown.
+# Zero uses the 10000ms default; values above 300000ms (5 minutes) are capped.
+# stop_timeout_ms = 10000
 
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.

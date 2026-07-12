@@ -1523,13 +1523,25 @@ impl AppState {
             return;
         };
 
-        let layout = crate::ui::compute_tab_bar_view(
-            ws,
-            area,
-            self.tab_scroll,
-            self.tab_scroll_follow_active,
-            self.mouse_capture,
-        );
+        let layout = if self.tab_bar_wrap {
+            crate::ui::compute_wrapped_tab_bar_view(
+                ws,
+                &self.terminals,
+                self.tab_agent_status,
+                area,
+                self.mouse_capture,
+            )
+        } else {
+            crate::ui::compute_tab_bar_view(
+                ws,
+                &self.terminals,
+                self.tab_agent_status,
+                area,
+                self.tab_scroll,
+                self.tab_scroll_follow_active,
+                self.mouse_capture,
+            )
+        };
         self.tab_scroll = layout.scroll;
         self.view.tab_hit_areas = layout.tab_hit_areas;
         self.view.tab_scroll_left_hit_area = layout.scroll_left_hit_area;

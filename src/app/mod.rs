@@ -230,6 +230,28 @@ fn agent_panel_sort_from_config(
     }
 }
 
+fn agent_panel_scope_from_config(
+    scope: crate::config::AgentPanelScopeConfig,
+) -> state::AgentPanelScope {
+    match scope {
+        crate::config::AgentPanelScopeConfig::All => state::AgentPanelScope::All,
+        crate::config::AgentPanelScopeConfig::Current => state::AgentPanelScope::Current,
+    }
+}
+
+fn agent_panel_modes_from_config(
+    modes: &[crate::config::AgentPanelModeConfig],
+) -> Vec<state::AgentPanelMode> {
+    modes
+        .iter()
+        .map(|mode| match mode {
+            crate::config::AgentPanelModeConfig::Priority => state::AgentPanelMode::Priority,
+            crate::config::AgentPanelModeConfig::Grouped => state::AgentPanelMode::Grouped,
+            crate::config::AgentPanelModeConfig::Space => state::AgentPanelMode::Space,
+        })
+        .collect()
+}
+
 /// Parse the configured agent name list into a deduplicated set of `Agent`
 /// values. Unknown agent names are silently dropped so a typo cannot disable
 /// other valid entries.
@@ -450,6 +472,8 @@ impl App {
         };
 
         let agent_panel_sort = agent_panel_sort_from_config(config.ui.agent_panel_sort);
+        let agent_panel_scope = agent_panel_scope_from_config(config.ui.agent_panel_scope);
+        let agent_panel_modes = agent_panel_modes_from_config(&config.ui.agent_panel_modes);
 
         // Validate sidebar bounds before they reach any `u16::clamp(min, max)`
         // call: `clamp` panics when `min > max`. On bad config, fall back to
@@ -598,6 +622,8 @@ impl App {
             sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
             sidebar_section_split,
             agent_panel_sort,
+            agent_panel_scope,
+            agent_panel_modes,
             next_agent_state_change_seq: 0,
             mouse_capture: config.ui.mouse_capture,
             right_click_passthrough_modifiers: config.ui.right_click_passthrough_modifiers(),
@@ -610,6 +636,10 @@ impl App {
             pane_gaps: config.ui.pane_gaps,
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
             hide_tab_bar_when_single_tab: config.ui.hide_tab_bar_when_single_tab,
+            tab_bar_wrap: config.ui.tab_bar_wrap,
+            tab_agent_status: config.ui.tab_agent_status,
+            scrollbar_mode: config.ui.show_scrollbar,
+            last_pane_scroll_activity: HashMap::new(),
             pane_history_persistence: config.experimental.pane_history,
             reveal_hidden_cursor_for_cjk_ime: config.experimental.reveal_hidden_cursor_for_cjk_ime,
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
@@ -1384,8 +1414,18 @@ impl App {
                 self.state.show_agent_labels_on_pane_borders =
                     config.ui.show_agent_labels_on_pane_borders;
                 self.state.hide_tab_bar_when_single_tab = config.ui.hide_tab_bar_when_single_tab;
+                self.state.tab_bar_wrap = config.ui.tab_bar_wrap;
+                self.state.tab_agent_status = config.ui.tab_agent_status;
+                self.state.scrollbar_mode = config.ui.show_scrollbar;
+                if self.state.scrollbar_mode != crate::config::ScrollbarMode::Auto {
+                    self.state.last_pane_scroll_activity.clear();
+                }
                 self.state.agent_panel_sort =
                     agent_panel_sort_from_config(config.ui.agent_panel_sort);
+                self.state.agent_panel_scope =
+                    agent_panel_scope_from_config(config.ui.agent_panel_scope);
+                self.state.agent_panel_modes =
+                    agent_panel_modes_from_config(&config.ui.agent_panel_modes);
                 self.state.agent_panel_scroll = 0;
                 self.state.accent = crate::config::parse_color(&config.ui.accent);
                 if !self.state.local_sound_playback && self.state.sound != config.ui.sound {
@@ -1739,6 +1779,17 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[test]
+    fn app_copies_show_scrollbar_mode_from_config() {
+        let mut config = Config::default();
+        config.ui.show_scrollbar = crate::config::ScrollbarMode::Auto;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert_eq!(app.state.scrollbar_mode, crate::config::ScrollbarMode::Auto);
     }
 
     fn unique_temp_path(name: &str) -> std::path::PathBuf {
@@ -2336,6 +2387,26 @@ mod tests {
     }
 
     #[test]
+    fn startup_uses_configured_agent_panel_modes() {
+        let mut config = Config::default();
+        config.ui.agent_panel_modes = vec![
+            crate::config::AgentPanelModeConfig::Priority,
+            crate::config::AgentPanelModeConfig::Space,
+        ];
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert_eq!(
+            app.state.agent_panel_modes,
+            vec![
+                state::AgentPanelMode::Priority,
+                state::AgentPanelMode::Space
+            ]
+        );
+    }
+
+    #[test]
     fn startup_uses_redraw_on_focus_gained_config() {
         let mut config = Config::default();
         config.ui.redraw_on_focus_gained = false;
@@ -2344,6 +2415,17 @@ mod tests {
         let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
 
         assert!(!app.state.redraw_on_focus_gained);
+    }
+
+    #[test]
+    fn startup_uses_tab_agent_status_config() {
+        let mut config = Config::default();
+        config.ui.tab_agent_status = true;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert!(app.state.tab_agent_status);
     }
 
     #[test]
@@ -2532,7 +2614,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[ui]\nagent_panel_scope = \"current\"\nagent_panel_sort = \"priority\"\nredraw_on_focus_gained = false\nright_click_passthrough_modifier = \"ctrl\"\n[ui.toast]\ndelivery = \"herdr\"\n[experimental]\nswitch_ascii_input_source_in_prefix = true\n",
+            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[ui]\nagent_panel_scope = \"current\"\nagent_panel_sort = \"priority\"\nagent_panel_modes = [\"space\", \"priority\"]\nredraw_on_focus_gained = false\nright_click_passthrough_modifier = \"ctrl\"\nshow_scrollbar = \"auto\"\ntab_agent_status = true\n[ui.toast]\ndelivery = \"herdr\"\n[experimental]\nswitch_ascii_input_source_in_prefix = true\n",
         )
         .unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -2555,7 +2637,17 @@ mod tests {
             crate::config::ToastDelivery::Herdr
         );
         assert_eq!(app.state.agent_panel_sort, state::AgentPanelSort::Priority);
+        assert_eq!(app.state.agent_panel_scope, state::AgentPanelScope::Current);
+        assert_eq!(
+            app.state.agent_panel_modes,
+            vec![
+                state::AgentPanelMode::Space,
+                state::AgentPanelMode::Priority
+            ]
+        );
+        assert_eq!(app.state.scrollbar_mode, crate::config::ScrollbarMode::Auto);
         assert!(!app.state.redraw_on_focus_gained);
+        assert!(app.state.tab_agent_status);
         assert_eq!(
             app.state.right_click_passthrough_modifiers,
             Some(KeyModifiers::CONTROL)
@@ -2975,7 +3067,7 @@ mod tests {
     }
 
     #[test]
-    fn save_agent_panel_sort_persists_then_applies_live_config() {
+    fn save_agent_panel_mode_persists_then_applies_live_config() {
         let _guard = config_env_lock().lock().unwrap();
         let path = temp_config_path("save-agent-panel-sort");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2984,12 +3076,18 @@ mod tests {
 
         let mut app = test_app();
         assert_eq!(app.state.agent_panel_sort, state::AgentPanelSort::Spaces);
+        assert_eq!(app.state.agent_panel_scope, state::AgentPanelScope::All);
 
-        app.save_agent_panel_sort(state::AgentPanelSort::Priority);
+        app.save_agent_panel_mode(
+            state::AgentPanelSort::Priority,
+            state::AgentPanelScope::Current,
+        );
 
         assert_eq!(app.state.agent_panel_sort, state::AgentPanelSort::Priority);
+        assert_eq!(app.state.agent_panel_scope, state::AgentPanelScope::Current);
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("agent_panel_sort = \"priority\""));
+        assert!(content.contains("agent_panel_scope = \"current\""));
         assert!(app.state.config_diagnostic.is_none());
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
@@ -4054,6 +4152,20 @@ mod tests {
         assert_eq!(
             app.next_headless_loop_deadline_with_git_refresh(now, false, true),
             app.session_save_deadline
+        );
+    }
+
+    #[test]
+    fn headless_next_loop_deadline_includes_scrollbar_auto_hide() {
+        let mut app = test_app();
+        let now = Instant::now();
+        app.state.scrollbar_mode = crate::config::ScrollbarMode::Auto;
+        app.state
+            .record_pane_scroll_activity(crate::layout::PaneId::from_raw(7), now);
+
+        assert_eq!(
+            app.next_headless_loop_deadline_with_git_refresh(now, false, false),
+            Some(now + state::SCROLLBAR_AUTO_HIDE_AFTER)
         );
     }
 

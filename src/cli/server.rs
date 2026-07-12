@@ -30,13 +30,29 @@ fn server_stop(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     }
 
-    match crate::session::stop_active_server() {
+    let timeout = load_server_stop_timeout();
+    match crate::session::stop_active_server(timeout) {
         Ok(()) => Ok(0),
         Err(err) => {
             eprintln!("{err}");
             Ok(1)
         }
     }
+}
+
+fn load_server_stop_timeout() -> std::time::Duration {
+    let config = crate::config::Config::load().config;
+    server_stop_timeout(&config)
+}
+
+fn server_stop_timeout(config: &crate::config::Config) -> std::time::Duration {
+    let configured_ms = config.session.stop_timeout_ms;
+    let timeout_ms = if configured_ms == 0 {
+        crate::config::DEFAULT_STOP_WAIT_TIMEOUT_MS
+    } else {
+        configured_ms.min(crate::config::MAX_STOP_WAIT_TIMEOUT_MS)
+    };
+    std::time::Duration::from_millis(timeout_ms)
 }
 
 fn server_reload_config(args: &[String]) -> std::io::Result<i32> {
@@ -264,6 +280,109 @@ fn print_server_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_stop_timeout_uses_configured_value_and_default() {
+        let default_config = crate::config::Config::default();
+        assert_eq!(
+            server_stop_timeout(&default_config),
+            std::time::Duration::from_millis(crate::config::DEFAULT_STOP_WAIT_TIMEOUT_MS)
+        );
+
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[session]
+stop_timeout_ms = 5000
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            server_stop_timeout(&config),
+            std::time::Duration::from_millis(5_000)
+        );
+    }
+
+    #[test]
+    fn server_stop_timeout_defaults_zero_and_clamps_oversized_values() {
+        assert_eq!(crate::config::MAX_STOP_WAIT_TIMEOUT_MS, 300_000);
+
+        let mut config = crate::config::Config::default();
+        config.session.stop_timeout_ms = 0;
+        assert_eq!(
+            server_stop_timeout(&config),
+            std::time::Duration::from_millis(crate::config::DEFAULT_STOP_WAIT_TIMEOUT_MS)
+        );
+
+        config.session.stop_timeout_ms = u64::MAX;
+        assert_eq!(
+            server_stop_timeout(&config),
+            std::time::Duration::from_millis(crate::config::MAX_STOP_WAIT_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn load_server_stop_timeout_reads_config_and_defaults_when_absent() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-server-stop-config-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        assert_eq!(
+            load_server_stop_timeout(),
+            std::time::Duration::from_millis(crate::config::DEFAULT_STOP_WAIT_TIMEOUT_MS)
+        );
+
+        std::fs::write(&path, "[session]\nstop_timeout_ms = 5000\n").unwrap();
+        assert_eq!(
+            load_server_stop_timeout(),
+            std::time::Duration::from_millis(5_000)
+        );
+
+        std::fs::write(&path, "[session]\nstop_timeout_ms = 0\n").unwrap();
+        assert_eq!(
+            load_server_stop_timeout(),
+            std::time::Duration::from_millis(crate::config::DEFAULT_STOP_WAIT_TIMEOUT_MS)
+        );
+
+        std::fs::write(
+            &path,
+            format!(
+                "[session]\nstop_timeout_ms = {}\n",
+                crate::config::MAX_STOP_WAIT_TIMEOUT_MS + 1
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            load_server_stop_timeout(),
+            std::time::Duration::from_millis(crate::config::MAX_STOP_WAIT_TIMEOUT_MS)
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn server_stop_timeout_falls_back_when_config_is_invalid() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-server-stop-invalid-config-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "[session\nstop_timeout_ms = 'broken'").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let timeout = load_server_stop_timeout();
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_file(path);
+        assert_eq!(
+            timeout,
+            std::time::Duration::from_millis(crate::config::DEFAULT_STOP_WAIT_TIMEOUT_MS)
+        );
+    }
 
     #[test]
     fn update_agent_manifest_status_fetches_reloads_then_reads_status() {

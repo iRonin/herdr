@@ -69,13 +69,13 @@ pub(crate) use self::{
         SETTINGS_POPUP_WIDTH,
     },
     sidebar::{
-        agent_panel_body_rect, agent_panel_entries, agent_panel_scroll_metrics,
-        agent_panel_scrollbar_rect, agent_panel_toggle_rect, collapsed_sidebar_sections,
-        collapsed_sidebar_toggle_rect, compute_workspace_card_areas, expanded_sidebar_sections,
-        expanded_sidebar_toggle_rect, normalized_workspace_scroll, sidebar_section_divider_rect,
-        workspace_drop_indicator_row, workspace_list_entries, workspace_list_entries_expanded,
-        workspace_list_rect, workspace_list_scroll_metrics, workspace_list_scrollbar_rect,
-        workspace_parent_group_state, WorkspaceListEntry,
+        agent_panel_body_rect, agent_panel_cycle_next, agent_panel_entries,
+        agent_panel_scroll_metrics, agent_panel_scrollbar_rect, agent_panel_toggle_rect,
+        collapsed_sidebar_sections, collapsed_sidebar_toggle_rect, compute_workspace_card_areas,
+        expanded_sidebar_sections, expanded_sidebar_toggle_rect, normalized_workspace_scroll,
+        sidebar_section_divider_rect, workspace_drop_indicator_row, workspace_list_entries,
+        workspace_list_entries_expanded, workspace_list_rect, workspace_list_scroll_metrics,
+        workspace_list_scrollbar_rect, workspace_parent_group_state, WorkspaceListEntry,
     },
 };
 pub(crate) use self::{
@@ -85,7 +85,7 @@ pub(crate) use self::{
         mobile_switcher_workspace_doc_range, MobileSwitcherTarget,
     },
     panes::{apply_pane_chrome, pane_inner_rect, pane_is_scrolled_back},
-    tabs::compute_tab_bar_view,
+    tabs::{compute_tab_bar_view, compute_wrapped_tab_bar_view},
     widgets::{centered_popup_rect, modal_stack_areas},
 };
 use crate::app::state::ViewLayout;
@@ -193,8 +193,23 @@ fn desktop_tab_bar_and_terminal_area(
 ) -> (Rect, Rect) {
     let hide_single_tab_bar = app.hide_tab_bar_when_single_tab && ws.tabs.len() == 1;
     if !hide_single_tab_bar && main_area.height > 1 {
+        let tab_bar_height = if app.tab_bar_wrap {
+            let desired = tabs::tab_bar_wrapped_rows(
+                ws,
+                &app.terminals,
+                app.tab_agent_status,
+                main_area.width,
+                app.mouse_capture,
+            );
+            // At least one row, and never more than half the pane's height so the
+            // terminal area below stays usable.
+            desired.clamp(1, (main_area.height / 2).max(1))
+        } else {
+            1
+        };
         let [tab_bar_rect, terminal_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main_area);
+            Layout::vertical([Constraint::Length(tab_bar_height), Constraint::Min(1)])
+                .areas(main_area);
         (tab_bar_rect, terminal_area)
     } else {
         (Rect::default(), main_area)
@@ -254,13 +269,25 @@ fn compute_view_internal(
         .active
         .and_then(|ws_idx| app.workspaces.get(ws_idx))
         .map(|ws| {
-            compute_tab_bar_view(
-                ws,
-                tab_bar_rect,
-                app.tab_scroll,
-                app.tab_scroll_follow_active,
-                app.mouse_capture,
-            )
+            if app.tab_bar_wrap {
+                compute_wrapped_tab_bar_view(
+                    ws,
+                    &app.terminals,
+                    app.tab_agent_status,
+                    tab_bar_rect,
+                    app.mouse_capture,
+                )
+            } else {
+                compute_tab_bar_view(
+                    ws,
+                    &app.terminals,
+                    app.tab_agent_status,
+                    tab_bar_rect,
+                    app.tab_scroll,
+                    app.tab_scroll_follow_active,
+                    app.mouse_capture,
+                )
+            }
         })
         .unwrap_or_default();
     app.tab_scroll = tab_bar_view.scroll;

@@ -9,6 +9,8 @@ use super::{
     DEFAULT_SCROLLBACK_LIMIT_BYTES,
 };
 
+pub const DEFAULT_STOP_WAIT_TIMEOUT_MS: u64 = 10_000;
+pub const MAX_STOP_WAIT_TIMEOUT_MS: u64 = 300_000;
 pub const MAX_TOAST_DELAY_SECONDS: u64 = 3600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -106,6 +108,64 @@ impl AgentPanelSortConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentPanelScopeConfig {
+    #[default]
+    All,
+    #[serde(alias = "current_workspace")]
+    Current,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentPanelModeConfig {
+    Priority,
+    #[serde(alias = "spaces")]
+    Grouped,
+    #[serde(alias = "current", alias = "current_workspace")]
+    Space,
+}
+
+impl AgentPanelModeConfig {
+    pub const ALL: [Self; 3] = [Self::Priority, Self::Grouped, Self::Space];
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "priority" => Some(Self::Priority),
+            "grouped" | "spaces" => Some(Self::Grouped),
+            "space" | "current" | "current_workspace" => Some(Self::Space),
+            _ => None,
+        }
+    }
+}
+
+fn default_agent_panel_modes() -> Vec<AgentPanelModeConfig> {
+    AgentPanelModeConfig::ALL.to_vec()
+}
+
+fn deserialize_agent_panel_modes<'de, D>(
+    deserializer: D,
+) -> Result<Vec<AgentPanelModeConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    let mut modes = Vec::with_capacity(values.len());
+    for value in values {
+        if let Some(mode) = AgentPanelModeConfig::parse(&value) {
+            if !modes.contains(&mode) {
+                modes.push(mode);
+            }
+        }
+    }
+    if modes.is_empty() {
+        Ok(default_agent_panel_modes())
+    } else {
+        Ok(modes)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HostCursorModeConfig {
@@ -121,6 +181,42 @@ pub enum SidebarCollapsedModeConfig {
     #[default]
     Compact,
     Hidden,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollbarMode {
+    #[default]
+    Always,
+    Auto,
+    Never,
+}
+
+impl<'de> Deserialize<'de> for ScrollbarMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum ScrollbarModeValue {
+            Bool(bool),
+            String(String),
+        }
+
+        match ScrollbarModeValue::deserialize(deserializer)? {
+            ScrollbarModeValue::Bool(true) => Ok(Self::Always),
+            ScrollbarModeValue::Bool(false) => Ok(Self::Never),
+            ScrollbarModeValue::String(value) => match value.as_str() {
+                "always" => Ok(Self::Always),
+                "auto" => Ok(Self::Auto),
+                "never" => Ok(Self::Never),
+                _ => Err(de::Error::unknown_variant(
+                    &value,
+                    &["always", "auto", "never"],
+                )),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -247,12 +343,21 @@ pub struct SessionConfig {
     /// Resume supported AI-agent panes into their native conversation sessions
     /// when restoring a Herdr session. Default: true.
     pub resume_agents_on_restore: bool,
+    /// Maximum time to wait for `herdr server stop` to finish. Default: 10000ms.
+    /// The server-stop command treats zero as the default and caps larger values at 300000ms.
+    #[serde(default = "default_stop_timeout_ms")]
+    pub stop_timeout_ms: u64,
+}
+
+fn default_stop_timeout_ms() -> u64 {
+    DEFAULT_STOP_WAIT_TIMEOUT_MS
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             resume_agents_on_restore: true,
+            stop_timeout_ms: default_stop_timeout_ms(),
         }
     }
 }
@@ -806,8 +911,27 @@ pub struct UiConfig {
     pub show_agent_labels_on_pane_borders: bool,
     /// Hide the tab row when the workspace has one tab. Default: false.
     pub hide_tab_bar_when_single_tab: bool,
+    /// Wrap tabs onto multiple rows instead of a single scrollable row. Default: false.
+    pub tab_bar_wrap: bool,
+    /// Show the highest-attention agent status indicator on each top tab. Default: false.
+    pub tab_agent_status: bool,
+    /// Main pane scrollback scrollbar mode. `always` reserves a column,
+    /// `auto` overlays the last text column briefly after scrolling, and
+    /// `never` does not draw it. Booleans remain accepted for compatibility
+    /// (`true` = `always`, `false` = `never`). Default: `always`.
+    pub show_scrollbar: ScrollbarMode,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
+    /// Agent sidebar scope. Saved values are "all" or "current"; "current_workspace"
+    /// is accepted as an alias for "current". Default: "all".
+    pub agent_panel_scope: AgentPanelScopeConfig,
+    /// Ordered modes for the clickable agent-panel toggle. Unknown and duplicate
+    /// entries are ignored. Default: ["priority", "grouped", "space"].
+    #[serde(
+        default = "default_agent_panel_modes",
+        deserialize_with = "deserialize_agent_panel_modes"
+    )]
+    pub agent_panel_modes: Vec<AgentPanelModeConfig>,
     /// Accent color for highlights, borders, and navigation UI.
     /// Accepts hex (#89b4fa), named colors (cyan, blue), or RGB (rgb(137,180,250)).
     pub accent: String,
@@ -999,7 +1123,12 @@ impl Default for UiConfig {
             pane_gaps: true,
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
+            tab_bar_wrap: false,
+            tab_agent_status: false,
+            show_scrollbar: ScrollbarMode::Always,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
+            agent_panel_scope: AgentPanelScopeConfig::All,
+            agent_panel_modes: default_agent_panel_modes(),
             accent: "cyan".into(),
             toast: ToastConfig::default(),
             sound: SoundConfig::default(),
@@ -1176,6 +1305,35 @@ resume_agents_on_restore = false
     }
 
     #[test]
+    fn stop_timeout_defaults_to_ten_seconds_and_parses() {
+        assert_eq!(DEFAULT_STOP_WAIT_TIMEOUT_MS, 10_000);
+
+        let default_config: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            default_config.session.stop_timeout_ms,
+            DEFAULT_STOP_WAIT_TIMEOUT_MS
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+[session]
+stop_timeout_ms = 5000
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.session.stop_timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn stop_timeout_preserves_values_for_server_command_resolution() {
+        for value in [0, MAX_STOP_WAIT_TIMEOUT_MS + 1, i64::MAX as u64] {
+            let toml = format!("[session]\nstop_timeout_ms = {value}\n");
+            let config: Config = toml::from_str(&toml).unwrap();
+            assert_eq!(config.session.stop_timeout_ms, value);
+        }
+    }
+
+    #[test]
     fn agent_panel_sort_config_parses_alias_and_defaults() {
         assert_eq!(
             Config::default().ui.agent_panel_sort,
@@ -1205,12 +1363,106 @@ agent_panel_scope = "current"
     }
 
     #[test]
+    fn agent_panel_scope_config_parses_alias_and_defaults() {
+        assert_eq!(
+            Config::default().ui.agent_panel_scope,
+            AgentPanelScopeConfig::All
+        );
+
+        let toml = r#"
+[ui]
+agent_panel_scope = "current"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.agent_panel_scope, AgentPanelScopeConfig::Current);
+
+        let toml = r#"
+[ui]
+agent_panel_scope = "current_workspace"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.agent_panel_scope, AgentPanelScopeConfig::Current);
+
+        let toml = r#"
+[ui]
+agent_panel_scope = "all"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.agent_panel_scope, AgentPanelScopeConfig::All);
+    }
+
+    #[test]
+    fn agent_panel_modes_default_to_all_three_in_cycle_order() {
+        let config: Config = toml::from_str("").unwrap();
+
+        assert_eq!(
+            config.ui.agent_panel_modes,
+            vec![
+                AgentPanelModeConfig::Priority,
+                AgentPanelModeConfig::Grouped,
+                AgentPanelModeConfig::Space,
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_panel_modes_parse_custom_order() {
+        let config: Config = toml::from_str(
+            r#"
+[ui]
+agent_panel_modes = ["priority", "space"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.ui.agent_panel_modes,
+            vec![AgentPanelModeConfig::Priority, AgentPanelModeConfig::Space]
+        );
+    }
+
+    #[test]
+    fn agent_panel_modes_drop_unknown_and_duplicate_entries_preserving_order() {
+        let config: Config = toml::from_str(
+            r#"
+[ui]
+agent_panel_modes = ["space", "unknown", "priority", "space", "grouped", "priority"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.ui.agent_panel_modes,
+            vec![
+                AgentPanelModeConfig::Space,
+                AgentPanelModeConfig::Priority,
+                AgentPanelModeConfig::Grouped,
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_panel_modes_empty_list_falls_back_to_all_three() {
+        let config: Config = toml::from_str(
+            r#"
+[ui]
+agent_panel_modes = []
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.ui.agent_panel_modes, AgentPanelModeConfig::ALL);
+    }
+
+    #[test]
     fn pane_appearance_defaults_and_parse() {
         let default_config = Config::default();
         assert!(default_config.ui.pane_borders);
         assert!(default_config.ui.pane_gaps);
         assert!(!default_config.ui.show_agent_labels_on_pane_borders);
         assert!(!default_config.ui.hide_tab_bar_when_single_tab);
+        assert!(!default_config.ui.tab_bar_wrap);
+        assert!(!default_config.ui.tab_agent_status);
 
         let toml = r#"
 [ui]
@@ -1218,12 +1470,32 @@ pane_borders = false
 pane_gaps = true
 show_agent_labels_on_pane_borders = true
 hide_tab_bar_when_single_tab = true
+tab_bar_wrap = true
+tab_agent_status = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.pane_borders);
         assert!(config.ui.pane_gaps);
         assert!(config.ui.show_agent_labels_on_pane_borders);
         assert!(config.ui.hide_tab_bar_when_single_tab);
+        assert!(config.ui.tab_bar_wrap);
+        assert!(config.ui.tab_agent_status);
+    }
+
+    #[test]
+    fn show_scrollbar_accepts_bool_and_string_modes_and_defaults_to_always() {
+        fn parse(value: &str) -> ScrollbarMode {
+            let config: Config = toml::from_str(&format!("[ui]\nshow_scrollbar = {value}\n"))
+                .expect("show_scrollbar mode should parse");
+            config.ui.show_scrollbar
+        }
+
+        assert_eq!(Config::default().ui.show_scrollbar, ScrollbarMode::Always);
+        assert_eq!(parse("true"), ScrollbarMode::Always);
+        assert_eq!(parse("false"), ScrollbarMode::Never);
+        assert_eq!(parse("\"always\""), ScrollbarMode::Always);
+        assert_eq!(parse("\"auto\""), ScrollbarMode::Auto);
+        assert_eq!(parse("\"never\""), ScrollbarMode::Never);
     }
 
     #[test]

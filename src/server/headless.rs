@@ -3227,12 +3227,30 @@ impl HeadlessServer {
     }
 
     fn retained_pty_update_allowed_by_app_state(&self) -> bool {
+        let now = Instant::now();
+        let auto_scrollbar_overlay_visible = self.app.state.scrollbar_mode
+            == crate::config::ScrollbarMode::Auto
+            && self.app.state.active.is_some_and(|ws_idx| {
+                self.app.state.view.pane_infos.iter().any(|info| {
+                    self.app
+                        .state
+                        .runtime_for_pane_in_workspace(&self.app.terminal_runtimes, ws_idx, info.id)
+                        .and_then(crate::terminal::TerminalRuntime::scroll_metrics)
+                        .is_some_and(|metrics| {
+                            self.app
+                                .state
+                                .pane_scrollbar_overlay_visible(info.id, metrics, now)
+                        })
+                })
+            });
+
         self.app.state.mode == app::Mode::Terminal
             && self.app.state.selection.is_none()
             && self.app.state.copy_mode.is_none()
             && self.app.state.context_menu.is_none()
             && self.app.state.toast.is_none()
             && self.app.state.copy_feedback.is_none()
+            && !auto_scrollbar_overlay_visible
             && !self.app.full_redraw_pending
     }
 
@@ -3668,6 +3686,8 @@ impl HeadlessServer {
             self.app.next_animation_tick = Some(now + app::HEADLESS_ANIMATION_INTERVAL);
             changed = true;
         }
+
+        changed |= self.app.state.expire_scrollbar_auto_hide(now);
 
         if self
             .app
@@ -5507,6 +5527,20 @@ next_tab = ""
     }
 
     #[test]
+    fn headless_scheduled_tasks_expires_scrollbar_overlay_activity() {
+        let mut server = test_headless_server();
+        let now = Instant::now();
+        server.app.state.scrollbar_mode = crate::config::ScrollbarMode::Auto;
+        server.app.state.record_pane_scroll_activity(
+            crate::layout::PaneId::from_raw(7),
+            now - app::state::SCROLLBAR_AUTO_HIDE_AFTER,
+        );
+
+        assert!(server.handle_scheduled_tasks_headless(now, false));
+        assert!(server.app.state.last_pane_scroll_activity.is_empty());
+    }
+
+    #[test]
     fn headless_scheduled_tasks_clears_disabled_agent_manifest_update_deadline() {
         let mut server = test_headless_server();
         let now = Instant::now();
@@ -7236,6 +7270,41 @@ next_tab = ""
         );
         assert!(patched.cells.iter().any(|cell| cell.symbol == "Z"));
         assert_eq!((patched.width, patched.height), (80, 24));
+    }
+
+    #[tokio::test]
+    async fn retained_pty_update_declines_while_auto_scrollbar_overlay_is_visible() {
+        let lines = (0..40)
+            .map(|line| format!("line {line:02}\r\n"))
+            .collect::<String>();
+        let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
+        server.app.state.workspaces[0].insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                80,
+                24,
+                16 * 1024,
+                lines.as_bytes(),
+            ),
+        );
+        server.app.state.scrollbar_mode = crate::config::ScrollbarMode::Auto;
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.scroll_up(1);
+        assert!(crate::ui::pane_is_scrolled_back(runtime));
+        server
+            .app
+            .state
+            .record_pane_scroll_activity(pane_id, Instant::now());
+        server.render_and_stream();
+        client_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initial frame");
+
+        assert!(!server.retained_pty_update_allowed_by_app_state());
     }
 
     #[tokio::test]
