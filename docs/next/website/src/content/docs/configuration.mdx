@@ -342,6 +342,8 @@ Use `herdr workspace report-metadata` in the same way for custom Space tokens. U
 
 Sidebar row settings affect only the expanded desktop sidebar. Collapsed and mobile views keep their compact layouts.
 
+Set `tab_bar_wrap = true` under `[ui]` to show tabs across the available rows instead of using the default single scrollable row with `<`/`>` buttons. The tab bar grows downward as needed, up to half of the pane area's height, and the terminal and popup geometry below shrink with it. When the row count reaches that cap, Herdr scrolls the visible row window to keep the active tab visible. The default is `false`.
+
 ## Notifications
 
 Herdr can notify you when a background agent finishes or needs input:

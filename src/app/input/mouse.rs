@@ -6,8 +6,8 @@ use tracing::warn;
 use crate::{
     app::state::{
         AgentPanelSort, AppState, ContextMenuKind, ContextMenuState, DragState, DragTarget,
-        MenuListState, Mode, RightClickPassthroughGesture, TabPressState, ViewLayout,
-        WorkspacePressState,
+        MenuListState, Mode, RightClickPassthroughGesture, TabDropTarget, TabPressState,
+        ViewLayout, WorkspacePressState,
     },
     layout::{PaneInfo, SplitBorder},
     selection::Selection,
@@ -690,7 +690,7 @@ impl AppState {
                 }
 
                 let workspace_drop_index = self.workspace_drop_index_at_row(mouse.row);
-                let tab_drop_index = self.tab_drop_index_at(mouse.column, mouse.row);
+                let tab_drop_target = self.tab_drop_index_at(mouse.column, mouse.row);
                 if self.drag.is_none() {
                     if let Some(press) = &self.workspace_press {
                         let delta_col = mouse.column.abs_diff(press.start_col);
@@ -715,7 +715,7 @@ impl AppState {
                                 target: DragTarget::TabReorder {
                                     ws_idx: press.ws_idx,
                                     source_tab_idx: press.tab_idx,
-                                    insert_idx: tab_drop_index,
+                                    drop_target: tab_drop_target,
                                 },
                             });
                         }
@@ -730,12 +730,14 @@ impl AppState {
                 } else if let Some(DragState {
                     target:
                         DragTarget::TabReorder {
-                            ws_idx, insert_idx, ..
+                            ws_idx,
+                            drop_target,
+                            ..
                         },
                 }) = &mut self.drag
                 {
                     if self.active == Some(*ws_idx) {
-                        *insert_idx = tab_drop_index;
+                        *drop_target = tab_drop_target;
                     }
                 } else if let Some(drag) = &self.drag {
                     match &drag.target {
@@ -864,7 +866,7 @@ impl AppState {
                             DragTarget::TabReorder {
                                 ws_idx,
                                 source_tab_idx,
-                                insert_idx: Some(insert_idx),
+                                drop_target: Some(drop_target),
                             },
                     }) => {
                         if self.active == Some(ws_idx) {
@@ -872,7 +874,7 @@ impl AppState {
                             return Some(MouseAction::MoveTab {
                                 ws_idx,
                                 source_tab_idx,
-                                insert_idx,
+                                insert_idx: drop_target.insert_idx,
                             });
                         }
                     }
@@ -1291,64 +1293,100 @@ impl AppState {
             && col < area.x + area.width
     }
 
-    pub(super) fn tab_drop_index_at(&self, col: u16, row: u16) -> Option<usize> {
+    pub(super) fn tab_drop_index_at(&self, col: u16, row: u16) -> Option<TabDropTarget> {
         if !self.on_tab_bar(col, row) {
             return None;
         }
 
-        let visible_tabs: Vec<_> = self
+        if self.on_tab_scroll_left_button(col, row) {
+            let area = self.view.tab_scroll_left_hit_area;
+            return Some(TabDropTarget {
+                insert_idx: 0,
+                indicator_position: (area.right(), area.y),
+            });
+        }
+        if self.on_tab_scroll_right_button(col, row) {
+            let area = self.view.tab_scroll_right_hit_area;
+            let insert_idx = self
+                .active
+                .and_then(|idx| self.workspaces.get(idx))?
+                .tabs
+                .len();
+            return Some(TabDropTarget {
+                insert_idx,
+                indicator_position: (area.x.saturating_sub(1), area.y),
+            });
+        }
+
+        let row_tabs: Vec<_> = self
             .view
             .tab_hit_areas
             .iter()
             .enumerate()
-            .filter(|(_, rect)| rect.width > 0)
+            .filter(|(_, rect)| rect.width > 0 && row >= rect.y && row < rect.y + rect.height)
+            .map(|(idx, rect)| (idx, *rect))
             .collect();
-        let (first_idx, first_rect) = *visible_tabs.first()?;
-        let (last_idx, last_rect) = *visible_tabs.last()?;
+        let (first_idx, first_rect) = *row_tabs.first()?;
+        let (last_idx, last_rect) = *row_tabs.last()?;
 
-        if self.on_tab_scroll_left_button(col, row) {
-            return Some(0);
-        }
-        if self.on_tab_scroll_right_button(col, row) {
-            return self
-                .active
-                .and_then(|idx| self.workspaces.get(idx))
-                .map(|ws| ws.tabs.len());
-        }
-
-        let left_edge = if first_idx == 0 {
+        let left_edge = if self.tab_bar_wrap || first_idx == 0 {
             first_rect.x
         } else {
-            self.view.tab_scroll_left_hit_area.x + self.view.tab_scroll_left_hit_area.width
+            self.view.tab_scroll_left_hit_area.right()
         };
-        let right_edge = if self
-            .active
-            .and_then(|idx| self.workspaces.get(idx))
-            .is_some_and(|ws| last_idx + 1 >= ws.tabs.len())
+        let right_edge = if self.tab_bar_wrap
+            || self
+                .active
+                .and_then(|idx| self.workspaces.get(idx))
+                .is_some_and(|ws| last_idx + 1 >= ws.tabs.len())
         {
-            last_rect.x + last_rect.width
+            last_rect.right()
         } else {
             self.view.tab_scroll_right_hit_area.x.saturating_sub(1)
         };
 
+        let before_position = |idx: usize, rect: Rect, first_on_row: bool| {
+            let x = if idx == 0 || (self.tab_bar_wrap && first_on_row) {
+                rect.x
+            } else {
+                rect.x.saturating_sub(1)
+            };
+            (x, rect.y)
+        };
+
         if col <= left_edge {
-            return Some(first_idx);
+            return Some(TabDropTarget {
+                insert_idx: first_idx,
+                indicator_position: before_position(first_idx, first_rect, true),
+            });
         }
         if col >= right_edge {
-            return Some(last_idx + 1);
+            return Some(TabDropTarget {
+                insert_idx: last_idx + 1,
+                indicator_position: (right_edge, last_rect.y),
+            });
         }
 
-        for (idx, rect) in visible_tabs {
+        for (row_idx, (idx, rect)) in row_tabs.into_iter().enumerate() {
             let midpoint = rect.x + rect.width / 2;
             if col < midpoint {
-                return Some(idx);
+                return Some(TabDropTarget {
+                    insert_idx: idx,
+                    indicator_position: before_position(idx, rect, row_idx == 0),
+                });
             }
-            if col < rect.x + rect.width {
-                return Some(idx + 1);
+            if col < rect.right() {
+                return Some(TabDropTarget {
+                    insert_idx: idx + 1,
+                    indicator_position: (rect.right(), rect.y),
+                });
             }
         }
 
-        Some(last_idx + 1)
+        Some(TabDropTarget {
+            insert_idx: last_idx + 1,
+            indicator_position: (right_edge, last_rect.y),
+        })
     }
 
     pub(super) fn on_new_tab_button(&self, col: u16, row: u16) -> bool {
@@ -1848,7 +1886,11 @@ fn apply_scroll(scroll: &mut usize, delta: i16, max_scroll: usize) {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
-    use ratatui::layout::{Direction, Rect};
+    use ratatui::{
+        backend::TestBackend,
+        layout::{Direction, Rect},
+        Terminal,
+    };
 
     use super::super::{
         app_for_mouse_test, capture_snapshot, mouse, numbered_lines_bytes, root_layout_ratio,
@@ -3460,6 +3502,194 @@ mod tests {
         assert_eq!(app.state.mode, Mode::ConfirmClose);
         assert_eq!(app.state.workspaces.len(), 2);
         assert!(app.state.context_menu.is_none());
+    }
+
+    #[test]
+    fn wrapped_tab_drop_index_uses_the_pointer_row() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("one");
+        for idx in 1..7 {
+            ws.test_add_tab(Some(&format!("tab-{idx}")));
+        }
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.tab_bar_wrap = true;
+        app.state.mouse_capture = false;
+
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 20));
+        let (tab_idx, rect) = app
+            .state
+            .view
+            .tab_hit_areas
+            .iter()
+            .enumerate()
+            .find(|(_, rect)| rect.width > 0 && rect.y > app.state.view.tab_bar_rect.y)
+            .map(|(idx, rect)| (idx, *rect))
+            .expect("a tab should wrap onto a lower row");
+
+        assert_eq!(
+            app.state
+                .tab_drop_index_at(rect.x + 1, rect.y)
+                .map(|target| target.insert_idx),
+            Some(tab_idx),
+            "the left half inserts before the lower-row tab"
+        );
+        assert_eq!(
+            app.state
+                .tab_drop_index_at(rect.x + rect.width / 2, rect.y)
+                .map(|target| target.insert_idx),
+            Some(tab_idx + 1),
+            "the right half inserts after the lower-row tab"
+        );
+    }
+
+    #[test]
+    fn dragging_over_a_wrapped_lower_row_reorders_there_and_previews_that_row() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("one");
+        for _ in 1..7 {
+            ws.test_add_tab(None);
+        }
+        let moved_root = ws.tabs[0].root_pane;
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.tab_bar_wrap = true;
+        app.state.mouse_capture = false;
+        app.state.mobile_width_threshold = 0;
+
+        let screen = Rect::new(0, 0, 56, 20);
+        crate::ui::compute_view(&mut app.state, screen);
+        assert_eq!(app.state.view.tab_bar_rect.width, 30);
+        assert_eq!(app.state.view.tab_hit_areas[4].width, 8);
+        let source = app.state.view.tab_hit_areas[0];
+        let target = app.state.view.tab_hit_areas[4];
+        let drop_col = app.state.view.tab_bar_rect.x + 13;
+        assert_eq!(target.y, app.state.view.tab_bar_rect.y + 1);
+        assert!(drop_col >= target.x && drop_col < target.right());
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            source.x + 1,
+            source.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            drop_col,
+            target.y,
+        ));
+
+        let (insert_idx, indicator_position) =
+            match app.state.drag.as_ref().map(|drag| &drag.target) {
+                Some(DragTarget::TabReorder {
+                    ws_idx: 0,
+                    source_tab_idx: 0,
+                    drop_target:
+                        Some(TabDropTarget {
+                            insert_idx,
+                            indicator_position,
+                        }),
+                }) => (*insert_idx, *indicator_position),
+                _ => panic!("expected a tab reorder drag"),
+            };
+        assert!(
+            matches!(insert_idx, 4 | 5),
+            "the second-row pointer must resolve around tab 4, not {insert_idx}"
+        );
+
+        let indicator_x = if insert_idx == 4 {
+            target.x
+        } else {
+            target.right()
+        };
+        assert_eq!(indicator_position, (indicator_x, target.y));
+        let mut terminal = Terminal::new(TestBackend::new(screen.width, screen.height)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(&app.state, frame))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(indicator_x, target.y)].symbol(),
+            "│",
+            "the drop preview must be rendered on the pointer row"
+        );
+        assert_ne!(
+            terminal.backend().buffer()[(indicator_x, app.state.view.tab_bar_rect.y)].symbol(),
+            "│",
+            "the lower-row preview must not be rendered on the first row"
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            drop_col,
+            target.y,
+        ));
+        let moved_idx = insert_idx - 1;
+        assert_eq!(
+            app.state.workspaces[0].tabs[moved_idx].root_pane,
+            moved_root
+        );
+    }
+
+    #[test]
+    fn wrapped_boundary_drop_preview_stays_on_the_pointer_row() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("one");
+        for _ in 1..7 {
+            ws.test_add_tab(None);
+        }
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.tab_bar_wrap = true;
+        app.state.mouse_capture = false;
+        app.state.mobile_width_threshold = 0;
+
+        let screen = Rect::new(0, 0, 56, 20);
+        crate::ui::compute_view(&mut app.state, screen);
+        let source = app.state.view.tab_hit_areas[6];
+        let first_row_end = app.state.view.tab_hit_areas[2];
+        let second_row_start = app.state.view.tab_hit_areas[3];
+        assert_eq!(first_row_end.y + 1, second_row_start.y);
+        assert_eq!(
+            app.state
+                .tab_drop_index_at(first_row_end.right(), first_row_end.y)
+                .map(|target| target.insert_idx),
+            Some(3)
+        );
+        assert_eq!(
+            app.state
+                .tab_drop_index_at(second_row_start.x, second_row_start.y)
+                .map(|target| target.insert_idx),
+            Some(3),
+            "both visual sides of the wrapped boundary share insert index 3"
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            source.x + 1,
+            source.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            first_row_end.right(),
+            first_row_end.y,
+        ));
+
+        let mut terminal = Terminal::new(TestBackend::new(screen.width, screen.height)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(&app.state, frame))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(first_row_end.right(), first_row_end.y)].symbol(),
+            "│",
+            "the shared insert index must preview at the row edge under the pointer"
+        );
+        assert_ne!(
+            terminal.backend().buffer()[(second_row_start.x, second_row_start.y)].symbol(),
+            "│",
+            "the preview must not jump to the equivalent boundary on the next row"
+        );
     }
 
     #[test]

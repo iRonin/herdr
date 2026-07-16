@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Added `ui.tab_bar_wrap` to show tabs across available rows, with a capped row window that follows the active tab.
+
 ## [0.7.4] - 2026-07-15
 
 ### Added

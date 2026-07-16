@@ -1386,7 +1386,7 @@ mod tests {
             Some(DragTarget::TabReorder {
                 ws_idx: 0,
                 source_tab_idx: 0,
-                insert_idx: Some(3),
+                drop_target: Some(crate::app::state::TabDropTarget { insert_idx: 3, .. }),
             })
         ));
         app.handle_mouse(mouse(

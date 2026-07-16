@@ -1094,6 +1094,12 @@ pub struct SettingsState {
     pub original_theme: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TabDropTarget {
+    pub insert_idx: usize,
+    pub indicator_position: (u16, u16),
+}
+
 pub(crate) enum DragTarget {
     WorkspaceReorder {
         source_ws_idx: usize,
@@ -1102,7 +1108,7 @@ pub(crate) enum DragTarget {
     TabReorder {
         ws_idx: usize,
         source_tab_idx: usize,
-        insert_idx: Option<usize>,
+        drop_target: Option<TabDropTarget>,
     },
     WorkspaceListScrollbar {
         grab_row_offset: u16,
@@ -1465,6 +1471,7 @@ pub struct AppState {
     pub pane_gaps: bool,
     pub show_agent_labels_on_pane_borders: bool,
     pub hide_tab_bar_when_single_tab: bool,
+    pub tab_bar_wrap: bool,
     pub pane_history_persistence: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
@@ -1838,6 +1845,7 @@ impl AppState {
             pane_gaps: false,
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
+            tab_bar_wrap: false,
             pane_history_persistence: false,
             reveal_hidden_cursor_for_cjk_ime: false,
             cjk_ime_agent_filter_configured: false,
@@ -2169,14 +2177,14 @@ impl AppState {
                 DragTarget::TabReorder {
                     ws_idx,
                     source_tab_idx,
-                    insert_idx,
+                    drop_target,
                 } => {
                     assert_tab_index(*ws_idx, *source_tab_idx, "tab drag source");
-                    if let Some(insert_idx) = insert_idx {
+                    if let Some(drop_target) = drop_target {
                         assert!(
-                            *insert_idx <= self.workspaces[*ws_idx].tabs.len(),
+                            drop_target.insert_idx <= self.workspaces[*ws_idx].tabs.len(),
                             "tab drag insert index {} out of bounds for workspace {} with {} tabs",
-                            insert_idx,
+                            drop_target.insert_idx,
                             ws_idx,
                             self.workspaces[*ws_idx].tabs.len()
                         );
