@@ -288,6 +288,7 @@ impl App {
         let handled_pane_double_click = self.handle_pane_double_click(mouse);
 
         let previous_agent_panel_sort = self.state.agent_panel_sort;
+        let previous_agent_panel_scope = self.state.agent_panel_scope;
         let previous_settings_section = self.state.settings.section;
         if !handled_pane_double_click {
             let right_button = matches!(
@@ -367,8 +368,10 @@ impl App {
         {
             self.refresh_integration_recommendations();
         }
-        if self.state.agent_panel_sort != previous_agent_panel_sort {
-            self.save_agent_panel_sort(self.state.agent_panel_sort);
+        if self.state.agent_panel_sort != previous_agent_panel_sort
+            || self.state.agent_panel_scope != previous_agent_panel_scope
+        {
+            self.save_agent_panel_mode(self.state.agent_panel_sort, self.state.agent_panel_scope);
         }
 
         if let Some(content) = self.state.request_clipboard_write.take() {

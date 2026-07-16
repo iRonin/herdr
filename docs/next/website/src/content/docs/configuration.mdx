@@ -342,6 +342,10 @@ Use `herdr workspace report-metadata` in the same way for custom Space tokens. U
 
 Sidebar row settings affect only the expanded desktop sidebar. Collapsed and mobile views keep their compact layouts.
 
+By default the agent panel shows all agents across all spaces. Set `agent_panel_scope = "current"` under `[ui]` to limit it to the active workspace; `"all"` is the default, and `"current_workspace"` remains accepted as an alias. `agent_panel_sort` remains independent: `"spaces"` groups by space, while `"priority"` orders blocked, done, working, idle, then unknown agents, breaking ties by the most recent state change. Current-space mode always uses priority ordering.
+
+Click the agent-panel mode label to cycle through `priority`, `grouped`, and `space`. `agent_panel_modes` controls which modes appear and their order, for example `["priority", "space"]`. Unknown and duplicate entries are ignored while preserving the first occurrence; an empty or invalid-only list falls back to all three modes. A one-item list makes clicks a no-op. The mode list controls cycling only and does not change the configured or persisted `agent_panel_sort` and `agent_panel_scope` at startup.
+
 Set `tab_bar_wrap = true` under `[ui]` to show tabs across the available rows instead of using the default single scrollable row with `<`/`>` buttons. The tab bar grows downward as needed, up to half of the pane area's height, and the terminal and popup geometry below shrink with it. When the row count reaches that cap, Herdr scrolls the visible row window to keep the active tab visible. The default is `false`.
 
 Choose how pane scrollbars are shown with `show_scrollbar = "always"`, `"auto"`, or `"never"` under `[ui]`. `"always"` is the default and reserves one terminal column whenever the pane is wide enough. `"auto"` keeps pane text full-width and briefly overlays the scrollbar on the rightmost text column after scrolling while the pane remains scrolled back; it disappears after about 1.2 seconds of inactivity. `"never"` keeps text full-width and never draws the pane scrollbar. Existing boolean values remain compatible: `true` means `"always"` and `false` means `"never"`.
