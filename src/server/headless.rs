@@ -252,6 +252,8 @@ pub struct HeadlessServer {
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
+    /// One-shot in-UI fork branding, armed until the first full-app client attaches.
+    startup_feedback_pending: bool,
     #[cfg(unix)]
     next_client_id: u64,
     /// The client currently driving the shared pane runtime size, theme, and input keybindings.
@@ -449,6 +451,7 @@ impl HeadlessServer {
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
+            startup_feedback_pending: true,
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
@@ -2701,6 +2704,9 @@ impl HeadlessServer {
                 }
                 if first_app_client {
                     self.app.mark_git_status_refresh_due(Instant::now());
+                    if std::mem::take(&mut self.startup_feedback_pending) {
+                        self.app.show_in_ui_feedback("herdr · iRonin fork");
+                    }
                 }
                 self.sync_foreground_client_state();
                 self.resize_shared_runtime_to_effective_size();
@@ -4478,6 +4484,7 @@ mod tests {
             client_socket_path: socket_path,
             client_socket_identity,
             clients: HashMap::new(),
+            startup_feedback_pending: false,
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
@@ -5424,6 +5431,114 @@ next_tab = ""
                 .direct_attach_resize_locks
                 .contains(&terminal_id));
         });
+    }
+
+    #[test]
+    fn first_full_app_client_receives_startup_feedback_in_frame() {
+        let mut server = test_headless_server();
+        server.startup_feedback_pending = true;
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Terminal;
+        server.app.state.toast_config.clipboard.enabled = false;
+        let (writer, control_rx, render_rx) = test_client_writer();
+
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 7,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            writer,
+        }));
+
+        assert!(!server.startup_feedback_pending);
+        assert_eq!(
+            server
+                .app
+                .state
+                .copy_feedback
+                .as_ref()
+                .map(|feedback| feedback.message.as_str()),
+            Some("herdr · iRonin fork")
+        );
+        assert!(server.app.copy_feedback_deadline.is_some());
+        assert!(server.app.state.toast.is_none());
+
+        server.render_and_stream();
+
+        let frame = read_server_frame(
+            render_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("startup feedback frame"),
+        );
+        assert!(
+            frame_text(&frame).contains("herdr · iRonin fork"),
+            "startup feedback should be rendered in the first full-app frame"
+        );
+        assert!(
+            control_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "startup feedback should not use client-local toast delivery"
+        );
+    }
+
+    #[test]
+    fn startup_feedback_waits_for_full_app_client_and_does_not_repeat() {
+        let mut server = test_headless_server();
+        server.startup_feedback_pending = true;
+        let (direct_writer, _direct_control_rx, _direct_render_rx) = test_client_writer();
+
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 6,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::TerminalAnsi,
+            keybindings: None,
+            direct_attach_requested: true,
+            writer: direct_writer,
+        }));
+        assert!(server.startup_feedback_pending);
+        assert!(server.app.state.copy_feedback.is_none());
+
+        let (first_writer, _first_control_rx, _first_render_rx) = test_client_writer();
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 7,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            writer: first_writer,
+        }));
+        let deadline = server
+            .app
+            .copy_feedback_deadline
+            .expect("startup feedback deadline");
+        assert!(!server.startup_feedback_pending);
+        assert!(server.handle_scheduled_tasks_headless(deadline, false));
+        assert!(server.app.state.copy_feedback.is_none());
+
+        assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 7 }));
+        let (second_writer, _second_control_rx, _second_render_rx) = test_client_writer();
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 8,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            writer: second_writer,
+        }));
+
+        assert!(server.app.state.copy_feedback.is_none());
+        assert!(server.app.copy_feedback_deadline.is_none());
     }
 
     fn app_client_marks_git_refresh_due_on_first_attach(render_encoding: RenderEncoding) {

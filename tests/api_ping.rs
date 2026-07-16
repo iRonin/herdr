@@ -310,6 +310,66 @@ fn ping_over_socket_returns_version() {
 }
 
 #[test]
+fn successful_server_stop_prints_dim_fork_branding_to_stderr() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .args(["server", "stop"])
+        .env("HERDR_SOCKET_PATH", &socket_path)
+        .output()
+        .expect("herdr server stop should run");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, b"\x1b[2mherdr \xc2\xb7 iRonin fork\x1b[0m\n");
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[test]
+fn failed_server_stop_does_not_print_fork_branding() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("missing.sock");
+    register_runtime_dir(&runtime_dir);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .args(["server", "stop"])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("HERDR_SOCKET_PATH", &socket_path)
+        .output()
+        .expect("herdr server stop should run");
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not running or cannot be reached"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("iRonin fork"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("\x1b[2mherdr · iRonin fork\x1b[0m"),
+        "stderr: {stderr}"
+    );
+
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn server_reload_agent_manifests_reports_runtime_override() {
     let _lock = test_lock();
     let base = unique_test_dir();

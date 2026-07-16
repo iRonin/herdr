@@ -891,13 +891,20 @@ fn remote_binary_matches(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Res
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(remote_binary_stdout_matches(&stdout))
+}
+
+fn remote_binary_stdout_matches(stdout: &str) -> bool {
     let mut lines = stdout.lines();
     let version = lines.next().unwrap_or_default().trim();
     let status = lines.next().unwrap_or_default();
-    Ok(version == format!("herdr {}", current_version())
+    let upstream_version = format!("herdr {}", current_version());
+    let branded_version = format!("{upstream_version} (iRonin fork)");
+
+    (version == upstream_version || version == branded_version)
         && parse_client_status_json(status)
             .map(|status| status.protocol == CURRENT_PROTOCOL)
-            .unwrap_or(false))
+            .unwrap_or(false)
 }
 
 fn remote_binary_exists(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
@@ -2601,6 +2608,43 @@ mod tests {
             Some(8)
         );
         assert!(parse_client_status_json(r#"{"protocol":"unknown"}"#).is_none());
+    }
+
+    #[test]
+    fn remote_binary_stdout_accepts_only_supported_version_labels_with_compatible_status() {
+        let version = current_version();
+        let status = format!(
+            r#"{{"version":"{version}","protocol":{CURRENT_PROTOCOL},"binary":"/bin/herdr"}}"#
+        );
+
+        assert!(remote_binary_stdout_matches(&format!(
+            "herdr {version}\n{status}\n"
+        )));
+        assert!(remote_binary_stdout_matches(&format!(
+            "herdr {version} (iRonin fork)\n{status}\n"
+        )));
+        assert!(!remote_binary_stdout_matches(&format!(
+            "herdr 0.0.0\n{status}\n"
+        )));
+        assert!(!remote_binary_stdout_matches(&format!(
+            "herdr {version} (iRonin fork) extra\n{status}\n"
+        )));
+        assert!(!remote_binary_stdout_matches(&format!(
+            "herdr {version}\nnot-json\n"
+        )));
+    }
+
+    #[test]
+    fn remote_binary_stdout_rejects_incompatible_protocol() {
+        let version = current_version();
+        let incompatible_protocol = CURRENT_PROTOCOL + 1;
+        let status = format!(
+            r#"{{"version":"{version}","protocol":{incompatible_protocol},"binary":"/bin/herdr"}}"#
+        );
+
+        assert!(!remote_binary_stdout_matches(&format!(
+            "herdr {version} (iRonin fork)\n{status}\n"
+        )));
     }
 
     #[test]
