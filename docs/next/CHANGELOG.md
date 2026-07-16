@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Added `session.stop_timeout_ms` to configure how long `herdr server stop` waits for shutdown.
 - Added `ui.tab_bar_wrap` to show tabs across available rows, with a capped row window that follows the active tab.
 - Added `ui.show_scrollbar` modes for always-visible, automatic overlay, or hidden pane scrollbars.
 - Added configurable Agent panel scope and ordered mode cycling with `ui.agent_panel_modes`.

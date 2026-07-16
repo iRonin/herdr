@@ -9,6 +9,8 @@ use super::{
     DEFAULT_SCROLLBACK_LIMIT_BYTES,
 };
 
+pub const DEFAULT_STOP_WAIT_TIMEOUT_MS: u64 = 15_000;
+pub const MAX_STOP_WAIT_TIMEOUT_MS: u64 = 300_000;
 pub const MAX_TOAST_DELAY_SECONDS: u64 = 3600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -341,12 +343,21 @@ pub struct SessionConfig {
     /// Resume supported AI-agent panes into their native conversation sessions
     /// when restoring a Herdr session. Default: true.
     pub resume_agents_on_restore: bool,
+    /// Maximum time to wait for `herdr server stop` to finish. Default: 15000ms.
+    /// The server-stop command treats zero as the default and caps larger values at 300000ms.
+    #[serde(default = "default_stop_timeout_ms")]
+    pub stop_timeout_ms: u64,
+}
+
+fn default_stop_timeout_ms() -> u64 {
+    DEFAULT_STOP_WAIT_TIMEOUT_MS
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             resume_agents_on_restore: true,
+            stop_timeout_ms: default_stop_timeout_ms(),
         }
     }
 }
@@ -1315,6 +1326,35 @@ resume_agents_on_restore = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.session.resume_agents_on_restore);
+    }
+
+    #[test]
+    fn stop_timeout_defaults_to_fifteen_seconds_and_parses() {
+        assert_eq!(DEFAULT_STOP_WAIT_TIMEOUT_MS, 15_000);
+
+        let default_config: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            default_config.session.stop_timeout_ms,
+            DEFAULT_STOP_WAIT_TIMEOUT_MS
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+[session]
+stop_timeout_ms = 5000
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.session.stop_timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn stop_timeout_preserves_values_for_server_command_resolution() {
+        for value in [0, MAX_STOP_WAIT_TIMEOUT_MS + 1, i64::MAX as u64] {
+            let toml = format!("[session]\nstop_timeout_ms = {value}\n");
+            let config: Config = toml::from_str(&toml).unwrap();
+            assert_eq!(config.session.stop_timeout_ms, value);
+        }
     }
 
     #[test]
