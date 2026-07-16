@@ -1496,30 +1496,52 @@ impl AppState {
     }
 
     pub(crate) fn scroll_pane_up(
-        &self,
+        &mut self,
         terminal_runtimes: &TerminalRuntimeRegistry,
         pane_id: crate::layout::PaneId,
         lines: usize,
     ) {
-        if let Some(ws_idx) = self.active {
-            if let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
-            {
-                rt.scroll_up(lines);
-            }
+        let changed = self.active.is_some_and(|ws_idx| {
+            let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+            else {
+                return false;
+            };
+            let before = rt
+                .scroll_metrics()
+                .map(|metrics| metrics.offset_from_bottom);
+            rt.scroll_up(lines);
+            let after = rt
+                .scroll_metrics()
+                .map(|metrics| metrics.offset_from_bottom);
+            before != after
+        });
+        if changed {
+            self.record_pane_scroll_activity(pane_id, std::time::Instant::now());
         }
     }
 
     pub(crate) fn scroll_pane_down(
-        &self,
+        &mut self,
         terminal_runtimes: &TerminalRuntimeRegistry,
         pane_id: crate::layout::PaneId,
         lines: usize,
     ) {
-        if let Some(ws_idx) = self.active {
-            if let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
-            {
-                rt.scroll_down(lines);
-            }
+        let changed = self.active.is_some_and(|ws_idx| {
+            let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+            else {
+                return false;
+            };
+            let before = rt
+                .scroll_metrics()
+                .map(|metrics| metrics.offset_from_bottom);
+            rt.scroll_down(lines);
+            let after = rt
+                .scroll_metrics()
+                .map(|metrics| metrics.offset_from_bottom);
+            before != after
+        });
+        if changed {
+            self.record_pane_scroll_activity(pane_id, std::time::Instant::now());
         }
     }
 
@@ -1647,13 +1669,19 @@ impl AppState {
             return;
         }
 
-        if let Some(ws_idx) = self.active {
-            if let Some(rt) = self.focused_runtime_in_workspace(terminal_runtimes, ws_idx) {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => rt.scroll_up(lines_per_notch),
-                    MouseEventKind::ScrollDown => rt.scroll_down(lines_per_notch),
-                    _ => {}
+        if let Some(pane_id) = self
+            .active
+            .and_then(|ws_idx| self.workspaces.get(ws_idx))
+            .and_then(crate::workspace::Workspace::focused_pane_id)
+        {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.scroll_pane_up(terminal_runtimes, pane_id, lines_per_notch)
                 }
+                MouseEventKind::ScrollDown => {
+                    self.scroll_pane_down(terminal_runtimes, pane_id, lines_per_notch)
+                }
+                _ => {}
             }
         }
     }
@@ -1779,17 +1807,30 @@ impl AppState {
     }
 
     pub(super) fn set_pane_scroll_offset(
-        &self,
+        &mut self,
         terminal_runtimes: &TerminalRuntimeRegistry,
         pane_id: crate::layout::PaneId,
         offset_from_bottom: usize,
     ) {
         for ws_idx in 0..self.workspaces.len() {
-            let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
-            else {
-                continue;
+            let changed = {
+                let Some(rt) =
+                    self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+                else {
+                    continue;
+                };
+                let before = rt
+                    .scroll_metrics()
+                    .map(|metrics| metrics.offset_from_bottom);
+                rt.set_scroll_offset_from_bottom(offset_from_bottom);
+                let after = rt
+                    .scroll_metrics()
+                    .map(|metrics| metrics.offset_from_bottom);
+                before != after
             };
-            rt.set_scroll_offset_from_bottom(offset_from_bottom);
+            if changed {
+                self.record_pane_scroll_activity(pane_id, std::time::Instant::now());
+            }
             return;
         }
     }
@@ -1914,7 +1955,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_wheel_uses_configured_mouse_scroll_lines() {
+    async fn terminal_wheel_uses_configured_lines_and_records_scrollbar_activity() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
         let pane_id = ws.tabs[0].root_pane;
@@ -1949,6 +1990,7 @@ mod tests {
             .and_then(crate::terminal::TerminalRuntime::scroll_metrics)
             .expect("scroll metrics after wheel");
         assert_eq!(metrics.offset_from_bottom, 7);
+        assert!(app.state.last_pane_scroll_activity.contains_key(&pane_id));
     }
 
     #[tokio::test]
@@ -3109,6 +3151,46 @@ mod tests {
                 .map(|selection| selection.pane_id),
             Some(second_pane)
         );
+    }
+
+    #[test]
+    fn auto_and_never_last_text_column_respect_copy_on_select() {
+        for mode in [
+            crate::config::ScrollbarMode::Auto,
+            crate::config::ScrollbarMode::Never,
+        ] {
+            let mut app = app_for_mouse_test();
+            let workspace = Workspace::test_new("test");
+            let pane_id = workspace.tabs[0].root_pane;
+            app.state.workspaces = vec![workspace];
+            app.state.active = Some(0);
+            app.state.selected = 0;
+            app.state.scrollbar_mode = mode;
+            crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+
+            let inner = app.state.view.pane_infos[0].inner_rect;
+            let col = inner.right() - 1;
+            let row = inner.y;
+            assert_eq!(
+                app.state.pane_at(col, row).map(|info| info.id),
+                Some(pane_id)
+            );
+
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+            assert_eq!(
+                app.state
+                    .selection
+                    .as_ref()
+                    .map(|selection| selection.pane_id),
+                Some(pane_id),
+                "{mode:?} must keep the last text column selectable"
+            );
+
+            app.state.clear_selection();
+            app.state.copy_on_select = false;
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+            assert!(app.state.selection.is_none());
+        }
     }
 
     #[test]

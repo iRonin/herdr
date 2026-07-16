@@ -5,6 +5,7 @@ use ratatui::{
 };
 
 use crate::app::AppState;
+use crate::config::ScrollbarMode;
 use crate::layout::PaneInfo;
 
 pub(crate) fn pane_scrollbar_rect(info: &PaneInfo) -> Option<Rect> {
@@ -170,7 +171,23 @@ pub(super) fn render_pane_scrollbar(
     let Some(metrics) = rt.scroll_metrics() else {
         return;
     };
-    let Some(track) = pane_scrollbar_rect(info) else {
+    let track = match app.scrollbar_mode {
+        ScrollbarMode::Always => pane_scrollbar_rect(info),
+        ScrollbarMode::Auto
+            if app.pane_scrollbar_overlay_visible(info.id, metrics, std::time::Instant::now())
+                && info.inner_rect.width > 0
+                && info.inner_rect.height > 0 =>
+        {
+            Some(Rect::new(
+                info.inner_rect.x + info.inner_rect.width - 1,
+                info.inner_rect.y,
+                1,
+                info.inner_rect.height,
+            ))
+        }
+        ScrollbarMode::Auto | ScrollbarMode::Never => None,
+    };
+    let Some(track) = track else {
         return;
     };
 

@@ -310,6 +310,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # The wrapped bar uses at most half of the pane area's height.
 # tab_bar_wrap = false
 
+# Main pane scrollbar: "always" reserves a column, "auto" briefly overlays
+# the last text column after scrolling, and "never" leaves copied text clean.
+# Boolean true/false remains accepted as "always"/"never" for compatibility.
+# show_scrollbar = "always"
+
 # Agent panel ordering: "spaces" (grouped by space) or "priority" (attention queue).
 # "workspaces" is accepted as an alias for "spaces".
 # agent_panel_sort = "spaces"
