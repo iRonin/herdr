@@ -632,7 +632,7 @@
           "key": "ui.prompt_new_tab_name",
           "type": "boolean",
           "default": "true",
-          "description": "Ask for a tab name before creating a new tab."
+          "description": "Ask for a tab name before creating a new tab. Alt/Option-click the new-tab button to invert this setting for one tab."
         },
         {
           "key": "ui.pane_borders",

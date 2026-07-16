@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Direction, Rect};
 use tracing::warn;
 
@@ -499,7 +499,8 @@ impl AppState {
                     return None;
                 }
                 if self.on_new_tab_button(mouse.column, mouse.row) {
-                    if self.prompt_new_tab_name {
+                    let option_held = mouse.modifiers.contains(KeyModifiers::ALT);
+                    if self.prompt_new_tab_name ^ option_held {
                         open_new_tab_dialog(self);
                     } else {
                         self.request_new_tab = true;
@@ -1164,7 +1165,8 @@ impl AppState {
                 return MobileMouseResult::Action(MouseAction::FocusWorkspace { ws_idx });
             }
             Some(crate::ui::MobileSwitcherTarget::NewTab) => {
-                if self.prompt_new_tab_name {
+                let option_held = mouse.modifiers.contains(KeyModifiers::ALT);
+                if self.prompt_new_tab_name ^ option_held {
                     open_new_tab_dialog(self);
                 } else {
                     self.request_new_tab = true;
@@ -4031,6 +4033,128 @@ mod tests {
         assert!(!app.state.creating_new_tab);
         assert!(app.state.request_new_tab);
         assert!(app.state.requested_new_tab_name.is_none());
+    }
+
+    #[test]
+    fn mobile_switcher_new_tab_option_click_inverts_prompt_setting() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("one");
+        ws.test_add_tab(Some("logs"));
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 44, 20));
+        let switch = app.state.view.mobile_menu_hit_area;
+
+        for prompt_new_tab_name in [false, true] {
+            for modifiers in [
+                KeyModifiers::empty(),
+                KeyModifiers::ALT,
+                KeyModifiers::ALT | KeyModifiers::SHIFT,
+            ] {
+                app.state.mode = Mode::Terminal;
+                app.state.creating_new_tab = false;
+                app.state.request_new_tab = false;
+                app.state.requested_new_tab_name = None;
+                app.state.prompt_new_tab_name = prompt_new_tab_name;
+                app.handle_mouse(mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    switch.x + 1,
+                    switch.y + 1,
+                ));
+                let viewport = crate::ui::mobile_switcher_areas(&app.state).viewport;
+                app.handle_mouse(MouseEvent {
+                    modifiers,
+                    ..mouse(
+                        MouseEventKind::Down(MouseButton::Left),
+                        viewport.x + 2,
+                        viewport.y + 5,
+                    )
+                });
+
+                let should_prompt = prompt_new_tab_name ^ modifiers.contains(KeyModifiers::ALT);
+                assert_eq!(app.state.creating_new_tab, should_prompt);
+                assert_eq!(
+                    app.state.mode,
+                    if should_prompt {
+                        Mode::RenameTab
+                    } else {
+                        Mode::Terminal
+                    }
+                );
+                assert_eq!(app.state.request_new_tab, !should_prompt);
+                assert!(app.state.requested_new_tab_name.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn desktop_new_tab_button_option_click_inverts_prompt_setting() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.copy_on_select = false;
+
+        for tab_bar_wrap in [false, true] {
+            app.state.tab_bar_wrap = tab_bar_wrap;
+            crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 40));
+            let new_tab_area = app.state.view.new_tab_hit_area;
+
+            for prompt_new_tab_name in [false, true] {
+                for modifiers in [KeyModifiers::empty(), KeyModifiers::ALT] {
+                    app.state.mode = Mode::Terminal;
+                    app.state.creating_new_tab = false;
+                    app.state.request_new_tab = false;
+                    app.state.requested_new_tab_name = None;
+                    app.state.prompt_new_tab_name = prompt_new_tab_name;
+                    app.handle_mouse(MouseEvent {
+                        modifiers,
+                        ..mouse(
+                            MouseEventKind::Down(MouseButton::Left),
+                            new_tab_area.x + 1,
+                            new_tab_area.y,
+                        )
+                    });
+
+                    let should_prompt = prompt_new_tab_name ^ modifiers.contains(KeyModifiers::ALT);
+                    assert_eq!(app.state.creating_new_tab, should_prompt);
+                    assert_eq!(
+                        app.state.mode,
+                        if should_prompt {
+                            Mode::RenameTab
+                        } else {
+                            Mode::Terminal
+                        }
+                    );
+                    assert_eq!(app.state.request_new_tab, !should_prompt);
+                    assert!(app.state.requested_new_tab_name.is_none());
+                    assert!(app.state.selection.is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sgr_alt_modifier_encoding_inverts_desktop_new_tab_prompt() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.prompt_new_tab_name = true;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 40));
+        let new_tab_area = app.state.view.new_tab_hit_area;
+        let input = format!("\x1b[<8;{};{}M", new_tab_area.x + 2, new_tab_area.y + 1);
+        let event = crate::raw_input::parse_raw_input_bytes_sync(input.as_bytes())
+            .pop()
+            .expect("SGR Alt-click should parse");
+
+        assert!(app.handle_raw_input_event(event).await);
+
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(!app.state.creating_new_tab);
+        assert!(app.state.request_new_tab);
     }
 
     #[test]

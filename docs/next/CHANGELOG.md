@@ -7,6 +7,7 @@
 - Added `ui.show_scrollbar` modes for always-visible, automatic overlay, or hidden pane scrollbars.
 - Added configurable Agent panel scope and ordered mode cycling with `ui.agent_panel_modes`.
 - Added `ui.tab_agent_status` to show each tab's highest-attention Agent state in the tab bar.
+- Alt/Option-clicking the new-tab button now temporarily inverts `ui.prompt_new_tab_name`.
 
 ## [0.7.4] - 2026-07-15
 
