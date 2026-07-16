@@ -648,6 +648,7 @@ impl App {
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
             hide_tab_bar_when_single_tab: config.ui.hide_tab_bar_when_single_tab,
             tab_bar_wrap: config.ui.tab_bar_wrap,
+            tab_agent_status: config.ui.tab_agent_status,
             scrollbar_mode: config.ui.show_scrollbar,
             last_pane_scroll_activity: HashMap::new(),
             pane_history_persistence: config.experimental.pane_history,
@@ -1449,6 +1450,7 @@ impl App {
                     config.ui.show_agent_labels_on_pane_borders;
                 self.state.hide_tab_bar_when_single_tab = config.ui.hide_tab_bar_when_single_tab;
                 self.state.tab_bar_wrap = config.ui.tab_bar_wrap;
+                self.state.tab_agent_status = config.ui.tab_agent_status;
                 self.state.scrollbar_mode = config.ui.show_scrollbar;
                 if self.state.scrollbar_mode != crate::config::ScrollbarMode::Auto {
                     self.state.last_pane_scroll_activity.clear();
@@ -2444,6 +2446,17 @@ mod tests {
     }
 
     #[test]
+    fn startup_uses_tab_agent_status_config() {
+        let mut config = Config::default();
+        config.ui.tab_agent_status = true;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert!(app.state.tab_agent_status);
+    }
+
+    #[test]
     fn startup_uses_redraw_on_focus_gained_config() {
         let mut config = Config::default();
         config.ui.redraw_on_focus_gained = false;
@@ -2640,7 +2653,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[ui]\nagent_panel_scope = \"current\"\nagent_panel_sort = \"priority\"\nagent_panel_modes = [\"space\", \"priority\"]\nredraw_on_focus_gained = false\ncopy_on_select = false\nright_click_passthrough_modifier = \"ctrl\"\nshow_scrollbar = \"auto\"\n[ui.toast]\ndelivery = \"herdr\"\n[experimental]\nswitch_ascii_input_source_in_prefix = true\n",
+            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[ui]\nagent_panel_scope = \"current\"\nagent_panel_sort = \"priority\"\nagent_panel_modes = [\"space\", \"priority\"]\nredraw_on_focus_gained = false\ncopy_on_select = false\nright_click_passthrough_modifier = \"ctrl\"\nshow_scrollbar = \"auto\"\ntab_agent_status = true\n[ui.toast]\ndelivery = \"herdr\"\n[experimental]\nswitch_ascii_input_source_in_prefix = true\n",
         )
         .unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -2695,6 +2708,7 @@ mod tests {
             ]
         );
         assert_eq!(app.state.scrollbar_mode, crate::config::ScrollbarMode::Auto);
+        assert!(app.state.tab_agent_status);
         assert!(!app.state.redraw_on_focus_gained);
         assert!(!app.state.copy_on_select);
         assert!(app.state.selection.is_none());

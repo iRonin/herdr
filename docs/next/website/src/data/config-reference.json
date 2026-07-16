@@ -665,6 +665,12 @@
           "description": "Wrap tabs onto multiple rows instead of using the default single scrollable row. The wrapped bar uses at most half of the pane area's height."
         },
         {
+          "key": "ui.tab_agent_status",
+          "type": "boolean",
+          "default": "false",
+          "description": "Show the highest-attention agent state on each top tab using the same glyphs and colors as the Agent panel."
+        },
+        {
           "key": "ui.show_scrollbar",
           "type": "enum",
           "default": "\"always\"",

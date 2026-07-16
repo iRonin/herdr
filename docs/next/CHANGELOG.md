@@ -6,6 +6,7 @@
 - Added `ui.tab_bar_wrap` to show tabs across available rows, with a capped row window that follows the active tab.
 - Added `ui.show_scrollbar` modes for always-visible, automatic overlay, or hidden pane scrollbars.
 - Added configurable Agent panel scope and ordered mode cycling with `ui.agent_panel_modes`.
+- Added `ui.tab_agent_status` to show each tab's highest-attention Agent state in the tab bar.
 
 ## [0.7.4] - 2026-07-15
 

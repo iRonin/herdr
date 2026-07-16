@@ -904,6 +904,8 @@ pub struct UiConfig {
     pub hide_tab_bar_when_single_tab: bool,
     /// Wrap tabs onto multiple rows instead of a single scrollable row. Default: false.
     pub tab_bar_wrap: bool,
+    /// Show the highest-attention agent status indicator on each top tab. Default: false.
+    pub tab_agent_status: bool,
     /// Main pane scrollback scrollbar mode. `always` reserves a column,
     /// `auto` overlays the last text column briefly after scrolling, and
     /// `never` does not draw it. Booleans remain accepted for compatibility
@@ -1116,6 +1118,7 @@ impl Default for UiConfig {
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
             tab_bar_wrap: false,
+            tab_agent_status: false,
             show_scrollbar: ScrollbarMode::Always,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             agent_panel_scope: AgentPanelScopeConfig::All,
@@ -1443,6 +1446,7 @@ agent_panel_modes = []
         assert!(!default_config.ui.show_agent_labels_on_pane_borders);
         assert!(!default_config.ui.hide_tab_bar_when_single_tab);
         assert!(!default_config.ui.tab_bar_wrap);
+        assert!(!default_config.ui.tab_agent_status);
 
         let toml = r#"
 [ui]
@@ -1451,6 +1455,7 @@ pane_gaps = true
 show_agent_labels_on_pane_borders = true
 hide_tab_bar_when_single_tab = true
 tab_bar_wrap = true
+tab_agent_status = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.pane_borders);
@@ -1458,6 +1463,7 @@ tab_bar_wrap = true
         assert!(config.ui.show_agent_labels_on_pane_borders);
         assert!(config.ui.hide_tab_bar_when_single_tab);
         assert!(config.ui.tab_bar_wrap);
+        assert!(config.ui.tab_agent_status);
     }
 
     #[test]

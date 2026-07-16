@@ -198,7 +198,13 @@ fn desktop_tab_bar_and_terminal_area(
     let hide_single_tab_bar = app.hide_tab_bar_when_single_tab && ws.tabs.len() == 1;
     if !hide_single_tab_bar && main_area.height > 1 {
         let tab_bar_height = if app.tab_bar_wrap {
-            let desired = tabs::tab_bar_wrapped_rows(ws, main_area.width, app.mouse_capture);
+            let desired = tabs::tab_bar_wrapped_rows(
+                ws,
+                &app.terminals,
+                app.tab_agent_status,
+                main_area.width,
+                app.mouse_capture,
+            );
             // Keep at least half of the main area available to tiled and popup panes.
             desired.clamp(1, (main_area.height / 2).max(1))
         } else {
@@ -267,10 +273,18 @@ fn compute_view_internal(
         .and_then(|ws_idx| app.workspaces.get(ws_idx))
         .map(|ws| {
             if app.tab_bar_wrap {
-                compute_wrapped_tab_bar_view(ws, tab_bar_rect, app.mouse_capture)
+                compute_wrapped_tab_bar_view(
+                    ws,
+                    &app.terminals,
+                    app.tab_agent_status,
+                    tab_bar_rect,
+                    app.mouse_capture,
+                )
             } else {
                 compute_tab_bar_view(
                     ws,
+                    &app.terminals,
+                    app.tab_agent_status,
                     tab_bar_rect,
                     app.tab_scroll,
                     app.tab_scroll_follow_active,
