@@ -53,6 +53,26 @@ run your agents, split panes, walk away. `ctrl+b q` detaches, `herdr` reattaches
 
 everything lives at [herdr.dev/docs](https://herdr.dev/docs/): [quick start](https://herdr.dev/docs/quick-start/) · [concepts](https://herdr.dev/docs/concepts/) · [supported agents](https://herdr.dev/docs/agents/) · [keyboard](https://herdr.dev/docs/keyboard/) · [configuration](https://herdr.dev/docs/configuration/) · [session state](https://herdr.dev/docs/session-state/) · [remote](https://herdr.dev/docs/persistence-remote/) · [integrations](https://herdr.dev/docs/integrations/) · [plugins](https://herdr.dev/docs/plugins/) · [socket api](https://herdr.dev/docs/socket-api/)
 
+## iRonin fork
+
+a fork of [herdr](https://github.com/ogulcancelik/herdr) maintained by [iRonin.IT](https://ironin.it), rebased on upstream **v0.7.4**. every customization is **opt-in** and defaults to stock herdr behavior.
+
+install the combined build from the [`ronin-release`](https://github.com/iRonin/herdr/tree/ronin-release) branch or a tagged [release](https://github.com/iRonin/herdr/releases). each feature also lives on an isolated `feat/*` branch as an upstream-PR candidate.
+
+| Feature | Setting (default) | Upstream discussion |
+|---|---|---|
+| Wrap tabs onto multiple rows | `ui.tab_bar_wrap = false` | [#697](https://github.com/ogulcancelik/herdr/discussions/697) |
+| Scrollbar visibility — always / auto / never | `ui.show_scrollbar = "always"` | [#743](https://github.com/ogulcancelik/herdr/discussions/743) |
+| Scope & sort the agents panel | `ui.agent_panel_scope`, `ui.agent_panel_modes` | [#859](https://github.com/ogulcancelik/herdr/discussions/859) |
+| Agent-status indicator on top tabs | `ui.tab_agent_status = false` | [#669](https://github.com/ogulcancelik/herdr/discussions/669) |
+| Auto-name new tabs (Alt-click the `+` to invert) | `ui.prompt_new_tab_name = true` | — |
+| Replay recorded `launch_argv` when resuming agents | automatic | [#632](https://github.com/ogulcancelik/herdr/discussions/632) |
+| Re-detect agents restarted in a reused pane | bugfix (always on) | — |
+| Configurable server-stop wait | `session.stop_timeout_ms = 15000` | — |
+| `herdr server restart` — stop → start → attach | command | — |
+
+releases are tagged `vX.Y.Z-ironin.N`; prior releases are retained for rollback.
+
 ## sponsors
 
 herdr is built full-time, in the open. sponsoring directly funds development, stability, and the path to a real agent runtime.
