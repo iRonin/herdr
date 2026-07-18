@@ -12,7 +12,7 @@ use self::tokens::{ResolvedToken, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{agent_icon, state_dot, state_label, state_label_color};
 use super::text::{display_width, display_width_u16, truncate_end};
-use crate::app::state::{AgentPanelSort, Palette};
+use crate::app::state::{AgentPanelScope, AgentPanelSort, Palette};
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
 use crate::terminal::TerminalRuntimeRegistry;
@@ -123,10 +123,21 @@ fn agent_panel_entries_with_runtimes(
         }
     };
 
+    // Current scope filters before ordering. With no active workspace, fall
+    // back to all agents rather than making the panel unexpectedly blank.
+    let scope_ws = match app.agent_panel_scope {
+        AgentPanelScope::Current => app.active,
+        AgentPanelScope::All => None,
+    };
+
     let mut entries: Vec<_> = app
         .workspaces
         .iter()
         .enumerate()
+        .filter(move |(ws_idx, _)| match scope_ws {
+            Some(active) => *ws_idx == active,
+            None => true,
+        })
         .flat_map(|(ws_idx, ws)| {
             let multi_tab = ws.tabs.len() > 1;
             let workspace_label = ws.display_name_from(&app.terminals, terminal_runtimes);
@@ -159,7 +170,9 @@ fn agent_panel_entries_with_runtimes(
         })
         .collect();
 
-    if matches!(app.agent_panel_sort, AgentPanelSort::Priority) {
+    if matches!(app.agent_panel_sort, AgentPanelSort::Priority)
+        || matches!(app.agent_panel_scope, AgentPanelScope::Current)
+    {
         entries.sort_by_key(|entry| {
             (
                 std::cmp::Reverse(workspace_attention_priority(entry.state, entry.seen)),
@@ -1724,6 +1737,123 @@ mod tests {
                 ("multi", Some("logs")),
             ]
         );
+    }
+
+    #[test]
+    fn current_scope_agent_panel_entries_filter_to_active_workspace() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![
+            Workspace::test_new("one"),
+            Workspace::test_new("two"),
+            Workspace::test_new("three"),
+        ];
+        app.ensure_test_terminals();
+        for ws_idx in 0..app.workspaces.len() {
+            let pane = app.workspaces[ws_idx].tabs[0].root_pane;
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            app.terminals.get_mut(&terminal_id).unwrap().detected_agent = Some(Agent::Claude);
+        }
+        app.selected = 0;
+
+        // Default scope (All) lists every workspace's agents.
+        app.active = Some(1);
+        app.agent_panel_scope = AgentPanelScope::All;
+        let labels: Vec<String> = agent_panel_entries(&app)
+            .into_iter()
+            .map(|entry| entry.primary_label)
+            .collect();
+        assert_eq!(labels, ["one", "two", "three"]);
+
+        // Current scope lists only the active workspace's agents.
+        app.agent_panel_scope = AgentPanelScope::Current;
+        let labels: Vec<String> = agent_panel_entries(&app)
+            .into_iter()
+            .map(|entry| entry.primary_label)
+            .collect();
+        assert_eq!(labels, ["two"]);
+
+        // Switching the active workspace updates the filtered list.
+        app.active = Some(2);
+        let labels: Vec<String> = agent_panel_entries(&app)
+            .into_iter()
+            .map(|entry| entry.primary_label)
+            .collect();
+        assert_eq!(labels, ["three"]);
+    }
+
+    #[test]
+    fn current_scope_filters_before_priority_sort() {
+        // Current scope must exclude other workspaces' agents under BOTH sort
+        // modes. Priority sort is the risky one: a higher-priority agent in
+        // another workspace must not leak into the active workspace's list.
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![
+            Workspace::test_new("one"),
+            Workspace::test_new("two"),
+            Workspace::test_new("three"),
+        ];
+        app.ensure_test_terminals();
+        app.selected = 0;
+        app.agent_panel_scope = AgentPanelScope::Current;
+        app.agent_panel_sort = AgentPanelSort::Priority;
+
+        let set_state = |app: &mut crate::app::state::AppState, ws_idx: usize, state| {
+            let pane = app.workspaces[ws_idx].tabs[0].root_pane;
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+            terminal.detected_agent = Some(Agent::Claude);
+            terminal.state = state;
+        };
+        // Active workspace holds only a Working agent; a non-active workspace
+        // holds a higher-priority Blocked agent that would sort first without
+        // the scope filter.
+        set_state(&mut app, 0, AgentState::Working);
+        set_state(&mut app, 1, AgentState::Blocked);
+        set_state(&mut app, 2, AgentState::Idle);
+        app.active = Some(0);
+
+        let labels: Vec<String> = agent_panel_entries(&app)
+            .into_iter()
+            .map(|entry| entry.primary_label)
+            .collect();
+        assert_eq!(labels, ["one"]);
+    }
+
+    #[test]
+    fn current_scope_priority_sorts_regardless_of_sort_field() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut active = Workspace::test_new("one");
+        let blocked_tab = active.test_add_tab(Some("blocked"));
+        app.workspaces = vec![active, Workspace::test_new("two")];
+        app.ensure_test_terminals();
+        app.selected = 0;
+        app.agent_panel_scope = AgentPanelScope::Current;
+        app.agent_panel_sort = AgentPanelSort::Spaces;
+
+        let set_state =
+            |app: &mut crate::app::state::AppState, ws_idx: usize, tab_idx: usize, state| {
+                let pane = app.workspaces[ws_idx].tabs[tab_idx].root_pane;
+                let terminal_id = app.workspaces[ws_idx].tabs[tab_idx].panes[&pane]
+                    .attached_terminal_id
+                    .clone();
+                let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+                terminal.detected_agent = Some(Agent::Claude);
+                terminal.state = state;
+            };
+        set_state(&mut app, 0, 0, AgentState::Working);
+        set_state(&mut app, 0, blocked_tab, AgentState::Blocked);
+        set_state(&mut app, 1, 0, AgentState::Idle);
+        app.active = Some(0);
+
+        let states: Vec<AgentState> = agent_panel_entries(&app)
+            .into_iter()
+            .map(|entry| entry.state)
+            .collect();
+        assert_eq!(states, [AgentState::Blocked, AgentState::Working]);
     }
 
     #[test]

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Added `ui.agent_panel_scope` to filter the Agents panel to the current workspace (`"current"`, alias `"current_workspace"`); the default `"all"` keeps showing agents across every space.
+
 ## [0.7.4] - 2026-07-15
 
 ### Added

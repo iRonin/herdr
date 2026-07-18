@@ -342,6 +342,8 @@ Use `herdr workspace report-metadata` in the same way for custom Space tokens. U
 
 Sidebar row settings affect only the expanded desktop sidebar. Collapsed and mobile views keep their compact layouts.
 
+By default the agent panel shows all agents across every space. Set `agent_panel_scope = "current"` under `[ui]` to limit it to the active workspace; `"all"` is the default, and `"current_workspace"` is accepted as an alias for `"current"`. The scope filter is applied before ordering, so a higher-priority agent in another space never leaks into the active workspace's list. Under `"current"`, entries are ordered by attention priority (blocked, then done, working, idle, and finally unknown, breaking ties by the most recent state change), independent of `agent_panel_sort`.
+
 ## Notifications
 
 Herdr can notify you when a background agent finishes or needs input:
