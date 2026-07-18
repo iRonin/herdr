@@ -669,6 +669,16 @@
           ]
         },
         {
+          "key": "ui.agent_panel_scope",
+          "type": "enum",
+          "default": "\"all\"",
+          "description": "Agent sidebar scope. \"all\" shows every space; \"current\" filters to the active workspace and uses priority ordering. \"current_workspace\" is accepted as an alias for \"current\".",
+          "values": [
+            "all",
+            "current"
+          ]
+        },
+        {
           "key": "ui.sidebar.agents.row_gap",
           "type": "integer",
           "default": "0",
