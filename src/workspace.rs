@@ -20,6 +20,7 @@ mod tab;
 
 #[cfg(test)]
 use self::git::git_ahead_behind;
+pub(crate) use self::git::persist_workspace_name;
 pub(crate) use self::tab::MovedPane;
 pub use self::{
     git::{

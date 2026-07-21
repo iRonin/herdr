@@ -56,6 +56,15 @@ pub fn derive_label_from_cwd(cwd: &Path) -> String {
 /// the filesystem root. Returns `None` when no file is found, the file is
 /// unreadable, the table is absent, or the name is empty/whitespace.
 fn project_workspace_name(cwd: &Path, repo_root: Option<&Path>) -> Option<String> {
+    existing_settings_path(cwd, repo_root)
+        .as_deref()
+        .and_then(read_workspace_name)
+}
+
+/// Path of the nearest `.herdr/settings.toml` found by walking up from `cwd`.
+/// The search stops at `repo_root` when given (so a project file cannot leak in
+/// from above the repository); otherwise it walks to the filesystem root.
+fn existing_settings_path(cwd: &Path, repo_root: Option<&Path>) -> Option<PathBuf> {
     let mut current = if cwd.is_dir() {
         cwd.to_path_buf()
     } else {
@@ -63,8 +72,9 @@ fn project_workspace_name(cwd: &Path, repo_root: Option<&Path>) -> Option<String
     };
 
     loop {
-        if let Some(name) = read_workspace_name(&current.join(".herdr/settings.toml")) {
-            return Some(name);
+        let candidate = current.join(".herdr/settings.toml");
+        if candidate.is_file() {
+            return Some(candidate);
         }
         if Some(current.as_path()) == repo_root {
             break;
@@ -75,6 +85,61 @@ fn project_workspace_name(cwd: &Path, repo_root: Option<&Path>) -> Option<String
     }
 
     None
+}
+
+/// Where a new `.herdr/settings.toml` is created when none exists in the walk
+/// range: at the repository root when inside one, otherwise at `cwd`.
+fn default_settings_path(cwd: &Path, repo_root: Option<&Path>) -> PathBuf {
+    repo_root
+        .map(|root| root.join(".herdr/settings.toml"))
+        .unwrap_or_else(|| cwd.join(".herdr/settings.toml"))
+}
+
+/// Persists `[workspace] name = name` into the project's `.herdr/settings.toml`.
+///
+/// Updates the nearest existing file in the walk range in place; if none
+/// exists, creates one at the repository root (or `cwd` outside a repository).
+/// Other tables and keys are preserved. The write is atomic (temp file +
+/// rename) and best-effort at the call site: a failure (e.g. a read-only
+/// checkout, or a `workspace` entry that is not a table) must not block an
+/// in-memory rename.
+pub(crate) fn persist_workspace_name(cwd: &Path, name: &str) -> std::io::Result<()> {
+    let repo_root = git_repo_root(cwd);
+    let path = existing_settings_path(cwd, repo_root.as_deref())
+        .unwrap_or_else(|| default_settings_path(cwd, repo_root.as_deref()));
+
+    let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|contents| contents.parse().ok())
+        .unwrap_or_default();
+
+    let workspace = match doc.entry("workspace") {
+        toml_edit::Entry::Occupied(entry) => entry.into_mut().as_table_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "`workspace` is not a table in .herdr/settings.toml",
+            )
+        })?,
+        toml_edit::Entry::Vacant(slot) => slot
+            .insert(toml_edit::table())
+            .as_table_mut()
+            .expect("workspace entry was just inserted as a table"),
+    };
+    workspace["name"] = toml_edit::value(name);
+
+    let contents = doc.to_string();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("settings.toml")
+    ));
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 fn read_workspace_name(path: &Path) -> Option<String> {
@@ -609,6 +674,61 @@ mod tests {
             .unwrap()
             .to_string();
         assert_eq!(derive_label_from_cwd(&root), expected);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persist_workspace_name_creates_file_at_repo_root() {
+        let root = temp_test_dir("persist-create");
+        let nested = root.join("sub");
+        write_git_repo_marker(&root);
+        std::fs::create_dir_all(&nested).unwrap();
+
+        persist_workspace_name(&nested, "created").unwrap();
+
+        let written = std::fs::read_to_string(root.join(".herdr/settings.toml")).unwrap();
+        assert!(written.contains("[workspace]"));
+        assert!(written.contains("name = \"created\""));
+        // round-trip: derive finds it from the nested cwd.
+        assert_eq!(derive_label_from_cwd(&nested), "created");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persist_workspace_name_updates_existing_preserving_other_keys() {
+        let root = temp_test_dir("persist-update");
+        write_git_repo_marker(&root);
+        std::fs::create_dir_all(root.join(".herdr")).unwrap();
+        std::fs::write(
+            root.join(".herdr/settings.toml"),
+            "[other]\nkey = \"keep-me\"\n[workspace]\nname = \"old\"\n",
+        )
+        .unwrap();
+
+        persist_workspace_name(&root, "new").unwrap();
+
+        let written = std::fs::read_to_string(root.join(".herdr/settings.toml")).unwrap();
+        assert!(
+            written.contains("keep-me"),
+            "unrelated keys must be preserved"
+        );
+        assert!(written.contains("name = \"new\""));
+        assert!(!written.contains("name = \"old\""));
+        assert_eq!(derive_label_from_cwd(&root), "new");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persist_workspace_name_in_non_git_dir() {
+        let root = temp_test_dir("persist-nogit");
+        persist_workspace_name(&root, "plain").unwrap();
+
+        let written = std::fs::read_to_string(root.join(".herdr/settings.toml")).unwrap();
+        assert!(written.contains("name = \"plain\""));
+        assert_eq!(derive_label_from_cwd(&root), "plain");
 
         std::fs::remove_dir_all(root).unwrap();
     }

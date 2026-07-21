@@ -95,10 +95,16 @@ impl App {
         let Some(index) = self.parse_workspace_id(&params.workspace_id) else {
             return workspace_not_found(id, &params.workspace_id);
         };
+        let persist_cwd = self.state.workspaces.get(index).and_then(|ws| {
+            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+        });
         let Some(ws) = self.state.workspaces.get_mut(index) else {
             return workspace_not_found(id, &params.workspace_id);
         };
         ws.set_custom_name(params.label.clone());
+        if let Some(cwd) = persist_cwd {
+            let _ = crate::workspace::persist_workspace_name(&cwd, &params.label);
+        }
         crate::logging::workspace_renamed(&ws.id);
         self.schedule_session_save();
         self.emit_event(EventEnvelope {
