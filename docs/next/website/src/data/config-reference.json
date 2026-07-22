@@ -699,6 +699,12 @@
           ]
         },
         {
+          "key": "ui.tab_bar_wrap",
+          "type": "boolean",
+          "default": "false",
+          "description": "Wrap tabs onto multiple rows instead of using the default single scrollable row. The wrapped bar uses at most half of the pane area's height."
+        },
+        {
           "key": "ui.agent_panel_sort",
           "type": "enum",
           "default": "\"spaces\"",

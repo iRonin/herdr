@@ -360,6 +360,8 @@ Sidebar row settings affect only the expanded desktop sidebar. Collapsed and mob
 
 `prompt_new_tab_name` controls whether the new-tab button asks for a label before creating the tab. Alt/Option-click the button to invert that setting for one tab.
 
+Set `tab_bar_wrap = true` under `[ui]` to show tabs across the available rows instead of using the default single scrollable row with `<`/`>` buttons. The tab bar grows downward as needed, up to half of the pane area's height, and the terminal and popup geometry below shrink with it. When the row count reaches that cap, Herdr scrolls the visible row window to keep the active tab visible. The tab bar keeps the placement chosen by `tab_bar_position`, so wrapped rows grow downward from the top edge or upward from the bottom edge. The default is `false`.
+
 ## Notifications
 
 Herdr can notify you when a background agent finishes or needs input:

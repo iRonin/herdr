@@ -679,7 +679,7 @@ impl AppState {
                 }
 
                 let workspace_drop_target = self.workspace_drop_target_at_row(mouse.row);
-                let tab_drop_index = self.tab_drop_index_at(mouse.column, mouse.row);
+                let tab_drop_target = self.tab_drop_index_at(mouse.column, mouse.row);
                 if self.drag.is_none() {
                     if let Some(press) = &self.workspace_press {
                         let delta_col = mouse.column.abs_diff(press.start_col);
@@ -704,7 +704,7 @@ impl AppState {
                                 target: DragTarget::TabReorder {
                                     ws_idx: press.ws_idx,
                                     source_tab_idx: press.tab_idx,
-                                    insert_idx: tab_drop_index,
+                                    drop_target: tab_drop_target,
                                 },
                             });
                         }
@@ -719,12 +719,14 @@ impl AppState {
                 } else if let Some(DragState {
                     target:
                         DragTarget::TabReorder {
-                            ws_idx, insert_idx, ..
+                            ws_idx,
+                            drop_target,
+                            ..
                         },
                 }) = &mut self.drag
                 {
                     if self.active == Some(*ws_idx) {
-                        *insert_idx = tab_drop_index;
+                        *drop_target = tab_drop_target;
                     }
                 } else if let Some(drag) = &self.drag {
                     match &drag.target {
@@ -877,7 +879,7 @@ impl AppState {
                             DragTarget::TabReorder {
                                 ws_idx,
                                 source_tab_idx,
-                                insert_idx: Some(insert_idx),
+                                drop_target: Some(drop_target),
                             },
                     }) => {
                         if self.active == Some(ws_idx) {
@@ -885,7 +887,7 @@ impl AppState {
                             return Some(MouseAction::MoveTab {
                                 ws_idx,
                                 source_tab_idx,
-                                insert_idx,
+                                insert_idx: drop_target.insert_idx,
                             });
                         }
                     }
@@ -1289,6 +1291,17 @@ impl AppState {
                 Mode::Navigate | Mode::Prefix | Mode::Copy | Mode::Resize
             )
             && self.on_tab_bar(col, row)
+            && row == self.mode_bar_overlay_row()
+    }
+
+    /// The single row the mode-bar overlay is drawn on: the last row of the
+    /// rect it is handed (`src/ui/menus.rs`). Without `tab_bar_wrap` the tab
+    /// bar is one row tall and this is that row, so the guard above keeps
+    /// upstream's exact behaviour; with wrapping it stops the rows *above*
+    /// the overlay -- which stay fully visible -- from going mouse-dead.
+    fn mode_bar_overlay_row(&self) -> u16 {
+        let area = self.view.tab_bar_rect;
+        area.y + area.height.saturating_sub(1)
     }
 
     pub(super) fn on_tab_bar(&self, col: u16, row: u16) -> bool {
@@ -1318,10 +1331,43 @@ impl AppState {
             && col < area.x + area.width
     }
 
-    pub(super) fn tab_drop_index_at(&self, col: u16, row: u16) -> Option<usize> {
+    pub(super) fn tab_drop_index_at(
+        &self,
+        col: u16,
+        row: u16,
+    ) -> Option<crate::app::state::TabDropTarget> {
         if !self.on_tab_bar(col, row) {
             return None;
         }
+
+        if self.on_tab_scroll_left_button(col, row) {
+            let area = self.view.tab_scroll_left_hit_area;
+            return Some(crate::app::state::TabDropTarget {
+                insert_idx: 0,
+                indicator_position: (area.right(), area.y),
+            });
+        }
+        if self.on_tab_scroll_right_button(col, row) {
+            let area = self.view.tab_scroll_right_hit_area;
+            let insert_idx = self
+                .active
+                .and_then(|idx| self.workspaces.get(idx))?
+                .tabs
+                .len();
+            return Some(crate::app::state::TabDropTarget {
+                insert_idx,
+                indicator_position: (area.x.saturating_sub(1), area.y),
+            });
+        }
+
+        let row_tabs: Vec<_> = self
+            .view
+            .tab_hit_areas
+            .iter()
+            .enumerate()
+            .filter(|(_, rect)| rect.width > 0 && row >= rect.y && row < rect.y + rect.height)
+            .map(|(idx, rect)| (idx, *rect))
+            .collect();
 
         let visible_tabs: Vec<_> = self
             .view
@@ -1333,14 +1379,56 @@ impl AppState {
         let (first_idx, first_rect) = *visible_tabs.first()?;
         let (last_idx, last_rect) = *visible_tabs.last()?;
 
-        if self.on_tab_scroll_left_button(col, row) {
-            return Some(0);
-        }
-        if self.on_tab_scroll_right_button(col, row) {
-            return self
+        if self.tab_bar_wrap {
+            let (first_on_row_idx, first_on_row_rect) = *row_tabs.first()?;
+            let (last_on_row_idx, last_on_row_rect) = *row_tabs.last()?;
+
+            let _left_edge = if first_idx == 0 {
+                first_rect.x
+            } else {
+                self.view.tab_scroll_left_hit_area.x + self.view.tab_scroll_left_hit_area.width
+            };
+            let right_edge = if self
                 .active
                 .and_then(|idx| self.workspaces.get(idx))
-                .map(|ws| ws.tabs.len());
+                .is_some_and(|ws| last_idx + 1 >= ws.tabs.len())
+            {
+                last_rect.x + last_rect.width
+            } else {
+                self.view.tab_scroll_right_hit_area.x.saturating_sub(1)
+            };
+            let _ = right_edge;
+
+            if col <= first_on_row_rect.x && row <= first_on_row_rect.y + first_on_row_rect.height {
+                return Some(crate::app::state::TabDropTarget {
+                    insert_idx: first_on_row_idx,
+                    indicator_position: (first_on_row_rect.x, first_on_row_rect.y),
+                });
+            }
+
+            for (idx, rect) in row_tabs.iter().copied() {
+                let midpoint = rect.x + rect.width / 2;
+                if col < midpoint {
+                    return Some(crate::app::state::TabDropTarget {
+                        insert_idx: idx,
+                        indicator_position: (rect.x, rect.y),
+                    });
+                }
+                if col < rect.x + rect.width {
+                    return Some(crate::app::state::TabDropTarget {
+                        insert_idx: idx + 1,
+                        indicator_position: (rect.x + rect.width, rect.y),
+                    });
+                }
+            }
+
+            return Some(crate::app::state::TabDropTarget {
+                insert_idx: last_on_row_idx + 1,
+                indicator_position: (
+                    last_on_row_rect.x + last_on_row_rect.width,
+                    last_on_row_rect.y,
+                ),
+            });
         }
 
         let left_edge = if first_idx == 0 {
@@ -1359,23 +1447,38 @@ impl AppState {
         };
 
         if col <= left_edge {
-            return Some(first_idx);
+            return Some(crate::app::state::TabDropTarget {
+                insert_idx: first_idx,
+                indicator_position: (first_rect.x, first_rect.y),
+            });
         }
         if col >= right_edge {
-            return Some(last_idx + 1);
+            return Some(crate::app::state::TabDropTarget {
+                insert_idx: last_idx + 1,
+                indicator_position: (last_rect.x + last_rect.width, last_rect.y),
+            });
         }
 
         for (idx, rect) in visible_tabs {
             let midpoint = rect.x + rect.width / 2;
             if col < midpoint {
-                return Some(idx);
+                return Some(crate::app::state::TabDropTarget {
+                    insert_idx: idx,
+                    indicator_position: (rect.x, rect.y),
+                });
             }
             if col < rect.x + rect.width {
-                return Some(idx + 1);
+                return Some(crate::app::state::TabDropTarget {
+                    insert_idx: idx + 1,
+                    indicator_position: (rect.x + rect.width, rect.y),
+                });
             }
         }
 
-        Some(last_idx + 1)
+        Some(crate::app::state::TabDropTarget {
+            insert_idx: last_idx + 1,
+            indicator_position: (last_rect.x + last_rect.width, last_rect.y),
+        })
     }
 
     pub(super) fn on_new_tab_button(&self, col: u16, row: u16) -> bool {
@@ -1893,7 +1996,9 @@ mod tests {
     use super::*;
     use crate::app::input::modal::handle_context_menu_key;
     use crate::{
-        app::state::{ContextMenuKind, ContextMenuState, MenuListState, Mode, ViewLayout},
+        app::state::{
+            ContextMenuKind, ContextMenuState, MenuListState, Mode, TabDropTarget, ViewLayout,
+        },
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
@@ -3471,6 +3576,100 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_bottom_tab_bar_swallows_only_the_mode_bar_row() {
+        // The mode-bar overlay is drawn on exactly ONE row -- `area.y +
+        // area.height - 1` (src/ui/menus.rs) -- while `on_tab_bar` matches the
+        // whole tab bar rect. With `tab_bar_wrap` the rect is several rows
+        // tall, so guarding the whole rect would leave every wrapped row above
+        // the overlay visible but mouse-dead. Only the drawn row may swallow.
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("one");
+        for _ in 1..7 {
+            ws.test_add_tab(None);
+        }
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.tab_bar_wrap = true;
+        app.state.tab_bar_position = crate::config::TabBarPositionConfig::Bottom;
+        app.state.mode = Mode::Prefix;
+        app.state.mouse_capture = false;
+        app.state.mobile_width_threshold = 0;
+
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 56, 20));
+        let bar = app.state.view.tab_bar_rect;
+        assert!(
+            bar.height > 1,
+            "this test is only meaningful on a wrapped multi-row tab bar"
+        );
+        let overlay_row = bar.y + bar.height - 1;
+
+        let (uncovered_idx, uncovered) = app
+            .state
+            .view
+            .tab_hit_areas
+            .iter()
+            .enumerate()
+            .find(|(idx, rect)| *idx != 0 && rect.width > 0 && rect.y < overlay_row)
+            .map(|(idx, rect)| (idx, *rect))
+            .expect("a wrapped bar has clickable tabs above the mode-bar row");
+        // A visible tab on a row the overlay never draws on stays live.
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            uncovered.x,
+            uncovered.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            uncovered.x,
+            uncovered.y,
+        ));
+        assert_eq!(
+            app.state.workspaces[0].active_tab, uncovered_idx,
+            "a wrapped row above the mode bar must still accept clicks"
+        );
+
+        // The row the overlay actually covers still swallows, exactly as it
+        // does for upstream's single-row bottom bar. Re-derive the geometry:
+        // switching tabs re-lays out the wrapped bar.
+        app.state.workspaces[0].active_tab = 0;
+        // The accepted click above left Prefix mode; the guard is mode-gated,
+        // so re-enter it before exercising the covered row.
+        app.state.mode = Mode::Prefix;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 56, 20));
+        let bar = app.state.view.tab_bar_rect;
+        let overlay_row = bar.y + bar.height - 1;
+        let (covered_idx, covered) = app
+            .state
+            .view
+            .tab_hit_areas
+            .iter()
+            .enumerate()
+            .find(|(idx, rect)| *idx != 0 && rect.width > 0 && rect.y == overlay_row)
+            .map(|(idx, rect)| (idx, *rect))
+            .expect("the mode-bar row also carries tabs");
+        assert_ne!(
+            covered_idx, 0,
+            "clicking the covered tab must be observable as a tab switch"
+        );
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            covered.x,
+            covered.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            covered.x,
+            covered.y,
+        ));
+        assert_eq!(
+            app.state.workspaces[0].active_tab, 0,
+            "the mode-bar row must keep swallowing tab clicks"
+        );
+        assert!(app.state.tab_press.is_none());
+    }
+
+    #[test]
     fn right_click_inactive_tab_opens_menu_without_switching_tabs() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("one");
@@ -3642,6 +3841,170 @@ mod tests {
         assert_eq!(app.state.mode, Mode::ConfirmClose);
         assert_eq!(app.state.workspaces.len(), 2);
         assert!(app.state.context_menu.is_none());
+    }
+
+    #[test]
+    fn wrapped_tab_drop_index_uses_the_pointer_row() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("one");
+        for idx in 1..7 {
+            ws.test_add_tab(Some(&format!("tab-{idx}")));
+        }
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.tab_bar_wrap = true;
+        app.state.mouse_capture = false;
+
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 20));
+        let (tab_idx, rect) = app
+            .state
+            .view
+            .tab_hit_areas
+            .iter()
+            .enumerate()
+            .find(|(_, rect)| rect.width > 0 && rect.y > app.state.view.tab_bar_rect.y)
+            .map(|(idx, rect)| (idx, *rect))
+            .expect("a tab should wrap onto a lower row");
+
+        assert_eq!(
+            app.state
+                .tab_drop_index_at(rect.x + 1, rect.y)
+                .map(|target| target.insert_idx),
+            Some(tab_idx),
+            "the left half inserts before the lower-row tab"
+        );
+        assert_eq!(
+            app.state
+                .tab_drop_index_at(rect.x + rect.width / 2, rect.y)
+                .map(|target| target.insert_idx),
+            Some(tab_idx + 1),
+            "the right half inserts after the lower-row tab"
+        );
+    }
+
+    #[test]
+    fn dragging_over_a_wrapped_lower_row_reorders_there_and_previews_that_row() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("one");
+        for _ in 1..7 {
+            ws.test_add_tab(None);
+        }
+        let moved_root = ws.tabs[0].root_pane;
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.tab_bar_wrap = true;
+        app.state.mouse_capture = false;
+        app.state.mobile_width_threshold = 0;
+
+        let screen = Rect::new(0, 0, 56, 20);
+        crate::ui::compute_view(&mut app.state, screen);
+        let source = app.state.view.tab_hit_areas[0];
+        let target = app.state.view.tab_hit_areas[4];
+        let drop_col = app.state.view.tab_bar_rect.x + 13;
+        assert_eq!(target.y, app.state.view.tab_bar_rect.y + 1);
+        assert!(
+            drop_col >= target.x && drop_col < target.right(),
+            "drop_col {drop_col} must be within target {:?}",
+            target
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            source.x + 1,
+            source.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            drop_col,
+            target.y,
+        ));
+
+        let (insert_idx, indicator_position) =
+            match app.state.drag.as_ref().map(|drag| &drag.target) {
+                Some(DragTarget::TabReorder {
+                    ws_idx: 0,
+                    source_tab_idx: 0,
+                    drop_target:
+                        Some(TabDropTarget {
+                            insert_idx,
+                            indicator_position,
+                        }),
+                }) => (*insert_idx, *indicator_position),
+                _ => panic!("expected a tab reorder drag"),
+            };
+        assert!(
+            matches!(insert_idx, 4 | 5),
+            "the second-row pointer must resolve around tab 4, not {insert_idx}"
+        );
+
+        let indicator_x = if insert_idx == 4 {
+            target.x
+        } else {
+            target.right()
+        };
+        assert_eq!(indicator_position, (indicator_x, target.y));
+        let mut terminal = Terminal::new(TestBackend::new(screen.width, screen.height)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(&app.state, frame))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(indicator_x, target.y)].symbol(),
+            "│",
+            "the drop preview must be rendered on the pointer row"
+        );
+        assert_ne!(
+            terminal.backend().buffer()[(indicator_x, app.state.view.tab_bar_rect.y)].symbol(),
+            "│",
+            "the lower-row preview must not be rendered on the first row"
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            drop_col,
+            target.y,
+        ));
+        let moved_idx = insert_idx - 1;
+        assert_eq!(
+            app.state.workspaces[0].tabs[moved_idx].root_pane,
+            moved_root
+        );
+    }
+
+    #[test]
+    fn wrapped_boundary_drop_preview_stays_on_the_pointer_row() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("one");
+        for _ in 1..7 {
+            ws.test_add_tab(None);
+        }
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.tab_bar_wrap = true;
+        app.state.mouse_capture = false;
+        app.state.mobile_width_threshold = 0;
+
+        let screen = Rect::new(0, 0, 56, 20);
+        crate::ui::compute_view(&mut app.state, screen);
+        let first_row_end = app.state.view.tab_hit_areas[2];
+        let second_row_start = app.state.view.tab_hit_areas[3];
+        assert_eq!(first_row_end.y + 1, second_row_start.y);
+        assert_eq!(
+            app.state
+                .tab_drop_index_at(first_row_end.right(), first_row_end.y)
+                .map(|target| target.insert_idx),
+            Some(3)
+        );
+        assert_eq!(
+            app.state
+                .tab_drop_index_at(second_row_start.x, second_row_start.y)
+                .map(|target| target.insert_idx),
+            Some(3),
+            "both visual sides of the wrapped boundary share insert index 3"
+        );
     }
 
     #[test]

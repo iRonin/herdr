@@ -329,6 +329,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 
 # Desktop tab row placement: "top" or "bottom".
 # tab_bar_position = "top"
+#
+# Wrap tabs onto multiple rows instead of using a single scrollable row.
+# The wrapped bar uses at most half of the pane area's height.
+# tab_bar_wrap = false
 
 # Agent panel ordering: "spaces" (grouped by space) or "priority" (attention queue).
 # "workspaces" is accepted as an alias for "spaces".

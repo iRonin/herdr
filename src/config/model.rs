@@ -864,6 +864,10 @@ pub struct UiConfig {
     pub hide_tab_bar_when_single_tab: bool,
     /// Desktop tab row placement. Default: top.
     pub tab_bar_position: TabBarPositionConfig,
+
+    /// Wrap tabs onto multiple rows instead of using a single scrollable row.
+    /// Default: false.
+    pub tab_bar_wrap: bool,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
     /// Expanded sidebar row composition.
@@ -1068,6 +1072,7 @@ impl Default for UiConfig {
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
             tab_bar_position: TabBarPositionConfig::Top,
+            tab_bar_wrap: false,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             sidebar: SidebarConfig::default(),
             accent: "cyan".into(),
@@ -1337,6 +1342,7 @@ agent_panel_scope = "current"
             default_config.ui.tab_bar_position,
             TabBarPositionConfig::Top
         );
+        assert!(!default_config.ui.tab_bar_wrap);
 
         let toml = r#"
 [ui]
@@ -1346,6 +1352,7 @@ pane_gaps = true
 show_agent_labels_on_pane_borders = true
 hide_tab_bar_when_single_tab = true
 tab_bar_position = "bottom"
+tab_bar_wrap = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.pane_borders);
@@ -1354,6 +1361,7 @@ tab_bar_position = "bottom"
         assert!(config.ui.show_agent_labels_on_pane_borders);
         assert!(config.ui.hide_tab_bar_when_single_tab);
         assert_eq!(config.ui.tab_bar_position, TabBarPositionConfig::Bottom);
+        assert!(config.ui.tab_bar_wrap);
     }
 
     #[test]
