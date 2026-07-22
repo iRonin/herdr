@@ -20,6 +20,7 @@ mod tab;
 
 #[cfg(test)]
 use self::git::git_ahead_behind;
+pub(crate) use self::git::persist_workspace_name;
 pub(crate) use self::tab::MovedPane;
 pub use self::{
     git::{
@@ -1187,7 +1188,21 @@ impl Workspace {
         let (events, _) = mpsc::channel(64);
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(AtomicBool::new(false));
-        let identity_cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+        // Sandbox the identity_cwd to a fresh tempdir so tests that drive the
+        // workspace-rename path (handle_workspace_rename -> persist_workspace_name)
+        // do not write `.herdr/settings.toml` into the worktree root. The
+        // tempdir is untracked (under std::env::temp_dir()) and is reused by the
+        // surrounding temp-test scaffolding; git_branch / git_space_metadata
+        // naturally resolve to None because the tempdir has no `.git` marker.
+        let identity_cwd = std::env::temp_dir().join(format!(
+            "herdr-workspace-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&identity_cwd).ok();
         let (layout, root_id) = TileLayout::new();
         let terminal_id = TerminalId::alloc();
         let mut panes = HashMap::new();

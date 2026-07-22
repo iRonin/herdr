@@ -6,6 +6,7 @@ mod status;
 #[cfg(test)]
 mod test_support;
 
+pub(crate) use self::discovery::persist_workspace_name;
 pub use self::{
     discovery::{derive_label_from_cwd, git_branch, git_space_metadata, GitSpaceMetadata},
     status::{git_status_cache_key, git_status_snapshot_for_cwd, GitStatusCacheEntry},
