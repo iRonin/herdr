@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // Effective state arbitration is intentionally centralized here. Full lifecycle
 // Herdr hook integrations are hook-authoritative while live; screen recovery
@@ -30,6 +30,8 @@ struct SuppressedFullLifecycleHookReport {
     session_ref: Option<crate::agent_resume::AgentSessionRef>,
     observed_at: Instant,
     reason: FullLifecycleHookSuppressionReason,
+    last_seq: Option<u64>,
+    detected_agent_at_suppression: Option<Agent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,10 +40,69 @@ enum FullLifecycleHookSuppressionReason {
     ProcessExit,
 }
 
+fn wall_clock_at_observation(
+    observed_at: Instant,
+    current_instant: Instant,
+    current_wall_clock: SystemTime,
+) -> SystemTime {
+    current_wall_clock
+        .checked_sub(current_instant.saturating_duration_since(observed_at))
+        .unwrap_or(current_wall_clock)
+}
+
+fn process_exit_sequence_floor_at(
+    source: &str,
+    last_seq: Option<u64>,
+    wall_clock: SystemTime,
+) -> Option<u64> {
+    let last_seq = last_seq?;
+    let Ok(elapsed) = wall_clock.duration_since(UNIX_EPOCH) else {
+        return Some(last_seq);
+    };
+    let Ok(epoch_millis) = u64::try_from(elapsed.as_millis()) else {
+        return Some(last_seq);
+    };
+    let Ok(epoch_micros) = u64::try_from(elapsed.as_micros()) else {
+        return Some(last_seq);
+    };
+    let Ok(epoch_nanos) = u64::try_from(elapsed.as_nanos()) else {
+        return Some(last_seq);
+    };
+    // Scale detection tolerates long-lived processes and clock drift while keeping
+    // millisecond, microsecond, and nanosecond epochs unambiguous.
+    let matches_epoch_scale =
+        |expected: u64| last_seq >= expected / 2 && last_seq <= expected.saturating_mul(2);
+
+    let wall_clock_floor = match source {
+        // The nanosecond Pi reporter adds a one-second margin to Date.now() nanoseconds.
+        "herdr:pi" if matches_epoch_scale(epoch_nanos) => {
+            let Some(floor) = epoch_millis
+                .checked_mul(1_000_000)
+                .and_then(|epoch_nanos| epoch_nanos.checked_add(1_000_000_000))
+            else {
+                return Some(last_seq);
+            };
+            floor
+        }
+        "herdr:pi" | "herdr:omp" | "herdr:opencode" | "herdr:kilo"
+            if matches_epoch_scale(epoch_micros) =>
+        {
+            epoch_micros
+        }
+        "herdr:hermes" | "herdr:mastracode" if matches_epoch_scale(epoch_nanos) => epoch_nanos,
+        "herdr:kimi" if matches_epoch_scale(epoch_nanos) => epoch_nanos,
+        "herdr:kimi" if matches_epoch_scale(epoch_millis) => epoch_millis,
+        _ => return Some(last_seq),
+    };
+
+    Some(last_seq.max(wall_clock_floor))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StaleFullLifecycleHookSession {
     agent_label: String,
     session_ref: crate::agent_resume::AgentSessionRef,
+    process_exit_sequence_floor: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,10 +318,38 @@ impl TerminalState {
         agent: Option<Agent>,
         fallback_state: AgentState,
         visible_blocker: bool,
+        visible_idle: bool,
+        visible_working: bool,
+        process_exited: bool,
+        now: Instant,
+    ) -> TerminalStateMutation {
+        let current_instant = Instant::now();
+        let current_wall_clock = SystemTime::now();
+        self.set_detected_state_with_screen_signals_at_and_clock(
+            agent,
+            fallback_state,
+            visible_blocker,
+            visible_idle,
+            visible_working,
+            process_exited,
+            now,
+            current_instant,
+            current_wall_clock,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Mirrors the detector event plus its sampled clock pair.
+    fn set_detected_state_with_screen_signals_at_and_clock(
+        &mut self,
+        agent: Option<Agent>,
+        fallback_state: AgentState,
+        visible_blocker: bool,
         _visible_idle: bool,
         _visible_working: bool,
         process_exited: bool,
         now: Instant,
+        current_instant: Instant,
+        current_wall_clock: SystemTime,
     ) -> TerminalStateMutation {
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
         let previous_known_agent = self.effective_known_agent();
@@ -336,8 +425,13 @@ impl TerminalState {
                 .hook_authority
                 .as_ref()
                 .map(|authority| authority.source.clone());
-            self.suppress_current_full_lifecycle_hook_authority(
+            // Use detector time so a later queued process observation is not
+            // mistaken for stale evidence merely because this event was handled late.
+            self.suppress_current_full_lifecycle_hook_authority_at_and_clock(
                 FullLifecycleHookSuppressionReason::ProcessExit,
+                now,
+                current_instant,
+                current_wall_clock,
             );
             if let Some(source) = cleared_source {
                 self.hook_report_sequences.remove(&source);
@@ -521,6 +615,7 @@ impl TerminalState {
                         source.clone(),
                         suppressed.agent_label,
                         suppressed_ref,
+                        None,
                     );
                 }
             }
@@ -591,6 +686,32 @@ impl TerminalState {
         &mut self,
         reason: FullLifecycleHookSuppressionReason,
     ) {
+        self.suppress_current_full_lifecycle_hook_authority_at(reason, Instant::now());
+    }
+
+    fn suppress_current_full_lifecycle_hook_authority_at(
+        &mut self,
+        reason: FullLifecycleHookSuppressionReason,
+        observed_at: Instant,
+    ) {
+        let current_instant = Instant::now();
+        let current_wall_clock = SystemTime::now();
+        self.suppress_current_full_lifecycle_hook_authority_at_and_clock(
+            reason,
+            observed_at,
+            current_instant,
+            current_wall_clock,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)] // Keeps the observation and sampled clocks explicit.
+    fn suppress_current_full_lifecycle_hook_authority_at_and_clock(
+        &mut self,
+        reason: FullLifecycleHookSuppressionReason,
+        observed_at: Instant,
+        current_instant: Instant,
+        current_wall_clock: SystemTime,
+    ) {
         if let Some((source, agent_label, session_ref)) =
             self.hook_authority.as_ref().and_then(|authority| {
                 crate::detect::full_lifecycle_hook_authority(
@@ -606,11 +727,14 @@ impl TerminalState {
                 })
             })
         {
-            self.suppress_full_lifecycle_hook_report_with_session_ref(
+            self.suppress_full_lifecycle_hook_report_with_session_ref_at_and_clock(
                 source,
                 agent_label,
                 session_ref,
                 reason,
+                observed_at,
+                current_instant,
+                current_wall_clock,
             );
         }
     }
@@ -642,13 +766,64 @@ impl TerminalState {
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
         reason: FullLifecycleHookSuppressionReason,
     ) {
+        self.suppress_full_lifecycle_hook_report_with_session_ref_at(
+            source,
+            agent_label,
+            session_ref,
+            reason,
+            Instant::now(),
+        );
+    }
+
+    fn suppress_full_lifecycle_hook_report_with_session_ref_at(
+        &mut self,
+        source: String,
+        agent_label: String,
+        session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        reason: FullLifecycleHookSuppressionReason,
+        observed_at: Instant,
+    ) {
+        let current_instant = Instant::now();
+        let current_wall_clock = SystemTime::now();
+        self.suppress_full_lifecycle_hook_report_with_session_ref_at_and_clock(
+            source,
+            agent_label,
+            session_ref,
+            reason,
+            observed_at,
+            current_instant,
+            current_wall_clock,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)] // Keeps the observation and sampled clocks explicit.
+    fn suppress_full_lifecycle_hook_report_with_session_ref_at_and_clock(
+        &mut self,
+        source: String,
+        agent_label: String,
+        session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        reason: FullLifecycleHookSuppressionReason,
+        observed_at: Instant,
+        current_instant: Instant,
+        current_wall_clock: SystemTime,
+    ) {
+        let last_seq = self.hook_report_sequences.get(&source).copied();
+        let last_seq = if reason == FullLifecycleHookSuppressionReason::ProcessExit {
+            let wall_clock =
+                wall_clock_at_observation(observed_at, current_instant, current_wall_clock);
+            process_exit_sequence_floor_at(&source, last_seq, wall_clock)
+        } else {
+            last_seq
+        };
         self.suppressed_full_lifecycle_hook_reports.insert(
             source,
             SuppressedFullLifecycleHookReport {
                 agent_label,
                 session_ref,
-                observed_at: Instant::now(),
+                observed_at,
                 reason,
+                last_seq,
+                detected_agent_at_suppression: self.detected_agent,
             },
         );
     }
@@ -796,7 +971,16 @@ impl TerminalState {
         let Some(detected_agent) = detected_agent else {
             return;
         };
-        if previous_detected_agent == Some(detected_agent) {
+        if previous_detected_agent == Some(detected_agent)
+            && !self
+                .suppressed_full_lifecycle_hook_reports
+                .values()
+                .any(|suppressed| {
+                    suppressed.reason == FullLifecycleHookSuppressionReason::ProcessExit
+                        && crate::detect::parse_agent_label(&suppressed.agent_label)
+                            == Some(detected_agent)
+                })
+        {
             return;
         }
         let detected_label = crate::detect::agent_label(detected_agent);
@@ -812,21 +996,56 @@ impl TerminalState {
                             StaleFullLifecycleHookSession {
                                 agent_label: suppressed.agent_label.clone(),
                                 session_ref,
+                                process_exit_sequence_floor: (suppressed.reason
+                                    == FullLifecycleHookSuppressionReason::ProcessExit)
+                                    .then_some(suppressed.last_seq)
+                                    .flatten(),
                             },
                         ));
                     }
                 }
                 !should_clear
             });
+        let mut confirmed_session_sources = Vec::new();
         for (source, stale_session) in stale_sessions {
-            self.remember_stale_full_lifecycle_hook_session(
-                source,
-                stale_session.agent_label,
-                stale_session.session_ref,
-            );
+            // Supported lifecycle reporters use monotonic wall-clock sequences, so
+            // a new process re-reporting the same session starts beyond every report
+            // generated by the exited process. Preserve that session-report floor
+            // for subsequent state reports.
+            let session_report_is_newer = stale_session
+                .process_exit_sequence_floor
+                .zip(self.hook_report_sequences.get(&source).copied())
+                .is_some_and(|(old_seq, reported_seq)| reported_seq > old_seq);
+            if session_report_is_newer
+                && self
+                    .persisted_agent_session
+                    .as_ref()
+                    .is_some_and(|session| {
+                        session.source == source
+                            && session.agent == stale_session.agent_label
+                            && session.session_ref == stale_session.session_ref
+                    })
+            {
+                self.forget_stale_full_lifecycle_hook_session(
+                    &source,
+                    &stale_session.agent_label,
+                    &stale_session.session_ref,
+                );
+                confirmed_session_sources.push(source);
+            } else {
+                self.remember_stale_full_lifecycle_hook_session(
+                    source,
+                    stale_session.agent_label,
+                    stale_session.session_ref,
+                    stale_session.process_exit_sequence_floor,
+                );
+            }
         }
         self.hook_report_sequences.retain(|source, _| {
-            !crate::detect::full_lifecycle_hook_authority(source, detected_label)
+            confirmed_session_sources
+                .iter()
+                .any(|confirmed| confirmed == source)
+                || !crate::detect::full_lifecycle_hook_authority(source, detected_label)
         });
     }
 
@@ -835,21 +1054,82 @@ impl TerminalState {
         source: String,
         agent_label: String,
         session_ref: crate::agent_resume::AgentSessionRef,
+        process_exit_sequence_floor: Option<u64>,
     ) {
-        let stale_session = StaleFullLifecycleHookSession {
-            agent_label,
-            session_ref,
-        };
         let source_stale_sessions = self
             .stale_full_lifecycle_hook_sessions
             .entry(source)
             .or_default();
-        if !source_stale_sessions
-            .iter()
-            .any(|existing| existing == &stale_session)
-        {
-            source_stale_sessions.push(stale_session);
+        if let Some(existing) = source_stale_sessions.iter_mut().find(|existing| {
+            existing.agent_label == agent_label && existing.session_ref == session_ref
+        }) {
+            existing.process_exit_sequence_floor = process_exit_sequence_floor;
+        } else {
+            source_stale_sessions.push(StaleFullLifecycleHookSession {
+                agent_label,
+                session_ref,
+                process_exit_sequence_floor,
+            });
         }
+    }
+
+    fn fresh_generation_confirms_session_report(
+        &self,
+        source: &str,
+        agent_label: &str,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+        seq: Option<u64>,
+    ) -> bool {
+        let hook_authority_absent = self.hook_authority.is_none();
+        let persisted_session_compatible =
+            self.persisted_agent_session.as_ref().is_none_or(|session| {
+                session.source == source
+                    && session.agent == agent_label
+                    && &session.session_ref == session_ref
+            });
+        let detected_agent_matches = self.detected_agent.is_some_and(|detected_agent| {
+            crate::detect::parse_agent_label(agent_label) == Some(detected_agent)
+        });
+        let matched_hook_clear_suppression = self
+            .suppressed_full_lifecycle_hook_reports
+            .get(source)
+            .filter(|suppressed| {
+                suppressed.agent_label == agent_label
+                    && suppressed.reason == FullLifecycleHookSuppressionReason::HookClear
+            });
+        let matched_hook_clear_sequence_floor =
+            matched_hook_clear_suppression.and_then(|suppressed| suppressed.last_seq);
+        let suppression_absent = !self
+            .suppressed_full_lifecycle_hook_reports
+            .contains_key(source);
+        let matched_stale = self
+            .stale_full_lifecycle_hook_sessions
+            .get(source)
+            .and_then(|stale_sessions| {
+                stale_sessions.iter().find(|stale| {
+                    stale.agent_label == agent_label && &stale.session_ref == session_ref
+                })
+            });
+        let matched_process_exit_sequence_floor =
+            matched_stale.and_then(|stale| stale.process_exit_sequence_floor);
+        let hook_clear_session_sequence_is_newer = matched_hook_clear_sequence_floor
+            .zip(seq)
+            .is_some_and(|(old_seq, reported_seq)| reported_seq > old_seq);
+        let process_exit_session_sequence_is_newer = matched_process_exit_sequence_floor
+            .zip(seq)
+            .is_some_and(|(old_seq, reported_seq)| reported_seq > old_seq);
+        let hook_only_without_process_exit = matched_hook_clear_suppression
+            .is_some_and(|suppressed| suppressed.detected_agent_at_suppression.is_none())
+            && self.detected_agent.is_none()
+            && self.recent_agent_process_exit_at.is_none();
+        let hook_clear_generation_confirmed =
+            hook_only_without_process_exit && hook_clear_session_sequence_is_newer;
+        let detected_process_generation_confirmed =
+            detected_agent_matches && suppression_absent && process_exit_session_sequence_is_newer;
+
+        hook_authority_absent
+            && persisted_session_compatible
+            && (hook_clear_generation_confirmed || detected_process_generation_confirmed)
     }
 
     fn forget_stale_full_lifecycle_hook_session(
@@ -1029,6 +1309,8 @@ impl TerminalState {
         session_start_source: Option<String>,
     ) -> Option<TerminalStateMutation> {
         let session_ref = session_ref?;
+        let fresh_generation_confirms_session =
+            self.fresh_generation_confirms_session_report(&source, &agent_label, &session_ref, seq);
         if !self.accept_hook_report(&source, seq) {
             return None;
         }
@@ -1077,7 +1359,13 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
-        if session_replacement_allowed || foreground_takeover_allowed {
+        if fresh_generation_confirms_session {
+            self.suppressed_full_lifecycle_hook_reports.remove(&source);
+        }
+        if session_replacement_allowed
+            || foreground_takeover_allowed
+            || fresh_generation_confirms_session
+        {
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
         }
         if let Some(replaced_hook_session) = replaced_hook_session {
@@ -1085,6 +1373,7 @@ impl TerminalState {
                 source.clone(),
                 agent_label.clone(),
                 replaced_hook_session,
+                None,
             );
             self.hook_authority = None;
         } else if foreground_takeover_allowed {
@@ -2274,6 +2563,200 @@ mod tests {
     }
 
     #[test]
+    fn hook_only_same_session_restart_reacquires_after_graceful_hook_clear() {
+        let mut terminal = test_terminal();
+        let session = crate::agent_resume::AgentSessionRef::path(test_session_path(
+            "hook-only-reused-pane-pi-session.jsonl",
+        ));
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                session.clone(),
+                Some(1000),
+            )
+            .expect("the first hook-only Pi process should establish authority");
+
+        terminal
+            .clear_hook_authority_with_mutation(Some("herdr:pi"), Some(1001))
+            .expect("the graceful HookClear should clear the first process");
+
+        assert_eq!(terminal.detected_agent, None);
+        assert_eq!(terminal.recent_agent_process_exit_at, None);
+        assert!(terminal.hook_authority.is_none());
+        assert_eq!(terminal.state, AgentState::Unknown);
+        assert_eq!(
+            terminal
+                .suppressed_full_lifecycle_hook_reports
+                .get("herdr:pi")
+                .map(|suppressed| (suppressed.reason, suppressed.last_seq)),
+            Some((FullLifecycleHookSuppressionReason::HookClear, Some(1001)))
+        );
+
+        let late_state = terminal.set_hook_authority_with_session_ref(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            Some("zombie".into()),
+            session.clone(),
+            Some(1002),
+        );
+        assert!(
+            late_state.is_none(),
+            "a newer state report alone must not bypass HookClear suppression"
+        );
+        let stale_session = terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            session.clone(),
+            Some(1001),
+            None,
+        );
+        assert!(
+            stale_session.is_none(),
+            "a session report at the HookClear sequence floor must stay suppressed"
+        );
+        assert!(terminal
+            .suppressed_full_lifecycle_hook_reports
+            .contains_key("herdr:pi"));
+
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                session.clone(),
+                Some(2000),
+                None,
+            )
+            .expect("a newer session report should announce the restarted generation");
+        assert!(
+            !terminal
+                .suppressed_full_lifecycle_hook_reports
+                .contains_key("herdr:pi"),
+            "the restarted session report should clear HookClear suppression"
+        );
+
+        let old_generation = terminal.set_hook_authority_with_session_ref(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            Some("late old generation".into()),
+            session.clone(),
+            Some(1002),
+        );
+        assert!(
+            old_generation.is_none(),
+            "an old-generation state report must stay below the restarted session floor"
+        );
+
+        let restarted_state = terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                session.clone(),
+                Some(2001),
+            )
+            .expect("the restarted state report should reacquire hook authority");
+
+        assert!(
+            restarted_state.effective_state_change.is_some(),
+            "the accepted restart must publish a panel-visible state change"
+        );
+        assert_eq!(terminal.detected_agent, None);
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Working);
+        assert!(terminal.is_agent_terminal());
+        assert_eq!(
+            terminal
+                .hook_authority
+                .as_ref()
+                .and_then(|authority| authority.session_ref.clone()),
+            session
+        );
+    }
+
+    #[test]
+    fn session_report_does_not_bypass_detector_or_process_exit_guards_after_hook_clear() {
+        for process_exit_before_hook_clear in [false, true] {
+            let mut terminal = test_terminal();
+            let session = crate::agent_resume::AgentSessionRef::path(test_session_path(&format!(
+                "guarded-hook-clear-pi-session-{process_exit_before_hook_clear}.jsonl"
+            )));
+            terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+            terminal
+                .set_hook_authority_with_session_ref(
+                    "herdr:pi".into(),
+                    "pi".into(),
+                    AgentState::Working,
+                    None,
+                    session.clone(),
+                    Some(1000),
+                )
+                .expect("the first Pi process should establish authority");
+
+            if process_exit_before_hook_clear {
+                terminal.set_detected_state_with_screen_signals_at(
+                    Some(Agent::Pi),
+                    AgentState::Idle,
+                    false,
+                    true,
+                    false,
+                    true,
+                    Instant::now() + Duration::from_millis(1),
+                );
+            }
+            terminal
+                .release_agent_with_mutation("herdr:pi", "pi", Some(1001))
+                .expect("the HookClear should be accepted");
+
+            assert_eq!(
+                terminal.recent_agent_process_exit_at.is_some(),
+                process_exit_before_hook_clear
+            );
+            assert_eq!(terminal.detected_agent, None);
+            assert_eq!(
+                terminal
+                    .suppressed_full_lifecycle_hook_reports
+                    .get("herdr:pi")
+                    .map(|suppressed| suppressed.reason),
+                Some(FullLifecycleHookSuppressionReason::HookClear)
+            );
+
+            terminal
+                .set_agent_session_ref_for_session_start(
+                    "herdr:pi".into(),
+                    "pi".into(),
+                    session,
+                    Some(2000),
+                    None,
+                )
+                .expect("the session report may be retained pending detector evidence");
+            assert!(
+                terminal
+                    .suppressed_full_lifecycle_hook_reports
+                    .contains_key("herdr:pi"),
+                "a session report must not bypass an existing detector/process-exit guard (process exit: {process_exit_before_hook_clear})"
+            );
+
+            let state_without_fresh_detector_evidence = terminal
+                .set_hook_authority_with_session_ref(
+                    "herdr:pi".into(),
+                    "pi".into(),
+                    AgentState::Working,
+                    None,
+                    None,
+                    Some(2001),
+                );
+            assert!(state_without_fresh_detector_evidence.is_none());
+            assert!(terminal.hook_authority.is_none());
+        }
+    }
+
+    #[test]
     fn changed_session_ref_allows_full_lifecycle_hook_after_suppression() {
         let mut terminal = test_terminal();
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
@@ -2502,6 +2985,397 @@ mod tests {
         assert!(fresh.is_some());
         assert!(terminal.hook_authority.is_some());
         assert_eq!(terminal.state, AgentState::Working);
+    }
+
+    #[test]
+    fn fresh_same_agent_detection_advances_process_generation() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            false,
+            now,
+        );
+        terminal
+            .set_hook_authority_at(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                crate::agent_resume::AgentSessionRef::id("pi-old"),
+                Some(1000),
+                now + Duration::from_millis(1),
+            )
+            .expect("the first Pi process should establish hook authority");
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            true,
+            now + Duration::from_millis(2),
+        );
+        assert!(terminal
+            .suppressed_full_lifecycle_hook_reports
+            .contains_key("herdr:pi"));
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            false,
+            now + Duration::from_millis(3),
+        );
+
+        assert!(
+            !terminal
+                .suppressed_full_lifecycle_hook_reports
+                .contains_key("herdr:pi"),
+            "fresh same-agent detector evidence should advance the process generation"
+        );
+        assert!(terminal
+            .stale_full_lifecycle_hook_sessions
+            .get("herdr:pi")
+            .is_some_and(|sessions| sessions.iter().any(|session| {
+                session.agent_label == "pi"
+                    && session.session_ref
+                        == crate::agent_resume::AgentSessionRef::id("pi-old").unwrap()
+            })));
+    }
+
+    #[test]
+    fn delayed_pre_exit_session_cannot_prove_same_session_process_generation() {
+        let mut terminal = test_terminal();
+        let current_instant = Instant::now();
+        let observed_at = current_instant - Duration::from_millis(10);
+        let current_wall_clock = std::time::UNIX_EPOCH
+            + Duration::from_secs(1_800_000_000)
+            + Duration::from_micros(500_789);
+        let observation_micros = 1_800_000_000_490_789_u64;
+        let observation_millis_start = observation_micros / 1000 * 1000;
+        let received_old_seq = observation_millis_start - 1;
+        let delayed_old_session_seq = observation_millis_start + 500;
+        let session = crate::agent_resume::AgentSessionRef::path(test_session_path(
+            "delayed-pre-exit-pi-session.jsonl",
+        ));
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            false,
+            observed_at - Duration::from_millis(2),
+        );
+        terminal
+            .set_hook_authority_at(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                session.clone(),
+                Some(received_old_seq),
+                observed_at - Duration::from_millis(1),
+            )
+            .expect("the old Pi process should establish hook authority");
+        terminal.set_detected_state_with_screen_signals_at_and_clock(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            true,
+            observed_at,
+            current_instant,
+            current_wall_clock,
+        );
+
+        assert!(delayed_old_session_seq > received_old_seq);
+        assert!(delayed_old_session_seq > observation_millis_start);
+        assert!(delayed_old_session_seq < observation_micros);
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                session.clone(),
+                Some(delayed_old_session_seq),
+                None,
+            )
+            .expect("the delayed old SESSION is retained pending detector evidence");
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            false,
+            observed_at + Duration::from_millis(1),
+        );
+
+        let delayed_old_state = terminal.set_hook_authority_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            Some("zombie".into()),
+            session.clone(),
+            Some(delayed_old_session_seq + 1),
+            observed_at + Duration::from_millis(2),
+        );
+        assert!(
+            delayed_old_state.is_none(),
+            "a SESSION generated before ProcessExit must not prove the detected process generation"
+        );
+        assert!(terminal.hook_authority.is_none());
+
+        let new_generation_session_seq = observation_micros + 1;
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                session.clone(),
+                Some(new_generation_session_seq),
+                None,
+            )
+            .expect("a genuinely post-observation SESSION should prove the new process generation");
+        let new_generation_state = terminal.set_hook_authority_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            session,
+            Some(new_generation_session_seq + 1),
+            observed_at + Duration::from_millis(3),
+        );
+
+        assert!(new_generation_state.is_some());
+        assert_eq!(terminal.state, AgentState::Working);
+    }
+
+    #[test]
+    fn process_exit_sequence_floor_matches_full_lifecycle_reporter_clocks() {
+        let wall_clock = std::time::UNIX_EPOCH
+            + Duration::from_secs(1_800_000_000)
+            + Duration::from_nanos(123_456_789);
+        let epoch_millis = 1_800_000_000_123_u64;
+        let epoch_micros = 1_800_000_000_123_456_u64;
+        let epoch_nanos = 1_800_000_000_123_456_789_u64;
+        let bakery_epoch_nanos = epoch_millis * 1_000_000 + 1_000_000_000;
+
+        for source in ["herdr:pi", "herdr:omp", "herdr:opencode", "herdr:kilo"] {
+            assert_eq!(
+                process_exit_sequence_floor_at(source, Some(epoch_micros - 1), wall_clock),
+                Some(epoch_micros),
+                "{source} should use the exact detector-observation microsecond boundary"
+            );
+        }
+        for source in ["herdr:hermes", "herdr:mastracode", "herdr:kimi"] {
+            assert_eq!(
+                process_exit_sequence_floor_at(source, Some(epoch_nanos - 1), wall_clock),
+                Some(epoch_nanos),
+                "{source} should use the exact Unix nanosecond boundary"
+            );
+        }
+        assert_eq!(
+            process_exit_sequence_floor_at("herdr:kimi", Some(epoch_millis - 1), wall_clock),
+            Some(epoch_millis),
+            "a delayed old PowerShell report from the exit millisecond must stay below the floor"
+        );
+        assert_eq!(
+            process_exit_sequence_floor_at("herdr:pi", Some(bakery_epoch_nanos - 1), wall_clock),
+            Some(bakery_epoch_nanos),
+            "the nanosecond Pi reporter should include its one-second margin"
+        );
+        assert_eq!(
+            process_exit_sequence_floor_at("herdr:omp", Some(epoch_micros + 7), wall_clock),
+            Some(epoch_micros + 7),
+            "a received high-water ahead of the wall-clock boundary must remain the floor"
+        );
+    }
+
+    #[test]
+    fn process_exit_clock_pair_preserves_observation_order_and_spacing() {
+        let current_instant = Instant::now();
+        let observed_at = current_instant - Duration::from_secs(10);
+        let current_wall_clock = std::time::UNIX_EPOCH + Duration::from_secs(100);
+        let observed_wall_clock =
+            wall_clock_at_observation(observed_at, current_instant, current_wall_clock);
+
+        assert!(observed_wall_clock < current_wall_clock);
+        assert_eq!(
+            current_wall_clock
+                .duration_since(observed_wall_clock)
+                .expect("observation wall clock should precede the current wall clock"),
+            current_instant.duration_since(observed_at)
+        );
+        assert_eq!(
+            observed_wall_clock,
+            std::time::UNIX_EPOCH + Duration::from_secs(90)
+        );
+        assert_eq!(
+            wall_clock_at_observation(
+                current_instant + Duration::from_secs(10),
+                current_instant,
+                current_wall_clock,
+            ),
+            current_wall_clock,
+            "a future observation should saturate instead of moving wall time forward"
+        );
+    }
+
+    #[test]
+    fn process_exit_sequence_floor_preserves_unknown_or_invalid_clocks() {
+        let wall_clock = std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+
+        assert_eq!(
+            process_exit_sequence_floor_at("custom:pi", Some(1234), wall_clock),
+            Some(1234)
+        );
+        assert_eq!(
+            process_exit_sequence_floor_at("herdr:pi", Some(1234), wall_clock),
+            Some(1234)
+        );
+        assert_eq!(
+            process_exit_sequence_floor_at(
+                "herdr:pi",
+                Some(1234),
+                std::time::UNIX_EPOCH - Duration::from_secs(1)
+            ),
+            Some(1234)
+        );
+        assert_eq!(
+            process_exit_sequence_floor_at("herdr:pi", None, wall_clock),
+            None
+        );
+    }
+
+    #[test]
+    fn reused_pane_same_pi_session_reacquires_hook_after_fresh_process_detection() {
+        for session_report_before_detection in [false, true] {
+            let mut terminal = test_terminal();
+            let session = crate::agent_resume::AgentSessionRef::path(test_session_path(&format!(
+                "reused-pane-pi-session-{session_report_before_detection}.jsonl"
+            )));
+            terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+            terminal
+                .set_hook_authority_with_session_ref(
+                    "herdr:pi".into(),
+                    "pi".into(),
+                    AgentState::Working,
+                    None,
+                    session.clone(),
+                    Some(1000),
+                )
+                .expect("the first Pi process should establish hook authority");
+
+            let process_exit_at = Instant::now() + Duration::from_millis(1);
+            terminal.set_detected_state_with_screen_signals_at(
+                Some(Agent::Pi),
+                AgentState::Idle,
+                false,
+                true,
+                false,
+                true,
+                process_exit_at,
+            );
+            assert!(terminal.agent_process_exited_within(process_exit_at, Duration::from_secs(2)));
+            assert!(terminal.hook_authority.is_none());
+            assert!(terminal
+                .suppressed_full_lifecycle_hook_reports
+                .contains_key("herdr:pi"));
+
+            let report_restarted_session = |terminal: &mut TerminalState| {
+                terminal.set_agent_session_ref_for_session_start(
+                    "herdr:pi".into(),
+                    "pi".into(),
+                    session.clone(),
+                    Some(1500),
+                    None,
+                )
+            };
+            if session_report_before_detection {
+                report_restarted_session(&mut terminal)
+                    .expect("the restarted process should report its resumed Pi session");
+                let before_detection = terminal.set_hook_authority_with_session_ref(
+                    "herdr:pi".into(),
+                    "pi".into(),
+                    AgentState::Working,
+                    None,
+                    session.clone(),
+                    Some(1001),
+                );
+                assert!(
+                    before_detection.is_none(),
+                    "a session report alone must not bypass process-exit suppression"
+                );
+            }
+
+            // ReportAgentRestart publishes the same Agent for the new process.
+            terminal.set_detected_state_with_screen_signals_at(
+                Some(Agent::Pi),
+                AgentState::Idle,
+                false,
+                true,
+                false,
+                false,
+                process_exit_at + Duration::from_millis(1),
+            );
+            if !session_report_before_detection {
+                report_restarted_session(&mut terminal)
+                    .expect("the restarted process should report its resumed Pi session");
+            }
+            let late_old_generation = terminal.set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                session.clone(),
+                Some(1001),
+            );
+            assert!(
+                late_old_generation.is_none(),
+                "the exited generation must stay below the restarted process sequence floor"
+            );
+
+            let fresh = terminal.set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                session.clone(),
+                Some(1501),
+            );
+
+            assert!(
+                fresh.is_some(),
+                "fresh detector evidence plus a new session report must let restarted Pi reacquire hook authority (session report before detection: {session_report_before_detection})"
+            );
+            assert!(
+                fresh
+                    .as_ref()
+                    .and_then(|mutation| mutation.effective_state_change.as_ref())
+                    .is_some(),
+                "the accepted restart must publish a panel-visible state change"
+            );
+            assert_eq!(terminal.detected_agent, Some(Agent::Pi));
+            assert_eq!(terminal.effective_agent_label(), Some("pi"));
+            assert!(terminal.is_agent_terminal());
+            assert_eq!(
+                terminal
+                    .hook_authority
+                    .as_ref()
+                    .and_then(|authority| authority.session_ref.clone()),
+                session
+            );
+        }
     }
 
     #[test]
