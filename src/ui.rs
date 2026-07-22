@@ -92,7 +92,7 @@ pub(crate) use self::{
     },
     panes::{apply_pane_chrome, pane_inner_rect, pane_is_scrolled_back},
     tab_surface::{tab_surface_cursor, tab_surface_hyperlinks, TabSurfaceView},
-    tabs::compute_tab_bar_view,
+    tabs::{compute_tab_bar_view, compute_wrapped_tab_bar_view},
     widgets::{centered_popup_rect, modal_stack_areas},
 };
 use crate::app::state::ViewLayout;
@@ -200,8 +200,16 @@ fn desktop_tab_bar_and_terminal_area(
 ) -> (Rect, Rect) {
     let hide_single_tab_bar = app.hide_tab_bar_when_single_tab && ws.tabs.len() == 1;
     if !hide_single_tab_bar && main_area.height > 1 {
+        let tab_bar_height = if app.tab_bar_wrap {
+            let desired = tabs::tab_bar_wrapped_rows(ws, main_area.width, app.mouse_capture);
+            // Keep at least half of the main area available to tiled and popup panes.
+            desired.clamp(1, (main_area.height / 2).max(1))
+        } else {
+            1
+        };
         let [tab_bar_rect, terminal_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main_area);
+            Layout::vertical([Constraint::Length(tab_bar_height), Constraint::Min(1)])
+                .areas(main_area);
         (tab_bar_rect, terminal_area)
     } else {
         (Rect::default(), main_area)
@@ -261,13 +269,17 @@ fn compute_view_internal(
         .active
         .and_then(|ws_idx| app.workspaces.get(ws_idx))
         .map(|ws| {
-            compute_tab_bar_view(
-                ws,
-                tab_bar_rect,
-                app.tab_scroll,
-                app.tab_scroll_follow_active,
-                app.mouse_capture,
-            )
+            if app.tab_bar_wrap {
+                compute_wrapped_tab_bar_view(ws, tab_bar_rect, app.mouse_capture)
+            } else {
+                compute_tab_bar_view(
+                    ws,
+                    tab_bar_rect,
+                    app.tab_scroll,
+                    app.tab_scroll_follow_active,
+                    app.mouse_capture,
+                )
+            }
         })
         .unwrap_or_default();
     app.tab_scroll = tab_bar_view.scroll;
@@ -789,6 +801,42 @@ mod tests {
         assert_eq!(app.view.layout, ViewLayout::Mobile);
         assert_eq!(app.view.mobile_header_rect, Rect::new(0, 0, 80, 2));
         assert_eq!(app.view.terminal_area, Rect::new(0, 2, 80, 18));
+    }
+
+    #[test]
+    fn wrapped_tab_rows_shrink_terminal_and_popup_geometry_together() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.tab_bar_wrap = true;
+        let mut workspace = Workspace::test_new("one");
+        for name in ["two", "three", "four", "five", "six", "seven", "eight"] {
+            workspace.test_add_tab(Some(name));
+        }
+        app.workspaces = vec![workspace];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.popup_pane = Some(crate::app::state::PopupPaneState {
+            pane_id: crate::layout::PaneId::alloc(),
+            terminal_id: crate::terminal::TerminalId::alloc(),
+            width: None,
+            height: None,
+        });
+
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+
+        assert!(app.view.tab_bar_rect.height > 1);
+        assert_eq!(app.view.terminal_area.y, app.view.tab_bar_rect.height);
+        assert_eq!(
+            app.view.tab_bar_rect.height + app.view.terminal_area.height,
+            20
+        );
+        let (popup_outer, _) =
+            panes::popup_pane_rects(&app, app.view.terminal_area).expect("popup rects");
+        assert!(popup_outer.y >= app.view.terminal_area.y);
+        assert!(
+            popup_outer.y + popup_outer.height
+                <= app.view.terminal_area.y + app.view.terminal_area.height
+        );
     }
 
     #[test]

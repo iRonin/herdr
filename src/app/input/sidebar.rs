@@ -1426,14 +1426,15 @@ mod tests {
             drop_col,
             source.y,
         ));
-        assert!(matches!(
-            app.state.drag.as_ref().map(|drag| &drag.target),
+        let drag_target = app.state.drag.as_ref().map(|drag| &drag.target);
+        match drag_target {
             Some(DragTarget::TabReorder {
                 ws_idx: 0,
                 source_tab_idx: 0,
-                insert_idx: Some(3),
-            })
-        ));
+                drop_target: Some(target),
+            }) => assert_eq!(target.insert_idx, 3),
+            _ => panic!("expected TabReorder drag with insert_idx=3, got {drag_target:?}"),
+        }
         app.handle_mouse(mouse(
             MouseEventKind::Up(MouseButton::Left),
             drop_col,
