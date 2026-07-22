@@ -313,6 +313,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # New tabs can still be created with the configured keybinding.
 # hide_tab_bar_when_single_tab = false
 
+# Mirror the highest-attention agent pane's standalone context percentage on each top tab.
+# Recognizes N%·PID and ~N%·PID labels from the Agents pane.
+# tab_agent_context = false
+
 # Agent panel ordering: "spaces" (grouped by space) or "priority" (attention queue).
 # "workspaces" is accepted as an alias for "spaces".
 # agent_panel_sort = "spaces"

@@ -812,6 +812,9 @@ pub struct UiConfig {
     pub show_agent_labels_on_pane_borders: bool,
     /// Hide the tab row when the workspace has one tab. Default: false.
     pub hide_tab_bar_when_single_tab: bool,
+    /// Show the highest-attention agent pane's context percentage on each top tab.
+    /// Default: false.
+    pub tab_agent_context: bool,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
     /// Expanded sidebar row composition.
@@ -1010,6 +1013,7 @@ impl Default for UiConfig {
             pane_gaps: true,
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
+            tab_agent_context: false,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             sidebar: SidebarConfig::default(),
             accent: "cyan".into(),
@@ -1232,6 +1236,21 @@ agent_panel_scope = "current"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.ui.agent_panel_sort, AgentPanelSortConfig::Spaces);
+    }
+
+    #[test]
+    fn tab_agent_context_defaults_off_and_parses_on() {
+        let default_config = Config::default();
+        assert!(!default_config.ui.tab_agent_context);
+
+        let config: Config = toml::from_str(
+            r#"
+[ui]
+tab_agent_context = true
+"#,
+        )
+        .unwrap();
+        assert!(config.ui.tab_agent_context);
     }
 
     #[test]

@@ -625,6 +625,7 @@ impl App {
             pane_gaps: config.ui.pane_gaps,
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
             hide_tab_bar_when_single_tab: config.ui.hide_tab_bar_when_single_tab,
+            tab_agent_context: config.ui.tab_agent_context,
             pane_history_persistence: config.experimental.pane_history,
             reveal_hidden_cursor_for_cjk_ime: config.experimental.reveal_hidden_cursor_for_cjk_ime,
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
@@ -1418,6 +1419,7 @@ impl App {
                 self.state.show_agent_labels_on_pane_borders =
                     config.ui.show_agent_labels_on_pane_borders;
                 self.state.hide_tab_bar_when_single_tab = config.ui.hide_tab_bar_when_single_tab;
+                self.state.tab_agent_context = config.ui.tab_agent_context;
                 self.state.agent_panel_sort =
                     agent_panel_sort_from_config(config.ui.agent_panel_sort);
                 self.state.sidebar_agents = config.ui.sidebar.agents.clone();
@@ -2372,6 +2374,17 @@ mod tests {
     }
 
     #[test]
+    fn startup_uses_tab_agent_context_config() {
+        let mut config = Config::default();
+        config.ui.tab_agent_context = true;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert!(app.state.tab_agent_context);
+    }
+
+    #[test]
     fn startup_uses_configured_sidebar_state() {
         let mut config = Config::default();
         config.ui.sidebar_start_collapsed = true;
@@ -2724,6 +2737,30 @@ mod tests {
             crate::config::HostCursorModeConfig::Native
         );
         assert!(app.state.request_client_config_reload);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_updates_tab_agent_context() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-tab-agent-context");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert!(!app.state.tab_agent_context);
+
+        std::fs::write(&path, "[ui]\ntab_agent_context = true\n").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(app.state.tab_agent_context);
+
+        std::fs::write(&path, "[ui]\ntab_agent_context = false\n").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(!app.state.tab_agent_context);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

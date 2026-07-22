@@ -671,6 +671,12 @@
           "description": "Hide the tab row when the workspace has one tab."
         },
         {
+          "key": "ui.tab_agent_context",
+          "type": "boolean",
+          "default": "false",
+          "description": "Mirror the standalone context percentage shown in the Agents pane for the highest-attention agent pane on each top tab. Recognizes standalone N%·PID and ~N%·PID labels, appends the exact percentage portion after the visible tab name and before the zoom marker, and omits missing or ambiguous labels. Disabled by default."
+        },
+        {
           "key": "ui.agent_panel_sort",
           "type": "enum",
           "default": "\"spaces\"",
