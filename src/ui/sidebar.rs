@@ -306,7 +306,7 @@ fn workspace_entry_gap(
     }
 }
 
-fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
+pub(super) fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
         (AgentState::Blocked, _) => 4,
         (AgentState::Idle, false) => 3,

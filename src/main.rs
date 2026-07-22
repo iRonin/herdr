@@ -317,6 +317,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # The wrapped bar uses at most half of the pane area's height.
 # tab_bar_wrap = false
 
+# Show the highest-attention agent status on each top tab.
+# Uses the same working/blocked/done/unknown glyphs as the agents panel.
+# tab_agent_status = false
+
 # Main pane scrollbar: "always" reserves a column, "auto" briefly overlays
 # the last text column after scrolling, and "never" leaves copied text clean.
 # Boolean true/false remains accepted as "always"/"never" for compatibility.

@@ -652,6 +652,7 @@ impl App {
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
             hide_tab_bar_when_single_tab: config.ui.hide_tab_bar_when_single_tab,
             tab_bar_wrap: config.ui.tab_bar_wrap,
+            tab_agent_status: config.ui.tab_agent_status,
             scrollbar_mode: config.ui.show_scrollbar,
             last_pane_scroll_activity: HashMap::new(),
             pane_history_persistence: config.experimental.pane_history,
@@ -1448,6 +1449,7 @@ impl App {
                     config.ui.show_agent_labels_on_pane_borders;
                 self.state.hide_tab_bar_when_single_tab = config.ui.hide_tab_bar_when_single_tab;
                 self.state.tab_bar_wrap = config.ui.tab_bar_wrap;
+                self.state.tab_agent_status = config.ui.tab_agent_status;
                 self.state.scrollbar_mode = config.ui.show_scrollbar;
                 if self.state.scrollbar_mode != crate::config::ScrollbarMode::Auto {
                     self.state.last_pane_scroll_activity.clear();
