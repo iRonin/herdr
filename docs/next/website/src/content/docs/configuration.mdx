@@ -356,6 +356,8 @@ Metadata reporters provide values only; styling stays in the local sidebar confi
 
 Sidebar row settings affect only the expanded desktop sidebar. Collapsed and mobile views keep their compact layouts.
 
+Set `tab_agent_status = true` under `[ui]` to show the highest-attention agent state on each top tab. The indicator uses the same glyphs and colors as the Agent panel: a spinner for working, `◉` blocked, `●` done and unread, `✓` done and read, and `○` unknown. It is disabled by default and works with both single-row and wrapped tab bars.
+
 ## Notifications
 
 Herdr can notify you when a background agent finishes or needs input:

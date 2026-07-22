@@ -671,6 +671,12 @@
           "description": "Hide the tab row when the workspace has one tab."
         },
         {
+          "key": "ui.tab_agent_status",
+          "type": "boolean",
+          "default": "false",
+          "description": "Show the highest-attention agent status on each top tab using the same glyphs as the agents panel (spinner for working, ◉ blocked, ● done and unread, ✓ done and read, and ○ unknown). Works with both single-row and wrapped tab bars. Disabled by default."
+        },
+        {
           "key": "ui.agent_panel_sort",
           "type": "enum",
           "default": "\"spaces\"",
