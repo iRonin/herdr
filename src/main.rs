@@ -313,6 +313,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # New tabs can still be created with the configured keybinding.
 # hide_tab_bar_when_single_tab = false
 
+# Wrap tabs onto multiple rows instead of using a single scrollable row.
+# The wrapped bar uses at most half of the pane area's height.
+# tab_bar_wrap = false
+
 # Agent panel ordering: "spaces" (grouped by space) or "priority" (attention queue).
 # "workspaces" is accepted as an alias for "spaces".
 # agent_panel_sort = "spaces"
