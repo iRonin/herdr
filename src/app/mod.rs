@@ -2434,7 +2434,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn startup_uses_configured_agent_panel_modes_without_forcing_active_mode() {
         let mut config = Config::default();
         config.ui.agent_panel_modes = vec![
@@ -2456,6 +2455,7 @@ mod tests {
         assert_eq!(app.state.agent_panel_scope, state::AgentPanelScope::All);
     }
 
+    #[test]
     fn startup_uses_redraw_on_focus_gained_config() {
         let mut config = Config::default();
         config.ui.redraw_on_focus_gained = false;

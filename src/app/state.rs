@@ -2413,7 +2413,6 @@ mod tests {
     use crossterm::event::KeyEvent;
 
     #[test]
-    #[test]
     fn agent_panel_mode_maps_to_and_from_sort_and_scope() {
         for (mode, sort, scope) in [
             (
@@ -2442,6 +2441,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn agent_terminal_keeps_final_child_cursor_exposed() {
         let mut state = AppState::test_new();
         let ws = crate::workspace::Workspace::test_new("test");
