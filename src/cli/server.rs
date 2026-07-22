@@ -33,7 +33,10 @@ fn server_stop(args: &[String]) -> std::io::Result<i32> {
 
     let timeout = load_server_stop_timeout();
     match crate::session::stop_active_server(timeout) {
-        Ok(()) => Ok(0),
+        Ok(()) => {
+            eprintln!("\x1b[2mherdr · iRonin fork\x1b[0m");
+            Ok(0)
+        }
         Err(err) => {
             eprintln!("{err}");
             Ok(1)

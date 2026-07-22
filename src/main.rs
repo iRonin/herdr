@@ -724,7 +724,7 @@ fn main() -> io::Result<()> {
     }
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("herdr {}", crate::build_info::version());
+        println!("herdr {} (iRonin fork)", crate::build_info::version());
         return Ok(());
     }
 

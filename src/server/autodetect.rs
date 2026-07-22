@@ -95,6 +95,20 @@ fn read_server_status() -> io::Result<Option<crate::api::RuntimeStatus>> {
     crate::api::read_runtime_status_at(&crate::api::socket_path(), STATUS_REQUEST_TIMEOUT)
 }
 
+#[cfg(any(windows, test))]
+fn client_protocol_readiness_hello() -> crate::protocol::ClientMessage {
+    crate::protocol::ClientMessage::Hello {
+        version: crate::protocol::PROTOCOL_VERSION,
+        cols: 80,
+        rows: 24,
+        cell_width_px: 0,
+        cell_height_px: 0,
+        requested_encoding: crate::protocol::RenderEncoding::SemanticFrame,
+        keybindings: crate::protocol::ClientKeybindings::Server,
+        launch_mode: crate::protocol::ClientLaunchMode::TerminalAttach,
+    }
+}
+
 #[cfg(windows)]
 fn client_protocol_accepts_hello(socket_path: &Path) -> io::Result<bool> {
     if !socket_path.exists() {
@@ -117,18 +131,7 @@ fn client_protocol_accepts_hello(socket_path: &Path) -> io::Result<bool> {
         Err(err) => return Err(err),
     };
 
-    let hello = crate::protocol::ClientMessage::Hello {
-        version: crate::protocol::PROTOCOL_VERSION,
-        cols: 80,
-        rows: 24,
-        cell_width_px: 0,
-        cell_height_px: 0,
-        requested_encoding: crate::protocol::RenderEncoding::SemanticFrame,
-        keybindings: crate::protocol::ClientKeybindings::Server,
-        launch_mode: crate::protocol::ClientLaunchMode::App,
-    };
-
-    match crate::protocol::write_message(&mut stream, &hello) {
+    match crate::protocol::write_message(&mut stream, &client_protocol_readiness_hello()) {
         Ok(()) => Ok(true),
         Err(crate::protocol::FramingError::Io(err))
             if matches!(
@@ -436,6 +439,21 @@ test "$sid" = "$$"
         assert!(!is_server_listening_at(&path));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn client_protocol_readiness_probe_does_not_request_app_attach() {
+        let crate::protocol::ClientMessage::Hello { launch_mode, .. } =
+            client_protocol_readiness_hello()
+        else {
+            panic!("readiness probe should send hello");
+        };
+
+        assert_eq!(
+            launch_mode,
+            crate::protocol::ClientLaunchMode::TerminalAttach,
+            "readiness probing must not consume first-app-client startup behavior"
+        );
     }
 
     #[test]
