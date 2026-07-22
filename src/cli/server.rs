@@ -7,6 +7,7 @@ pub(super) fn run_server_command(args: &[String]) -> std::io::Result<Option<i32>
 
     match subcommand {
         "stop" => server_stop(&args[1..]).map(Some),
+        "restart" => server_restart(&args[1..]).map(Some),
         "live-handoff" => server_live_handoff(&args[1..]).map(Some),
         "--handoff-import" => Ok(None),
         "reload-config" => server_reload_config(&args[1..]).map(Some),
@@ -36,6 +37,54 @@ fn server_stop(args: &[String]) -> std::io::Result<i32> {
             eprintln!("{err}");
             Ok(1)
         }
+    }
+}
+
+fn server_restart(args: &[String]) -> std::io::Result<i32> {
+    if !args.is_empty() {
+        eprintln!("usage: herdr server restart");
+        return Ok(2);
+    }
+
+    match restart_server_with(
+        |name| std::env::var_os(name),
+        crate::session::active_api_socket_path,
+        crate::session::stop_active_server,
+        crate::server::autodetect::auto_detect_launch,
+    ) {
+        Ok(()) => Ok(0),
+        Err(err) => {
+            eprintln!("{err}");
+            Ok(1)
+        }
+    }
+}
+
+fn restart_server_with(
+    get_env: impl FnOnce(&str) -> Option<std::ffi::OsString>,
+    resolve_target_socket: impl FnOnce() -> std::path::PathBuf,
+    stop_server: impl FnOnce() -> Result<(), String>,
+    start_and_attach: impl FnOnce() -> std::io::Result<()>,
+) -> Result<(), String> {
+    if let Some(hosting_socket) = get_env(crate::api::SOCKET_PATH_ENV_VAR) {
+        let hosting_socket = std::path::PathBuf::from(hosting_socket);
+        let target_socket = resolve_target_socket();
+        if canonical_socket_paths_match(&hosting_socket, &target_socket) {
+            return Err("server restart: refusing to restart the server that hosts this pane — stopping it would kill this command before the new server can start. Run it from a shell outside this session: herdr --session <name> server restart".to_string());
+        }
+    }
+
+    stop_server()
+        .map_err(|err| format!("server restart aborted: {err}\nThe server was not restarted."))?;
+
+    start_and_attach()
+        .map_err(|err| format!("server stopped but failed to restart and attach: {err}"))
+}
+
+fn canonical_socket_paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
     }
 }
 
@@ -256,6 +305,9 @@ fn print_server_help() {
     eprintln!("herdr server commands:");
     eprintln!("  herdr server                run as headless server");
     eprintln!("  herdr server stop           stop the running server via the API socket");
+    eprintln!(
+        "  herdr server restart        stop, start, and attach (run from outside the target session)"
+    );
     eprintln!("  herdr server live-handoff   hand off live panes to a new local server");
     eprintln!("  herdr server reload-config  reload config.toml in the running server");
     eprintln!("  herdr server agent-manifests [--json]  show agent detection manifest status");
@@ -268,6 +320,160 @@ mod tests {
     use super::*;
 
     #[test]
+
+    #[test]
+    fn server_restart_stops_before_starting_and_attaching() {
+        let events = std::cell::RefCell::new(Vec::new());
+
+        restart_server_with(
+            |_| None,
+            || panic!("target socket is irrelevant outside a hosted pane"),
+            || {
+                events.borrow_mut().push("stop");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("start-and-attach");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*events.borrow(), ["stop", "start-and-attach"]);
+    }
+
+    #[test]
+    fn server_restart_refuses_when_target_server_hosts_current_pane() {
+        let target_socket = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let hosting_socket = target_socket.join("src").join("..");
+        assert_ne!(
+            hosting_socket, target_socket,
+            "fixture must require canonicalization"
+        );
+        let stop_called = std::cell::Cell::new(false);
+        let start_called = std::cell::Cell::new(false);
+
+        let error = restart_server_with(
+            |name| {
+                assert_eq!(name, crate::api::SOCKET_PATH_ENV_VAR);
+                Some(hosting_socket.clone().into_os_string())
+            },
+            || target_socket.clone(),
+            || {
+                stop_called.set(true);
+                Ok(())
+            },
+            || {
+                start_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "server restart: refusing to restart the server that hosts this pane — stopping it would kill this command before the new server can start. Run it from a shell outside this session: herdr --session <name> server restart"
+        );
+        assert!(!stop_called.get(), "guard must run before stop");
+        assert!(!start_called.get(), "refused restart must not start");
+    }
+
+    #[test]
+    fn server_restart_proceeds_when_hosting_socket_is_unset() {
+        let events = std::cell::RefCell::new(Vec::new());
+
+        restart_server_with(
+            |name| {
+                assert_eq!(name, crate::api::SOCKET_PATH_ENV_VAR);
+                None
+            },
+            || std::env::current_dir().unwrap(),
+            || {
+                events.borrow_mut().push("stop");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("start-and-attach");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*events.borrow(), ["stop", "start-and-attach"]);
+    }
+
+    #[test]
+    fn server_restart_proceeds_when_hosted_by_a_different_server() {
+        let hosting_socket = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let target_socket = hosting_socket
+            .parent()
+            .expect("test working directory has a parent")
+            .to_path_buf();
+        let events = std::cell::RefCell::new(Vec::new());
+
+        restart_server_with(
+            |_| Some(hosting_socket.clone().into_os_string()),
+            || target_socket.clone(),
+            || {
+                events.borrow_mut().push("stop");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("start-and-attach");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*events.borrow(), ["stop", "start-and-attach"]);
+    }
+
+    #[test]
+    fn server_restart_does_not_start_when_stop_fails() {
+        let start_called = std::cell::Cell::new(false);
+
+        let error = restart_server_with(
+            |_| None,
+            || panic!("target socket is irrelevant outside a hosted pane"),
+            || Err("server did not stop within 15000ms".to_string()),
+            || {
+                start_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            !start_called.get(),
+            "restart must not start over a live server"
+        );
+        assert_eq!(
+            error,
+            "server restart aborted: server did not stop within 15000ms\nThe server was not restarted."
+        );
+    }
+
+    #[test]
+    fn server_restart_reports_attach_failure_after_stop() {
+        let stop_called = std::cell::Cell::new(false);
+
+        let error = restart_server_with(
+            |_| None,
+            || panic!("target socket is irrelevant outside a hosted pane"),
+            || {
+                stop_called.set(true);
+                Ok(())
+            },
+            || Err(std::io::Error::other("attach failed")),
+        )
+        .unwrap_err();
+
+        assert!(stop_called.get());
+        assert_eq!(
+            error,
+            "server stopped but failed to restart and attach: attach failed"
+        );
+    }
     fn update_agent_manifest_status_fetches_reloads_then_reads_status() {
         let mut methods = Vec::new();
         let response = update_agent_manifest_status(
