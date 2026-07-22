@@ -626,6 +626,8 @@ impl App {
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
             hide_tab_bar_when_single_tab: config.ui.hide_tab_bar_when_single_tab,
             tab_bar_wrap: config.ui.tab_bar_wrap,
+            scrollbar_mode: config.ui.show_scrollbar,
+            last_pane_scroll_activity: HashMap::new(),
             pane_history_persistence: config.experimental.pane_history,
             reveal_hidden_cursor_for_cjk_ime: config.experimental.reveal_hidden_cursor_for_cjk_ime,
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
@@ -1420,6 +1422,10 @@ impl App {
                     config.ui.show_agent_labels_on_pane_borders;
                 self.state.hide_tab_bar_when_single_tab = config.ui.hide_tab_bar_when_single_tab;
                 self.state.tab_bar_wrap = config.ui.tab_bar_wrap;
+                self.state.scrollbar_mode = config.ui.show_scrollbar;
+                if self.state.scrollbar_mode != crate::config::ScrollbarMode::Auto {
+                    self.state.last_pane_scroll_activity.clear();
+                }
                 self.state.agent_panel_sort =
                     agent_panel_sort_from_config(config.ui.agent_panel_sort);
                 self.state.sidebar_agents = config.ui.sidebar.agents.clone();
@@ -1777,6 +1783,17 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[test]
+    fn app_copies_show_scrollbar_mode_from_config() {
+        let mut config = Config::default();
+        config.ui.show_scrollbar = crate::config::ScrollbarMode::Auto;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert_eq!(app.state.scrollbar_mode, crate::config::ScrollbarMode::Auto);
     }
 
     fn unique_temp_path(name: &str) -> std::path::PathBuf {
@@ -2609,7 +2626,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[ui]\nagent_panel_sort = \"priority\"\nredraw_on_focus_gained = false\ncopy_on_select = false\nright_click_passthrough_modifier = \"ctrl\"\nprompt_new_workspace_name = true\n[ui.toast]\ndelivery = \"herdr\"\n[experimental]\nswitch_ascii_input_source_in_prefix = true\n",
+            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[ui]\nagent_panel_sort = \"priority\"\nredraw_on_focus_gained = false\ncopy_on_select = false\nright_click_passthrough_modifier = \"ctrl\"\nprompt_new_workspace_name = true\nshow_scrollbar = \"auto\"\n[ui.toast]\ndelivery = \"herdr\"\n[experimental]\nswitch_ascii_input_source_in_prefix = true\n",
         )
         .unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -2655,6 +2672,7 @@ mod tests {
             crate::config::ToastDelivery::Herdr
         );
         assert_eq!(app.state.agent_panel_sort, state::AgentPanelSort::Priority);
+        assert_eq!(app.state.scrollbar_mode, crate::config::ScrollbarMode::Auto);
         assert!(!app.state.redraw_on_focus_gained);
         assert!(!app.state.copy_on_select);
         assert!(app.state.prompt_new_workspace_name);
@@ -4509,6 +4527,20 @@ mod tests {
         assert_eq!(
             app.next_headless_loop_deadline_with_git_refresh(now, false, true),
             app.session_save_deadline
+        );
+    }
+
+    #[test]
+    fn headless_next_loop_deadline_includes_scrollbar_auto_hide() {
+        let mut app = test_app();
+        let now = Instant::now();
+        app.state.scrollbar_mode = crate::config::ScrollbarMode::Auto;
+        app.state
+            .record_pane_scroll_activity(crate::layout::PaneId::from_raw(7), now);
+
+        assert_eq!(
+            app.next_headless_loop_deadline_with_git_refresh(now, false, false),
+            Some(now + state::SCROLLBAR_AUTO_HIDE_AFTER)
         );
     }
 

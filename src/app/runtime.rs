@@ -301,6 +301,8 @@ impl App {
             changed = true;
         }
 
+        changed |= self.state.expire_scrollbar_auto_hide(now);
+
         changed |= self.clear_due_selection_highlight(now);
 
         self.start_git_status_refresh_if_due(now);
@@ -621,6 +623,7 @@ impl App {
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
             self.selection_highlight_clear_deadline,
+            self.state.next_scrollbar_auto_hide_deadline(now),
             render_deadline,
         ]
         .into_iter()

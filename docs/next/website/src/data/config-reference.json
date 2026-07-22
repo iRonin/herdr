@@ -677,6 +677,17 @@
           "description": "Wrap tabs onto multiple rows instead of using the default single scrollable row. The wrapped bar uses at most half of the pane area's height."
         },
         {
+          "key": "ui.show_scrollbar",
+          "type": "enum",
+          "default": "\"always\"",
+          "description": "Main pane scrollbar mode. always reserves a column, auto briefly overlays the rightmost text column after scrolling, and never disables pane scrollbars. Boolean true and false remain accepted as always and never.",
+          "values": [
+            "always",
+            "auto",
+            "never"
+          ]
+        },
+        {
           "key": "ui.agent_panel_sort",
           "type": "enum",
           "default": "\"spaces\"",
