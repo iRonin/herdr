@@ -360,6 +360,10 @@ Set `tab_bar_wrap = true` under `[ui]` to show tabs across the available rows in
 
 Choose how pane scrollbars are shown with `show_scrollbar = "always"`, `"auto"`, or `"never"` under `[ui]`. `"always"` is the default and reserves one terminal column whenever the pane is wide enough. `"auto"` keeps pane text full-width and briefly overlays the scrollbar on the rightmost text column after scrolling while the pane remains scrolled back; it disappears after about 1.2 seconds of inactivity. `"never"` keeps text full-width and never draws the pane scrollbar. Existing boolean values remain compatible: `true` means `"always"` and `false` means `"never"`.
 
+Set `agent_panel_scope = "all"` or `agent_panel_scope = "current"` under `[ui]` to filter the Agent panel to every space or to the active space only. `"current_workspace"` is accepted as an alias for `"current"`. Default is `"all"`. Current scope always sorts by attention priority.
+
+Set `agent_panel_modes = ["priority", "grouped", "space"]` under `[ui]` to control the modes cycled when clicking the Agent panel mode label. Allowed values: `"priority"`, `"grouped"` (`"spaces"` is an alias), and `"space"` (`"current"` and `"current_workspace"` are aliases). Unknown and duplicate entries are ignored. An empty or invalid-only list falls back to all three modes in this default order.
+
 ## Notifications
 
 Herdr can notify you when a background agent finishes or needs input:
