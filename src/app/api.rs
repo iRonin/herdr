@@ -413,8 +413,12 @@ impl App {
             self.copy_feedback_deadline = None;
             return;
         }
+        self.show_in_ui_feedback("copied to clipboard");
+    }
+
+    pub(crate) fn show_in_ui_feedback(&mut self, message: &str) {
         self.state.copy_feedback = Some(crate::app::state::CopyFeedback {
-            message: "copied to clipboard".to_string(),
+            message: message.to_string(),
         });
         self.copy_feedback_deadline = Some(Instant::now() + super::COPY_FEEDBACK_DURATION);
     }
