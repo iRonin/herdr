@@ -322,6 +322,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Uses the same working/blocked/done/unknown glyphs as the agents panel.
 # tab_agent_status = false
 
+# Mirror the highest-attention agent pane's standalone context percentage on each top tab.
+# Recognizes N%·PID and ~N%·PID labels from the Agents pane.
+# tab_agent_context = false
+
 # Main pane scrollbar: "always" reserves a column, "auto" briefly overlays
 # the last text column after scrolling, and "never" leaves copied text clean.
 # Boolean true/false remains accepted as "always"/"never" for compatibility.

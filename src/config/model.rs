@@ -922,6 +922,9 @@ pub struct UiConfig {
     pub tab_bar_wrap: bool,
     /// Show the highest-attention agent status indicator on each top tab. Default: false.
     pub tab_agent_status: bool,
+    /// Show the highest-attention agent pane's context percentage on each top tab.
+    /// Default: false.
+    pub tab_agent_context: bool,
     /// Main pane scrollback scrollbar mode. `always` reserves a column,
     /// `auto` overlays the last text column briefly after scrolling, and
     /// `never` does not draw it. Booleans remain accepted for compatibility
@@ -1137,6 +1140,7 @@ impl Default for UiConfig {
             hide_tab_bar_when_single_tab: false,
             tab_bar_wrap: false,
             tab_agent_status: false,
+            tab_agent_context: false,
             show_scrollbar: ScrollbarMode::Always,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             agent_panel_scope: AgentPanelScopeConfig::All,
@@ -1483,6 +1487,21 @@ agent_panel_modes = []
         .unwrap();
 
         assert_eq!(config.ui.agent_panel_modes, AgentPanelModeConfig::ALL);
+    }
+
+    #[test]
+    fn tab_agent_context_defaults_off_and_parses_on() {
+        let default_config = Config::default();
+        assert!(!default_config.ui.tab_agent_context);
+
+        let config: Config = toml::from_str(
+            r#"
+[ui]
+tab_agent_context = true
+"#,
+        )
+        .unwrap();
+        assert!(config.ui.tab_agent_context);
     }
 
     #[test]

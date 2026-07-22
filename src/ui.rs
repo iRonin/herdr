@@ -206,6 +206,7 @@ fn desktop_tab_bar_and_terminal_area(
                 ws,
                 &app.terminals,
                 app.tab_agent_status,
+                app.tab_agent_context,
                 main_area.width,
                 app.mouse_capture,
             );
@@ -281,6 +282,7 @@ fn compute_view_internal(
                     ws,
                     &app.terminals,
                     app.tab_agent_status,
+                    app.tab_agent_context,
                     tab_bar_rect,
                     app.mouse_capture,
                 )
@@ -289,6 +291,7 @@ fn compute_view_internal(
                     ws,
                     &app.terminals,
                     app.tab_agent_status,
+                    app.tab_agent_context,
                     tab_bar_rect,
                     app.tab_scroll,
                     app.tab_scroll_follow_active,

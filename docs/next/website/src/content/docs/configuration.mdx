@@ -362,6 +362,8 @@ Set `tab_bar_wrap = true` under `[ui]` to show tabs across the available rows in
 
 Set `tab_agent_status = true` under `[ui]` to show the highest-attention agent state on each top tab. The indicator uses the same glyphs and colors as the Agent panel: a spinner for working, `◉` blocked, `●` done and unread, `✓` done and read, and `○` unknown. It is disabled by default and works with both single-row and wrapped tab bars.
 
+Set `tab_agent_context = true` under `[ui]` to mirror the standalone context percentage already shown in the Agents pane for that same highest-attention agent pane. Herdr recognizes a standalone `N%·PID` or `~N%·PID` label, appends the exact `N%` or `~N%` portion after the visible tab name and before a ` Z` zoom marker, and omits the suffix when the highest-attention pane has no single valid label. It works independently of `tab_agent_status` and is disabled by default.
+
 Choose how pane scrollbars are shown with `show_scrollbar = "always"`, `"auto"`, or `"never"` under `[ui]`. `"always"` is the default and reserves one terminal column whenever the pane is wide enough. `"auto"` keeps pane text full-width and briefly overlays the scrollbar on the rightmost text column after scrolling while the pane remains scrolled back; it disappears after about 1.2 seconds of inactivity. `"never"` keeps text full-width and never draws the pane scrollbar. Existing boolean values remain compatible: `true` means `"always"` and `false` means `"never"`.
 
 Set `agent_panel_scope = "all"` or `agent_panel_scope = "current"` under `[ui]` to filter the Agent panel to every space or to the active space only. `"current_workspace"` is accepted as an alias for `"current"`. Default is `"all"`. Current scope always sorts by attention priority.

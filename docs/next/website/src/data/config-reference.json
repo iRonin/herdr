@@ -683,6 +683,12 @@
           "description": "Show the highest-attention agent status on each top tab using the same glyphs as the agents panel (spinner for working, ◉ blocked, ● done and unread, ✓ done and read, and ○ unknown). Works with both single-row and wrapped tab bars. Disabled by default."
         },
         {
+          "key": "ui.tab_agent_context",
+          "type": "boolean",
+          "default": "false",
+          "description": "Mirror the standalone context percentage already shown in the Agents pane for the same highest-attention agent pane. Recognizes standalone N%·PID and ~N%·PID labels, appends the exact percentage portion after the visible tab name and before the zoom marker, and omits missing or ambiguous labels. Works independently of ui.tab_agent_status. Disabled by default."
+        },
+        {
           "key": "ui.show_scrollbar",
           "type": "enum",
           "default": "\"always\"",
