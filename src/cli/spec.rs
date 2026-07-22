@@ -159,6 +159,10 @@ fn server_command() -> Command {
     Command::new("server")
         .about("Run or control the headless server")
         .subcommand(Command::new("stop").about("Stop the running server"))
+        .subcommand(
+            Command::new("restart")
+                .about("Restart the server and attach (run from outside the target session)"),
+        )
         .subcommand(Command::new("reload-config").about("Reload config in the running server"))
         .subcommand(
             Command::new("agent-manifests")
@@ -1078,6 +1082,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn spec_includes_server_restart() {
+        let cmd = super::command();
+        let restart = command_path(&cmd, &["server", "restart"]);
+
+        assert_eq!(
+            restart.get_about().map(ToString::to_string).as_deref(),
+            Some("Restart the server and attach (run from outside the target session)")
+        );
     }
 
     #[test]
