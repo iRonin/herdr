@@ -356,6 +356,8 @@ Metadata reporters provide values only; styling stays in the local sidebar confi
 
 Sidebar row settings affect only the expanded desktop sidebar. Collapsed and mobile views keep their compact layouts.
 
+`prompt_new_tab_name` controls whether the new-tab button asks for a label before creating the tab. Alt/Option-click the button to invert that setting for one tab.
+
 Set `tab_bar_wrap = true` under `[ui]` to show tabs across the available rows instead of using the default single scrollable row with `<`/`>` buttons. The tab bar grows downward as needed, up to half of the pane area's height, and the terminal and popup geometry below shrink with it. When the row count reaches that cap, Herdr scrolls the visible row window to keep the active tab visible. The default is `false`.
 
 Set `tab_agent_status = true` under `[ui]` to show the highest-attention agent state on each top tab. The indicator uses the same glyphs and colors as the Agent panel: a spinner for working, `◉` blocked, `●` done and unread, `✓` done and read, and `○` unknown. It is disabled by default and works with both single-row and wrapped tab bars.
