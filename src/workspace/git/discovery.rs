@@ -19,7 +19,18 @@ pub struct GitWorktreeInfo {
 }
 
 pub fn derive_label_from_cwd(cwd: &Path) -> String {
-    if let Some(repo_root) = git_repo_root(cwd) {
+    let repo_root = git_repo_root(cwd);
+
+    // Project-local override: a `.herdr/settings.toml` placed in the working
+    // tree (found by walking up from `cwd`, capped at the repository root when
+    // inside one) can pin the workspace label via `[workspace] name`. When the
+    // file is absent, unreadable, or lacks the field, derivation falls through
+    // to the defaults below, preserving the upstream behavior exactly.
+    if let Some(name) = project_workspace_name(cwd, repo_root.as_deref()) {
+        return name;
+    }
+
+    if let Some(repo_root) = repo_root {
         if let Some(name) = repo_root.file_name().and_then(|n| n.to_str()) {
             return name.to_string();
         }
@@ -37,6 +48,58 @@ pub fn derive_label_from_cwd(cwd: &Path) -> String {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| cwd.display().to_string())
+}
+
+/// Reads `[workspace] name` from the nearest `.herdr/settings.toml` found by
+/// walking up from `cwd`. When `repo_root` is given, the search stops there so a
+/// project file cannot leak in from above the repository; otherwise it walks to
+/// the filesystem root. Returns `None` when no file is found, the file is
+/// unreadable, the table is absent, or the name is empty/whitespace.
+fn project_workspace_name(cwd: &Path, repo_root: Option<&Path>) -> Option<String> {
+    let mut current = if cwd.is_dir() {
+        cwd.to_path_buf()
+    } else {
+        cwd.parent()?.to_path_buf()
+    };
+
+    loop {
+        if let Some(name) = read_workspace_name(&current.join(".herdr/settings.toml")) {
+            return Some(name);
+        }
+        if Some(current.as_path()) == repo_root {
+            break;
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+
+    None
+}
+
+fn read_workspace_name(path: &Path) -> Option<String> {
+    if !path.is_file() {
+        return None;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Settings {
+        #[serde(default)]
+        workspace: WorkspaceSettings,
+    }
+
+    #[derive(Default, serde::Deserialize)]
+    struct WorkspaceSettings {
+        name: Option<String>,
+    }
+
+    let contents = std::fs::read_to_string(path).ok()?;
+    let settings: Settings = toml::from_str(&contents).ok()?;
+    settings
+        .workspace
+        .name
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
 }
 
 pub fn git_worktree_info(cwd: &Path) -> Option<GitWorktreeInfo> {
@@ -442,6 +505,110 @@ mod tests {
         let label = root.file_name().and_then(|name| name.to_str()).unwrap();
 
         assert_eq!(derive_label_from_cwd(Path::new(&root)), label);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn write_git_repo_marker(root: &Path) {
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    #[test]
+    fn derive_label_prefers_herdr_settings_workspace_name() {
+        let root = temp_test_dir("settings-name");
+        let nested = root.join("nested/deep");
+        write_git_repo_marker(&root);
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(root.join(".herdr")).unwrap();
+        std::fs::write(
+            root.join(".herdr/settings.toml"),
+            "[workspace]\nname = \"custom-label\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(derive_label_from_cwd(&nested), "custom-label");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn derive_label_walks_up_to_settings_capped_at_repo_root() {
+        // Settings live at the repo root and are found from a deeply nested cwd.
+        let root = temp_test_dir("settings-walkup");
+        let nested = root.join("a/b/c");
+        write_git_repo_marker(&root);
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(root.join(".herdr")).unwrap();
+        std::fs::write(
+            root.join(".herdr/settings.toml"),
+            "[workspace]\nname = \"deep\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(derive_label_from_cwd(&nested), "deep");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn derive_label_settings_name_in_non_git_dir() {
+        let root = temp_test_dir("settings-nogit");
+        std::fs::create_dir_all(root.join(".herdr")).unwrap();
+        std::fs::write(
+            root.join(".herdr/settings.toml"),
+            "[workspace]\nname = \"plain\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(derive_label_from_cwd(&root), "plain");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn derive_label_falls_back_when_settings_name_absent_or_empty() {
+        let root = temp_test_dir("settings-fallback");
+        write_git_repo_marker(&root);
+        std::fs::create_dir_all(root.join(".herdr")).unwrap();
+        let expected = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+
+        // No [workspace] table.
+        std::fs::write(root.join(".herdr/settings.toml"), "[other]\nkey = 1\n").unwrap();
+        assert_eq!(derive_label_from_cwd(&root), expected);
+
+        // Empty/whitespace name.
+        std::fs::write(
+            root.join(".herdr/settings.toml"),
+            "[workspace]\nname = \"  \"\n",
+        )
+        .unwrap();
+        assert_eq!(derive_label_from_cwd(&root), expected);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn derive_label_ignores_malformed_settings() {
+        let root = temp_test_dir("settings-malformed");
+        write_git_repo_marker(&root);
+        std::fs::create_dir_all(root.join(".herdr")).unwrap();
+        std::fs::write(
+            root.join(".herdr/settings.toml"),
+            "[workspace\nname = \"x\n",
+        )
+        .unwrap();
+
+        let expected = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        assert_eq!(derive_label_from_cwd(&root), expected);
 
         std::fs::remove_dir_all(root).unwrap();
     }
