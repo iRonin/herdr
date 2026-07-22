@@ -419,6 +419,17 @@ kitty_graphics = true
 
 Enable it only when testing terminal image behavior.
 
+## Server stop timeout
+
+Set how long `herdr server stop` waits for the server and client sockets to shut down:
+
+```toml
+[session]
+stop_timeout_ms = 15000
+```
+
+The value is in milliseconds and defaults to 15,000 (15 seconds), preserving upstream v0.7.4 behavior when unset. Zero uses the default, and values above 300,000 (5 minutes) are capped at that maximum. This setting applies to `herdr server stop`; named `herdr session stop` commands continue to use the 15-second default.
+
 ## Agent session restore
 
 Herdr resumes supported Agent conversations after a server restart by default:
