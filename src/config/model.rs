@@ -124,6 +124,42 @@ pub enum SidebarCollapsedModeConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollbarMode {
+    #[default]
+    Always,
+    Auto,
+    Never,
+}
+
+impl<'de> Deserialize<'de> for ScrollbarMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum ScrollbarModeValue {
+            Bool(bool),
+            String(String),
+        }
+
+        match ScrollbarModeValue::deserialize(deserializer)? {
+            ScrollbarModeValue::Bool(true) => Ok(Self::Always),
+            ScrollbarModeValue::Bool(false) => Ok(Self::Never),
+            ScrollbarModeValue::String(value) => match value.as_str() {
+                "always" => Ok(Self::Always),
+                "auto" => Ok(Self::Auto),
+                "never" => Ok(Self::Never),
+                _ => Err(de::Error::unknown_variant(
+                    &value,
+                    &["always", "auto", "never"],
+                )),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RightClickPassthroughModifierConfig(Option<KeyModifiers>);
 
 impl RightClickPassthroughModifierConfig {
@@ -812,6 +848,11 @@ pub struct UiConfig {
     pub show_agent_labels_on_pane_borders: bool,
     /// Hide the tab row when the workspace has one tab. Default: false.
     pub hide_tab_bar_when_single_tab: bool,
+    /// Main pane scrollback scrollbar mode. `always` reserves a column,
+    /// `auto` overlays the last text column briefly after scrolling, and
+    /// `never` does not draw it. Booleans remain accepted for compatibility
+    /// (`true` = `always`, `false` = `never`). Default: `always`.
+    pub show_scrollbar: ScrollbarMode,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
     /// Expanded sidebar row composition.
@@ -1010,6 +1051,7 @@ impl Default for UiConfig {
             pane_gaps: true,
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
+            show_scrollbar: ScrollbarMode::Always,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             sidebar: SidebarConfig::default(),
             accent: "cyan".into(),
@@ -1254,6 +1296,22 @@ hide_tab_bar_when_single_tab = true
         assert!(config.ui.pane_gaps);
         assert!(config.ui.show_agent_labels_on_pane_borders);
         assert!(config.ui.hide_tab_bar_when_single_tab);
+    }
+
+    #[test]
+    fn show_scrollbar_accepts_bool_and_string_modes_and_defaults_to_always() {
+        fn parse(value: &str) -> ScrollbarMode {
+            let config: Config = toml::from_str(&format!("[ui]\nshow_scrollbar = {value}\n"))
+                .expect("show_scrollbar mode should parse");
+            config.ui.show_scrollbar
+        }
+
+        assert_eq!(Config::default().ui.show_scrollbar, ScrollbarMode::Always);
+        assert_eq!(parse("true"), ScrollbarMode::Always);
+        assert_eq!(parse("false"), ScrollbarMode::Never);
+        assert_eq!(parse("\"always\""), ScrollbarMode::Always);
+        assert_eq!(parse("\"auto\""), ScrollbarMode::Auto);
+        assert_eq!(parse("\"never\""), ScrollbarMode::Never);
     }
 
     #[test]

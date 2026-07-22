@@ -356,6 +356,8 @@ Metadata reporters provide values only; styling stays in the local sidebar confi
 
 Sidebar row settings affect only the expanded desktop sidebar. Collapsed and mobile views keep their compact layouts.
 
+Choose how pane scrollbars are shown with `show_scrollbar = "always"`, `"auto"`, or `"never"` under `[ui]`. `"always"` is the default and reserves one terminal column whenever the pane is wide enough. `"auto"` keeps pane text full-width and briefly overlays the scrollbar on the rightmost text column after scrolling while the pane remains scrolled back; it disappears after about 1.2 seconds of inactivity. `"never"` keeps text full-width and never draws the pane scrollbar. Existing boolean values remain compatible: `true` means `"always"` and `false` means `"never"`.
+
 ## Notifications
 
 Herdr can notify you when a background agent finishes or needs input:
