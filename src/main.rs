@@ -297,6 +297,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 
 # Ask for a tab name before creating a new tab.
 # Set false to create tabs immediately with generated names.
+# Alt/Option-click the new-tab button to invert this setting for that tab.
 # prompt_new_tab_name = true
 
 # Ask for a workspace name before interactive creation.
