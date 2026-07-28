@@ -1550,11 +1550,13 @@ mod tests {
         assert!(first.starts_with('w'));
         assert!(second.starts_with('w'));
         assert_ne!(first, second);
-        assert!(first.len() <= 3, "unexpectedly long workspace id: {first}");
-        assert!(
-            second.len() <= 3,
-            "unexpectedly long workspace id: {second}"
-        );
+        // The counter is PROCESS-GLOBAL and shared by every test in the binary,
+        // so an absolute length cap breaks the moment the suite grows past the
+        // base32 boundary (any feature adding workspace-creating tests tips
+        // it). Assert RELATIVE growth instead — consecutive ids stay short
+        // base32 handles that only ever lengthen at a digit rollover.
+        assert!(second.len() >= first.len());
+        assert!(second.len() <= first.len() + 1);
     }
 
     #[test]
