@@ -256,6 +256,8 @@ Color values accept hex, named colors, `rgb(r,g,b)`, or reset aliases like `rese
 
 The sidebar is the main Herdr dashboard. Search `ui.` in the [Config reference](/docs/config-reference/) for sizing, collapsed mode, Agent panel ordering, mouse behavior, pane borders, and other presentation settings.
 
+Set `ui.tab_close_button = true` to show an `x` in the last cell of each tab label in the desktop tab bar. Alt/Option-click the `x` to close that tab immediately, without a confirmation prompt; clicking it without Alt activates the tab as usual. Closing the last tab of a workspace closes the workspace and still honors `ui.confirm_close`.
+
 ### Sidebar row layouts
 
 The expanded desktop sidebar renders each inner array in `rows` as one line. These are the complete default layouts:
