@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Direction, Rect};
 use tracing::warn;
 
@@ -32,6 +32,10 @@ pub(super) enum MouseAction {
         ws_idx: usize,
     },
     FocusTab {
+        tab_idx: usize,
+    },
+    CloseTab {
+        ws_idx: usize,
         tab_idx: usize,
     },
     FocusPane {
@@ -487,6 +491,13 @@ impl AppState {
                 if self.on_tab_scroll_right_button(mouse.column, mouse.row) {
                     self.scroll_tabs_right();
                     return None;
+                }
+                if self.tab_close_button && mouse.modifiers.contains(KeyModifiers::ALT) {
+                    if let (Some(ws_idx), Some(tab_idx)) =
+                        (self.active, self.tab_close_hit_at(mouse.column, mouse.row))
+                    {
+                        return Some(MouseAction::CloseTab { ws_idx, tab_idx });
+                    }
                 }
                 if let (Some(ws_idx), Some(tab_idx)) =
                     (self.active, self.tab_at(mouse.column, mouse.row))
@@ -1266,6 +1277,22 @@ impl AppState {
             })
     }
 
+    /// Tab whose label's last cell (the close marker drawn when
+    /// `ui.tab_close_button` is on) is at the given position.
+    pub(super) fn tab_close_hit_at(&self, col: u16, row: u16) -> Option<usize> {
+        self.view
+            .tab_hit_areas
+            .iter()
+            .enumerate()
+            .find_map(|(idx, area)| {
+                (area.width > 0
+                    && row >= area.y
+                    && row < area.y + area.height
+                    && col == area.x + area.width - 1)
+                    .then_some(idx)
+            })
+    }
+
     pub(super) fn on_tab_bar(&self, col: u16, row: u16) -> bool {
         let area = self.view.tab_bar_rect;
         area.width > 0
@@ -1857,6 +1884,7 @@ mod tests {
     };
     use super::*;
     use crate::app::input::modal::handle_context_menu_key;
+    use crate::app::App;
     use crate::{
         app::state::{ContextMenuKind, ContextMenuState, MenuListState, Mode, ViewLayout},
         detect::{Agent, AgentState},
@@ -3359,6 +3387,121 @@ mod tests {
             .events_after(0)
             .iter()
             .any(|(_, event)| { matches!(event.event, crate::api::schema::EventKind::TabClosed) }));
+    }
+
+    fn alt_click(x: u16, y: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::ALT,
+        }
+    }
+
+    fn app_with_tabs_for_close_marker(tab_names: &[&str]) -> App {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new(tab_names[0]);
+        for name in &tab_names[1..] {
+            ws.test_add_tab(Some(name));
+        }
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.tab_close_button = true;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        app
+    }
+
+    #[test]
+    fn alt_click_tab_close_marker_closes_background_tab_without_switching() {
+        let mut app = app_with_tabs_for_close_marker(&["one", "two", "three"]);
+        let third_tab = app.state.view.tab_hit_areas[2];
+
+        app.handle_mouse(alt_click(third_tab.x + third_tab.width - 1, third_tab.y));
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert_eq!(app.state.workspaces[0].active_tab_index(), 0);
+        assert_eq!(
+            app.state.workspaces[0].tab_display_name(1).as_deref(),
+            Some("two")
+        );
+        assert!(app
+            .event_hub
+            .events_after(0)
+            .iter()
+            .any(|(_, event)| { matches!(event.event, crate::api::schema::EventKind::TabClosed) }));
+    }
+
+    #[test]
+    fn alt_click_tab_label_body_does_not_close() {
+        let mut app = app_with_tabs_for_close_marker(&["one", "two"]);
+        let second_tab = app.state.view.tab_hit_areas[1];
+
+        app.handle_mouse(alt_click(second_tab.x + 1, second_tab.y));
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert!(app.state.tab_press.is_some());
+    }
+
+    #[test]
+    fn plain_click_tab_close_marker_does_not_close() {
+        let mut app = app_with_tabs_for_close_marker(&["one", "two"]);
+        let second_tab = app.state.view.tab_hit_areas[1];
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            second_tab.x + second_tab.width - 1,
+            second_tab.y,
+        ));
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert!(app.state.tab_press.is_some());
+    }
+
+    #[test]
+    fn tab_close_button_disabled_alt_click_marker_does_not_close() {
+        let mut app = app_with_tabs_for_close_marker(&["one", "two"]);
+        app.state.tab_close_button = false;
+        let second_tab = app.state.view.tab_hit_areas[1];
+
+        app.handle_mouse(alt_click(second_tab.x + second_tab.width - 1, second_tab.y));
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert!(app.state.tab_press.is_some());
+    }
+
+    #[test]
+    fn alt_click_close_marker_on_last_tab_prompts_worktree_group_confirmation() {
+        let mut app = app_for_mouse_test();
+        let mut parent = Workspace::test_new("main");
+        mark_worktree_space_member(&mut parent, 0, "repo-key");
+        let mut linked = Workspace::test_new("issue");
+        mark_worktree_space_member(&mut linked, 1, "repo-key");
+        app.state.workspaces = vec![parent, linked];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.tab_close_button = true;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let only_tab = app.state.view.tab_hit_areas[0];
+
+        app.handle_mouse(alt_click(only_tab.x + only_tab.width - 1, only_tab.y));
+
+        assert_eq!(app.state.mode, Mode::ConfirmClose);
+        assert_eq!(app.state.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn alt_click_close_marker_on_last_tab_closes_workspace() {
+        let mut app = app_with_tabs_for_close_marker(&["one"]);
+        app.state.workspaces.push(Workspace::test_new("two"));
+        let only_tab = app.state.view.tab_hit_areas[0];
+
+        app.handle_mouse(alt_click(only_tab.x + only_tab.width - 1, only_tab.y));
+
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.state.workspaces[0].display_name(), "two");
     }
 
     #[test]

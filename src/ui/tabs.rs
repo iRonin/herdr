@@ -5,7 +5,7 @@ use ratatui::{
     Frame,
 };
 
-use super::text::display_width_u16;
+use super::text::{display_width, display_width_u16, truncate_end};
 use super::widgets::panel_contrast_fg;
 use crate::app::AppState;
 
@@ -338,7 +338,20 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
         };
         let width = rect.width as usize;
         let name = tab_chrome_label(ws, idx);
-        let text = format!(" {:width$}", name, width = width.saturating_sub(1));
+        let text = if app.tab_close_button && app.mouse_capture && width > 0 {
+            // Reserve the last cell of the label background for the close
+            // marker; Alt-click there closes the tab (see mouse input).
+            let name_width = width.saturating_sub(2);
+            let name = truncate_end(&name, name_width);
+            let pad = name_width.saturating_sub(display_width(&name));
+            if width >= 2 {
+                format!(" {name}{}x", " ".repeat(pad))
+            } else {
+                "x".to_string()
+            }
+        } else {
+            format!(" {:width$}", name, width = width.saturating_sub(1))
+        };
         frame.render_widget(Paragraph::new(text).style(style), rect);
     }
 
@@ -461,6 +474,87 @@ mod tests {
         assert_eq!(style.bg, Some(app.palette.accent));
         assert!(!style.add_modifier.contains(Modifier::DIM));
         assert!(!style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn tab_close_button_renders_marker_in_last_label_cell() {
+        let mut app = AppState::test_new();
+        let mut ws = Workspace::test_new("test");
+        ws.test_add_tab(Some("logs"));
+
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.tab_close_button = true;
+        app.mouse_capture = true;
+        app.view.tab_bar_rect = Rect::new(0, 0, 30, 1);
+        let view = compute_tab_bar_view(&app.workspaces[0], app.view.tab_bar_rect, 0, true, false);
+        app.view.tab_hit_areas = view.tab_hit_areas;
+
+        let backend = TestBackend::new(30, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        for rect in &app.view.tab_hit_areas {
+            let last = &buffer[(rect.x + rect.width - 1, rect.y)];
+            assert_eq!(last.symbol(), "x", "last cell of tab rect {rect:?}");
+        }
+        let row = buffer_row_text(buffer, app.view.tab_bar_rect, 0);
+        assert!(row.starts_with(" 1"), "tab row: {row:?}");
+        assert!(row.contains("logs"), "tab row: {row:?}");
+    }
+
+    #[test]
+    fn tab_close_button_disabled_leaves_last_cell_blank() {
+        let mut app = AppState::test_new();
+        let ws = Workspace::test_new("test");
+
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.mouse_capture = true;
+        app.view.tab_bar_rect = Rect::new(0, 0, 30, 1);
+        let view = compute_tab_bar_view(&app.workspaces[0], app.view.tab_bar_rect, 0, true, false);
+        app.view.tab_hit_areas = view.tab_hit_areas;
+
+        let backend = TestBackend::new(30, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rect = app.view.tab_hit_areas[0];
+        assert_eq!(buffer[(rect.x + rect.width - 1, rect.y)].symbol(), " ");
+    }
+
+    #[test]
+    fn tab_close_button_truncates_long_name_but_keeps_marker() {
+        let mut app = AppState::test_new();
+        let mut ws = Workspace::test_new("test");
+        ws.tabs[0].set_custom_name("averylongtabname".into());
+
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.tab_close_button = true;
+        app.mouse_capture = true;
+        app.view.tab_bar_rect = Rect::new(0, 0, 12, 1);
+        let view = compute_tab_bar_view(&app.workspaces[0], app.view.tab_bar_rect, 0, true, false);
+        app.view.tab_hit_areas = view.tab_hit_areas;
+
+        let backend = TestBackend::new(12, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rect = app.view.tab_hit_areas[0];
+        assert!(rect.width < 20, "tab rect should be clamped: {rect:?}");
+        assert_eq!(buffer[(rect.x + rect.width - 1, rect.y)].symbol(), "x");
+        let row = buffer_row_text(buffer, app.view.tab_bar_rect, 0);
+        assert!(row.contains('\u{2026}'), "tab row: {row:?}");
     }
 
     #[test]

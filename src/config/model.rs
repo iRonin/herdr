@@ -802,6 +802,8 @@ pub struct UiConfig {
     pub confirm_close: bool,
     /// Ask for a tab name before creating a new tab. Default: true.
     pub prompt_new_tab_name: bool,
+    /// Show an `x` in the last cell of each tab label; Alt-click it to close the tab. Default: false.
+    pub tab_close_button: bool,
     /// Ask for a workspace name before interactive creation. Default: false.
     pub prompt_new_workspace_name: bool,
     /// Draw borders around split panes. Default: true.
@@ -1005,6 +1007,7 @@ impl Default for UiConfig {
             mouse_scroll_lines: None,
             confirm_close: true,
             prompt_new_tab_name: true,
+            tab_close_button: false,
             prompt_new_workspace_name: false,
             pane_borders: true,
             pane_gaps: true,
@@ -1280,6 +1283,19 @@ prompt_new_tab_name = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.prompt_new_tab_name);
+    }
+
+    #[test]
+    fn tab_close_button_defaults_off_and_parses() {
+        let default_config = Config::default();
+        assert!(!default_config.ui.tab_close_button);
+
+        let toml = r#"
+[ui]
+tab_close_button = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.ui.tab_close_button);
     }
 
     #[test]
