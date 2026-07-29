@@ -256,7 +256,9 @@ Color values accept hex, named colors, `rgb(r,g,b)`, or reset aliases like `rese
 
 The sidebar is the main Herdr dashboard. Search `ui.` in the [Config reference](/docs/config-reference/) for sizing, collapsed mode, Agent panel ordering, mouse behavior, pane borders, and other presentation settings.
 
-Set `tab_bar_position = "bottom"` under `[ui]` to place the desktop tab row below the terminal panes. Prefix, Navigate, Copy, and Resize mode bars temporarily replace the bottom tab row while active. The default is `"top"`.
+Set `tab_bar_position = "bottom"` under `[ui]` to place the desktop tab row below the terminal panes. Prefix, Navigate, Copy, and Resize mode bars temporarily replace the bottom tab row while active; with `tab_bar_wrap` the mode bar only covers the bottom-most tab row, so the rows above it stay clickable. The default is `"top"`.
+
+Set `ui.tab_close_button = true` to show an `x` in the last cell of each tab label in the desktop tab bar. Alt/Option-click the `x` to close that tab immediately, without a confirmation prompt; clicking it without Alt activates the tab as usual. Closing the last tab of a workspace closes the workspace and still honors `ui.confirm_close`.
 
 ### Sidebar row layouts
 

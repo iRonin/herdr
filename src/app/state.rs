@@ -1506,6 +1506,7 @@ pub struct AppState {
     pub mouse_scroll_lines: usize,
     pub confirm_close: bool,
     pub prompt_new_tab_name: bool,
+    pub tab_close_button: bool,
     pub prompt_new_workspace_name: bool,
     pub pane_borders: bool,
     /// Pane scrollbar presentation mode.
@@ -1928,6 +1929,7 @@ impl AppState {
             mouse_scroll_lines: crate::config::DEFAULT_MOUSE_SCROLL_LINES,
             confirm_close: true,
             prompt_new_tab_name: true,
+            tab_close_button: false,
             prompt_new_workspace_name: false,
             pane_borders: true,
             pane_scrollbars: ScrollbarMode::Always,

@@ -465,19 +465,33 @@ impl App {
         let Some(ws_idx) = self.state.active else {
             return false;
         };
-        if self
-            .state
-            .workspaces
-            .get(ws_idx)
-            .is_some_and(|ws| ws.tabs.len() <= 1)
-        {
+        self.close_tab_requires_confirmation(
+            ws_idx,
+            self.state.workspaces[ws_idx].active_tab_index(),
+        )
+    }
+
+    /// Close an arbitrary tab of a workspace (e.g. Alt-click on the tab's close
+    /// marker). Mirrors the CloseTab keybind: closing the last tab closes the
+    /// workspace, keeping the worktree-group confirmation guard.
+    pub(crate) fn close_tab_via_api(&mut self, ws_idx: usize, tab_idx: usize) {
+        self.close_tab_requires_confirmation(ws_idx, tab_idx);
+    }
+
+    fn close_tab_requires_confirmation(&mut self, ws_idx: usize, tab_idx: usize) -> bool {
+        let Some(ws) = self.state.workspaces.get(ws_idx) else {
+            return false;
+        };
+        if tab_idx >= ws.tabs.len() {
+            return false;
+        }
+        if ws.tabs.len() <= 1 {
             if self.state.confirm_implicit_worktree_group_close(ws_idx) {
                 return true;
             }
             self.close_workspace_idx_via_api(ws_idx);
             return false;
         }
-        let tab_idx = self.state.workspaces[ws_idx].active_tab_index();
         let Some(tab_id) = self.public_tab_id(ws_idx, tab_idx) else {
             return false;
         };

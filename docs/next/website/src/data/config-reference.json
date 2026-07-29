@@ -653,6 +653,12 @@
           "description": "Ask for a tab name before creating a new tab. Alt/Option-click the new-tab button to invert this setting for one tab."
         },
         {
+          "key": "ui.tab_close_button",
+          "type": "boolean",
+          "default": "false",
+          "description": "Show an x in the last cell of each tab label; Alt-click it to close the tab without confirmation."
+        },
+        {
           "key": "ui.prompt_new_workspace_name",
           "type": "boolean",
           "default": "false",
