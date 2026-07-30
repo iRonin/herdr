@@ -30,7 +30,9 @@ impl Tab {
         self.panes.values().any(|pane| {
             terminals
                 .get(&pane.attached_terminal_id)
-                .is_some_and(|terminal| terminal.state == AgentState::Working)
+                // display_state() so an optimistic-working overlay (e.g. `/compact`)
+                // also drives the spinner animation, not just the rendered glyph.
+                .is_some_and(|terminal| terminal.display_state() == AgentState::Working)
         })
     }
 
@@ -69,7 +71,7 @@ impl Tab {
                     agent_label,
                     agent_kind_label,
                     agent: terminal.effective_known_agent(),
-                    state: terminal.state,
+                    state: terminal.display_state(),
                     seen: pane.seen,
                     last_agent_state_change_seq: terminal.last_agent_state_change_seq,
                     state_labels: presentation.state_labels,
@@ -82,9 +84,10 @@ impl Tab {
 
 fn pane_attention_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
-        (AgentState::Blocked, _) => 4,
+        (AgentState::Blocked, false) => 4,
         (AgentState::Idle, false) => 3,
         (AgentState::Working, _) => 2,
+        (AgentState::Blocked, true) => 1,
         (AgentState::Idle, true) => 1,
         (AgentState::Unknown, _) => 0,
     }
@@ -101,7 +104,7 @@ impl Workspace {
             .filter_map(|pane| {
                 terminals
                     .get(&pane.attached_terminal_id)
-                    .map(|terminal| (terminal.state, pane.seen))
+                    .map(|terminal| (terminal.display_state(), pane.seen))
             })
             .max_by_key(|(state, seen)| pane_attention_priority(*state, *seen))
             .unwrap_or((AgentState::Unknown, true))
@@ -141,6 +144,24 @@ mod tests {
 
     fn terminal_for_pane(ws: &Workspace, pane_id: PaneId) -> TerminalState {
         TerminalState::new(ws.terminal_id(pane_id).unwrap().clone(), "/tmp".into())
+    }
+
+    #[test]
+    fn pane_attention_priority_unread_blocked_outranks_read() {
+        assert!(
+            pane_attention_priority(AgentState::Blocked, false)
+                > pane_attention_priority(AgentState::Blocked, true)
+        );
+        // Acknowledged (read) blocked sinks below working and done-unread so it
+        // stops bubbling to the top of the sidebar once the user interacts.
+        assert!(
+            pane_attention_priority(AgentState::Blocked, true)
+                < pane_attention_priority(AgentState::Working, true)
+        );
+        assert!(
+            pane_attention_priority(AgentState::Blocked, true)
+                < pane_attention_priority(AgentState::Idle, false)
+        );
     }
 
     #[test]

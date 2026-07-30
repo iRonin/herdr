@@ -1524,6 +1524,10 @@ pub struct AppState {
     pub config_diagnostic: Option<String>,
     pub toast: Option<ToastNotification>,
     pub pending_agent_notifications: std::collections::HashMap<PaneId, PendingAgentNotification>,
+    /// Per-pane accumulator of the input line the user is currently typing, used
+    /// only to detect in-process commands like `/compact` that perform work
+    /// without emitting an agent lifecycle event.
+    pub compact_input_lines: std::collections::HashMap<PaneId, String>,
     pub copy_feedback: Option<CopyFeedback>,
     /// Last reported focus state for the outer terminal hosting herdr.
     /// None means unsupported or not yet reported, which preserves active-pane suppression.
@@ -1966,6 +1970,7 @@ impl AppState {
             config_diagnostic: None,
             toast: None,
             pending_agent_notifications: std::collections::HashMap::new(),
+            compact_input_lines: std::collections::HashMap::new(),
             copy_feedback: None,
             outer_terminal_focus: None,
             prefix_code: KeyCode::Char('b'),

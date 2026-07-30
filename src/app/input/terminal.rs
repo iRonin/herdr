@@ -246,8 +246,20 @@ impl App {
         let Some(input) = self.prepare_terminal_key_forward(key) else {
             return;
         };
-        if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
-            let _ = runtime.send_bytes(input.bytes).await;
+        let PreparedPaneInput {
+            ws_idx,
+            pane_id,
+            bytes,
+        } = input;
+        // Any direct input to a blocked pane (keystroke/paste/command such as
+        // `/rewind`) acknowledges it: flip it from needs-attention to read.
+        self.state
+            .mark_pane_acknowledged_if_blocked(ws_idx, pane_id);
+        // Detect in-process commands (`/compact`) that do work without an agent
+        // lifecycle event, and show the pane as Working while they run.
+        self.state.note_forwarded_input(ws_idx, pane_id, &bytes);
+        if let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) {
+            let _ = runtime.send_bytes(bytes).await;
         }
     }
 }

@@ -185,6 +185,11 @@ pub struct TerminalState {
     pub respawn_shell_on_exit: bool,
     recent_agent_process_exit_at: Option<Instant>,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
+    /// When the user submitted an in-process command that does work without
+    /// emitting an agent lifecycle event (e.g. `/compact`), herdr optimistically
+    /// shows the pane as Working until this instant. Pure display overlay — it
+    /// never participates in hook-authority arbitration.
+    optimistic_working_until: Option<Instant>,
 }
 
 impl TerminalState {
@@ -217,7 +222,29 @@ impl TerminalState {
             respawn_shell_on_exit: false,
             recent_agent_process_exit_at: None,
             pending_agent_resume_plan: None,
+            optimistic_working_until: None,
         }
+    }
+
+    /// State to render/report for this pane, accounting for an optimistic
+    /// working overlay (see `note_optimistic_working`). When the overlay is
+    /// active, returns [`AgentState::Working`] regardless of the real state.
+    pub fn display_state(&self) -> AgentState {
+        if self
+            .optimistic_working_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            AgentState::Working
+        } else {
+            self.state
+        }
+    }
+
+    /// Show this pane as Working for the next `ttl` (a display-only overlay).
+    /// Used when the user submits an in-process command like `/compact` that
+    /// performs work without emitting an agent lifecycle event.
+    pub fn note_optimistic_working(&mut self, ttl: std::time::Duration) {
+        self.optimistic_working_until = Some(Instant::now() + ttl);
     }
 
     pub(crate) fn terminal_title_stripped(&self) -> Option<String> {
@@ -1830,6 +1857,7 @@ impl TerminalState {
         self.respawn_shell_on_exit = false;
         self.recent_agent_process_exit_at = None;
         self.pending_agent_resume_plan = None;
+        self.optimistic_working_until = None;
         self.clear_agent_name();
     }
 
@@ -1917,6 +1945,12 @@ impl TerminalState {
             return None;
         }
 
+        if previous_state != state {
+            // A real state transition takes over from any optimistic-working
+            // overlay (e.g. the agent re-blocks or reports idle after `/compact`),
+            // so the overlay never masks a genuine state change.
+            self.optimistic_working_until = None;
+        }
         self.state = state;
         Some(EffectiveStateChange {
             previous_agent_label,
@@ -2010,6 +2044,40 @@ mod tests {
         assert!(timed_out.reconcile_managed_agent_at(now + Duration::from_millis(20), false));
         assert_eq!(timed_out.agent_name, None);
         assert_eq!(timed_out.managed_agent_kind(), None);
+    }
+
+    #[test]
+    fn display_state_defaults_to_real_state() {
+        let mut terminal = test_terminal();
+        terminal.state = AgentState::Blocked;
+        assert_eq!(terminal.display_state(), AgentState::Blocked);
+    }
+
+    #[test]
+    fn optimistic_working_overlays_display_state() {
+        let mut terminal = test_terminal();
+        terminal.state = AgentState::Idle;
+        // A `/compact`-style optimistic overlay shows Working regardless of the
+        // real state, without touching the underlying state used for arbitration.
+        terminal.note_optimistic_working(std::time::Duration::from_secs(90));
+        assert_eq!(terminal.display_state(), AgentState::Working);
+        assert_eq!(terminal.state, AgentState::Idle, "real state is untouched");
+    }
+
+    #[test]
+    fn real_state_transition_clears_optimistic_working() {
+        let mut terminal = test_terminal();
+        terminal.state = AgentState::Idle;
+        terminal.note_optimistic_working(std::time::Duration::from_secs(90));
+        assert_eq!(terminal.display_state(), AgentState::Working);
+        // A genuine state change (e.g. the agent re-blocks after compacting)
+        // must take over and drop the overlay so it never masks a real signal.
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Blocked);
+        assert_eq!(
+            terminal.display_state(),
+            AgentState::Blocked,
+            "real state change must clear the optimistic overlay"
+        );
     }
 
     #[test]

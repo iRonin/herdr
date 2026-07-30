@@ -565,7 +565,7 @@ impl AppState {
                     .or_else(|| terminal.and_then(|terminal| terminal.effective_agent_label()))
             });
             let state = terminal
-                .map(|terminal| terminal.state)
+                .map(|terminal| terminal.display_state())
                 .unwrap_or(AgentState::Unknown);
             let status_label = terminal
                 .map(|terminal| terminal.effective_presentation().state_labels)
@@ -863,13 +863,50 @@ fn navigator_query_kind(
     }
 }
 
+/// How long `/compact` shows the pane as Working before reverting to the real
+/// reported state. Generous because compaction of large contexts can take a
+/// while; the next real lifecycle report clears it sooner in practice.
+const COMPACT_OPTIMISTIC_WORKING_TTL: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Append forwarded input bytes to the in-progress line, returning true when a
+/// submitted line is `/compact` (or `/compact …`). CR/LF ends the line; common
+/// line-editing controls (backspace, Ctrl+C, Ctrl+U) are honoured so editing the
+/// command still matches. Other non-printable bytes (escape sequences, controls,
+/// and the 0x80..=0xFF range, which for ASCII `/compact` is irrelevant) are ignored
+/// so the command text is reconstructed from plain keystrokes.
+fn feed_compact_detector(line: &mut String, bytes: &[u8]) -> bool {
+    let mut submitted_compact = false;
+    for &byte in bytes {
+        match byte {
+            b'\r' | b'\n' => {
+                let trimmed = line.trim();
+                if trimmed == "/compact" || trimmed.starts_with("/compact ") {
+                    submitted_compact = true;
+                }
+                line.clear();
+            }
+            0x08 | 0x7f => {
+                line.pop();
+            }
+            0x03 | 0x15 => {
+                line.clear();
+            }
+            0x20..=0x7e => line.push(byte as char),
+            _ => {}
+        }
+    }
+    submitted_compact
+}
+
 fn navigator_state_filter_matches(
     filter: NavigatorStateFilter,
     state: AgentState,
     seen: bool,
 ) -> bool {
     match filter {
-        NavigatorStateFilter::Blocked => state == AgentState::Blocked,
+        // Only needs-attention (unread) blocked panes match; acknowledged
+        // (read) ones no longer count as "blocked" here.
+        NavigatorStateFilter::Blocked => state == AgentState::Blocked && !seen,
         NavigatorStateFilter::Working => state == AgentState::Working,
         NavigatorStateFilter::Idle => state == AgentState::Idle && seen,
         NavigatorStateFilter::Done => state == AgentState::Idle && !seen,
@@ -913,8 +950,8 @@ fn tab_aggregate_state(
         let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
             continue;
         };
-        if state_priority(terminal.state, pane.seen) > state_priority(aggregate, seen) {
-            aggregate = terminal.state;
+        if state_priority(terminal.display_state(), pane.seen) > state_priority(aggregate, seen) {
+            aggregate = terminal.display_state();
             seen = pane.seen;
         }
     }
@@ -923,10 +960,12 @@ fn tab_aggregate_state(
 
 fn state_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
-        (AgentState::Blocked, _) => 5,
+        // Unread blocked sorts highest; acknowledged (read) blocked sinks to
+        // idle-read priority so it stops competing for attention.
+        (AgentState::Blocked, false) => 5,
         (AgentState::Working, _) => 4,
         (AgentState::Idle, false) => 3,
-        (AgentState::Idle, true) => 2,
+        (AgentState::Blocked, true) | (AgentState::Idle, true) => 2,
         (AgentState::Unknown, _) => 1,
     }
 }
@@ -965,8 +1004,10 @@ fn activity_summary_for_panes<'a>(
         let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
             continue;
         };
-        match (terminal.state, pane.seen) {
-            (AgentState::Blocked, _) => blocked += 1,
+        match (terminal.display_state(), pane.seen) {
+            // Only needs-attention (unread) blocked panes are flagged; an
+            // acknowledged (read) blocked pane no longer counts as blocked.
+            (AgentState::Blocked, false) => blocked += 1,
             (AgentState::Working, _) => working += 1,
             (AgentState::Idle, false) => done += 1,
             _ => {}
@@ -1291,6 +1332,81 @@ impl AppState {
             }
         }
         changed
+    }
+
+    /// Mark a blocked pane as acknowledged ("read") because the user interacted
+    /// with it directly — typed, pasted, or ran a command such as `/rewind`.
+    /// Only blocked panes are affected; other states keep their own transitions.
+    /// Returns true when the pane flipped from unread to read.
+    ///
+    /// `terminal_id` is resolved across all tabs, but the `seen` mutation targets
+    /// the active tab: input only ever reaches the focused pane of the active
+    /// tab, so a pane outside it has nothing to acknowledge here.
+    pub(crate) fn mark_pane_acknowledged_if_blocked(
+        &mut self,
+        ws_idx: usize,
+        pane_id: PaneId,
+    ) -> bool {
+        let terminal_id = self
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone());
+        let Some(terminal_id) = terminal_id else {
+            return false;
+        };
+        let is_blocked = self
+            .terminals
+            .get(&terminal_id)
+            .is_some_and(|terminal| terminal.state == AgentState::Blocked);
+        if !is_blocked {
+            return false;
+        }
+        let Some(tab) = self
+            .workspaces
+            .get_mut(ws_idx)
+            .and_then(crate::workspace::Workspace::active_tab_mut)
+        else {
+            return false;
+        };
+        let Some(pane) = tab.panes.get_mut(&pane_id) else {
+            return false;
+        };
+        if !pane.seen {
+            pane.seen = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Feed forwarded input bytes into the per-pane line accumulator and, when the
+    /// user submits `/compact`, flip the pane to an optimistic Working display
+    /// (compaction performs work without emitting an agent lifecycle event).
+    pub(crate) fn note_forwarded_input(&mut self, ws_idx: usize, pane_id: PaneId, bytes: &[u8]) {
+        let terminal_id = self
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone());
+        let Some(terminal_id) = terminal_id else {
+            return;
+        };
+        let submitted_compact = {
+            let line = self.compact_input_lines.entry(pane_id).or_default();
+            feed_compact_detector(line, bytes)
+        };
+        if submitted_compact {
+            if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                // Only agent panes: `/compact` in a plain shell is not a command
+                // that performs work, so don't optimistically mark a shell Working.
+                let is_agent_pane =
+                    terminal.is_agent_terminal() || terminal.detected_agent.is_some();
+                if is_agent_pane {
+                    terminal.note_optimistic_working(COMPACT_OPTIMISTIC_WORKING_TTL);
+                }
+            }
+        }
     }
 
     pub(crate) fn visible_workspace_order(&self) -> Vec<usize> {
@@ -3000,8 +3116,15 @@ impl AppState {
             .iter_mut()
             .find_map(|tab| tab.panes.get_mut(&pane_id))?;
 
-        if change.state != AgentState::Idle {
+        // `seen` doubles as the blocked "acknowledged" flag. Working is always
+        // seen. Blocked mirrors Idle completion: blocking while you're looking
+        // at the pane is immediately acknowledged (read), while a pane that
+        // blocks in a background/unfocused tab stays unread (needs-attention)
+        // until you interact with it (see mark_pane_acknowledged_if_blocked).
+        if change.state == AgentState::Working {
             pane.seen = true;
+        } else if change.state == AgentState::Blocked {
+            pane.seen = suppress_active_tab_notifications;
         } else if is_completion_transition(change) {
             pane.seen = suppress_active_tab_notifications || auto_read;
         }
@@ -3232,6 +3355,7 @@ impl AppState {
 
     fn handle_pane_died(&mut self, pane_id: PaneId) {
         self.pending_agent_notifications.remove(&pane_id);
+        self.compact_input_lines.remove(&pane_id);
         self.remove_plugin_pane_records([pane_id]);
         let ws_idx = self
             .workspaces
@@ -4892,6 +5016,163 @@ mod tests {
         assert_eq!(toast.kind, ToastKind::NeedsAttention);
         assert_eq!(toast.title, "pi needs attention");
         assert_eq!(toast.context, "background · 2");
+    }
+
+    #[test]
+    fn background_blocked_is_unread_until_acknowledged() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id: bg_pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Blocked,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        // A pane that blocks in a background tab stays unread (needs-attention).
+        let pane = state.workspaces[1].panes.get(&bg_pane_id).unwrap();
+        assert!(!pane.seen, "background blocked pane should be unread");
+    }
+
+    #[test]
+    fn active_tab_blocked_is_immediately_read() {
+        let mut state = app_with_workspaces(&["active"]);
+        state.active = Some(0);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Blocked,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        // Blocking while you're looking at the pane is acknowledged (read).
+        let pane = state.workspaces[0].panes.get(&pane_id).unwrap();
+        assert!(pane.seen, "active-tab blocked pane should be read");
+    }
+
+    #[test]
+    fn acknowledging_blocked_pane_marks_it_read() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id: bg_pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Blocked,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        assert!(!state.workspaces[1].panes.get(&bg_pane_id).unwrap().seen);
+
+        // Any direct user input (keystroke/paste/`/rewind`) acknowledges it.
+        assert!(state.mark_pane_acknowledged_if_blocked(1, bg_pane_id));
+        assert!(state.workspaces[1].panes.get(&bg_pane_id).unwrap().seen);
+
+        // Acknowledging an already-read pane is a no-op.
+        assert!(!state.mark_pane_acknowledged_if_blocked(1, bg_pane_id));
+    }
+
+    #[test]
+    fn acknowledging_ignores_non_blocked_panes() {
+        let mut state = app_with_workspaces(&["active"]);
+        state.active = Some(0);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        // Input to a Working pane must not flip its seen flag as a side effect.
+        assert!(!state.mark_pane_acknowledged_if_blocked(0, pane_id));
+    }
+
+    #[test]
+    fn state_priority_blocked_read_sinks_below_working() {
+        assert!(
+            state_priority(AgentState::Blocked, false) > state_priority(AgentState::Working, true)
+        );
+        // Acknowledged (read) blocked no longer outranks working/done-unread.
+        assert!(
+            state_priority(AgentState::Blocked, true) < state_priority(AgentState::Working, true)
+        );
+        assert!(
+            state_priority(AgentState::Blocked, true) < state_priority(AgentState::Idle, false)
+        );
+    }
+
+    #[test]
+    fn feed_compact_detector_matches_compact_submit() {
+        let mut line = String::new();
+        // Typed one character at a time, then Enter.
+        assert!(!feed_compact_detector(&mut line, b"/"));
+        assert!(!feed_compact_detector(&mut line, b"compact"));
+        assert!(feed_compact_detector(&mut line, b"\r"));
+        assert!(line.is_empty(), "line resets after submit");
+    }
+
+    #[test]
+    fn feed_compact_detector_matches_pasted_compact() {
+        let mut line = String::new();
+        // Whole command + Enter in a single chunk (paste / fast typing).
+        assert!(feed_compact_detector(&mut line, b"/compact\n"));
+    }
+
+    #[test]
+    fn feed_compact_detector_ignores_other_commands() {
+        let mut line = String::new();
+        assert!(!feed_compact_detector(&mut line, b"/rewind\r"));
+        assert!(!feed_compact_detector(&mut line, b"fix the bug\r"));
+        // `/compact` with an argument still counts.
+        assert!(feed_compact_detector(&mut line, b"/compact --foo\r"));
+    }
+
+    #[test]
+    fn feed_compact_detector_handles_line_editing() {
+        let mut line = String::new();
+        // Type `/compactt`, backspace the stray `t`, then submit.
+        feed_compact_detector(&mut line, b"/compactt");
+        feed_compact_detector(&mut line, b"\x7f");
+        assert!(feed_compact_detector(&mut line, b"\r"));
+        // Ctrl+U (line kill) after a partial command resets the accumulator.
+        feed_compact_detector(&mut line, b"/comp");
+        feed_compact_detector(&mut line, b"\x15");
+        assert!(!feed_compact_detector(&mut line, b"\r"));
+    }
+
+    #[test]
+    fn navigator_blocked_filter_excludes_read() {
+        assert!(navigator_state_filter_matches(
+            NavigatorStateFilter::Blocked,
+            AgentState::Blocked,
+            false
+        ));
+        // Acknowledged (read) blocked panes no longer match the "blocked" filter.
+        assert!(!navigator_state_filter_matches(
+            NavigatorStateFilter::Blocked,
+            AgentState::Blocked,
+            true
+        ));
     }
 
     #[test]

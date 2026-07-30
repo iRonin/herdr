@@ -1041,6 +1041,13 @@ mod tests {
         let terminal_state = app.terminals.get_mut(&terminal_id).unwrap();
         terminal_state.detected_agent = Some(Agent::Claude);
         terminal_state.state = AgentState::Blocked;
+        // Unread blocked shows the filled dot; fresh test panes are seen
+        // (acknowledged) by default, so mark the pane unread.
+        app.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .seen = false;
         app.active = Some(0);
         app.selected = 0;
 
@@ -1094,6 +1101,13 @@ mod tests {
             terminal_state.detected_agent = Some(Agent::Claude);
             terminal_state.state = state;
         }
+        // Unread blocked outranks working and shows the filled dot; fresh
+        // test panes are seen (acknowledged) by default, so mark it unread.
+        app.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&blocked_pane)
+            .unwrap()
+            .seen = false;
         app.active = Some(0);
         app.selected = 0;
         app.tab_agent_status = true;
@@ -1304,6 +1318,13 @@ mod tests {
             Some("🥷✅ ~2%·4242 $1.23"),
         );
         set_agent_with_display_agent(&mut app, 0, blocked_pane, AgentState::Blocked, None);
+        // Unread blocked outranks working; fresh test panes are seen
+        // (acknowledged) by default, so mark the pane unread.
+        app.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&blocked_pane)
+            .unwrap()
+            .seen = false;
         app.active = Some(0);
         app.selected = 0;
 
@@ -1416,6 +1437,13 @@ mod tests {
             AgentState::Blocked,
             Some("blocked 42%·4242 cost unavailable"),
         );
+        // Unread blocked outranks working; fresh test panes are seen
+        // (acknowledged) by default, so mark the pane unread.
+        app.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&blocked_pane)
+            .unwrap()
+            .seen = false;
         app.active = Some(0);
         app.selected = 0;
         app.tab_agent_status = true;
@@ -1809,6 +1837,13 @@ mod tests {
         let terminal_state = app.terminals.get_mut(&terminal_id).unwrap();
         terminal_state.detected_agent = Some(Agent::Claude);
         terminal_state.state = AgentState::Blocked;
+        // Unread blocked shows the filled dot; fresh test panes are seen
+        // (acknowledged) by default, so mark the pane unread.
+        app.workspaces[0].tabs[status_tab]
+            .panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .seen = false;
 
         let width = 27;
         let rows = tab_bar_wrapped_rows(

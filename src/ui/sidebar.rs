@@ -308,9 +308,13 @@ fn workspace_entry_gap(
 
 pub(super) fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
-        (AgentState::Blocked, _) => 4,
+        // Unread (needs-attention) blocked panes sort to the top; acknowledged
+        // (read) blocked panes sink below working/done-unread so they stop
+        // competing for attention once the user has interacted with them.
+        (AgentState::Blocked, false) => 4,
         (AgentState::Idle, false) => 3,
         (AgentState::Working, _) => 2,
+        (AgentState::Blocked, true) => 1,
         (AgentState::Idle, true) => 1,
         (AgentState::Unknown, _) => 0,
     }
@@ -1558,6 +1562,19 @@ mod tests {
     }
 
     #[test]
+    fn workspace_attention_priority_read_blocked_does_not_bubble() {
+        use crate::detect::AgentState;
+        assert!(
+            workspace_attention_priority(AgentState::Blocked, false)
+                > workspace_attention_priority(AgentState::Blocked, true)
+        );
+        assert!(
+            workspace_attention_priority(AgentState::Blocked, true)
+                < workspace_attention_priority(AgentState::Working, true)
+        );
+    }
+
+    #[test]
     fn default_agent_rows_remove_redundant_state_text() {
         let mut app = crate::app::state::AppState::test_new();
         let workspace = Workspace::test_new("one");
@@ -2128,6 +2145,14 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         set_state(&mut app, 0, 0, AgentState::Working);
         set_state(&mut app, 0, blocked_tab, AgentState::Blocked);
         set_state(&mut app, 1, 0, AgentState::Idle);
+        // Only an unread blocked pane outranks working; fresh test panes are
+        // seen (acknowledged) by default, so mark this one unread.
+        let blocked_pane = app.workspaces[0].tabs[blocked_tab].root_pane;
+        app.workspaces[0].tabs[blocked_tab]
+            .panes
+            .get_mut(&blocked_pane)
+            .unwrap()
+            .seen = false;
         app.active = Some(0);
 
         let states: Vec<AgentState> = agent_panel_entries(&app)
@@ -2169,6 +2194,13 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.workspaces[1].tabs[0]
             .panes
             .get_mut(&done_pane)
+            .unwrap()
+            .seen = false;
+        // The blocked agent must be unread (needs-attention) to sort first.
+        let blocked_pane = app.workspaces[3].tabs[0].root_pane;
+        app.workspaces[3].tabs[0]
+            .panes
+            .get_mut(&blocked_pane)
             .unwrap()
             .seen = false;
 
@@ -2264,6 +2296,12 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         set_state(&mut app, 0, first_pane, AgentState::Working);
         set_state(&mut app, 1, second_pane, AgentState::Working);
         set_state(&mut app, 1, urgent_pane, AgentState::Blocked);
+        // The blocked agent must be unread (needs-attention) to sort first.
+        app.workspaces[1].tabs[0]
+            .panes
+            .get_mut(&urgent_pane)
+            .unwrap()
+            .seen = false;
 
         assert_eq!(app.workspaces[1].public_pane_number(urgent_pane), Some(2));
         assert_eq!(agent_panel_entries(&app)[0].pane_id, urgent_pane);
