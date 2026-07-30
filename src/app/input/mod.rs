@@ -198,6 +198,17 @@ impl App {
         }
 
         if let Some(ws_idx) = self.state.active {
+            let pane_id = self
+                .state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.focused_pane_id());
+            if let Some(pane_id) = pane_id {
+                self.state
+                    .mark_pane_acknowledged_if_blocked(ws_idx, pane_id);
+                self.state
+                    .note_forwarded_input(ws_idx, pane_id, text.as_bytes());
+            }
             if let Some(rt) = self
                 .state
                 .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)

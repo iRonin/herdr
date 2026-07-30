@@ -1217,6 +1217,12 @@ mod tests {
         };
         set_state(&mut app, 0, first_pane, AgentState::Working);
         set_state(&mut app, 1, second_pane, AgentState::Blocked);
+        // The blocked agent must be unread (needs-attention) to sort first.
+        app.state.workspaces[1].tabs[0]
+            .panes
+            .get_mut(&second_pane)
+            .unwrap()
+            .seen = false;
 
         let (_, _, detail_area) =
             crate::ui::collapsed_sidebar_sections(app.state.view.sidebar_rect);

@@ -626,6 +626,7 @@ impl App {
             config_diagnostic,
             toast: None,
             pending_agent_notifications: std::collections::HashMap::new(),
+            compact_input_lines: std::collections::HashMap::new(),
             copy_feedback: None,
             outer_terminal_focus: None,
             prefix_code,

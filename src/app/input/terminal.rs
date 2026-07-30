@@ -387,13 +387,25 @@ impl App {
             }
         }
 
-        let input = self.prepare_terminal_key_forward(crate::app::LOCAL_INPUT_SOURCE, key)?;
-        let sent = if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
-            runtime.send_bytes(input.bytes).await.is_ok()
+        let PreparedPaneInput {
+            ws_idx,
+            pane_id,
+            target,
+            bytes,
+        } = self.prepare_terminal_key_forward(crate::app::LOCAL_INPUT_SOURCE, key)?;
+        // Any direct input to a blocked pane (keystroke/paste/command such as
+        // `/rewind`) acknowledges it: flip it from needs-attention to read.
+        self.state
+            .mark_pane_acknowledged_if_blocked(ws_idx, pane_id);
+        // Detect in-process commands (`/compact`) that do work without an agent
+        // lifecycle event, and show the pane as Working while they run.
+        self.state.note_forwarded_input(ws_idx, pane_id, &bytes);
+        let sent = if let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) {
+            runtime.send_bytes(bytes).await.is_ok()
         } else {
             false
         };
-        sent.then_some(input.target)
+        sent.then_some(target)
     }
 }
 

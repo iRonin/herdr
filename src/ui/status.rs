@@ -195,7 +195,10 @@ pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &
 
 pub(super) fn state_dot(state: AgentState, seen: bool, p: &Palette) -> (&'static str, Style) {
     match (state, seen) {
-        (AgentState::Blocked, _) => ("●", Style::default().fg(p.red)),
+        // Blocked + unread = needs-attention (filled). Blocked + read = acknowledged
+        // (hollow), e.g. after the user rewinds/acks without starting work.
+        (AgentState::Blocked, false) => ("●", Style::default().fg(p.red)),
+        (AgentState::Blocked, true) => ("○", Style::default().fg(p.red)),
         (AgentState::Working, _) => ("●", Style::default().fg(p.yellow)),
         (AgentState::Idle, false) => ("●", Style::default().fg(p.teal)),
         (AgentState::Idle, true) => ("○", Style::default().fg(p.green)),
@@ -248,7 +251,12 @@ mod tests {
     fn state_dots_use_aligned_static_workspace_marks() {
         let palette = Palette::catppuccin();
         for (state, seen, symbol, color) in [
-            (AgentState::Blocked, true, "●", palette.red),
+            // Blocked splits on `seen` in this fork: filled while it needs
+            // attention, hollow once acknowledged -- upstream's own
+            // filled/hollow convention for Idle, applied to a state upstream
+            // left collapsed. Both stay red: acknowledged, not un-blocked.
+            (AgentState::Blocked, false, "●", palette.red),
+            (AgentState::Blocked, true, "○", palette.red),
             (AgentState::Working, true, "●", palette.yellow),
             (AgentState::Idle, false, "●", palette.teal),
             (AgentState::Idle, true, "○", palette.green),
@@ -322,5 +330,17 @@ mod tests {
             bottom_center.x,
             area.x + area.width.saturating_sub(bottom_center.width) / 2
         );
+    }
+
+    #[test]
+    fn state_dot_blocked_read_is_hollow_red() {
+        let p = Palette::catppuccin();
+        let (unread, unread_style) = state_dot(AgentState::Blocked, false, &p);
+        let (read, read_style) = state_dot(AgentState::Blocked, true, &p);
+        assert_eq!(unread, "●");
+        assert_eq!(read, "○");
+        // Still red either way: acknowledged, not un-blocked.
+        assert_eq!(unread_style.fg, Some(p.red));
+        assert_eq!(read_style.fg, Some(p.red));
     }
 }
