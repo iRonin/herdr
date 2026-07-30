@@ -996,11 +996,13 @@ fn global_agent_counts(app: &AppState) -> GlobalAgentCounts {
     let mut counts = GlobalAgentCounts::default();
     for entry in crate::ui::all_agent_panel_entries(app) {
         match (entry.state, entry.seen) {
-            (AgentState::Blocked, _) => counts.blocked += 1,
+            // Only needs-attention (unread) blocked agents count; acknowledged
+            // (read) ones no longer count as blocked.
+            (AgentState::Blocked, false) => counts.blocked += 1,
             (AgentState::Idle, false) => counts.done += 1,
             (AgentState::Working, _) => counts.working += 1,
             (AgentState::Idle, true) => counts.idle += 1,
-            (AgentState::Unknown, _) => {}
+            (AgentState::Blocked, true) | (AgentState::Unknown, _) => {}
         }
     }
     counts
@@ -1192,6 +1194,15 @@ mod tests {
             let terminal = app.terminals.get_mut(&terminal_id).unwrap();
             terminal.detected_agent = Some(crate::detect::Agent::Claude);
             terminal.state = state;
+            if state == AgentState::Blocked {
+                // Only unread blocked agents count; read/acknowledged blocked
+                // ones are excluded from summaries by design.
+                app.workspaces[ws_idx].tabs[0]
+                    .panes
+                    .get_mut(&pane_id)
+                    .unwrap()
+                    .seen = false;
+            }
         }
         app.agent_view_override = Some(crate::api::schema::AgentViewSetParams {
             source: "example.views".to_string(),

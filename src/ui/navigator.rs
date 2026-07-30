@@ -523,7 +523,7 @@ fn row_state(
         .and_then(|ws| ws.tabs.get(tab_idx))
         .and_then(|tab| tab.terminal_id(pane_id))
         .and_then(|terminal_id| app.terminals.get(terminal_id))
-        .map(|terminal| terminal.state)
+        .map(|terminal| terminal.display_state())
         .unwrap_or(crate::detect::AgentState::Unknown)
 }
 
