@@ -260,6 +260,8 @@ Set `tab_bar_position = "bottom"` under `[ui]` to place the desktop tab row belo
 
 Set `ui.tab_close_button = true` to show an `x` in the last cell of each tab label in the desktop tab bar. Alt/Option-click the `x` to close that tab immediately, without a confirmation prompt; clicking it without Alt activates the tab as usual. Closing the last tab of a workspace closes the workspace and still honors `ui.confirm_close`.
 
+The modifier is configurable via `ui.tab_close_button_modifier`: `"alt"` (default), `"ctrl"`, `"shift"`, or a `+`-separated combination such as `"ctrl+shift"`. Terminal mouse reporting can only encode Shift, Alt, and Ctrl, so Cmd/Super is not accepted — it could never reach the app. Practical notes: on macOS, Ctrl-click is treated by the system as a right-click, and in iTerm2 holding Option bypasses mouse reporting (for text selection), so the effective gesture there is **Cmd-click, which iTerm2 reports to the app as Alt-click** — disable "⌘-Click opens filename/url" (Settings → Pointer) or restrict Semantic History (Settings → Profiles → Advanced) if iTerm2 captures the click to open/download instead.
+
 ### Sidebar row layouts
 
 The expanded desktop sidebar renders each inner array in `rows` as one line. These are the complete default layouts:

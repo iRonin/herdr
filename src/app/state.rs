@@ -1507,6 +1507,7 @@ pub struct AppState {
     pub confirm_close: bool,
     pub prompt_new_tab_name: bool,
     pub tab_close_button: bool,
+    pub tab_close_button_modifier: crossterm::event::KeyModifiers,
     pub prompt_new_workspace_name: bool,
     pub pane_borders: bool,
     /// Pane scrollbar presentation mode.
@@ -1930,6 +1931,7 @@ impl AppState {
             confirm_close: true,
             prompt_new_tab_name: true,
             tab_close_button: false,
+            tab_close_button_modifier: crossterm::event::KeyModifiers::ALT,
             prompt_new_workspace_name: false,
             pane_borders: true,
             pane_scrollbars: ScrollbarMode::Always,

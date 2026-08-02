@@ -499,7 +499,8 @@ impl AppState {
                     self.scroll_tabs_right();
                     return None;
                 }
-                if self.tab_close_button && mouse.modifiers.contains(KeyModifiers::ALT) {
+                if self.tab_close_button && mouse.modifiers.contains(self.tab_close_button_modifier)
+                {
                     if let (Some(ws_idx), Some(tab_idx)) =
                         (self.active, self.tab_close_hit_at(mouse.column, mouse.row))
                     {
@@ -3959,6 +3960,45 @@ mod tests {
 
         assert_eq!(app.state.workspaces[0].tabs.len(), 2);
         assert!(app.state.tab_press.is_some());
+    }
+
+    #[test]
+    fn ctrl_modifier_ctrl_click_marker_closes_alt_does_not() {
+        let mut app = app_with_tabs_for_close_marker(&["one", "two"]);
+        app.state.tab_close_button_modifier = KeyModifiers::CONTROL;
+        let second_tab = app.state.view.tab_hit_areas[1];
+        let marker_col = second_tab.x + second_tab.width - 1;
+
+        // Alt no longer arms the marker: it falls through to the normal press.
+        app.handle_mouse(alt_click(marker_col, second_tab.y));
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert!(app.state.tab_press.is_some());
+        app.state.tab_press = None;
+
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: marker_col,
+            row: second_tab.y,
+            modifiers: KeyModifiers::CONTROL,
+        });
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+    }
+
+    #[test]
+    fn shift_modifier_shift_click_marker_closes() {
+        let mut app = app_with_tabs_for_close_marker(&["one", "two"]);
+        app.state.tab_close_button_modifier = KeyModifiers::SHIFT;
+        let second_tab = app.state.view.tab_hit_areas[1];
+
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: second_tab.x + second_tab.width - 1,
+            row: second_tab.y,
+            modifiers: KeyModifiers::SHIFT,
+        });
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
     }
 
     #[test]
