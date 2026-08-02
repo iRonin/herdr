@@ -647,6 +647,12 @@
           "description": "Show an x in the last cell of each tab label; Alt-click it to close the tab without confirmation."
         },
         {
+          "key": "ui.tab_close_button_modifier",
+          "type": "string",
+          "default": "\"alt\"",
+          "description": "Modifier that arms the ui.tab_close_button close marker: alt/option, ctrl/control, shift, or a +-separated combination. Mouse reporting cannot encode Cmd/Super."
+        },
+        {
           "key": "ui.prompt_new_workspace_name",
           "type": "boolean",
           "default": "false",
