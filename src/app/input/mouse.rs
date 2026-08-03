@@ -48,6 +48,11 @@ pub(super) enum MouseAction {
         source_tab_idx: usize,
         insert_idx: usize,
     },
+    MoveTabToWorkspace {
+        ws_idx: usize,
+        source_tab_idx: usize,
+        target_ws_idx: usize,
+    },
     SetSplitRatio {
         path: Vec<bool>,
         ratio: f32,
@@ -689,6 +694,12 @@ impl AppState {
 
                 let workspace_drop_index = self.workspace_drop_index_at_row(mouse.row);
                 let tab_drop_index = self.tab_drop_index_at(mouse.column, mouse.row);
+                // Precomputed before the drag state is borrowed mutably below.
+                let tab_move_hover_ws = if self.tab_drag_move_workspace {
+                    self.workspace_at_row(mouse.row)
+                } else {
+                    None
+                };
                 if self.drag.is_none() {
                     if let Some(press) = &self.workspace_press {
                         let delta_col = mouse.column.abs_diff(press.start_col);
@@ -714,6 +725,7 @@ impl AppState {
                                     ws_idx: press.ws_idx,
                                     source_tab_idx: press.tab_idx,
                                     insert_idx: tab_drop_index,
+                                    move_target: None,
                                 },
                             });
                         }
@@ -728,12 +740,26 @@ impl AppState {
                 } else if let Some(DragState {
                     target:
                         DragTarget::TabReorder {
-                            ws_idx, insert_idx, ..
+                            ws_idx,
+                            insert_idx,
+                            move_target,
+                            ..
                         },
                 }) = &mut self.drag
                 {
                     if self.active == Some(*ws_idx) {
                         *insert_idx = tab_drop_index;
+                    }
+                    if self.tab_drag_move_workspace {
+                        *move_target = match tab_move_hover_ws {
+                            Some(target_ws_idx) if target_ws_idx != *ws_idx => {
+                                // While a sidebar workspace entry is the drop
+                                // target, suppress the in-bar reorder indicator.
+                                *insert_idx = None;
+                                Some(target_ws_idx)
+                            }
+                            _ => None,
+                        };
                     }
                 } else if let Some(drag) = &self.drag {
                     match &drag.target {
@@ -867,6 +893,7 @@ impl AppState {
                                 ws_idx,
                                 source_tab_idx,
                                 insert_idx: Some(insert_idx),
+                                ..
                             },
                     }) => {
                         if self.active == Some(ws_idx) {
@@ -877,6 +904,22 @@ impl AppState {
                                 insert_idx,
                             });
                         }
+                    }
+                    Some(DragState {
+                        target:
+                            DragTarget::TabReorder {
+                                ws_idx,
+                                source_tab_idx,
+                                move_target: Some(target_ws_idx),
+                                ..
+                            },
+                    }) => {
+                        self.mode = Mode::Terminal;
+                        return Some(MouseAction::MoveTabToWorkspace {
+                            ws_idx,
+                            source_tab_idx,
+                            target_ws_idx,
+                        });
                     }
                     Some(_) => {}
                     None => {

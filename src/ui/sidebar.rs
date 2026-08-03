@@ -1121,6 +1121,16 @@ fn render_workspace_list(
         }
         _ => None,
     };
+    // While a tab is dragged over a sidebar workspace entry with
+    // `ui.tab_drag_move_workspace` enabled, highlight the entry as the drop
+    // target (same treatment as a dragged workspace card).
+    let tab_move_target_ws_idx = match app.drag.as_ref().map(|drag| &drag.target) {
+        Some(crate::app::state::DragTarget::TabReorder {
+            move_target: Some(move_target),
+            ..
+        }) => Some(*move_target),
+        _ => None,
+    };
     let insertion_row = match app.drag.as_ref().map(|drag| &drag.target) {
         Some(crate::app::state::DragTarget::WorkspaceReorder {
             insert_idx: Some(insert_idx),
@@ -1151,7 +1161,7 @@ fn render_workspace_list(
         let row_height = card.rect.height;
         let selected = i == app.selected && is_navigating;
         let is_active = Some(i) == app.active;
-        let is_dragged = dragged_ws_idx == Some(i);
+        let is_dragged = dragged_ws_idx == Some(i) || tab_move_target_ws_idx == Some(i);
         let highlighted = selected || is_active || is_dragged;
         let (agg_state, agg_seen) = ws.aggregate_state(&app.terminals);
 

@@ -671,6 +671,12 @@
           "description": "Hide the tab row when the workspace has one tab."
         },
         {
+          "key": "ui.tab_drag_move_workspace",
+          "type": "boolean",
+          "default": "false",
+          "description": "Allow dragging a tab from the tab bar onto a sidebar workspace entry to move the tab (and all its panes) to that workspace."
+        },
+        {
           "key": "ui.agent_panel_sort",
           "type": "enum",
           "default": "\"spaces\"",
