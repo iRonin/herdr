@@ -1799,6 +1799,7 @@ mod tests {
                     insert_idx,
                     indicator_position: (target_rect.x, target_rect.y),
                 }),
+                move_target: None,
             },
         });
 

@@ -2,6 +2,39 @@ use std::collections::HashMap;
 
 use super::*;
 
+#[test]
+fn unknown_method_names_fail_deserialization_loudly() {
+    // A server that predates a method must reject it at parse time instead of
+    // silently mis-executing it — this is what makes additive methods (like
+    // tab.move_to_workspace) safe to mix across shim/server versions.
+    let unknown = serde_json::json!({
+        "id": "req",
+        "method": "tab.translocate",
+        "params": { "tab_id": "w1:1" }
+    });
+    assert!(serde_json::from_value::<Request>(unknown).is_err());
+
+    let mistyped_params = serde_json::json!({
+        "id": "req",
+        "method": "tab.move_to_workspace",
+        "params": { "tab_id": 42, "workspace_id": "w2" }
+    });
+    assert!(serde_json::from_value::<Request>(mistyped_params).is_err());
+}
+
+#[test]
+fn tab_move_reorder_contract_is_unchanged() {
+    // The in-workspace reorder contract must stay exactly as existing clients
+    // know it: `insert_index` is required and no destination field exists that
+    // an older server could silently ignore.
+    let missing_index = serde_json::json!({
+        "id": "req",
+        "method": "tab.move",
+        "params": { "tab_id": "w1:1" }
+    });
+    assert!(serde_json::from_value::<Request>(missing_index).is_err());
+}
+
 fn protocol_schema_entry<T: schemars::JsonSchema>(name: &str) -> serde_json::Value {
     let mut schema = serde_json::to_value(schemars::schema_for!(T)).unwrap();
     rewrite_schema_refs(&mut schema, name);
@@ -476,6 +509,8 @@ fn event_envelope_round_trips() {
                 workspace_id: "w_1".into(),
                 insert_index: 1,
                 tabs: vec![],
+                previous_tab_id: None,
+                previous_workspace_id: None,
             },
         },
         EventEnvelope {
@@ -1074,6 +1109,20 @@ fn authority_mutation_requests_round_trip() {
     assert_eq!(json["method"], "tab.move");
     let restored: Request = serde_json::from_value(json).unwrap();
     assert_eq!(restored, tab_move);
+
+    let tab_move_to_workspace = Request {
+        id: "move_tab_ws".into(),
+        method: Method::TabMoveToWorkspace(TabMoveToWorkspaceParams {
+            tab_id: "w1:1".into(),
+            workspace_id: "w2".into(),
+            insert_index: None,
+            focus: false,
+        }),
+    };
+    let json = serde_json::to_value(&tab_move_to_workspace).unwrap();
+    assert_eq!(json["method"], "tab.move_to_workspace");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, tab_move_to_workspace);
 
     let pane_focus = Request {
         id: "focus_pane".into(),

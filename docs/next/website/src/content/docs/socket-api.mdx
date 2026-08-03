@@ -102,7 +102,7 @@ Raw socket method names use dot notation:
 | Session | `session.snapshot` |
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
-| Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
+| Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.move_to_workspace`, `tab.close` |
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
@@ -294,6 +294,30 @@ Cross-workspace moves keep the internal pane and terminal alive but assign a new
 public pane id in the destination workspace. Subscribers can listen for
 `pane.moved`; Herdr does not emit fake pane close/create events for the moved
 terminal process.
+
+`tab.move` reorders a tab inside its workspace (`insert_index` required) and
+responds with the updated `type: "tab_list"`. `tab.move_to_workspace` moves the
+whole tab — panes, split layout, label, zoom, and running terminals — to
+another workspace as a unit. It is a separate method so older servers reject
+it as unknown instead of silently reordering:
+
+```json
+{"id":"req_tab_reorder","method":"tab.move","params":{"tab_id":"w1:t2","insert_index":0}}
+{"id":"req_tab_move","method":"tab.move_to_workspace","params":{"tab_id":"w1:t2","workspace_id":"w2","focus":true}}
+{"id":"req_tab_move_at","method":"tab.move_to_workspace","params":{"tab_id":"w1:t2","workspace_id":"w2","insert_index":1}}
+```
+
+`insert_index` is optional (omitted appends to the destination's tab bar). The
+response is `type: "tab_move_to_workspace"` with `changed`, `previous_tab_id`,
+`previous_workspace_id`, the moved `tab`, the final `insert_index`, optional
+`closed_workspace_id`, a `pane_id_map` of per-pane public id reassignment, and
+`target_layout`. A `workspace_id` naming the tab's own workspace reorders and
+reports the same shape. The destination assigns the tab and its panes fresh
+public numbers; prior public pane ids keep resolving as aliases, and agent
+status follows the moved terminals. A source workspace left without tabs is
+closed. Subscribers receive `tab.moved` carrying `previous_tab_id` and
+`previous_workspace_id` to correlate the old identity with the new one; Herdr
+does not emit fake tab close/create events for the moved tab.
 
 `pane.zoom` toggles, enables, or disables zoom for the target pane's tab:
 
@@ -762,7 +786,9 @@ Workspace event subscriptions include `workspace.created`, `workspace.updated`, 
 Tab event subscriptions include `tab.created`, `tab.closed`, `tab.focused`,
 `tab.renamed`, and `tab.moved`. `tab.moved` includes the moved `tab_id`,
 `workspace_id`, requested `insert_index`, and updated ordered `tabs` list for
-that workspace.
+that workspace. For a `tab.move_to_workspace` cross-workspace move, `tab.moved`
+additionally carries `previous_tab_id` and `previous_workspace_id` naming the
+identity the tab had in the source workspace.
 Pane event subscriptions include `pane.created`, `pane.updated`, `pane.closed`, `pane.focused`,
 `pane.moved`, `pane.exited`, `pane.agent_detected`,
 `pane.output_matched`, `pane.agent_status_changed`, and `pane.scroll_changed`.

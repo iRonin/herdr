@@ -659,6 +659,7 @@ impl App {
             tab_agent_context: config.ui.tab_agent_context,
             scrollbar_mode: config.ui.show_scrollbar,
             last_pane_scroll_activity: HashMap::new(),
+            tab_drag_move_workspace: config.ui.tab_drag_move_workspace,
             pane_history_persistence: config.experimental.pane_history,
             reveal_hidden_cursor_for_cjk_ime: config.experimental.reveal_hidden_cursor_for_cjk_ime,
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
@@ -1462,6 +1463,7 @@ impl App {
                 if self.state.scrollbar_mode != crate::config::ScrollbarMode::Auto {
                     self.state.last_pane_scroll_activity.clear();
                 }
+                self.state.tab_drag_move_workspace = config.ui.tab_drag_move_workspace;
                 self.state.agent_panel_sort =
                     agent_panel_sort_from_config(config.ui.agent_panel_sort);
                 self.state.agent_panel_scope =

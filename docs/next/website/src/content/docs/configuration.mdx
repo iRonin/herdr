@@ -260,6 +260,8 @@ Set `ui.tab_close_button = true` to show an `x` in the last cell of each tab lab
 
 The modifier is configurable via `ui.tab_close_button_modifier`: `"alt"` (default), `"ctrl"`, `"shift"`, or a `+`-separated combination such as `"ctrl+shift"`. Terminal mouse reporting can only encode Shift, Alt, and Ctrl, so Cmd/Super is not accepted — it could never reach the app. Practical notes: on macOS, Ctrl-click is treated by the system as a right-click, and in iTerm2 holding Option bypasses mouse reporting (for text selection), so the effective gesture there is **Cmd-click, which iTerm2 reports to the app as Alt-click** — disable "⌘-Click opens filename/url" (Settings → Pointer) or restrict Semantic History (Settings → Profiles → Advanced) if iTerm2 captures the click to open/download instead.
 
+Set `ui.tab_drag_move_workspace = true` to drag a tab from the tab bar onto a sidebar workspace entry, moving the tab (and all its panes) to that workspace as a unit. The hovered entry highlights as the drop target; dropping anywhere else keeps the usual in-bar reorder behavior. The move appends to the destination's tab bar without switching focus.
+
 ### Sidebar row layouts
 
 The expanded desktop sidebar renders each inner array in `rows` as one line. These are the complete default layouts:

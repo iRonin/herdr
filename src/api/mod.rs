@@ -38,6 +38,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::TabFocus(_)
             | Method::TabRename(_)
             | Method::TabMove(_)
+            | Method::TabMoveToWorkspace(_)
             | Method::TabClose(_)
             | Method::LayoutApply(_)
             | Method::LayoutSetSplitRatio(_)

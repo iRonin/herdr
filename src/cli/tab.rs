@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::api::schema::{TabCreateParams, TabListParams, TabRenameParams};
+use crate::api::schema::{
+    TabCreateParams, TabListParams, TabMoveParams, TabMoveToWorkspaceParams, TabRenameParams,
+};
 
 pub(super) fn run_tab_command(args: &[String]) -> std::io::Result<i32> {
     let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
@@ -14,6 +16,7 @@ pub(super) fn run_tab_command(args: &[String]) -> std::io::Result<i32> {
         "get" => tab_get(&args[1..]),
         "focus" => tab_focus(&args[1..]),
         "rename" => tab_rename(&args[1..]),
+        "move" => tab_move(&args[1..]),
         "close" => tab_close(&args[1..]),
         "help" | "--help" | "-h" => {
             print_tab_help();
@@ -174,6 +177,83 @@ fn tab_close(args: &[String]) -> std::io::Result<i32> {
     super::runtime::tab_close(super::normalize_tab_id(raw_tab_id))
 }
 
+fn tab_move(args: &[String]) -> std::io::Result<i32> {
+    let mut tab_id = None;
+    let mut insert_index = None;
+    let mut workspace_id = None;
+    let mut focus = false;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--index" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --index");
+                    return Ok(2);
+                };
+                match value.parse::<usize>() {
+                    Ok(parsed) => insert_index = Some(parsed),
+                    Err(_) => {
+                        eprintln!("invalid value for --index: {value}");
+                        return Ok(2);
+                    }
+                }
+                index += 2;
+            }
+            "--workspace" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --workspace");
+                    return Ok(2);
+                };
+                workspace_id = Some(super::normalize_workspace_id(value));
+                index += 2;
+            }
+            "--focus" => {
+                focus = true;
+                index += 1;
+            }
+            "--no-focus" => {
+                focus = false;
+                index += 1;
+            }
+            other if tab_id.is_none() && !other.starts_with('-') => {
+                tab_id = Some(super::normalize_tab_id(other));
+                index += 1;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    let Some(tab_id) = tab_id else {
+        eprintln!("usage: herdr tab move <tab_id> --index N [--workspace ID] [--focus|--no-focus]");
+        return Ok(2);
+    };
+    match workspace_id {
+        Some(workspace_id) => super::runtime::tab_move_to_workspace(TabMoveToWorkspaceParams {
+            tab_id,
+            workspace_id,
+            insert_index,
+            focus,
+        }),
+        None => {
+            let Some(insert_index) = insert_index else {
+                eprintln!(
+                    "usage: herdr tab move <tab_id> --index N [--workspace ID] [--focus|--no-focus]"
+                );
+                eprintln!("--index is required when reordering within the current workspace");
+                return Ok(2);
+            };
+            super::runtime::tab_move(TabMoveParams {
+                tab_id,
+                insert_index,
+            })
+        }
+    }
+}
+
 fn print_tab_help() {
     eprintln!("herdr tab commands:");
     eprintln!("  herdr tab list [--workspace <workspace_id>]");
@@ -183,5 +263,8 @@ fn print_tab_help() {
     eprintln!("  herdr tab get <tab_id>");
     eprintln!("  herdr tab focus <tab_id>");
     eprintln!("  herdr tab rename <tab_id> <label>");
+    eprintln!(
+        "  herdr tab move <tab_id> [--index N] [--workspace <workspace_id>] [--focus|--no-focus]"
+    );
     eprintln!("  herdr tab close <tab_id>");
 }

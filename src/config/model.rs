@@ -983,6 +983,9 @@ pub struct UiConfig {
     /// `never` does not draw it. Booleans remain accepted for compatibility
     /// (`true` = `always`, `false` = `never`). Default: `always`.
     pub show_scrollbar: ScrollbarMode,
+    /// Allow dragging a tab from the tab bar onto a sidebar workspace entry to
+    /// move the tab (and all its panes) to that workspace. Default: false.
+    pub tab_drag_move_workspace: bool,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
     /// Agent sidebar scope. Saved values are "all" or "current"; "current_workspace"
@@ -1197,6 +1200,7 @@ impl Default for UiConfig {
             tab_agent_status: false,
             tab_agent_context: false,
             show_scrollbar: ScrollbarMode::Always,
+            tab_drag_move_workspace: false,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             agent_panel_scope: AgentPanelScopeConfig::All,
             agent_panel_modes: default_agent_panel_modes(),
