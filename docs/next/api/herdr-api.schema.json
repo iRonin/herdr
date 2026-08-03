@@ -397,6 +397,19 @@
                   "minimum": 0,
                   "type": "integer"
                 },
+                "previous_tab_id": {
+                  "description": "Set when the tab moved here from another workspace, linking the new\nidentity to the one that disappeared from the source workspace.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "previous_workspace_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "tab_id": {
                   "type": "string"
                 },
@@ -4065,6 +4078,37 @@
           ],
           "type": "object"
         },
+        "TabMoveToWorkspaceParams": {
+          "description": "Move a whole tab — panes, split layout, label, zoom, and running terminals\n— to another workspace as a unit. This is a separate method from `tab.move`\n(in-workspace reorder) so older servers reject it as an unknown method\ninstead of silently ignoring a `workspace_id` field and reordering.",
+          "properties": {
+            "focus": {
+              "default": false,
+              "description": "Focus the tab (and its workspace) after the move.",
+              "type": "boolean"
+            },
+            "insert_index": {
+              "description": "Position within the target workspace. Omitted appends to the end of the\ntarget workspace's tab bar.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "tab_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "description": "Destination workspace. May name the tab's own workspace, which reorders\nthe tab within it.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tab_id",
+            "workspace_id"
+          ],
+          "type": "object"
+        },
         "TabRenameParams": {
           "properties": {
             "label": {
@@ -4838,6 +4882,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/TabMoveParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "tab.move_to_workspace",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TabMoveToWorkspaceParams"
             }
           },
           "required": [
@@ -6609,6 +6669,19 @@
                   "format": "uint",
                   "minimum": 0,
                   "type": "integer"
+                },
+                "previous_tab_id": {
+                  "description": "Set when the tab moved here from another workspace, linking the new\nidentity to the one that disappeared from the source workspace.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "previous_workspace_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "tab_id": {
                   "type": "string"
@@ -8833,6 +8906,22 @@
             },
             {
               "properties": {
+                "move_result": {
+                  "$ref": "#/schemas/success_response/$defs/TabMoveToWorkspaceResult"
+                },
+                "type": {
+                  "const": "tab_move_to_workspace",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "move_result"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "agent": {
                   "$ref": "#/schemas/success_response/$defs/AgentInfo"
                 },
@@ -9784,6 +9873,69 @@
             "focused",
             "pane_count",
             "agent_status"
+          ],
+          "type": "object"
+        },
+        "TabMovePaneRemap": {
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            },
+            "previous_pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "previous_pane_id",
+            "pane_id"
+          ],
+          "type": "object"
+        },
+        "TabMoveToWorkspaceResult": {
+          "properties": {
+            "changed": {
+              "type": "boolean"
+            },
+            "closed_workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "insert_index": {
+              "description": "Final position of the tab within the target workspace.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_id_map": {
+              "description": "Public pane id reassignment for every pane that moved with the tab.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/TabMovePaneRemap"
+              },
+              "type": "array"
+            },
+            "previous_tab_id": {
+              "type": "string"
+            },
+            "previous_workspace_id": {
+              "type": "string"
+            },
+            "tab": {
+              "$ref": "#/schemas/success_response/$defs/TabInfo"
+            },
+            "target_layout": {
+              "$ref": "#/schemas/success_response/$defs/PaneLayoutSnapshot"
+            }
+          },
+          "required": [
+            "changed",
+            "previous_tab_id",
+            "previous_workspace_id",
+            "tab",
+            "insert_index",
+            "pane_id_map",
+            "target_layout"
           ],
           "type": "object"
         },

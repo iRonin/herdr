@@ -722,7 +722,12 @@
           "description": "Wrap tabs onto multiple rows instead of using the default single scrollable row. The wrapped bar uses at most half of the pane area's height."
         },
         {
-
+          "key": "ui.tab_drag_move_workspace",
+          "type": "boolean",
+          "default": "false",
+          "description": "Allow dragging a tab from the tab bar onto a sidebar workspace entry to move the tab (and all its panes) to that workspace."
+        },
+        {
           "key": "ui.agent_panel_sort",
           "type": "enum",
           "default": "\"spaces\"",

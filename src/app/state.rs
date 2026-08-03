@@ -1142,6 +1142,12 @@ pub(crate) enum DragTarget {
         ws_idx: usize,
         source_tab_idx: usize,
         drop_target: Option<TabDropTarget>,
+        /// Sidebar workspace entry currently hovered while dragging a tab,
+        /// when `ui.tab_drag_move_workspace` is enabled. Set only for entries
+        /// other than the tab's own workspace; while set, `drop_target` stays
+        /// `None` and dropping moves the tab to that workspace instead of
+        /// reordering it.
+        move_target: Option<usize>,
     },
     WorkspaceListScrollbar {
         grab_row_offset: u16,
@@ -1519,6 +1525,9 @@ pub struct AppState {
     pub tab_bar_wrap: bool,
     /// Last host-scrollback offset change per pane, used by auto-hide overlays.
     pub(crate) last_pane_scroll_activity: std::collections::HashMap<PaneId, std::time::Instant>,
+    /// Allow tab drags to continue onto sidebar workspace entries, moving the
+    /// tab to another workspace on drop. See `ui.tab_drag_move_workspace`.
+    pub tab_drag_move_workspace: bool,
     pub pane_history_persistence: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
@@ -1941,6 +1950,7 @@ impl AppState {
             tab_bar_position: TabBarPositionConfig::Top,
             tab_bar_wrap: false,
             last_pane_scroll_activity: std::collections::HashMap::new(),
+            tab_drag_move_workspace: false,
             pane_history_persistence: false,
             reveal_hidden_cursor_for_cjk_ime: false,
             cjk_ime_agent_filter_configured: false,
@@ -2268,6 +2278,7 @@ impl AppState {
                     ws_idx,
                     source_tab_idx,
                     drop_target,
+                    move_target,
                 } => {
                     assert_tab_index(*ws_idx, *source_tab_idx, "tab drag source");
                     if let Some(drop_target) = drop_target {
@@ -2277,6 +2288,15 @@ impl AppState {
                             drop_target.insert_idx,
                             ws_idx,
                             self.workspaces[*ws_idx].tabs.len()
+                        );
+                    }
+                    if let Some(move_target) = move_target {
+                        assert!(
+                            *move_target < self.workspaces.len() && *move_target != *ws_idx,
+                            "tab drag move target {} invalid for {} workspaces (source {})",
+                            move_target,
+                            self.workspaces.len(),
+                            ws_idx
                         );
                     }
                 }

@@ -962,6 +962,9 @@ pub struct UiConfig {
     /// Wrap tabs onto multiple rows instead of using a single scrollable row.
     /// Default: false.
     pub tab_bar_wrap: bool,
+    /// Allow dragging a tab from the tab bar onto a sidebar workspace entry to
+    /// move the tab (and all its panes) to that workspace. Default: false.
+    pub tab_drag_move_workspace: bool,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
     /// Expanded sidebar row composition.
@@ -1169,6 +1172,7 @@ impl Default for UiConfig {
             hide_tab_bar_when_single_tab: false,
             tab_bar_position: TabBarPositionConfig::Top,
             tab_bar_wrap: false,
+            tab_drag_move_workspace: false,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             sidebar: SidebarConfig::default(),
             accent: "cyan".into(),

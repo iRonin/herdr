@@ -517,6 +517,32 @@ impl App {
         );
     }
 
+    pub(crate) fn move_tab_to_workspace_via_api(
+        &mut self,
+        ws_idx: usize,
+        source_tab_idx: usize,
+        target_ws_idx: usize,
+    ) {
+        let Some(tab_id) = self.public_tab_id(ws_idx, source_tab_idx) else {
+            return;
+        };
+        if target_ws_idx >= self.state.workspaces.len() {
+            return;
+        }
+        let workspace_id = self.public_workspace_id(target_ws_idx);
+        // Dropping on a workspace entry appends to its tab bar without
+        // yanking the user to that workspace.
+        self.runtime_tab_move_to_workspace(
+            "tui.tab.move_workspace",
+            crate::api::schema::TabMoveToWorkspaceParams {
+                tab_id,
+                workspace_id,
+                insert_index: None,
+                focus: false,
+            },
+        );
+    }
+
     pub(crate) fn focus_pane_internal_via_api(
         &mut self,
         ws_idx: usize,

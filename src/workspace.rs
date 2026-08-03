@@ -1080,6 +1080,39 @@ impl Workspace {
         self.tabs.len() - 1
     }
 
+    /// Detach a whole tab so it can be moved to another workspace. The tab
+    /// keeps its panes, layout, terminals, label, and zoom state; only its
+    /// per-workspace public numbers are released (the destination workspace
+    /// re-assigns them in `insert_moved_tab`).
+    pub(crate) fn take_tab_for_move(&mut self, tab_idx: usize) -> Option<Tab> {
+        if tab_idx >= self.tabs.len() {
+            return None;
+        }
+        let tab = self.tabs.remove(tab_idx);
+        for pane_id in tab.panes.keys() {
+            self.unregister_pane(*pane_id);
+        }
+        self.adjust_active_tab_after_removal(tab_idx);
+        Some(tab)
+    }
+
+    /// Insert a tab detached by `take_tab_for_move`, assigning it a fresh
+    /// public tab number and fresh public pane numbers so they cannot collide
+    /// with numbers already used in this workspace.
+    pub(crate) fn insert_moved_tab(&mut self, mut tab: Tab, insert_idx: usize) -> usize {
+        tab.number = self.next_public_tab_number;
+        self.next_public_tab_number += 1;
+        let pane_ids: Vec<_> = tab.panes.keys().copied().collect();
+        for pane_id in pane_ids {
+            if !self.public_pane_numbers.contains_key(&pane_id) {
+                self.register_new_pane_with_number(pane_id, self.next_public_pane_number);
+            }
+        }
+        let insert_idx = insert_idx.min(self.tabs.len());
+        self.tabs.insert(insert_idx, tab);
+        insert_idx
+    }
+
     pub(crate) fn unregister_moved_pane(&mut self, pane_id: PaneId) {
         self.unregister_pane(pane_id);
     }

@@ -1496,6 +1496,7 @@ mod tests {
                 ws_idx: 0,
                 source_tab_idx: 0,
                 drop_target: Some(target),
+                ..
             }) => assert_eq!(target.insert_idx, 3),
             _ => panic!("expected TabReorder drag with insert_idx=3, got {drag_target:?}"),
         }
@@ -1523,6 +1524,239 @@ mod tests {
         assert_eq!(app.state.workspaces[0].tabs[2].number, 1);
         assert_eq!(app.state.workspaces[0].tabs[2].root_pane, moved_root);
         assert_eq!(app.state.workspaces[0].active_tab, 2);
+    }
+
+    #[test]
+    fn dragging_tab_onto_workspace_card_moves_tab_when_gate_enabled() {
+        let mut app = app_for_mouse_test();
+        app.state.tab_drag_move_workspace = true;
+        let mut source = Workspace::test_new("source");
+        source.test_add_tab(Some("keep"));
+        let target = Workspace::test_new("target");
+        app.state.workspaces = vec![source, target];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+
+        let moved_root = app.state.workspaces[0].tabs[0].root_pane;
+        let moved_terminal = app.state.workspaces[0].tabs[0]
+            .terminal_id(moved_root)
+            .unwrap()
+            .clone();
+        let source_tab = app.state.view.tab_hit_areas[0];
+        let target_card = app
+            .state
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.ws_idx == 1)
+            .expect("workspace card for target")
+            .rect;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            source_tab.x + 1,
+            source_tab.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            target_card.x + 1,
+            target_card.y,
+        ));
+        // While hovering the target card, the drag is a cross-workspace move,
+        // not an in-bar reorder.
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(DragTarget::TabReorder {
+                ws_idx: 0,
+                source_tab_idx: 0,
+                drop_target: None,
+                move_target: Some(1),
+            })
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            target_card.x + 1,
+            target_card.y,
+        ));
+
+        // The tab moved as a unit: pane, terminal, and label intact in the
+        // target workspace; the user is not yanked to it (focus stays).
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        assert_eq!(app.state.workspaces[1].tabs.len(), 2);
+        let moved = &app.state.workspaces[1].tabs[1];
+        assert_eq!(moved.root_pane, moved_root);
+        assert_eq!(moved.terminal_id(moved_root), Some(&moved_terminal));
+        assert_eq!(app.state.active, Some(0));
+    }
+
+    #[test]
+    fn dragging_tab_onto_workspace_card_is_noop_when_gate_disabled() {
+        let mut app = app_for_mouse_test();
+        let mut source = Workspace::test_new("source");
+        source.test_add_tab(Some("keep"));
+        let target = Workspace::test_new("target");
+        app.state.workspaces = vec![source, target];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+
+        let source_tab = app.state.view.tab_hit_areas[0];
+        let target_card = app
+            .state
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.ws_idx == 1)
+            .expect("workspace card for target")
+            .rect;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            source_tab.x + 1,
+            source_tab.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            target_card.x + 1,
+            target_card.y,
+        ));
+        // Gate off: the drag never becomes a cross-workspace move.
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(DragTarget::TabReorder {
+                move_target: None,
+                ..
+            })
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            target_card.x + 1,
+            target_card.y,
+        ));
+
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert_eq!(app.state.workspaces[1].tabs.len(), 1);
+    }
+
+    #[test]
+    fn dragging_tab_onto_own_workspace_card_does_not_move() {
+        let mut app = app_for_mouse_test();
+        app.state.tab_drag_move_workspace = true;
+        let mut source = Workspace::test_new("source");
+        source.test_add_tab(Some("keep"));
+        app.state.workspaces = vec![source, Workspace::test_new("target")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+
+        let source_tab = app.state.view.tab_hit_areas[0];
+        let own_card = app
+            .state
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.ws_idx == 0)
+            .expect("workspace card for source")
+            .rect;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            source_tab.x + 1,
+            source_tab.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            own_card.x + 1,
+            own_card.y,
+        ));
+        // The tab's own workspace is never a move target — dropping there
+        // must not silently reorder the tab to the end.
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(DragTarget::TabReorder {
+                move_target: None,
+                ..
+            })
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            own_card.x + 1,
+            own_card.y,
+        ));
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert_eq!(app.state.workspaces[0].tabs[0].custom_name.as_deref(), None);
+    }
+
+    #[test]
+    fn dragging_tab_from_wrapped_lower_row_onto_workspace_card_moves_tab() {
+        // ui.tab_bar_wrap composition: the drag must hit-test from a wrapped
+        // lower row, not just the single-row bar.
+        let mut app = app_for_mouse_test();
+        app.state.tab_drag_move_workspace = true;
+        app.state.tab_bar_wrap = true;
+        let mut source = Workspace::test_new("source");
+        for idx in 1..7 {
+            source.test_add_tab(Some(&format!("tab-{idx}")));
+        }
+        app.state.workspaces = vec![source, Workspace::test_new("target")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 20));
+
+        let (lower_row_idx, lower_row_rect) = app
+            .state
+            .view
+            .tab_hit_areas
+            .iter()
+            .enumerate()
+            .find(|(_, rect)| rect.width > 0 && rect.y > app.state.view.tab_bar_rect.y)
+            .map(|(idx, rect)| (idx, *rect))
+            .expect("a tab should wrap onto a lower row");
+        let moved_root = app.state.workspaces[0].tabs[lower_row_idx].root_pane;
+        let target_card = app
+            .state
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.ws_idx == 1)
+            .expect("workspace card for target")
+            .rect;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            lower_row_rect.x + 1,
+            lower_row_rect.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            target_card.x + 1,
+            target_card.y,
+        ));
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(DragTarget::TabReorder {
+                ws_idx: 0,
+                move_target: Some(1),
+                ..
+            })
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            target_card.x + 1,
+            target_card.y,
+        ));
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 6);
+        assert_eq!(app.state.workspaces[1].tabs.len(), 2);
+        assert_eq!(app.state.workspaces[1].tabs[1].root_pane, moved_root);
     }
 
     fn temp_git_repo(branch: &str) -> std::path::PathBuf {

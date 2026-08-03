@@ -433,6 +433,11 @@ impl App {
                         source_tab_idx,
                         insert_idx,
                     } => self.move_tab_via_api(ws_idx, source_tab_idx, insert_idx),
+                    MouseAction::MoveTabToWorkspace {
+                        ws_idx,
+                        source_tab_idx,
+                        target_ws_idx,
+                    } => self.move_tab_to_workspace_via_api(ws_idx, source_tab_idx, target_ws_idx),
                     MouseAction::SetSplitRatio { path, ratio } => {
                         self.set_split_ratio_via_api(path, ratio)
                     }
