@@ -853,6 +853,20 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
         "reattached client frame should expose persisted agent working status"
     );
 
+    // Blocked renders as the needs-attention mark (filled ● in red) only for a
+    // pane you are *not* looking at. A pane that blocks in the focused, active
+    // tab is acknowledged on arrival and renders the hollow read mark (○, still
+    // red) instead, so leaving the agent pane focused here would assert the read
+    // glyph while claiming to assert the needs-attention one. Focus a second tab
+    // first, which is the state this assertion is actually named for.
+    let workspace_id = workspace_id_by_label(&workspace_list(&api_socket), "agent-persist");
+    send_json_request(
+        &api_socket,
+        "tab_create_unfocus_agent",
+        "tab.create",
+        json!({ "workspace_id": workspace_id, "focus": true }),
+    );
+
     // Transition to blocked and verify API + client surfaces both observe it.
     // The fake process remains visibly working, so blocked is the deterministic
     // higher-priority semantic transition for this cross-area projection test.
