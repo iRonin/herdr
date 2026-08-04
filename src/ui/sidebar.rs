@@ -12,7 +12,7 @@ use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{state_dot, state_label, state_label_color};
 use super::text::{display_width, display_width_u16, truncate_end};
-use crate::app::state::{AgentPanelSort, Palette};
+use crate::app::state::{AgentPanelMode, AgentPanelScope, AgentPanelSort, Palette};
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
 use crate::terminal::TerminalRuntimeRegistry;
@@ -78,6 +78,8 @@ pub(crate) fn sidebar_section_divider_rect(area: Rect, split_ratio: f32) -> Rect
     Rect::new(content.x, content.y + ws_h, content.width, 1)
 }
 
+/// Upstream's sort label. Kept and DELEGATED TO rather than reimplemented, so a
+/// change to upstream's label vocabulary reaches this fork's panel automatically.
 fn agent_panel_sort_label(sort: AgentPanelSort) -> &'static str {
     match sort {
         AgentPanelSort::Spaces => "grouped",
@@ -85,8 +87,62 @@ fn agent_panel_sort_label(sort: AgentPanelSort) -> &'static str {
     }
 }
 
-pub(crate) fn agent_panel_toggle_rect(area: Rect, sort: AgentPanelSort) -> Rect {
-    agent_panel_header_label_rect(area, agent_panel_sort_label(sort))
+fn agent_panel_mode_label(sort: AgentPanelSort, scope: AgentPanelScope) -> &'static str {
+    match scope {
+        AgentPanelScope::Current => "space",
+        AgentPanelScope::All => agent_panel_sort_label(sort),
+    }
+}
+
+/// Cycle the agent-panel toggle through the configured mode order.
+pub(crate) fn agent_panel_cycle_next(
+    sort: AgentPanelSort,
+    scope: AgentPanelScope,
+    configured_modes: &[AgentPanelMode],
+) -> (AgentPanelSort, AgentPanelScope) {
+    let default_modes;
+    let modes = if configured_modes.is_empty() {
+        default_modes = AgentPanelMode::ALL;
+        default_modes.as_slice()
+    } else {
+        configured_modes
+    };
+
+    if modes.len() == 1 {
+        return (sort, scope);
+    }
+
+    let current = AgentPanelMode::from_state(sort, scope);
+    let next = modes
+        .iter()
+        .position(|mode| *mode == current)
+        .map_or(modes[0], |index| modes[(index + 1) % modes.len()]);
+    next.to_state()
+}
+
+#[allow(dead_code)] // Used by tests in src/app/input/sidebar.rs.
+pub(crate) fn agent_panel_toggle_rect(
+    area: Rect,
+    sort: AgentPanelSort,
+    scope: AgentPanelScope,
+) -> Rect {
+    agent_panel_header_label_rect(area, agent_panel_mode_label(sort, scope))
+}
+
+/// Resolve the visible label for the agent-panel toggle: the active view's
+/// label wins when present, otherwise the derived `agent_panel_mode_label`.
+/// This is shared by the render and hit-test paths so the click target tracks
+/// the rendered text exactly.
+pub(crate) fn agent_panel_toggle_label(app: &AppState) -> String {
+    active_agent_view_label(app)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            agent_panel_mode_label(app.agent_panel_sort, app.agent_panel_scope).to_string()
+        })
+}
+
+pub(crate) fn agent_panel_toggle_rect_for_label(area: Rect, label: &str) -> Rect {
+    agent_panel_header_label_rect(area, label)
 }
 
 fn agent_panel_header_label_rect(area: Rect, label: &str) -> Rect {
@@ -129,6 +185,19 @@ fn agent_panel_entries_with_runtimes(
     terminal_runtimes: Option<&TerminalRuntimeRegistry>,
 ) -> Vec<AgentPanelEntry> {
     let mut entries = collect_agent_panel_entries_with_runtimes(app, terminal_runtimes);
+    // Current scope filters before ordering. With no active workspace, fall
+    // back to all agents rather than making the panel unexpectedly blank.
+    //
+    // This lives here and NOT in `collect_agent_panel_entries_with_runtimes`
+    // so that `all_agent_panel_entries` stays genuinely global: it feeds
+    // `global_agent_counts`, which drives the mobile badge and summary and
+    // must count every workspace regardless of the panel's scope setting.
+    if let Some(active) = match app.agent_panel_scope {
+        AgentPanelScope::Current => app.active,
+        AgentPanelScope::All => None,
+    } {
+        entries.retain(|entry| entry.ws_idx == active);
+    }
     crate::app::agent_view::apply_agent_view(app, &mut entries);
     entries
 }
@@ -1436,9 +1505,8 @@ fn render_agent_detail(
         )])),
         Rect::new(area.x, area.y + 1, area.width, 1),
     );
-    let control_label = active_agent_view_label(app)
-        .unwrap_or_else(|| agent_panel_sort_label(app.agent_panel_sort));
-    let toggle_rect = agent_panel_header_label_rect(area, control_label);
+    let control_label = agent_panel_toggle_label(app);
+    let toggle_rect = agent_panel_toggle_rect_for_label(area, &control_label);
     if toggle_rect != Rect::default() {
         let color = if app.agent_view_override.is_some() {
             p.accent
@@ -2062,6 +2130,123 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                 ("multi", Some("logs")),
             ]
         );
+    }
+
+    #[test]
+    fn current_scope_agent_panel_entries_filter_to_active_workspace() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![
+            Workspace::test_new("one"),
+            Workspace::test_new("two"),
+            Workspace::test_new("three"),
+        ];
+        app.ensure_test_terminals();
+        for ws_idx in 0..app.workspaces.len() {
+            let pane = app.workspaces[ws_idx].tabs[0].root_pane;
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            app.terminals.get_mut(&terminal_id).unwrap().detected_agent = Some(Agent::Claude);
+        }
+        app.selected = 0;
+
+        // Default scope (All) lists every workspace's agents.
+        app.active = Some(1);
+        app.agent_panel_scope = AgentPanelScope::All;
+        let labels: Vec<String> = agent_panel_entries(&app)
+            .into_iter()
+            .map(|entry| entry.primary_label)
+            .collect();
+        assert_eq!(labels, ["one", "two", "three"]);
+
+        // Current scope lists only the active workspace's agents.
+        app.agent_panel_scope = AgentPanelScope::Current;
+        let labels: Vec<String> = agent_panel_entries(&app)
+            .into_iter()
+            .map(|entry| entry.primary_label)
+            .collect();
+        assert_eq!(labels, ["two"]);
+
+        // Switching the active workspace updates the filtered list.
+        app.active = Some(2);
+        let labels: Vec<String> = agent_panel_entries(&app)
+            .into_iter()
+            .map(|entry| entry.primary_label)
+            .collect();
+        assert_eq!(labels, ["three"]);
+    }
+
+    #[test]
+    fn current_scope_filters_before_priority_sort() {
+        // Current scope must exclude other workspaces' agents under BOTH sort
+        // modes. Priority sort is the risky one: a higher-priority agent in
+        // another workspace must not leak into the active workspace's list.
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![
+            Workspace::test_new("one"),
+            Workspace::test_new("two"),
+            Workspace::test_new("three"),
+        ];
+        app.ensure_test_terminals();
+        app.selected = 0;
+        app.agent_panel_scope = AgentPanelScope::Current;
+        app.agent_panel_sort = AgentPanelSort::Priority;
+
+        let set_state = |app: &mut crate::app::state::AppState, ws_idx: usize, state| {
+            let pane = app.workspaces[ws_idx].tabs[0].root_pane;
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+            terminal.detected_agent = Some(Agent::Claude);
+            terminal.state = state;
+        };
+        // Active workspace holds only a Working agent; a non-active workspace
+        // holds a higher-priority Blocked agent that would sort first without
+        // the scope filter.
+        set_state(&mut app, 0, AgentState::Working);
+        set_state(&mut app, 1, AgentState::Blocked);
+        set_state(&mut app, 2, AgentState::Idle);
+        app.active = Some(0);
+
+        let labels: Vec<String> = agent_panel_entries(&app)
+            .into_iter()
+            .map(|entry| entry.primary_label)
+            .collect();
+        assert_eq!(labels, ["one"]);
+    }
+
+    #[test]
+    fn space_scope_priority_sorts_regardless_of_sort_field() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut active = Workspace::test_new("one");
+        let blocked_tab = active.test_add_tab(Some("blocked"));
+        app.workspaces = vec![active, Workspace::test_new("two")];
+        app.ensure_test_terminals();
+        app.selected = 0;
+        app.agent_panel_scope = AgentPanelScope::Current;
+        app.agent_panel_sort = AgentPanelSort::Spaces;
+
+        let set_state =
+            |app: &mut crate::app::state::AppState, ws_idx: usize, tab_idx: usize, state| {
+                let pane = app.workspaces[ws_idx].tabs[tab_idx].root_pane;
+                let terminal_id = app.workspaces[ws_idx].tabs[tab_idx].panes[&pane]
+                    .attached_terminal_id
+                    .clone();
+                let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+                terminal.detected_agent = Some(Agent::Claude);
+                terminal.state = state;
+            };
+        set_state(&mut app, 0, 0, AgentState::Working);
+        set_state(&mut app, 0, blocked_tab, AgentState::Blocked);
+        set_state(&mut app, 1, 0, AgentState::Idle);
+        app.active = Some(0);
+
+        let states: Vec<AgentState> = agent_panel_entries(&app)
+            .into_iter()
+            .map(|entry| entry.state)
+            .collect();
+        assert_eq!(states, [AgentState::Blocked, AgentState::Working]);
     }
 
     #[test]

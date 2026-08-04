@@ -340,6 +340,15 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # "workspaces" is accepted as an alias for "spaces".
 # agent_panel_sort = "spaces"
 
+# Agent panel scope: "all" shows every space; "current" shows the active space only.
+# "current_workspace" is accepted as an alias for "current".
+# agent_panel_scope = "all"
+
+# Modes cycled by clicking the agent-panel mode label, in order.
+# Values: "priority", "grouped", and "space". Unknown and duplicate entries are ignored.
+# An empty or invalid-only list falls back to all three modes in this default order.
+# agent_panel_modes = ["priority", "grouped", "space"]
+
 # Expanded agent rows. Built-ins are state_icon, state_text, workspace, tab, pane, agent,
 # terminal_title, and terminal_title_stripped.
 # Custom values reported through pane metadata use a $name token.

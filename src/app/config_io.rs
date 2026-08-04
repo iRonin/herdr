@@ -92,8 +92,12 @@ impl App {
         }
     }
 
-    pub(super) fn save_agent_panel_sort(&mut self, sort: crate::app::state::AgentPanelSort) {
-        let value = match sort {
+    pub(super) fn save_agent_panel_mode(
+        &mut self,
+        sort: crate::app::state::AgentPanelSort,
+        scope: crate::app::state::AgentPanelScope,
+    ) {
+        let sort_value = match sort {
             crate::app::state::AgentPanelSort::Spaces => {
                 crate::config::AgentPanelSortConfig::Spaces.as_str()
             }
@@ -101,12 +105,22 @@ impl App {
                 crate::config::AgentPanelSortConfig::Priority.as_str()
             }
         };
-        if self.update_config_file("agent panel sort", |content| {
-            crate::config::upsert_section_value(
+        let scope_value = match scope {
+            crate::app::state::AgentPanelScope::All => "all",
+            crate::app::state::AgentPanelScope::Current => "current",
+        };
+        if self.update_config_file("agent panel mode", |content| {
+            let content = crate::config::upsert_section_value(
                 content,
                 "ui",
                 "agent_panel_sort",
-                &format!("\"{value}\""),
+                &format!("\"{sort_value}\""),
+            );
+            crate::config::upsert_section_value(
+                &content,
+                "ui",
+                "agent_panel_scope",
+                &format!("\"{scope_value}\""),
             )
         }) {
             self.apply_config_from_disk(false);

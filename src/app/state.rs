@@ -987,6 +987,42 @@ pub enum AgentPanelSort {
     Priority,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentPanelScope {
+    #[default]
+    All,
+    Current,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentPanelMode {
+    Priority,
+    Grouped,
+    Space,
+}
+
+impl AgentPanelMode {
+    pub const ALL: [Self; 3] = [Self::Priority, Self::Grouped, Self::Space];
+
+    pub(crate) fn from_state(sort: AgentPanelSort, scope: AgentPanelScope) -> Self {
+        match scope {
+            AgentPanelScope::Current => Self::Space,
+            AgentPanelScope::All => match sort {
+                AgentPanelSort::Priority => Self::Priority,
+                AgentPanelSort::Spaces => Self::Grouped,
+            },
+        }
+    }
+
+    pub(crate) fn to_state(self) -> (AgentPanelSort, AgentPanelScope) {
+        match self {
+            Self::Priority => (AgentPanelSort::Priority, AgentPanelScope::All),
+            Self::Grouped => (AgentPanelSort::Spaces, AgentPanelScope::All),
+            Self::Space => (AgentPanelSort::Priority, AgentPanelScope::Current),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Settings UI state
 // ---------------------------------------------------------------------------
@@ -1497,6 +1533,8 @@ pub struct AppState {
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
     pub agent_panel_sort: AgentPanelSort,
+    pub agent_panel_scope: AgentPanelScope,
+    pub agent_panel_modes: Vec<AgentPanelMode>,
     /// Transient session-wide projection override for the built-in Agents view.
     pub agent_view_override: Option<crate::api::schema::AgentViewSetParams>,
     pub sidebar_agents: crate::config::AgentsSidebarConfig,
@@ -1927,6 +1965,8 @@ impl AppState {
             sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
             sidebar_section_split: 0.5,
             agent_panel_sort: AgentPanelSort::Spaces,
+            agent_panel_scope: AgentPanelScope::All,
+            agent_panel_modes: AgentPanelMode::ALL.to_vec(),
             agent_view_override: None,
             sidebar_agents: crate::config::AgentsSidebarConfig::default(),
             sidebar_spaces: crate::config::SpacesSidebarConfig::default(),
@@ -2365,6 +2405,35 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn agent_panel_mode_maps_to_and_from_sort_and_scope() {
+        for (mode, sort, scope) in [
+            (
+                AgentPanelMode::Priority,
+                AgentPanelSort::Priority,
+                AgentPanelScope::All,
+            ),
+            (
+                AgentPanelMode::Grouped,
+                AgentPanelSort::Spaces,
+                AgentPanelScope::All,
+            ),
+            (
+                AgentPanelMode::Space,
+                AgentPanelSort::Priority,
+                AgentPanelScope::Current,
+            ),
+        ] {
+            assert_eq!(mode.to_state(), (sort, scope));
+            assert_eq!(AgentPanelMode::from_state(sort, scope), mode);
+        }
+
+        assert_eq!(
+            AgentPanelMode::from_state(AgentPanelSort::Spaces, AgentPanelScope::Current),
+            AgentPanelMode::Space
+        );
+    }
 
     #[test]
     fn agent_terminal_keeps_final_child_cursor_exposed() {

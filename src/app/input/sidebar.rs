@@ -474,7 +474,10 @@ impl AppState {
             self.view.sidebar_rect,
             self.sidebar_section_split,
         );
-        let rect = crate::ui::agent_panel_toggle_rect(detail_area, self.agent_panel_sort);
+        let rect = crate::ui::agent_panel_toggle_rect_for_label(
+            detail_area,
+            &crate::ui::agent_panel_toggle_label(self),
+        );
         rect.width > 0
             && col >= rect.x
             && col < rect.x + rect.width
@@ -530,7 +533,7 @@ mod tests {
 
     use super::super::{app_for_mouse_test, capture_snapshot, mouse, unique_temp_path};
     use crate::{
-        app::state::{AgentPanelSort, DragTarget, Mode},
+        app::state::{AgentPanelMode, AgentPanelScope, AgentPanelSort, DragTarget, Mode},
         config::SidebarCollapsedModeConfig,
         detect::{Agent, AgentState},
         workspace::Workspace,
@@ -843,28 +846,122 @@ mod tests {
         );
     }
 
+    fn click_agent_panel_toggle(app: &mut crate::app::App) {
+        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
+            app.state.view.sidebar_rect,
+            app.state.sidebar_section_split,
+        );
+        let toggle = crate::ui::agent_panel_toggle_rect_for_label(
+            detail_area,
+            &crate::ui::agent_panel_toggle_label(&app.state),
+        );
+        let _ = app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(MouseEventKind::Down(MouseButton::Left), toggle.x, toggle.y),
+        );
+    }
+
     #[test]
-    fn clicking_agent_panel_toggle_switches_sort() {
+    fn clicking_agent_panel_toggle_cycles_priority_grouped_space() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("test")];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
+        app.state.agent_panel_sort = AgentPanelSort::Priority;
+        app.state.agent_panel_scope = AgentPanelScope::All;
         app.state.agent_panel_scroll = 3;
 
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            app.state.view.sidebar_rect,
-            app.state.sidebar_section_split,
-        );
-        let toggle = crate::ui::agent_panel_toggle_rect(detail_area, app.state.agent_panel_sort);
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            toggle.x,
-            toggle.y,
-        ));
+        click_agent_panel_toggle(&mut app);
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Spaces);
+        assert_eq!(app.state.agent_panel_scope, AgentPanelScope::All);
+        assert_eq!(app.state.agent_panel_scroll, 0);
+
+        app.state.agent_panel_scroll = 3;
+        click_agent_panel_toggle(&mut app);
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
+        assert_eq!(app.state.agent_panel_scope, AgentPanelScope::Current);
+        assert_eq!(app.state.agent_panel_scroll, 0);
+
+        click_agent_panel_toggle(&mut app);
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
+        assert_eq!(app.state.agent_panel_scope, AgentPanelScope::All);
+    }
+
+    #[test]
+    fn clicking_agent_panel_toggle_uses_configured_priority_space_cycle() {
+        let mut app = app_for_mouse_test();
+        app.state.agent_panel_modes = vec![AgentPanelMode::Priority, AgentPanelMode::Space];
+        app.state.agent_panel_sort = AgentPanelSort::Priority;
+        app.state.agent_panel_scope = AgentPanelScope::All;
+
+        click_agent_panel_toggle(&mut app);
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
+        assert_eq!(app.state.agent_panel_scope, AgentPanelScope::Current);
+
+        click_agent_panel_toggle(&mut app);
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
+        assert_eq!(app.state.agent_panel_scope, AgentPanelScope::All);
+    }
+
+    #[test]
+    fn clicking_agent_panel_toggle_snaps_to_first_mode_when_current_is_disabled() {
+        let mut app = app_for_mouse_test();
+        app.state.agent_panel_modes = vec![AgentPanelMode::Priority, AgentPanelMode::Space];
+        app.state.agent_panel_sort = AgentPanelSort::Spaces;
+        app.state.agent_panel_scope = AgentPanelScope::All;
+
+        click_agent_panel_toggle(&mut app);
 
         assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
-        assert_eq!(app.state.agent_panel_scroll, 0);
+        assert_eq!(app.state.agent_panel_scope, AgentPanelScope::All);
+    }
+
+    #[test]
+    fn clicking_agent_panel_toggle_with_single_mode_is_a_no_op() {
+        let mut app = app_for_mouse_test();
+        app.state.agent_panel_modes = vec![AgentPanelMode::Space];
+        app.state.agent_panel_sort = AgentPanelSort::Priority;
+        app.state.agent_panel_scope = AgentPanelScope::All;
+        app.state.agent_panel_scroll = 3;
+        app.state.session_dirty = false;
+
+        click_agent_panel_toggle(&mut app);
+
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
+        assert_eq!(app.state.agent_panel_scope, AgentPanelScope::All);
+        assert_eq!(app.state.agent_panel_scroll, 3);
+        assert!(!app.state.session_dirty);
+    }
+
+    #[test]
+    fn clicking_agent_panel_toggle_yields_to_active_agent_view() {
+        // Per the supervisor policy: when an agent view is active, the view
+        // owns the panel. The mode-cycle click must not cycle (no change in
+        // sort/scope), and the override view must stay active.
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.agent_panel_sort = AgentPanelSort::Priority;
+        app.state.agent_panel_scope = AgentPanelScope::All;
+        app.state.agent_view_override = Some(crate::api::schema::AgentViewSetParams {
+            source: "test".into(),
+            label: Some("focused".into()),
+            filter: None,
+            sort: Vec::new(),
+        });
+        app.state.agent_panel_scroll = 3;
+        app.state.session_dirty = false;
+
+        click_agent_panel_toggle(&mut app);
+
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
+        assert_eq!(app.state.agent_panel_scope, AgentPanelScope::All);
+        assert_eq!(app.state.agent_panel_scroll, 3);
+        assert!(app.state.agent_view_override.is_some());
+        assert!(!app.state.session_dirty);
     }
 
     #[test]
