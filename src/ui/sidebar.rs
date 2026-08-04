@@ -179,6 +179,19 @@ fn agent_panel_entries_with_runtimes(
     terminal_runtimes: Option<&TerminalRuntimeRegistry>,
 ) -> Vec<AgentPanelEntry> {
     let mut entries = collect_agent_panel_entries_with_runtimes(app, terminal_runtimes);
+    // Current scope filters before ordering. With no active workspace, fall
+    // back to all agents rather than making the panel unexpectedly blank.
+    //
+    // This lives here and NOT in `collect_agent_panel_entries_with_runtimes`
+    // so that `all_agent_panel_entries` stays genuinely global: it feeds
+    // `global_agent_counts`, which drives the mobile badge and summary and
+    // must count every workspace regardless of the panel's scope setting.
+    if let Some(active) = match app.agent_panel_scope {
+        AgentPanelScope::Current => app.active,
+        AgentPanelScope::All => None,
+    } {
+        entries.retain(|entry| entry.ws_idx == active);
+    }
     crate::app::agent_view::apply_agent_view(app, &mut entries);
     entries
 }
@@ -196,20 +209,9 @@ fn collect_agent_panel_entries_with_runtimes(
         }
     };
 
-    // Current scope filters before ordering. With no active workspace, fall
-    // back to all agents rather than making the panel unexpectedly blank.
-    let scope_ws = match app.agent_panel_scope {
-        AgentPanelScope::Current => app.active,
-        AgentPanelScope::All => None,
-    };
-
     app.workspaces
         .iter()
         .enumerate()
-        .filter(move |(ws_idx, _)| match scope_ws {
-            Some(active) => *ws_idx == active,
-            None => true,
-        })
         .flat_map(|(ws_idx, ws)| {
             let multi_tab = ws.tabs.len() > 1;
             let workspace_label = ws.display_name_from(&app.terminals, terminal_runtimes);

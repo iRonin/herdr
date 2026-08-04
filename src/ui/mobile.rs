@@ -1221,6 +1221,71 @@ mod tests {
         assert_eq!(counts.working, 1);
     }
 
+    /// `global_agent_counts` drives the mobile badge and summary, which are
+    /// global by definition. `agent_panel_scope` is a *panel* setting: scoping
+    /// the panel to the current workspace must not make the badge under-report
+    /// agents in other workspaces.
+    ///
+    /// This guards a real defect: the scope filter used to live inside
+    /// `collect_agent_panel_entries_with_runtimes`, which `all_agent_panel_entries`
+    /// calls directly — so the "global" counts silently inherited the panel's
+    /// scope. The sibling test above cannot catch it: it exercises the agent-view
+    /// override path, not the scope field.
+    ///
+    /// NEGATIVE CONTROL: move the scope filter back into
+    /// `collect_agent_panel_entries_with_runtimes` and this test must FAIL
+    /// (working drops to 0). If it still passes, it is not measuring the defect.
+    #[test]
+    fn global_agent_counts_ignore_agent_panel_scope() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            crate::workspace::Workspace::test_new("blocked"),
+            crate::workspace::Workspace::test_new("working"),
+        ];
+        app.ensure_test_terminals();
+        for (ws_idx, state) in [(0, AgentState::Blocked), (1, AgentState::Working)] {
+            let pane_id = app.workspaces[ws_idx].tabs[0].root_pane;
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+            terminal.detected_agent = Some(crate::detect::Agent::Claude);
+            terminal.state = state;
+            if state == AgentState::Blocked {
+                app.workspaces[ws_idx].tabs[0]
+                    .panes
+                    .get_mut(&pane_id)
+                    .unwrap()
+                    .seen = false;
+            }
+        }
+
+        // Scope the panel to the active workspace (0). The working agent in
+        // workspace 1 is outside the panel's scope but must still be counted.
+        app.active = Some(0);
+        app.agent_panel_scope = crate::app::state::AgentPanelScope::Current;
+
+        let counts = global_agent_counts(&app);
+        assert_eq!(
+            counts.blocked, 1,
+            "blocked agent in the active workspace must be counted"
+        );
+        assert_eq!(
+            counts.working, 1,
+            "working agent OUTSIDE the panel scope must still be counted globally"
+        );
+
+        // The panel itself must remain scoped — the fix moves the filter, it
+        // does not remove it.
+        let scoped = crate::ui::agent_panel_entries(&app);
+        assert_eq!(
+            scoped.len(),
+            1,
+            "panel must stay scoped to the active workspace"
+        );
+        assert_eq!(scoped[0].ws_idx, 0);
+    }
+
     #[test]
     fn agent_summary_leads_with_attention_states_in_priority_order() {
         let counts = GlobalAgentCounts {
