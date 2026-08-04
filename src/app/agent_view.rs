@@ -64,6 +64,9 @@ pub(crate) fn apply_agent_view(app: &AppState, entries: &mut Vec<AgentPanelEntry
     if matches!(
         app.agent_panel_sort,
         crate::app::state::AgentPanelSort::Priority
+    ) || matches!(
+        app.agent_panel_scope,
+        crate::app::state::AgentPanelScope::Current
     ) {
         entries.sort_by_key(|entry| {
             (

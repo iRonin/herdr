@@ -356,6 +356,10 @@ Metadata reporters provide values only; styling stays in the local sidebar confi
 
 Sidebar row settings affect only the expanded desktop sidebar. Collapsed and mobile views keep their compact layouts.
 
+Set `agent_panel_scope = "all"` or `agent_panel_scope = "current"` under `[ui]` to filter the Agent panel to every space or to the active space only. `"current_workspace"` is accepted as an alias for `"current"`. Default is `"all"`. Current scope always sorts by attention priority.
+
+Set `agent_panel_modes = ["priority", "grouped", "space"]` under `[ui]` to control the modes cycled when clicking the Agent panel mode label. Allowed values: `"priority"`, `"grouped"` (`"spaces"` is an alias), and `"space"` (`"current"` and `"current_workspace"` are aliases). Unknown and duplicate entries are ignored. An empty or invalid-only list falls back to all three modes in this default order.
+
 ## Notifications
 
 Herdr can notify you when a background agent finishes or needs input:
