@@ -147,6 +147,13 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # "current" for Herdr's process directory, or a fixed path such as "~/Projects".
 # new_cwd = "follow"
 
+[agent]
+# Name of the Pi executable on this machine, for example a Pi-compatible fork.
+# Pi agents are started with it, panes running it are detected as Pi agents, and
+# it is the program used to resume or relaunch them. Blank values fall back to
+# `pi`.
+# pi_program = "pi"
+
 [update]
 # Update channel used by background version checks and `herdr update`.
 # Defaults to "stable" on Linux/macOS and "preview" on Windows.

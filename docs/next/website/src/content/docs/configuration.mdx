@@ -411,6 +411,25 @@ kitty_graphics = true
 
 Enable it only when testing terminal image behavior.
 
+## Pi executable name
+
+Herdr recognizes a Pi Agent by the name of the program running in the pane, and relaunches it under that same name. If you run Pi through a differently named executable, such as a Pi-compatible fork or a wrapper on your `PATH`, name it here:
+
+```toml
+[agent]
+pi_program = "custom-pi"
+```
+
+Herdr uses that name everywhere it handles Pi, so the executable it starts is the same one it recognizes and resumes:
+
+- **Starting** a Pi Agent, including `agent.start`, launches `custom-pi`.
+- **Detecting** a pane running `custom-pi` reports it as a Pi Agent, in status, the agents panel, and session restore.
+- **Resuming or relaunching** a Pi session uses `custom-pi`.
+
+For detection the name is matched the same way as the built-in Agent names: case-insensitively, ignoring a `.exe`, `.cmd`, `.bat`, `.ps1`, or `.js` extension, and using the final path component if you give a full path. Starting an Agent uses the value exactly as written, so a full path launches that path.
+
+The default is `"pi"`, which changes nothing. Blank or whitespace-only values also fall back to `"pi"`. A name that already belongs to another Agent, such as `claude`, keeps that Agent, and other Agents always launch under their own executables. Reloading the config applies the new name immediately, to detection, to newly started Agents, and to any resume that has not started yet.
+
 ## Agent session restore
 
 Herdr resumes supported Agent conversations after a server restart by default:
@@ -419,6 +438,8 @@ Herdr resumes supported Agent conversations after a server restart by default:
 [session]
 resume_agents_on_restore = true
 ```
+
+Pi resumes with the executable named by `agent.pi_program`, described under Pi executable name above. Herdr applies the current setting when the deferred resume starts, so a config reload can change a pending Pi resume.
 
 Only panes with a valid native session reference from an official integration can resume; other panes restore as normal shells. See [Session state and restore](/docs/session-state/) for supported Agents and persistence behavior.
 

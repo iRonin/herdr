@@ -241,6 +241,44 @@ pub struct TerminalConfig {
     pub new_cwd: NewTerminalCwdConfig,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    /// Name of the Pi executable on this machine. Pi agents are started with it,
+    /// panes running it are detected as Pi agents, and it is the program used to
+    /// resume or relaunch them. Blank values fall back to `pi`.
+    #[serde(
+        default = "default_pi_program",
+        deserialize_with = "deserialize_pi_program"
+    )]
+    pub pi_program: String,
+}
+
+fn default_pi_program() -> String {
+    "pi".to_string()
+}
+
+fn deserialize_pi_program<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let program = String::deserialize(deserializer)?;
+    let program = program.trim();
+    Ok(if program.is_empty() {
+        default_pi_program()
+    } else {
+        program.to_string()
+    })
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            pi_program: default_pi_program(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct SessionConfig {
@@ -290,6 +328,8 @@ pub struct Config {
     pub onboarding: Option<bool>,
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
+    #[serde(default)]
+    pub agent: AgentConfig,
     pub session: SessionConfig,
     pub update: UpdateConfig,
     pub keys: KeysConfig,
@@ -1162,6 +1202,39 @@ manifest_check = false
             without_update_channel.update.channel,
             UpdateChannelConfig::Preview
         );
+    }
+
+    #[test]
+    fn pi_program_defaults_to_pi_and_parses_override() {
+        let default_config: Config = toml::from_str("").unwrap();
+        assert_eq!(default_config.agent.pi_program, "pi");
+
+        let config: Config = toml::from_str(
+            r#"
+[agent]
+pi_program = "custom-pi"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.agent.pi_program, "custom-pi");
+    }
+
+    #[test]
+    fn pi_program_normalizes_whitespace_and_defaults_blank_values_to_pi() {
+        for value in ["", "   ", "\t\n"] {
+            let config: Config =
+                toml::from_str(&format!("[agent]\npi_program = {:?}\n", value)).unwrap();
+            assert_eq!(config.agent.pi_program, "pi");
+        }
+
+        let config: Config = toml::from_str(
+            r#"
+[agent]
+pi_program = "  custom-pi  "
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.agent.pi_program, "custom-pi");
     }
 
     #[test]

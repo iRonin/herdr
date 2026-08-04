@@ -174,6 +174,18 @@
       ]
     },
     {
+      "id": "agent",
+      "title": "Agent",
+      "keys": [
+        {
+          "key": "agent.pi_program",
+          "type": "string",
+          "default": "\"pi\"",
+          "description": "Name of the Pi executable on this machine. Herdr starts Pi agents with it, detects a pane running it as a Pi agent, and uses it when a deferred Pi resume starts. Detection matches it like the built-in agent names: case-insensitive, extension-stripped, basename only; starting an agent uses the value as written. Blank or whitespace-only values fall back to pi, a name already used by another agent keeps that agent, and other agents always launch under their own executables. Recorded non-pi launch programs remain unchanged."
+        }
+      ]
+    },
+    {
       "id": "update",
       "title": "Updates",
       "keys": [

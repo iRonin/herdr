@@ -216,6 +216,7 @@ impl App {
             return false;
         }
 
+        let plan = plan.with_pi_program(&self.state.pi_program);
         let Some(resume_command) = shell_command_from_argv(&plan.argv) else {
             tracing::warn!(
                 pane = pane_id.raw(),

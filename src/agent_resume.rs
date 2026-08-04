@@ -25,6 +25,17 @@ pub struct AgentResumePlan {
     pub dedupe_key: String,
 }
 
+impl AgentResumePlan {
+    pub fn with_pi_program(mut self, program: &str) -> Self {
+        if self.agent == "pi" && self.argv.first().map(String::as_str) == Some("pi") {
+            if let Some(first) = self.argv.first_mut() {
+                *first = program.to_string();
+            }
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedAgentSession {
     pub source: String,
@@ -845,6 +856,118 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn pi_program_override_rewrites_only_the_native_pi_program() {
+        let session_path = absolute_test_path("pi-program-override.jsonl");
+        let original = plan(
+            "herdr:pi",
+            "pi",
+            &AgentSessionRef::path(&session_path).unwrap(),
+        )
+        .unwrap();
+
+        let overridden = original.clone().with_pi_program("custom-pi");
+
+        assert_eq!(
+            overridden.argv,
+            argv(&["custom-pi", "--session", &session_path])
+        );
+        assert_eq!(overridden.argv[1..], original.argv[1..]);
+    }
+
+    #[test]
+    fn pi_program_override_rewrites_replayed_native_pi_program() {
+        let session_path = absolute_test_path("pi-program-replayed-native.jsonl");
+        let launch = argv(&["pi", "--model", "opus"]);
+        let plan = plan_replaying_launch_argv(
+            "herdr:pi",
+            "pi",
+            &AgentSessionRef::path(&session_path).unwrap(),
+            Some(&launch),
+        )
+        .unwrap()
+        .with_pi_program("custom-pi");
+
+        assert_eq!(
+            plan.argv,
+            argv(&["custom-pi", "--model", "opus", "--session", &session_path])
+        );
+    }
+
+    #[test]
+    fn default_pi_program_keeps_native_pi_plan_unchanged() {
+        let session_path = absolute_test_path("pi-program-default.jsonl");
+        let original = plan(
+            "herdr:pi",
+            "pi",
+            &AgentSessionRef::path(&session_path).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(original.clone().with_pi_program("pi"), original);
+    }
+
+    #[test]
+    fn pi_program_override_does_not_rewrite_non_pi_agents() {
+        for (source, agent) in [
+            ("herdr:claude", "claude"),
+            ("herdr:codex", "codex"),
+            ("herdr:copilot", "copilot"),
+            ("herdr:devin", "devin"),
+            ("herdr:droid", "droid"),
+            ("herdr:kimi", "kimi"),
+            ("herdr:mastracode", "mastracode"),
+            ("herdr:omp", "omp"),
+            ("herdr:hermes", "hermes"),
+            ("herdr:opencode", "opencode"),
+            ("herdr:qodercli", "qodercli"),
+            ("herdr:kilo", "kilo"),
+            ("herdr:cursor", "cursor"),
+        ] {
+            let original = plan(
+                source,
+                agent,
+                &AgentSessionRef::id(format!("{agent}-session")).unwrap(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                original.clone().with_pi_program("custom-pi"),
+                original,
+                "configured Pi program must not change {agent}"
+            );
+        }
+    }
+
+    #[test]
+    fn pi_program_override_leaves_replayed_fork_program_untouched() {
+        let session_path = absolute_test_path("pi-program-replay.jsonl");
+        let launch = argv(&["custom-pi", "--model", "opus"]);
+        let original = plan_replaying_launch_argv(
+            "herdr:pi",
+            "pi",
+            &AgentSessionRef::path(&session_path).unwrap(),
+            Some(&launch),
+        )
+        .unwrap();
+
+        let overridden = original.clone().with_pi_program("configured-pi");
+
+        assert_eq!(overridden, original);
+        assert_eq!(
+            overridden.argv,
+            argv(&["custom-pi", "--model", "opus", "--session", &session_path])
+        );
+        assert_eq!(
+            overridden
+                .argv
+                .iter()
+                .filter(|arg| *arg == "custom-pi")
+                .count(),
+            1
+        );
     }
 
     #[test]

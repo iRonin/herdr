@@ -190,7 +190,7 @@ impl App {
         let shell_name = available_shell_name(runtime)
             .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
 
-        let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
+        let mut argv = vec![self.interactive_launch_program(kind)];
         argv.extend(params.args);
         let command = crate::platform::interactive_shell_command(&argv, &shell_name)
             .ok_or(AgentStartError::InvalidArgument)?;
@@ -222,6 +222,18 @@ impl App {
             .agent_info(ws_idx, pane_id)
             .ok_or(AgentStartError::TargetUnavailable(params.pane_id))?;
         Ok((agent, argv))
+    }
+
+    /// Program used to launch `agent` interactively. Pi launches under the
+    /// configured executable name so that the process herdr starts is the same
+    /// one it then detects and resumes; every other agent keeps its canonical
+    /// executable. The default configured name is `pi`, which is exactly what
+    /// [`crate::detect::interactive_agent_executable`] returns for Pi.
+    fn interactive_launch_program(&self, agent: crate::detect::Agent) -> String {
+        if agent == crate::detect::Agent::Pi {
+            return self.state.pi_program.clone();
+        }
+        crate::detect::interactive_agent_executable(agent).to_string()
     }
 
     pub(super) fn agent_start_error_body(

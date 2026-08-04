@@ -3,6 +3,8 @@
 //! Each pane's live bottom-of-buffer text is read periodically and matched
 //! against known agent output patterns to determine state.
 
+use std::sync::{OnceLock, RwLock};
+
 pub mod manifest;
 pub mod manifest_update;
 
@@ -174,7 +176,43 @@ pub(crate) fn parse_canonical_agent_label(label: &str) -> Option<Agent> {
     (agent_label(agent) == label).then_some(agent)
 }
 
+/// Extra process name that resolves to [`Agent::Pi`], or `None` for built-in
+/// names only. Stored process-wide because the lookup functions are called from
+/// process-inspection paths that carry no configuration.
+static PI_PROGRAM_ALIAS: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+fn pi_program_alias() -> &'static RwLock<Option<String>> {
+    PI_PROGRAM_ALIAS.get_or_init(|| RwLock::new(None))
+}
+
+/// Register the executable name this machine uses to run Pi so process-name
+/// detection recognizes it alongside the built-in names.
+///
+/// The default program name, and any name that already belongs to a built-in
+/// agent, register nothing: detection then behaves exactly as if this had never
+/// been called.
+pub fn set_pi_program(program: &str) {
+    let name = normalized_agent_lookup_name(path_basename(program));
+    let alias = (!name.is_empty() && builtin_lookup_agent(&name).is_none()).then_some(name);
+    match pi_program_alias().write() {
+        Ok(mut guard) => *guard = alias,
+        Err(poisoned) => *poisoned.into_inner() = alias,
+    }
+}
+
+fn is_pi_program_alias(name: &str) -> bool {
+    let guard = match pi_program_alias().read() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.as_deref() == Some(name)
+}
+
 fn lookup_agent(name: &str) -> Option<Agent> {
+    builtin_lookup_agent(name).or_else(|| is_pi_program_alias(name).then_some(Agent::Pi))
+}
+
+fn builtin_lookup_agent(name: &str) -> Option<Agent> {
     match name {
         "pi" => Some(Agent::Pi),
         "claude" | "claude-code" => Some(Agent::Claude),
@@ -773,6 +811,79 @@ mod tests {
             "mastracode"
         ));
         assert!(!Agent::SCREEN_MANIFEST_AGENTS.contains(&Agent::Mastracode));
+    }
+
+    // The configured Pi program is a process-wide detection override, so these
+    // tests set it explicitly and restore the default before returning.
+    #[test]
+    fn configured_pi_program_is_detected_as_pi() {
+        set_pi_program("pi");
+        assert_eq!(
+            identify_agent("forkpi"),
+            None,
+            "an unconfigured program must not be detected as Pi"
+        );
+
+        set_pi_program("forkpi");
+        assert_eq!(
+            identify_agent("forkpi"),
+            Some(Agent::Pi),
+            "the configured program is how this machine runs Pi"
+        );
+        assert_eq!(
+            identify_agent("pi"),
+            Some(Agent::Pi),
+            "configuring a program must not unregister the built-in name"
+        );
+
+        set_pi_program("pi");
+        assert_eq!(
+            identify_agent("forkpi"),
+            None,
+            "returning to the default must restore built-in-only detection"
+        );
+    }
+
+    #[test]
+    fn configured_pi_program_uses_the_shared_lookup_normalization() {
+        set_pi_program("  ForkPi.exe  ");
+        assert_eq!(identify_agent("forkpi"), Some(Agent::Pi));
+        assert_eq!(identify_agent("ForkPi"), Some(Agent::Pi));
+        assert_eq!(identify_agent("forkpi.cmd"), Some(Agent::Pi));
+
+        // A configured absolute path still identifies the process by basename.
+        set_pi_program("/opt/tools/bin/forkpi");
+        assert_eq!(identify_agent("forkpi"), Some(Agent::Pi));
+
+        set_pi_program("pi");
+    }
+
+    #[test]
+    fn configured_pi_program_canonicalizes_to_the_pi_label() {
+        set_pi_program("forkpi");
+
+        // Detection reports canonical labels, so a pane running the configured
+        // program is indistinguishable downstream from one running `pi`.
+        assert_eq!(agent_name_from_basename("forkpi").as_deref(), Some("pi"));
+        assert_eq!(
+            parse_canonical_agent_label("forkpi"),
+            None,
+            "the configured program is an alias, not a second canonical label"
+        );
+
+        set_pi_program("pi");
+    }
+
+    #[test]
+    fn configured_pi_program_cannot_shadow_another_agent() {
+        set_pi_program("claude");
+        assert_eq!(
+            identify_agent("claude"),
+            Some(Agent::Claude),
+            "built-in names always win; the override only adds a new name"
+        );
+
+        set_pi_program("pi");
     }
 
     #[test]

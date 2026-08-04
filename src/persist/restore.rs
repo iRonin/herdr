@@ -1055,6 +1055,63 @@ mod tests {
     }
 
     #[test]
+    fn pending_pi_resume_uses_current_program_after_custom_to_custom_reload() {
+        let pi_session_path = test_session_path("pi-custom-to-custom.jsonl");
+        let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Path,
+            value: pi_session_path.clone(),
+        };
+
+        let pending = restore_plan_for_snapshot(&session, true, None).unwrap();
+        assert_eq!(
+            pending.argv,
+            vec!["pi", "--session", pi_session_path.as_str()],
+            "restore must keep the pending plan canonical"
+        );
+
+        assert_eq!(
+            pending.clone().with_pi_program("custom-pi").argv,
+            vec!["custom-pi", "--session", pi_session_path.as_str()],
+            "the startup custom program would apply at launch time"
+        );
+        assert_eq!(
+            pending.with_pi_program("bakery").argv,
+            vec!["bakery", "--session", pi_session_path.as_str()],
+            "deferred launch must instead apply the current reloaded program"
+        );
+    }
+
+    #[test]
+    fn pending_pi_resume_uses_current_program_after_custom_to_pi_reload() {
+        let pi_session_path = test_session_path("pi-custom-to-pi.jsonl");
+        let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Path,
+            value: pi_session_path.clone(),
+        };
+
+        let pending = restore_plan_for_snapshot(&session, true, None).unwrap();
+        assert_eq!(
+            pending.argv,
+            vec!["pi", "--session", pi_session_path.as_str()],
+            "restore must not bake the startup program into a pending plan"
+        );
+        assert_eq!(
+            pending.clone().with_pi_program("custom-pi").argv,
+            vec!["custom-pi", "--session", pi_session_path.as_str()],
+            "the startup custom program would apply at launch time"
+        );
+        assert_eq!(
+            pending.with_pi_program("pi").argv,
+            vec!["pi", "--session", pi_session_path.as_str()],
+            "reloading back to pi must launch the canonical program"
+        );
+    }
+
+    #[test]
     fn restore_plan_selection_suppresses_duplicates() {
         let pi_session_path = test_session_path("pi-session.jsonl");
         let session = super::super::snapshot::PaneAgentSessionSnapshot {
@@ -1173,6 +1230,76 @@ mod tests {
         assert_eq!(preserved.source, "herdr:hermes");
         assert_eq!(preserved.agent, "hermes");
         assert_eq!(preserved.session_ref.value, "hermes-session");
+    }
+
+    #[tokio::test]
+    async fn restore_keeps_pi_program_canonical_until_deferred_launch() {
+        let cwd = std::env::current_dir().unwrap();
+        let pi_session_path = test_session_path("pi-configured-program-session.jsonl");
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:pi".into(),
+                                agent: "pi".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Path,
+                                value: pi_session_path.clone(),
+                            }),
+                            launch_argv: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (_workspaces, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let plan = terminals
+            .values()
+            .next()
+            .and_then(|terminal| terminal.pending_agent_resume_plan.as_ref())
+            .expect("resume-enabled pi pane should defer a resume plan");
+        assert_eq!(plan.argv, vec!["pi", "--session", pi_session_path.as_str()]);
     }
 
     #[test]

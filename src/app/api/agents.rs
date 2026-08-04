@@ -433,6 +433,66 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    fn started_agent_argv(kind: &str, pi_program: &str) -> Vec<String> {
+        let mut app = app_with_agent();
+        app.state.pi_program = pi_program.to_string();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id, runtime);
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let (_agent, argv) = app
+            .start_agent(AgentStartParams {
+                name: "reviewer".into(),
+                kind: kind.into(),
+                pane_id: public_pane_id,
+                args: Vec::new(),
+                timeout_ms: None,
+            })
+            .unwrap_or_else(|_| panic!("agent start should succeed in the test harness"));
+        argv
+    }
+
+    #[tokio::test]
+    async fn agent_start_launches_the_configured_pi_program() {
+        // The configured program names the Pi executable on this machine, so it
+        // is the one to LAUNCH. Starting stock `pi` here would run a different
+        // binary from the one herdr then detects and resumes.
+        assert_eq!(
+            started_agent_argv("pi", "forkpi")
+                .first()
+                .map(String::as_str),
+            Some("forkpi"),
+            "agent.start must launch the configured Pi executable"
+        );
+
+        // Default: identical to upstream.
+        assert_eq!(
+            started_agent_argv("pi", "pi").first().map(String::as_str),
+            Some("pi"),
+            "the default program must launch exactly what upstream launches"
+        );
+
+        // Other agents keep their own canonical executables. `cursor` maps to
+        // `cursor-agent`, so this also proves the launch path still resolves
+        // through interactive_agent_executable rather than echoing the kind.
+        assert_eq!(
+            started_agent_argv("opencode", "forkpi")
+                .first()
+                .map(String::as_str),
+            Some("opencode"),
+            "the configured Pi program must not leak into other agents"
+        );
+        assert_eq!(
+            started_agent_argv("cursor", "forkpi")
+                .first()
+                .map(String::as_str),
+            Some("cursor-agent")
+        );
+    }
+
     #[tokio::test]
     async fn agent_prompt_rejects_managed_agent_while_startup_is_pending() {
         let mut app = app_with_agent();

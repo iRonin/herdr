@@ -6,6 +6,7 @@ use super::{model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
 
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "advanced",
+    "agent",
     "experimental",
     "keys",
     "onboarding",
@@ -283,6 +284,14 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.terminal = section,
+    );
+    load_live_section(
+        table,
+        "agent",
+        "agent config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.agent = section,
     );
     load_live_section(
         table,
@@ -861,6 +870,50 @@ resume_agents_on_restore = true
         assert!(loaded.config.session.resume_agents_on_restore);
         assert!(loaded.diagnostics.is_empty());
         assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn load_live_config_parses_agent_section() {
+        let loaded = load_live_config_from_str(
+            r#"
+[agent]
+pi_program = "custom-pi"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(loaded.config.agent.pi_program, "custom-pi");
+        assert!(loaded.diagnostics.is_empty());
+        assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn startup_and_live_agent_config_default_blank_pi_program_to_pi() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-config-blank-pi-program-{}-{stamp}",
+            std::process::id()
+        ));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "[agent]\npi_program = \"   \"\n").unwrap();
+        std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+
+        let startup = Config::load();
+        assert_eq!(startup.config.agent.pi_program, "pi");
+        assert!(startup.diagnostics.is_empty());
+
+        let live = load_live_config().unwrap();
+        assert_eq!(live.config.agent.pi_program, "pi");
+        assert!(live.diagnostics.is_empty());
+        assert!(live.invalid_sections.is_empty());
+
+        std::env::remove_var(CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

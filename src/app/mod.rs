@@ -370,6 +370,7 @@ impl App {
     ) -> Self {
         let (prefix_code, prefix_mods) = config.prefix_key();
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
+        crate::detect::set_pi_program(&config.agent.pi_program);
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
@@ -644,6 +645,7 @@ impl App {
                 .experimental
                 .switch_ascii_input_source_in_prefix,
             kitty_graphics_enabled: config.experimental.kitty_graphics,
+            pi_program: config.agent.pi_program.clone(),
             default_shell: config.terminal.default_shell.clone(),
             shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
@@ -1523,6 +1525,11 @@ impl App {
             self.state.default_shell = config.terminal.default_shell.clone();
             self.state.shell_mode = config.terminal.shell_mode;
             self.state.new_terminal_cwd = config.terminal.new_cwd.clone();
+        }
+
+        if !invalid_section("agent") {
+            self.state.pi_program = config.agent.pi_program.clone();
+            crate::detect::set_pi_program(&config.agent.pi_program);
         }
 
         if !invalid_section("worktrees") {
@@ -2623,6 +2630,46 @@ mod tests {
     }
 
     #[test]
+    fn app_copies_pi_program_from_config() {
+        let mut config = Config::default();
+        config.agent.pi_program = "custom-pi".to_string();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert_eq!(app.state.pi_program, "custom-pi");
+    }
+
+    #[test]
+    fn app_publishes_pi_program_to_agent_detection() {
+        let mut config = Config::default();
+        config.agent.pi_program = "forkpi".to_string();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let _app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert_eq!(
+            crate::detect::identify_agent("forkpi"),
+            Some(crate::detect::Agent::Pi),
+            "a pane running the configured program is a Pi pane and must detect as one"
+        );
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        assert_eq!(
+            crate::detect::identify_agent("forkpi"),
+            None,
+            "the default program must leave detection exactly as upstream ships it"
+        );
+    }
+
+    #[test]
     fn startup_uses_configured_sidebar_state() {
         let mut config = Config::default();
         config.ui.sidebar_start_collapsed = true;
@@ -3182,6 +3229,73 @@ mod tests {
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert_eq!(app.state.mobile_width_threshold, 96);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_updates_pi_program() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-pi-program");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[agent]\npi_program = \"custom-pi\"\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert_eq!(app.state.pi_program, "pi");
+
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(app.state.pi_program, "custom-pi");
+
+        std::fs::write(&path, "[agent]\npi_program = \"bakery\"\n").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(app.state.pi_program, "bakery");
+
+        std::fs::write(&path, "[agent]\npi_program = \"pi\"\n").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(app.state.pi_program, "pi");
+
+        std::fs::write(&path, "[agent]\npi_program = \"   \"\n").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(app.state.pi_program, "pi");
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_retargets_agent_detection_program() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-detection-program");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[agent]\npi_program = \"forkpi\"\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert_eq!(crate::detect::identify_agent("forkpi"), None);
+
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(
+            crate::detect::identify_agent("forkpi"),
+            Some(crate::detect::Agent::Pi),
+            "a reload must retarget detection, not only the deferred resume"
+        );
+
+        std::fs::write(&path, "[agent]\npi_program = \"pi\"\n").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(
+            crate::detect::identify_agent("forkpi"),
+            None,
+            "reloading back to the default must restore built-in-only detection"
+        );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
