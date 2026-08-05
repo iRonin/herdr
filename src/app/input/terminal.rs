@@ -53,11 +53,23 @@ impl App {
             }
         }
 
-        let input = self.prepare_terminal_key_forward(source_id, key)?;
+        let PreparedPaneInput {
+            ws_idx,
+            pane_id,
+            target,
+            bytes,
+        } = self.prepare_terminal_key_forward(source_id, key)?;
+        // Same two hooks as the local TUI path below. A remote or second client
+        // forwards its keystrokes through here, and its input is no less direct
+        // than a local one -- acknowledging a blocked pane and noticing an
+        // in-process command must not depend on which client typed.
+        self.state
+            .mark_pane_acknowledged_if_blocked(ws_idx, pane_id);
+        self.state.note_forwarded_input(ws_idx, pane_id, &bytes);
         let sent = self
-            .lookup_runtime_sender(input.ws_idx, input.pane_id)
-            .is_some_and(|runtime| runtime.try_send_bytes(input.bytes).is_ok());
-        sent.then_some(input.target)
+            .lookup_runtime_sender(ws_idx, pane_id)
+            .is_some_and(|runtime| runtime.try_send_bytes(bytes).is_ok());
+        sent.then_some(target)
     }
 
     fn prepare_terminal_key_forward(
@@ -419,6 +431,56 @@ mod tests {
     use super::super::{unique_temp_path, wait_for_file};
     use super::*;
     use crate::{config::Config, events::AppEvent, workspace::Workspace};
+
+    // The blocked-read feature promises that "any direct input to a blocked pane
+    // acknowledges it". Direct input does not only arrive from the local TUI:
+    // the headless server forwards every remote and second-client keystroke
+    // through `handle_terminal_key_headless_from`, and that path reached
+    // `prepare_terminal_key_forward` without acknowledging anything -- so the
+    // promise held for one caller and not the other.
+    //
+    // Needs a REAL spawned pane: `prepare_terminal_key_forward` encodes the key
+    // through the pane runtime and returns `None` when there isn't one, which
+    // would make this test pass or fail for reasons that have nothing to do with
+    // acknowledgement. The `assert!(handled.is_some())` below is what keeps that
+    // honest -- without it, a fixture that never reaches the hooks looks
+    // indistinguishable from a fix that doesn't work.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn headless_client_input_acknowledges_a_blocked_pane() {
+        let mut app = app_with_spawned_workspace();
+
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.detected_agent = Some(crate::detect::Agent::Pi);
+        terminal.state = crate::detect::AgentState::Blocked;
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .seen = false;
+
+        let handled = app.handle_terminal_key_headless_from(
+            crate::app::LOCAL_INPUT_SOURCE,
+            TerminalKey::new(KeyCode::Char('y'), KeyModifiers::empty()),
+        );
+
+        assert!(
+            handled.is_some(),
+            "fixture must actually reach the forward path -- otherwise the \
+             assertion below proves nothing"
+        );
+        assert!(
+            app.state.workspaces[0].tabs[0].panes[&pane_id].seen,
+            "input forwarded through the headless path must acknowledge a blocked \
+             pane, exactly as the local TUI path does"
+        );
+
+        shutdown_test_runtimes(&mut app);
+    }
 
     #[cfg(unix)]
     fn app_with_spawned_workspace() -> App {
