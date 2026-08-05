@@ -307,7 +307,7 @@ fn workspace_entry_gap(app: &AppState, entries: &[WorkspaceListEntry], entry_idx
     }
 }
 
-fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
+pub(super) fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
         // Unread (needs-attention) blocked panes sort to the top; acknowledged
         // (read) blocked panes sink below working/done-unread so they stop

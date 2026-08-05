@@ -1034,6 +1034,8 @@ pub struct UiConfig {
     /// Allow dragging a tab from the tab bar onto a sidebar workspace entry to
     /// move the tab (and all its panes) to that workspace. Default: false.
     pub tab_drag_move_workspace: bool,
+    /// Show the highest-attention agent status indicator on each top tab. Default: false.
+    pub tab_agent_status: bool,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
     /// Agent sidebar scope. Saved values are "all" or "current"; "current_workspace"
@@ -1252,6 +1254,7 @@ impl Default for UiConfig {
             tab_bar_position: TabBarPositionConfig::Top,
             tab_bar_wrap: false,
             tab_drag_move_workspace: false,
+            tab_agent_status: false,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             agent_panel_scope: AgentPanelScopeConfig::All,
             agent_panel_modes: default_agent_panel_modes(),
@@ -1645,6 +1648,7 @@ agent_panel_modes = []
             TabBarPositionConfig::Top
         );
         assert!(!default_config.ui.tab_bar_wrap);
+        assert!(!default_config.ui.tab_agent_status);
 
         let toml = r#"
 [ui]
@@ -1655,6 +1659,7 @@ show_agent_labels_on_pane_borders = true
 hide_tab_bar_when_single_tab = true
 tab_bar_position = "bottom"
 tab_bar_wrap = true
+tab_agent_status = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.pane_borders);
@@ -1664,6 +1669,7 @@ tab_bar_wrap = true
         assert!(config.ui.hide_tab_bar_when_single_tab);
         assert_eq!(config.ui.tab_bar_position, TabBarPositionConfig::Bottom);
         assert!(config.ui.tab_bar_wrap);
+        assert!(config.ui.tab_agent_status);
     }
 
     #[test]

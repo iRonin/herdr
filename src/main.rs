@@ -336,6 +336,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # The wrapped bar uses at most half of the pane area's height.
 # tab_bar_wrap = false
 
+# Show the highest-attention agent status on each top tab.
+# Uses the same status marks as the agents panel.
+# tab_agent_status = false
+
 # Agent panel ordering: "spaces" (grouped by space) or "priority" (attention queue).
 # "workspaces" is accepted as an alias for "spaces".
 # agent_panel_sort = "spaces"
