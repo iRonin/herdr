@@ -1,5 +1,6 @@
 use crate::config::{
-    Keybinds, NewTerminalCwdConfig, SoundConfig, TabBarPositionConfig, ToastConfig, ToastDelivery,
+    Keybinds, NewTerminalCwdConfig, ScrollbarMode, SoundConfig, TabBarPositionConfig, ToastConfig,
+    ToastDelivery,
 };
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Direction, Rect};
@@ -12,6 +13,9 @@ use crate::selection::Selection;
 
 pub(crate) type InstalledPluginRegistry =
     std::collections::HashMap<String, crate::api::schema::InstalledPluginInfo>;
+
+pub(crate) const SCROLLBAR_AUTO_HIDE_AFTER: std::time::Duration =
+    std::time::Duration::from_millis(1200);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PluginPaneRecord {
@@ -1504,12 +1508,15 @@ pub struct AppState {
     pub prompt_new_tab_name: bool,
     pub prompt_new_workspace_name: bool,
     pub pane_borders: bool,
-    pub pane_scrollbars: bool,
+    /// Pane scrollbar presentation mode.
+    pub pane_scrollbars: ScrollbarMode,
     pub pane_gaps: bool,
     pub show_agent_labels_on_pane_borders: bool,
     pub hide_tab_bar_when_single_tab: bool,
     pub tab_bar_position: TabBarPositionConfig,
     pub tab_bar_wrap: bool,
+    /// Last host-scrollback offset change per pane, used by auto-hide overlays.
+    pub(crate) last_pane_scroll_activity: std::collections::HashMap<PaneId, std::time::Instant>,
     pub pane_history_persistence: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
@@ -1587,6 +1594,55 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn record_pane_scroll_activity(&mut self, pane_id: PaneId, now: std::time::Instant) {
+        self.last_pane_scroll_activity.insert(pane_id, now);
+    }
+
+    pub(crate) fn pane_scrollbar_overlay_visible(
+        &self,
+        pane_id: PaneId,
+        metrics: crate::pane::ScrollMetrics,
+        now: std::time::Instant,
+    ) -> bool {
+        self.pane_scrollbars == ScrollbarMode::Auto
+            && metrics.offset_from_bottom > 0
+            && self
+                .last_pane_scroll_activity
+                .get(&pane_id)
+                .and_then(|last_activity| now.checked_duration_since(*last_activity))
+                .is_some_and(|elapsed| elapsed < SCROLLBAR_AUTO_HIDE_AFTER)
+    }
+
+    pub(crate) fn next_scrollbar_auto_hide_deadline(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Instant> {
+        if self.pane_scrollbars != ScrollbarMode::Auto {
+            return None;
+        }
+
+        self.last_pane_scroll_activity
+            .values()
+            .filter_map(|last_activity| last_activity.checked_add(SCROLLBAR_AUTO_HIDE_AFTER))
+            .filter(|deadline| *deadline > now)
+            .min()
+    }
+
+    pub(crate) fn expire_scrollbar_auto_hide(&mut self, now: std::time::Instant) -> bool {
+        if self.pane_scrollbars != ScrollbarMode::Auto {
+            self.last_pane_scroll_activity.clear();
+            return false;
+        }
+
+        let previous_len = self.last_pane_scroll_activity.len();
+        self.last_pane_scroll_activity.retain(|_, last_activity| {
+            last_activity
+                .checked_add(SCROLLBAR_AUTO_HIDE_AFTER)
+                .is_some_and(|deadline| deadline > now)
+        });
+        self.last_pane_scroll_activity.len() != previous_len
+    }
+
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
     }
@@ -1874,12 +1930,13 @@ impl AppState {
             prompt_new_tab_name: true,
             prompt_new_workspace_name: false,
             pane_borders: true,
-            pane_scrollbars: true,
+            pane_scrollbars: ScrollbarMode::Always,
             pane_gaps: false,
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
             tab_bar_position: TabBarPositionConfig::Top,
             tab_bar_wrap: false,
+            last_pane_scroll_activity: std::collections::HashMap::new(),
             pane_history_persistence: false,
             reveal_hidden_cursor_for_cjk_ime: false,
             cjk_ime_agent_filter_configured: false,

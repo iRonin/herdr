@@ -313,9 +313,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Draw borders around split panes.
 # pane_borders = true
 
-# Draw interactive scrollbars beside terminal panes.
-# Set false to reclaim the scrollbar column and keep it out of terminal-native selections.
-# pane_scrollbars = true
+# Pane scrollbars: "always" reserves a column, "auto" briefly overlays the
+# rightmost text column after scrolling, and "never" reclaims the column and
+# keeps it out of terminal-native selections.
+# Boolean true/false remains accepted as "always"/"never".
+# pane_scrollbars = "always"
 
 # Keep split panes visually separated instead of sharing divider borders.
 # pane_gaps = true

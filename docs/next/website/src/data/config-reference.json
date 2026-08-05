@@ -666,9 +666,14 @@
         },
         {
           "key": "ui.pane_scrollbars",
-          "type": "boolean",
-          "default": "true",
-          "description": "Draw interactive scrollbars beside terminal panes. Disable to reclaim the scrollbar column and keep it out of terminal-native selections."
+          "type": "enum",
+          "default": "\"always\"",
+          "description": "Pane scrollbar mode. always reserves a column, auto briefly overlays the rightmost text column after scrolling, and never reclaims the column and keeps it out of terminal-native selections. Boolean true and false remain accepted as always and never, and \"show_scrollbar\" is accepted as an alias for this key.",
+          "values": [
+            "always",
+            "auto",
+            "never"
+          ]
         },
         {
           "key": "ui.pane_gaps",
@@ -705,6 +710,7 @@
           "description": "Wrap tabs onto multiple rows instead of using the default single scrollable row. The wrapped bar uses at most half of the pane area's height."
         },
         {
+
           "key": "ui.agent_panel_sort",
           "type": "enum",
           "default": "\"spaces\"",

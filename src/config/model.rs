@@ -124,6 +124,42 @@ pub enum SidebarCollapsedModeConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollbarMode {
+    #[default]
+    Always,
+    Auto,
+    Never,
+}
+
+impl<'de> Deserialize<'de> for ScrollbarMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum ScrollbarModeValue {
+            Bool(bool),
+            String(String),
+        }
+
+        match ScrollbarModeValue::deserialize(deserializer)? {
+            ScrollbarModeValue::Bool(true) => Ok(Self::Always),
+            ScrollbarModeValue::Bool(false) => Ok(Self::Never),
+            ScrollbarModeValue::String(value) => match value.as_str() {
+                "always" => Ok(Self::Always),
+                "auto" => Ok(Self::Auto),
+                "never" => Ok(Self::Never),
+                _ => Err(de::Error::unknown_variant(
+                    &value,
+                    &["always", "auto", "never"],
+                )),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RightClickPassthroughModifierConfig(Option<KeyModifiers>);
 
 impl RightClickPassthroughModifierConfig {
@@ -854,8 +890,13 @@ pub struct UiConfig {
     pub prompt_new_workspace_name: bool,
     /// Draw borders around split panes. Default: true.
     pub pane_borders: bool,
-    /// Draw interactive scrollbars beside terminal panes. Default: true.
-    pub pane_scrollbars: bool,
+    /// Pane scrollback scrollbar mode. `always`/`true` reserves a column,
+    /// `auto` briefly overlays the rightmost text column after scrolling, and
+    /// `never`/`false` hides it. Default: `always` (identical to upstream's
+    /// `pane_scrollbars = true`). Accepts the fork's earlier `show_scrollbar`
+    /// spelling as an alias; setting both spellings is a hard parse error.
+    #[serde(alias = "show_scrollbar")]
+    pub pane_scrollbars: ScrollbarMode,
     /// Keep split panes visually separated instead of sharing divider borders. Default: true.
     pub pane_gaps: bool,
     /// Show agent labels in split pane borders when no manual pane label is set. Default: false.
@@ -1067,7 +1108,7 @@ impl Default for UiConfig {
             prompt_new_tab_name: true,
             prompt_new_workspace_name: false,
             pane_borders: true,
-            pane_scrollbars: true,
+            pane_scrollbars: ScrollbarMode::Always,
             pane_gaps: true,
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
@@ -1334,7 +1375,7 @@ agent_panel_scope = "current"
     fn pane_appearance_defaults_and_parse() {
         let default_config = Config::default();
         assert!(default_config.ui.pane_borders);
-        assert!(default_config.ui.pane_scrollbars);
+        assert_eq!(default_config.ui.pane_scrollbars, ScrollbarMode::Always);
         assert!(default_config.ui.pane_gaps);
         assert!(!default_config.ui.show_agent_labels_on_pane_borders);
         assert!(!default_config.ui.hide_tab_bar_when_single_tab);
@@ -1356,12 +1397,51 @@ tab_bar_wrap = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.pane_borders);
-        assert!(!config.ui.pane_scrollbars);
+        assert_eq!(config.ui.pane_scrollbars, ScrollbarMode::Never);
         assert!(config.ui.pane_gaps);
         assert!(config.ui.show_agent_labels_on_pane_borders);
         assert!(config.ui.hide_tab_bar_when_single_tab);
         assert_eq!(config.ui.tab_bar_position, TabBarPositionConfig::Bottom);
         assert!(config.ui.tab_bar_wrap);
+    }
+
+    #[test]
+    fn pane_scrollbars_accepts_bool_string_and_the_show_scrollbar_alias() {
+        fn parse(key: &str, value: &str) -> ScrollbarMode {
+            let config: Config = toml::from_str(&format!("[ui]\n{key} = {value}\n"))
+                .expect("scrollbar mode should parse");
+            config.ui.pane_scrollbars
+        }
+
+        assert_eq!(Config::default().ui.pane_scrollbars, ScrollbarMode::Always);
+        // Upstream's own bool spelling must keep reproducing upstream behaviour
+        // exactly -- this is the default-preservation guarantee, not a nicety.
+        assert_eq!(parse("pane_scrollbars", "true"), ScrollbarMode::Always);
+        assert_eq!(parse("pane_scrollbars", "false"), ScrollbarMode::Never);
+        assert_eq!(
+            parse("pane_scrollbars", "\"always\""),
+            ScrollbarMode::Always
+        );
+        assert_eq!(parse("pane_scrollbars", "\"never\""), ScrollbarMode::Never);
+        // The capability this fork exists to keep.
+        assert_eq!(parse("pane_scrollbars", "\"auto\""), ScrollbarMode::Auto);
+        // The alias keeps configs written before the rename working untouched.
+        assert_eq!(parse("show_scrollbar", "\"auto\""), ScrollbarMode::Auto);
+        assert_eq!(parse("show_scrollbar", "true"), ScrollbarMode::Always);
+        assert_eq!(parse("show_scrollbar", "false"), ScrollbarMode::Never);
+    }
+
+    #[test]
+    fn pane_scrollbars_rejects_the_canonical_key_and_its_alias_together() {
+        // Ambiguity must fail LOUDLY rather than silently picking one -- a config
+        // carrying both spellings is the user's to resolve, not ours to guess.
+        let err =
+            toml::from_str::<Config>("[ui]\npane_scrollbars = true\nshow_scrollbar = \"auto\"\n")
+                .expect_err("both spellings must be rejected");
+        assert!(
+            err.to_string().contains("duplicate field"),
+            "expected a duplicate-field error, got: {err}"
+        );
     }
 
     #[test]

@@ -362,6 +362,8 @@ Sidebar row settings affect only the expanded desktop sidebar. Collapsed and mob
 
 Set `tab_bar_wrap = true` under `[ui]` to show tabs across the available rows instead of using the default single scrollable row with `<`/`>` buttons. The tab bar grows downward as needed, up to half of the pane area's height, and the terminal and popup geometry below shrink with it. When the row count reaches that cap, Herdr scrolls the visible row window to keep the active tab visible. The tab bar keeps the placement chosen by `tab_bar_position`, so wrapped rows grow downward from the top edge or upward from the bottom edge. The default is `false`.
 
+Choose how pane scrollbars are shown with `pane_scrollbars = "always"`, `"auto"`, or `"never"` under `[ui]`. `"always"` is the default and reserves one terminal column whenever the pane is wide enough. `"auto"` keeps pane text full-width and briefly overlays the scrollbar on the rightmost text column after scrolling while the pane remains scrolled back; it disappears after about 1.2 seconds of inactivity. `"never"` keeps text full-width and never draws the pane scrollbar. Boolean values remain compatible: `true` means `"always"` and `false` means `"never"`. The earlier `show_scrollbar` spelling is still accepted as an alias for this key; setting both spellings is a parse error.
+
 ## Notifications
 
 Herdr can notify you when a background agent finishes or needs input:
