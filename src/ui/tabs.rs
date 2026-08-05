@@ -672,7 +672,7 @@ mod tests {
     use crate::detect::{Agent, AgentState};
     use crate::terminal::AgentMetadataReport;
     use crate::workspace::Workspace;
-    use ratatui::{backend::TestBackend, layout::Direction, Terminal};
+    use ratatui::{backend::TestBackend, layout::Direction, style::Color, Terminal};
 
     /// One fixture for BOTH surfaces: `state` lives on the TERMINAL and `seen`
     /// on the PANE, and both surfaces read the same two fields. Building them
@@ -703,7 +703,7 @@ mod tests {
     /// offset and the `tab_hit_areas[0]` anchor are the ones the existing
     /// `tab_agent_status_*` tests already use -- reusing a known-good extraction
     /// rather than inventing a second one that could read the wrong cell.
-    fn render_tab_status_cell(state: AgentState, seen: bool) -> String {
+    fn render_tab_status_cell(state: AgentState, seen: bool) -> (String, Color) {
         let mut app = app_with_agent(state, seen);
         app.tab_agent_status = true;
         crate::ui::compute_view(&mut app, Rect::new(0, 0, 80, 20));
@@ -713,9 +713,8 @@ mod tests {
             .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
             .unwrap();
         let rect = app.view.tab_hit_areas[0];
-        terminal.backend().buffer()[(rect.x + 1, rect.y)]
-            .symbol()
-            .to_string()
+        let cell = &terminal.backend().buffer()[(rect.x + 1, rect.y)];
+        (cell.symbol().to_string(), cell.fg)
     }
 
     /// Renders the real sidebar and returns the AGENT DETAIL ROW's mark.
@@ -730,7 +729,7 @@ mod tests {
     /// `body.x + 1` on the panel body's first row. If that layout ever moves,
     /// the vacuity guard in the test below fires rather than the comparison
     /// silently succeeding on two blanks.
-    fn render_sidebar_status_cell(state: AgentState, seen: bool) -> String {
+    fn render_sidebar_status_cell(state: AgentState, seen: bool) -> (String, Color) {
         let app = app_with_agent(state, seen);
         let area = Rect::new(0, 0, 26, 20);
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
@@ -746,9 +745,8 @@ mod tests {
             .unwrap();
         let (_, agent_area) = crate::ui::expanded_sidebar_sections(area, app.sidebar_section_split);
         let body = crate::ui::agent_panel_body_rect(agent_area, false);
-        terminal.backend().buffer()[(body.x + 1, body.y)]
-            .symbol()
-            .to_string()
+        let cell = &terminal.backend().buffer()[(body.x + 1, body.y)];
+        (cell.symbol().to_string(), cell.fg)
     }
 
     fn buffer_row_text(buffer: &ratatui::buffer::Buffer, area: Rect, row: u16) -> String {
@@ -1125,14 +1123,13 @@ mod tests {
             (AgentState::Idle, true),
             (AgentState::Unknown, false),
         ] {
-            let tab_mark = render_tab_status_cell(state, seen);
-            let sidebar_mark = render_sidebar_status_cell(state, seen);
-            let expected = crate::ui::status::state_dot(
+            let (tab_mark, tab_fg) = render_tab_status_cell(state, seen);
+            let (sidebar_mark, sidebar_fg) = render_sidebar_status_cell(state, seen);
+            let (expected, expected_style) = crate::ui::status::state_dot(
                 state,
                 seen,
                 &crate::app::state::Palette::catppuccin(),
-            )
-            .0;
+            );
 
             // Vacuity guard: a helper that silently renders nothing returns a
             // blank on both sides, and the comparison below would then pass for
@@ -1151,6 +1148,22 @@ mod tests {
             assert_eq!(
                 tab_mark, expected,
                 "tab must render state_dot's mark, not a fork-local glyph"
+            );
+            // (3) the symbol alphabet is AMBIGUOUS -- three states share the
+            // filled dot and two share the hollow one, separated only by colour.
+            // A symbol-only comparison therefore passes on a tab rendering the
+            // right glyph in the wrong colour. Unreachable on today's path (the
+            // tab destructures both halves of `state_dot` and renders them
+            // together), but one refactor away -- and reading a glyph without
+            // its colour has already caused a full misdiagnosis on this project.
+            assert_eq!(
+                tab_fg, sidebar_fg,
+                "tab and sidebar must render the same COLOUR for {state:?}/seen={seen}"
+            );
+            assert_eq!(
+                Some(tab_fg),
+                expected_style.fg,
+                "tab must render state_dot's colour, not just its glyph"
             );
         }
     }
