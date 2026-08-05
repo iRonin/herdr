@@ -96,10 +96,26 @@ impl App {
         let Some(index) = self.parse_workspace_id(&params.workspace_id) else {
             return workspace_not_found(id, &params.workspace_id);
         };
+        let persist_cwd = self.state.workspaces.get(index).and_then(|ws| {
+            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+        });
         let Some(ws) = self.state.workspaces.get_mut(index) else {
             return workspace_not_found(id, &params.workspace_id);
         };
         ws.set_custom_name(params.label.clone());
+        if let Some(cwd) = persist_cwd {
+            // Best-effort: a read-only checkout must not block an in-memory rename.
+            if crate::workspace::persist_workspace_name(&cwd, &params.label).is_ok() {
+                // Keep the identity cache consistent with the file we just wrote.
+                // Do NOT rely on the periodic refresh to observe our own write:
+                // repository discovery runs on a 5-minute interval and the faster
+                // tick is gated on the sidebar carrying a `branch`/`git_status`
+                // token. With neither, the cache would stay stale until the next
+                // cwd change.
+                ws.cached_auto_label = params.label.clone();
+                ws.cached_auto_label_pinned = true;
+            }
+        }
         crate::logging::workspace_renamed(&ws.id);
         self.schedule_session_save();
         self.emit_event(EventEnvelope {
@@ -352,6 +368,60 @@ fn workspace_not_found(id: String, workspace_id: &str) -> String {
 mod tests {
     use super::*;
     use crate::{api::schema::SuccessResponse, config::Config, workspace::Workspace};
+
+    // The rename writes `.herdr/settings.toml` AND must update the identity cache
+    // itself. Repository discovery runs on a 5-minute interval and the faster
+    // tick is gated on the sidebar carrying git tokens, so waiting for a refresh
+    // to observe our own write can leave the automatic label stale indefinitely.
+    #[test]
+    fn workspace_rename_updates_the_cached_pinned_label() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let cwd = std::env::temp_dir().join(format!(
+            "herdr-api-rename-pin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut ws = Workspace::test_new("before");
+        ws.identity_cwd = cwd.clone();
+        ws.cached_identity_cwd = cwd.clone();
+        ws.cached_auto_label = "before".into();
+        ws.cached_auto_label_pinned = false;
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let workspace_id = app.public_workspace_id(0);
+
+        let response = app.handle_workspace_rename(
+            "rename".into(),
+            crate::api::schema::WorkspaceRenameParams {
+                workspace_id,
+                label: "renamed".into(),
+            },
+        );
+        let _: SuccessResponse = serde_json::from_str(&response).expect("rename should succeed");
+
+        assert_eq!(app.state.workspaces[0].cached_auto_label, "renamed");
+        assert!(
+            app.state.workspaces[0].cached_auto_label_pinned,
+            "a rename that wrote the project file must mark the label pinned"
+        );
+        let written = std::fs::read_to_string(cwd.join(".herdr/settings.toml"))
+            .expect("rename should have written the project settings file");
+        assert!(written.contains("name = \"renamed\""), "{written}");
+
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
 
     // `new_cwd = follow` must anchor on the focused pane for every creation
     // surface. Splits and tabs already do; a new workspace must follow the
