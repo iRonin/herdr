@@ -667,6 +667,7 @@ impl App {
             tab_bar_position: config.ui.tab_bar_position,
             tab_bar_wrap: config.ui.tab_bar_wrap,
             tab_agent_status: config.ui.tab_agent_status,
+            tab_agent_context: config.ui.tab_agent_context,
             last_pane_scroll_activity: HashMap::new(),
             tab_drag_move_workspace: config.ui.tab_drag_move_workspace,
             pane_history_persistence: config.experimental.pane_history,
@@ -1484,6 +1485,7 @@ impl App {
                 self.state.tab_bar_position = config.ui.tab_bar_position;
                 self.state.tab_bar_wrap = config.ui.tab_bar_wrap;
                 self.state.tab_agent_status = config.ui.tab_agent_status;
+                self.state.tab_agent_context = config.ui.tab_agent_context;
                 if self.state.pane_scrollbars != crate::config::ScrollbarMode::Auto {
                     self.state.last_pane_scroll_activity.clear();
                 }
@@ -2047,6 +2049,17 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[test]
+    fn app_copies_tab_agent_context_from_config() {
+        let mut config = Config::default();
+        config.ui.tab_agent_context = true;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert!(app.state.tab_agent_context);
     }
 
     #[test]
@@ -3121,6 +3134,30 @@ mod tests {
             crate::config::HostCursorModeConfig::Native
         );
         assert!(app.state.request_client_config_reload);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_updates_tab_agent_context() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-tab-agent-context");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert!(!app.state.tab_agent_context);
+
+        std::fs::write(&path, "[ui]\ntab_agent_context = true\n").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(app.state.tab_agent_context);
+
+        std::fs::write(&path, "[ui]\ntab_agent_context = false\n").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(!app.state.tab_agent_context);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

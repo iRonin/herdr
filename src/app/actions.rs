@@ -1871,6 +1871,7 @@ impl AppState {
                 ws,
                 &self.terminals,
                 self.tab_agent_status,
+                self.tab_agent_context,
                 area,
                 self.mouse_capture,
             )
@@ -1879,6 +1880,7 @@ impl AppState {
                 ws,
                 &self.terminals,
                 self.tab_agent_status,
+                self.tab_agent_context,
                 area,
                 self.tab_scroll,
                 self.tab_scroll_follow_active,

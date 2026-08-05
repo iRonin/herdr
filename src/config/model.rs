@@ -1036,6 +1036,9 @@ pub struct UiConfig {
     pub tab_drag_move_workspace: bool,
     /// Show the highest-attention agent status indicator on each top tab. Default: false.
     pub tab_agent_status: bool,
+    /// Show the highest-attention agent pane's context percentage on each top tab.
+    /// Default: false.
+    pub tab_agent_context: bool,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
     /// Agent sidebar scope. Saved values are "all" or "current"; "current_workspace"
@@ -1255,6 +1258,7 @@ impl Default for UiConfig {
             tab_bar_wrap: false,
             tab_drag_move_workspace: false,
             tab_agent_status: false,
+            tab_agent_context: false,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             agent_panel_scope: AgentPanelScopeConfig::All,
             agent_panel_modes: default_agent_panel_modes(),
@@ -1633,6 +1637,21 @@ agent_panel_modes = []
         .unwrap();
 
         assert_eq!(config.ui.agent_panel_modes, AgentPanelModeConfig::ALL);
+    }
+
+    #[test]
+    fn tab_agent_context_defaults_off_and_parses_on() {
+        let default_config = Config::default();
+        assert!(!default_config.ui.tab_agent_context);
+
+        let config: Config = toml::from_str(
+            r#"
+[ui]
+tab_agent_context = true
+"#,
+        )
+        .unwrap();
+        assert!(config.ui.tab_agent_context);
     }
 
     #[test]

@@ -340,6 +340,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Uses the same status marks as the agents panel.
 # tab_agent_status = false
 
+# Mirror the highest-attention agent pane's standalone context percentage on each top tab.
+# Recognizes N%·PID and ~N%·PID labels from the Agents pane.
+# tab_agent_context = false
+
 # Agent panel ordering: "spaces" (grouped by space) or "priority" (attention queue).
 # "workspaces" is accepted as an alias for "spaces".
 # agent_panel_sort = "spaces"

@@ -1566,6 +1566,7 @@ pub struct AppState {
     pub tab_bar_position: TabBarPositionConfig,
     pub tab_bar_wrap: bool,
     pub tab_agent_status: bool,
+    pub tab_agent_context: bool,
     /// Last host-scrollback offset change per pane, used by auto-hide overlays.
     pub(crate) last_pane_scroll_activity: std::collections::HashMap<PaneId, std::time::Instant>,
     /// Allow tab drags to continue onto sidebar workspace entries, moving the
@@ -1996,6 +1997,7 @@ impl AppState {
             tab_bar_position: TabBarPositionConfig::Top,
             tab_bar_wrap: false,
             tab_agent_status: false,
+            tab_agent_context: false,
             last_pane_scroll_activity: std::collections::HashMap::new(),
             tab_drag_move_workspace: false,
             pane_history_persistence: false,

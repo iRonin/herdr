@@ -734,6 +734,12 @@
           "description": "Show the highest-attention agent status on each top tab, using the same status marks as the agents panel and the rest of the app: a filled dot for blocked-and-unread (red), working (yellow) and done-and-unread (teal), a hollow dot for blocked-and-read (red) and done-and-read (green), and a middle dot for unknown. Works with both single-row and wrapped tab bars. Disabled by default."
         },
         {
+          "key": "ui.tab_agent_context",
+          "type": "boolean",
+          "default": "false",
+          "description": "Mirror the standalone context percentage already shown in the Agents pane for the same highest-attention agent pane. Recognizes standalone N%·PID and ~N%·PID labels, appends the exact percentage portion after the visible tab name and before the zoom marker, and omits missing or ambiguous labels. Works independently of ui.tab_agent_status. Disabled by default."
+        },
+        {
           "key": "ui.agent_panel_sort",
           "type": "enum",
           "default": "\"spaces\"",

@@ -35,11 +35,17 @@ fn tab_width(ws: &crate::workspace::Workspace, tab_idx: usize) -> u16 {
         .max(MIN_TAB_WIDTH)
 }
 
-fn tab_agent_state(
+struct TabAgentPresentation<'a> {
+    state: AgentState,
+    seen: bool,
+    terminal: &'a TerminalState,
+}
+
+fn tab_agent_presentation<'a>(
     ws: &crate::workspace::Workspace,
-    terminals: &HashMap<TerminalId, TerminalState>,
+    terminals: &'a HashMap<TerminalId, TerminalState>,
     tab_idx: usize,
-) -> Option<(AgentState, bool)> {
+) -> Option<TabAgentPresentation<'a>> {
     let tab = ws.tabs.get(tab_idx)?;
     tab.layout
         .pane_ids()
@@ -51,26 +57,102 @@ fn tab_agent_state(
                 .agent_name
                 .as_deref()
                 .or_else(|| terminal.effective_agent_label())?;
-            Some((terminal.state, pane.seen))
+            Some(TabAgentPresentation {
+                state: terminal.state,
+                seen: pane.seen,
+                terminal,
+            })
         })
-        .max_by_key(|(state, seen)| workspace_attention_priority(*state, *seen))
+        // `max_by_key` keeps the last maximum, so ties intentionally preserve
+        // the existing last-in-layout-order winner.
+        .max_by_key(|presentation| {
+            workspace_attention_priority(presentation.state, presentation.seen)
+        })
+}
+
+fn extract_tab_agent_context(display_agent: &str) -> Option<&str> {
+    let mut found = None;
+    for candidate in display_agent.split_whitespace() {
+        let body = candidate.strip_prefix('~').unwrap_or(candidate);
+        let Some((percentage, pid)) = body.split_once("%·") else {
+            continue;
+        };
+        if percentage.is_empty()
+            || !percentage.bytes().all(|byte| byte.is_ascii_digit())
+            || percentage
+                .parse::<u16>()
+                .ok()
+                .is_none_or(|value| value > 100)
+            || pid.is_empty()
+            || !pid.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            continue;
+        }
+
+        let percentage_end = candidate.len() - '·'.len_utf8() - pid.len();
+        let percentage = &candidate[..percentage_end];
+        if found.is_some() {
+            return None;
+        }
+        found = Some(percentage);
+    }
+    found
+}
+
+fn tab_agent_context_suffix(presentation: Option<&TabAgentPresentation<'_>>) -> Option<String> {
+    let display_agent = presentation?.terminal.effective_display_agent()?;
+    extract_tab_agent_context(&display_agent).map(str::to_owned)
 }
 
 fn tab_layout_width(
     ws: &crate::workspace::Workspace,
     terminals: &HashMap<TerminalId, TerminalState>,
     tab_agent_status: bool,
+    tab_agent_context: bool,
     tab_idx: usize,
 ) -> u16 {
-    tab_width(ws, tab_idx).saturating_add(
-        u16::from(tab_agent_status && tab_agent_state(ws, terminals, tab_idx).is_some()) * 2,
-    )
+    let presentation = (tab_agent_status || tab_agent_context)
+        .then(|| tab_agent_presentation(ws, terminals, tab_idx))
+        .flatten();
+    let context = tab_agent_context
+        .then(|| tab_agent_context_suffix(presentation.as_ref()))
+        .flatten();
+    tab_width(ws, tab_idx)
+        .saturating_add(u16::from(tab_agent_status && presentation.is_some()) * 2)
+        .saturating_add(
+            context
+                .as_deref()
+                .map_or(0, |value| display_width_u16(value).saturating_add(1)),
+        )
+}
+
+fn tab_layout_widths(
+    ws: &crate::workspace::Workspace,
+    terminals: &HashMap<TerminalId, TerminalState>,
+    tab_agent_status: bool,
+    tab_agent_context: bool,
+) -> Vec<u16> {
+    (0..ws.tabs.len())
+        .map(|idx| tab_layout_width(ws, terminals, tab_agent_status, tab_agent_context, idx))
+        .collect()
 }
 
 fn tab_chrome_label(ws: &crate::workspace::Workspace, tab_idx: usize) -> String {
-    let name = ws
+    tab_chrome_label_with_context(ws, tab_idx, None)
+}
+
+fn tab_chrome_label_with_context(
+    ws: &crate::workspace::Workspace,
+    tab_idx: usize,
+    context: Option<&str>,
+) -> String {
+    let mut name = ws
         .tab_display_name(tab_idx)
         .unwrap_or_else(|| (tab_idx + 1).to_string());
+    if let Some(context) = context {
+        name.push(' ');
+        name.push_str(context);
+    }
     if ws.tabs.get(tab_idx).is_some_and(|tab| tab.zoomed) {
         format!("{name} Z")
     } else {
@@ -106,16 +188,19 @@ pub(super) fn tab_bar_wrapped_rows(
     ws: &crate::workspace::Workspace,
     terminals: &HashMap<TerminalId, TerminalState>,
     tab_agent_status: bool,
+    tab_agent_context: bool,
     width: u16,
     with_new_tab: bool,
 ) -> u16 {
     if width == 0 || ws.tabs.is_empty() {
         return 1;
     }
-    let widths = (0..ws.tabs.len())
-        .map(|idx| tab_layout_width(ws, terminals, tab_agent_status, idx))
+    let widths = tab_layout_widths(ws, terminals, tab_agent_status, tab_agent_context);
+    let item_widths = widths
+        .iter()
+        .copied()
         .chain(with_new_tab.then_some(NEW_TAB_WIDTH));
-    wrap_flow(widths, width)
+    wrap_flow(item_widths, width)
         .last()
         .map(|(_, y, _)| y.saturating_add(1))
         .unwrap_or(1)
@@ -131,27 +216,27 @@ pub(super) fn tab_bar_wrapped_rows(
 /// view; tabs outside that window get a zero-width rect (still reachable by
 /// selecting them, which re-centers the window on the new active row).
 fn layout_tab_hit_areas_wrapped(
-    ws: &crate::workspace::Workspace,
-    terminals: &HashMap<TerminalId, TerminalState>,
-    tab_agent_status: bool,
+    tab_widths: &[u16],
+    active_tab: usize,
     area: Rect,
     with_new_tab: bool,
 ) -> (Vec<Rect>, Rect) {
-    let mut rects = vec![Rect::default(); ws.tabs.len()];
+    let mut rects = vec![Rect::default(); tab_widths.len()];
     let mut new_tab = Rect::default();
     if area.width == 0 || area.height == 0 {
         return (rects, new_tab);
     }
-    let widths = (0..ws.tabs.len())
-        .map(|idx| tab_layout_width(ws, terminals, tab_agent_status, idx))
+    let item_widths = tab_widths
+        .iter()
+        .copied()
         .chain(with_new_tab.then_some(NEW_TAB_WIDTH));
-    let flow = wrap_flow(widths, area.width);
+    let flow = wrap_flow(item_widths, area.width);
     let total_rows = flow.last().map(|(_, y, _)| y + 1).unwrap_or(0);
 
     // Common case (unclamped): show every row from the top. Only when the bar
     // is too short to fit all rows do we scroll to keep the active tab visible.
     let row_offset = if total_rows > area.height {
-        let active_row = flow.get(ws.active_tab).map(|(_, y, _)| *y).unwrap_or(0);
+        let active_row = flow.get(active_tab).map(|(_, y, _)| *y).unwrap_or(0);
         active_row
             .saturating_sub(area.height / 2)
             .min(total_rows.saturating_sub(area.height))
@@ -182,14 +267,16 @@ pub(crate) fn compute_wrapped_tab_bar_view(
     ws: &crate::workspace::Workspace,
     terminals: &HashMap<TerminalId, TerminalState>,
     tab_agent_status: bool,
+    tab_agent_context: bool,
     area: Rect,
     mouse_chrome: bool,
 ) -> TabBarView {
     if area.width == 0 || area.height == 0 {
         return TabBarView::default();
     }
+    let tab_widths = tab_layout_widths(ws, terminals, tab_agent_status, tab_agent_context);
     let (tab_hit_areas, new_tab_hit_area) =
-        layout_tab_hit_areas_wrapped(ws, terminals, tab_agent_status, area, mouse_chrome);
+        layout_tab_hit_areas_wrapped(&tab_widths, ws.active_tab, area, mouse_chrome);
     TabBarView {
         scroll: 0,
         tab_hit_areas,
@@ -199,14 +286,8 @@ pub(crate) fn compute_wrapped_tab_bar_view(
     }
 }
 
-fn layout_tab_hit_areas(
-    ws: &crate::workspace::Workspace,
-    terminals: &HashMap<TerminalId, TerminalState>,
-    tab_agent_status: bool,
-    area: Rect,
-    scroll: usize,
-) -> Vec<Rect> {
-    let mut rects = vec![Rect::default(); ws.tabs.len()];
+fn layout_tab_hit_areas(tab_widths: &[u16], area: Rect, scroll: usize) -> Vec<Rect> {
+    let mut rects = vec![Rect::default(); tab_widths.len()];
     if area.width == 0 || area.height == 0 {
         return rects;
     }
@@ -217,7 +298,7 @@ fn layout_tab_hit_areas(
         if x >= right {
             break;
         }
-        let desired = tab_layout_width(ws, terminals, tab_agent_status, idx);
+        let desired = tab_widths[idx];
         let remaining = right.saturating_sub(x);
         let width = desired.min(remaining).max(1);
         *rect = Rect::new(x, area.y, width, 1);
@@ -226,19 +307,14 @@ fn layout_tab_hit_areas(
     rects
 }
 
-fn centered_tab_scroll(
-    ws: &crate::workspace::Workspace,
-    terminals: &HashMap<TerminalId, TerminalState>,
-    tab_agent_status: bool,
-    area: Rect,
-) -> usize {
-    let mut best_scroll = ws.active_tab;
+fn centered_tab_scroll(active_tab: usize, tab_widths: &[u16], area: Rect) -> usize {
+    let mut best_scroll = active_tab;
     let mut best_distance = u16::MAX;
     let viewport_center = area.x.saturating_mul(2).saturating_add(area.width);
 
-    for scroll in 0..=ws.active_tab {
-        let rects = layout_tab_hit_areas(ws, terminals, tab_agent_status, area, scroll);
-        let Some(active_rect) = rects.get(ws.active_tab).copied() else {
+    for scroll in 0..=active_tab {
+        let rects = layout_tab_hit_areas(tab_widths, area, scroll);
+        let Some(active_rect) = rects.get(active_tab).copied() else {
             continue;
         };
         if active_rect.width == 0 {
@@ -268,15 +344,10 @@ fn trailing_tab_controls_x(tab_hit_areas: &[Rect], fallback_x: u16) -> u16 {
         .unwrap_or(fallback_x)
 }
 
-fn max_tab_scroll(
-    ws: &crate::workspace::Workspace,
-    terminals: &HashMap<TerminalId, TerminalState>,
-    tab_agent_status: bool,
-    area: Rect,
-) -> usize {
-    (0..ws.tabs.len())
+fn max_tab_scroll(tab_widths: &[u16], area: Rect) -> usize {
+    (0..tab_widths.len())
         .find(|&scroll| {
-            layout_tab_hit_areas(ws, terminals, tab_agent_status, area, scroll)
+            layout_tab_hit_areas(tab_widths, area, scroll)
                 .last()
                 .is_some_and(|rect| rect.width > 0)
         })
@@ -287,6 +358,7 @@ pub(crate) fn compute_tab_bar_view(
     ws: &crate::workspace::Workspace,
     terminals: &HashMap<TerminalId, TerminalState>,
     tab_agent_status: bool,
+    tab_agent_context: bool,
     area: Rect,
     current_scroll: usize,
     follow_active: bool,
@@ -296,16 +368,17 @@ pub(crate) fn compute_tab_bar_view(
         return TabBarView::default();
     }
 
+    let tab_widths = tab_layout_widths(ws, terminals, tab_agent_status, tab_agent_context);
     if !mouse_chrome {
-        let max_scroll = max_tab_scroll(ws, terminals, tab_agent_status, area);
+        let max_scroll = max_tab_scroll(&tab_widths, area);
         let scroll = if follow_active {
-            centered_tab_scroll(ws, terminals, tab_agent_status, area).min(max_scroll)
+            centered_tab_scroll(ws.active_tab, &tab_widths, area).min(max_scroll)
         } else {
             current_scroll.min(max_scroll)
         };
         return TabBarView {
             scroll,
-            tab_hit_areas: layout_tab_hit_areas(ws, terminals, tab_agent_status, area, scroll),
+            tab_hit_areas: layout_tab_hit_areas(&tab_widths, area, scroll),
             scroll_left_hit_area: Rect::default(),
             scroll_right_hit_area: Rect::default(),
             new_tab_hit_area: Rect::default(),
@@ -319,7 +392,7 @@ pub(crate) fn compute_tab_bar_view(
         area.width.saturating_sub(NEW_TAB_WIDTH),
         area.height,
     );
-    let all_tabs = layout_tab_hit_areas(ws, terminals, tab_agent_status, all_tabs_area, 0);
+    let all_tabs = layout_tab_hit_areas(&tab_widths, all_tabs_area, 0);
     let overflow = all_tabs.iter().any(|rect| rect.width == 0);
     if !overflow {
         let new_tab_x = trailing_tab_controls_x(&all_tabs, area.x);
@@ -349,13 +422,13 @@ pub(crate) fn compute_tab_bar_view(
         area.height,
     );
 
-    let max_scroll = max_tab_scroll(ws, terminals, tab_agent_status, tab_area);
+    let max_scroll = max_tab_scroll(&tab_widths, tab_area);
     let scroll = if follow_active {
-        centered_tab_scroll(ws, terminals, tab_agent_status, tab_area).min(max_scroll)
+        centered_tab_scroll(ws.active_tab, &tab_widths, tab_area).min(max_scroll)
     } else {
         current_scroll.min(max_scroll)
     };
-    let tab_hit_areas = layout_tab_hit_areas(ws, terminals, tab_agent_status, tab_area, scroll);
+    let tab_hit_areas = layout_tab_hit_areas(&tab_widths, tab_area, scroll);
     let trailing_x = trailing_tab_controls_x(&tab_hit_areas, tab_area_x).min(tab_area_right);
     let right_hit_area = Rect::new(
         trailing_x,
@@ -474,20 +547,27 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
             Style::default().fg(p.overlay1).bg(p.surface0)
         };
         let width = rect.width as usize;
-        let name = tab_chrome_label(ws, idx);
+        let presentation = (app.tab_agent_status || app.tab_agent_context)
+            .then(|| tab_agent_presentation(ws, &app.terminals, idx))
+            .flatten();
+        let context = app
+            .tab_agent_context
+            .then(|| tab_agent_context_suffix(presentation.as_ref()))
+            .flatten();
+        let name = tab_chrome_label_with_context(ws, idx, context.as_deref());
         // Reserve the last cell of the label background for the close marker;
         // Alt-click there closes the tab (see mouse input).
         let close_marker = app.tab_close_button && app.mouse_capture && width > 0;
-        if let Some((state, seen)) = app
+        if let Some(presentation) = app
             .tab_agent_status
-            .then(|| tab_agent_state(ws, &app.terminals, idx))
+            .then_some(presentation.as_ref())
             .flatten()
         {
             // `state_dot` is upstream's one status vocabulary, shared with the
             // sidebar, navigator and mobile surfaces. Call it directly: a
             // tab-local glyph table would be a second vocabulary to maintain
             // and would drift from the rest of the app at the next rebase.
-            let (glyph, glyph_style) = state_dot(state, seen, p);
+            let (glyph, glyph_style) = state_dot(presentation.state, presentation.seen, p);
             if close_marker {
                 let label_width = width.saturating_sub(4);
                 let label = truncate_end(&name, label_width);
@@ -590,6 +670,7 @@ mod tests {
     use super::*;
     use crate::app::state::AppState;
     use crate::detect::{Agent, AgentState};
+    use crate::terminal::AgentMetadataReport;
     use crate::workspace::Workspace;
     use ratatui::{backend::TestBackend, layout::Direction, Terminal};
 
@@ -693,6 +774,7 @@ mod tests {
             &app.workspaces[0],
             &app.terminals,
             app.tab_agent_status,
+            app.tab_agent_context,
             app.view.tab_bar_rect,
             0,
             true,
@@ -728,6 +810,7 @@ mod tests {
             &app.workspaces[0],
             &app.terminals,
             app.tab_agent_status,
+            app.tab_agent_context,
             app.view.tab_bar_rect,
             0,
             true,
@@ -764,6 +847,7 @@ mod tests {
             &app.workspaces[0],
             &app.terminals,
             app.tab_agent_status,
+            app.tab_agent_context,
             app.view.tab_bar_rect,
             0,
             true,
@@ -800,6 +884,7 @@ mod tests {
             &app.workspaces[0],
             &app.terminals,
             app.tab_agent_status,
+            app.tab_agent_context,
             app.view.tab_bar_rect,
             0,
             true,
@@ -833,6 +918,7 @@ mod tests {
             &app.workspaces[0],
             &app.terminals,
             app.tab_agent_status,
+            app.tab_agent_context,
             app.view.tab_bar_rect,
             0,
             true,
@@ -887,6 +973,7 @@ mod tests {
             &app.workspaces[0],
             &app.terminals,
             app.tab_agent_status,
+            app.tab_agent_context,
             app.view.tab_bar_rect,
             0,
             true,
@@ -913,13 +1000,96 @@ mod tests {
     }
 
     #[test]
+    fn tab_agent_context_extracts_current_producer_format() {
+        assert_eq!(
+            extract_tab_agent_context("🥷✅ ~42%·4242 $1.23"),
+            Some("~42%")
+        );
+    }
+
+    #[test]
+    fn tab_agent_context_tolerates_variable_prefix_and_suffix() {
+        for (display_agent, expected) in [
+            ("0%·1", "0%"),
+            ("working 100%·999999 trailing", "100%"),
+            ("🔧 ready ~7%·0042 cost=unknown", "~7%"),
+        ] {
+            assert_eq!(
+                extract_tab_agent_context(display_agent),
+                Some(expected),
+                "display agent: {display_agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_agent_context_rejects_absent_malformed_and_out_of_range_labels() {
+        assert_eq!(extract_tab_agent_context("🥷✅ working $1.23"), None);
+        for display_agent in [
+            "~%·4242",
+            "~42%4242",
+            "~42%·",
+            "~42%·pid",
+            "101%·4242",
+            "~999%·4242",
+            "-1%·4242",
+            "42%·-1",
+            "x42%·4242",
+            "42%·4242x",
+        ] {
+            assert_eq!(
+                extract_tab_agent_context(display_agent),
+                None,
+                "display agent: {display_agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_agent_context_rejects_ambiguous_two_candidate_label() {
+        assert_eq!(
+            extract_tab_agent_context("🥷 ~42%·4242 moved 43%·4343 $1.23"),
+            None
+        );
+    }
+
+    fn set_agent_with_display_agent(
+        app: &mut AppState,
+        tab_idx: usize,
+        pane_id: crate::layout::PaneId,
+        state: AgentState,
+        display_agent: Option<&str>,
+    ) {
+        let terminal_id = app.workspaces[0].tabs[tab_idx].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_metadata(AgentMetadataReport {
+            source: "test:tab-agent-context".into(),
+            agent_label: None,
+            applies_to_source: None,
+            title: Some("Metadata title must not replace the visible tab name".into()),
+            display_agent: display_agent.map(str::to_owned),
+            state_labels: HashMap::new(),
+            clear_title: false,
+            clear_display_agent: false,
+            clear_state_labels: false,
+            ttl: None,
+            seq: None,
+        });
+        terminal.detected_agent = Some(Agent::Claude);
+        terminal.state = state;
+    }
+
+    #[test]
     fn wrapped_layout_flows_tabs_onto_multiple_rows() {
         // Auto-named tabs are MIN_TAB_WIDTH (8) wide + 1 gap, so 3 fit per row at
         // width 30 and the 4th wraps to the next row.
         let ws = workspace_with_tabs(7);
         let area = Rect::new(0, 0, 30, 5);
+        let tab_widths = tab_layout_widths(&ws, &HashMap::new(), false, false);
         let (rects, _new_tab) =
-            layout_tab_hit_areas_wrapped(&ws, &HashMap::new(), false, area, false);
+            layout_tab_hit_areas_wrapped(&tab_widths, ws.active_tab, area, false);
 
         assert_eq!(rects.len(), 7);
         assert!(
@@ -1183,6 +1353,443 @@ mod tests {
     }
 
     #[test]
+    fn tab_agent_context_renders_exact_percentage_before_zoom_independently_of_status() {
+        let mut app = AppState::test_new();
+        let mut ws = Workspace::test_new("test");
+        ws.tabs[0].set_custom_name("Visible Tab".into());
+        ws.tabs[0].zoomed = true;
+        let pane_id = ws.tabs[0].root_pane;
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        set_agent_with_display_agent(
+            &mut app,
+            0,
+            pane_id,
+            AgentState::Working,
+            Some("🥷✅ ~2%·4242 $1.23"),
+        );
+        app.active = Some(0);
+        app.selected = 0;
+        app.mouse_capture = false;
+        app.tab_agent_status = false;
+        app.tab_agent_context = false;
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        crate::ui::compute_view(&mut app, Rect::new(0, 0, 100, 20));
+        let baseline_rect = app.view.tab_hit_areas[0];
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+        let baseline_row = buffer_row_text(
+            terminal.backend().buffer(),
+            app.view.tab_bar_rect,
+            baseline_rect.y,
+        );
+        assert_eq!(baseline_row, " Visible Tab Z");
+
+        app.tab_agent_context = true;
+        crate::ui::compute_view(&mut app, Rect::new(0, 0, 100, 20));
+        let enabled_rect = app.view.tab_hit_areas[0];
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+        let enabled_row = buffer_row_text(
+            terminal.backend().buffer(),
+            app.view.tab_bar_rect,
+            enabled_rect.y,
+        );
+        assert_eq!(enabled_row, " Visible Tab ~2% Z");
+        assert!(!enabled_row.contains("4242"));
+        assert!(!enabled_row.contains("$1.23"));
+        assert!(!enabled_row.contains("Metadata title"));
+        assert_eq!(
+            enabled_rect.width,
+            tab_width(&app.workspaces[0], 0) + display_width_u16(" ~2%")
+        );
+
+        app.tab_agent_status = true;
+        crate::ui::compute_view(&mut app, Rect::new(0, 0, 100, 20));
+        let composed_rect = app.view.tab_hit_areas[0];
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+        let composed_row = buffer_row_text(
+            terminal.backend().buffer(),
+            app.view.tab_bar_rect,
+            composed_rect.y,
+        );
+        assert!(
+            composed_row.contains("Visible Tab ~2% Z"),
+            "tab row: {composed_row:?}"
+        );
+        // Working is `state_dot`'s filled dot; upstream removed the spinner in
+        // 81f355fa, so there is no per-frame animation on the tab path.
+        assert_eq!(
+            terminal.backend().buffer()[(composed_rect.x + 1, composed_rect.y)].symbol(),
+            "●"
+        );
+        assert_eq!(composed_rect.width, enabled_rect.width + 2);
+
+        app.tab_agent_status = false;
+        app.tab_agent_context = false;
+        crate::ui::compute_view(&mut app, Rect::new(0, 0, 100, 20));
+        let disabled_rect = app.view.tab_hit_areas[0];
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+        let disabled_row = buffer_row_text(
+            terminal.backend().buffer(),
+            app.view.tab_bar_rect,
+            disabled_rect.y,
+        );
+        assert_eq!(disabled_rect, baseline_rect);
+        assert_eq!(disabled_row, baseline_row);
+    }
+
+    #[test]
+    fn tab_agent_context_does_not_fall_back_from_selected_agent_without_percentage() {
+        let mut app = AppState::test_new();
+        let mut ws = Workspace::test_new("test");
+        ws.tabs[0].set_custom_name("pairing".into());
+        let working_pane = ws.tabs[0].root_pane;
+        let blocked_pane = ws.test_split(Direction::Horizontal);
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        set_agent_with_display_agent(
+            &mut app,
+            0,
+            working_pane,
+            AgentState::Working,
+            Some("🥷✅ ~2%·4242 $1.23"),
+        );
+        set_agent_with_display_agent(&mut app, 0, blocked_pane, AgentState::Blocked, None);
+        // Unread blocked outranks working; fresh test panes are seen
+        // (acknowledged) by default, so mark the pane unread. Without this the
+        // working pane wins and its `~2%` label makes the test assert the
+        // opposite of what its name says.
+        app.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&blocked_pane)
+            .unwrap()
+            .seen = false;
+        app.active = Some(0);
+        app.selected = 0;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        app.tab_agent_context = false;
+        crate::ui::compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        let baseline_rect = app.view.tab_hit_areas[0];
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+        let baseline_row = buffer_row_text(
+            terminal.backend().buffer(),
+            app.view.tab_bar_rect,
+            baseline_rect.y,
+        );
+
+        app.tab_agent_context = true;
+        crate::ui::compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        let enabled_rect = app.view.tab_hit_areas[0];
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+        let enabled_row = buffer_row_text(
+            terminal.backend().buffer(),
+            app.view.tab_bar_rect,
+            enabled_rect.y,
+        );
+        assert_eq!(enabled_rect, baseline_rect);
+        assert_eq!(enabled_row, baseline_row);
+        assert!(!enabled_row.contains("~2%"), "tab row: {enabled_row:?}");
+    }
+
+    #[test]
+    fn invalid_tab_agent_context_labels_preserve_baseline_bytes_and_width() {
+        for display_agent in [
+            "working 101%·4242 trailing",
+            "working 42%·4242 then 43%·4343",
+        ] {
+            let mut app = AppState::test_new();
+            let mut ws = Workspace::test_new("test");
+            ws.tabs[0].set_custom_name("baseline".into());
+            let pane_id = ws.tabs[0].root_pane;
+            app.workspaces = vec![ws];
+            app.ensure_test_terminals();
+            set_agent_with_display_agent(
+                &mut app,
+                0,
+                pane_id,
+                AgentState::Working,
+                Some(display_agent),
+            );
+            app.active = Some(0);
+            app.selected = 0;
+
+            let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+            app.tab_agent_context = false;
+            crate::ui::compute_view(&mut app, Rect::new(0, 0, 80, 20));
+            let baseline_rect = app.view.tab_hit_areas[0];
+            terminal
+                .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+                .unwrap();
+            let baseline_row = buffer_row_text(
+                terminal.backend().buffer(),
+                app.view.tab_bar_rect,
+                baseline_rect.y,
+            );
+
+            app.tab_agent_context = true;
+            crate::ui::compute_view(&mut app, Rect::new(0, 0, 80, 20));
+            let enabled_rect = app.view.tab_hit_areas[0];
+            terminal
+                .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+                .unwrap();
+            let enabled_row = buffer_row_text(
+                terminal.backend().buffer(),
+                app.view.tab_bar_rect,
+                enabled_rect.y,
+            );
+            assert_eq!(
+                enabled_rect, baseline_rect,
+                "display agent: {display_agent:?}"
+            );
+            assert_eq!(
+                enabled_row, baseline_row,
+                "display agent: {display_agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_agent_context_pairs_with_highest_attention_status_pane() {
+        let mut app = AppState::test_new();
+        let mut ws = Workspace::test_new("test");
+        ws.tabs[0].set_custom_name("Agent Context Usage Tab".into());
+        let working_pane = ws.tabs[0].root_pane;
+        let blocked_pane = ws.test_split(Direction::Horizontal);
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        set_agent_with_display_agent(
+            &mut app,
+            0,
+            working_pane,
+            AgentState::Working,
+            Some("working ~2%·2002 estimate"),
+        );
+        set_agent_with_display_agent(
+            &mut app,
+            0,
+            blocked_pane,
+            AgentState::Blocked,
+            Some("blocked 42%·4242 cost unavailable"),
+        );
+        // Unread blocked outranks working; fresh test panes are seen
+        // (acknowledged) by default, so mark the pane unread -- otherwise the
+        // working pane wins and the test pairs the wrong percentage.
+        app.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&blocked_pane)
+            .unwrap()
+            .seen = false;
+        app.active = Some(0);
+        app.selected = 0;
+        app.tab_agent_status = true;
+        app.tab_agent_context = true;
+
+        crate::ui::compute_view(&mut app, Rect::new(0, 0, 100, 20));
+        let rect = app.view.tab_hit_areas[0];
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+
+        let status_cell = &terminal.backend().buffer()[(rect.x + 1, rect.y)];
+        let row = buffer_row_text(terminal.backend().buffer(), app.view.tab_bar_rect, rect.y);
+        // `state_dot`'s unread-blocked mark; upstream retired the ring glyph
+        // with agent_icon in 81f355fa.
+        assert_eq!(status_cell.symbol(), "●");
+        assert!(
+            row.contains("Agent Context Usage Tab 42%"),
+            "tab row: {row:?}"
+        );
+        assert!(!row.contains("~2%"), "tab row: {row:?}");
+        assert_eq!(
+            rect.width,
+            tab_width(&app.workspaces[0], 0) + 2 + display_width_u16(" 42%")
+        );
+    }
+
+    #[test]
+    fn tab_agent_presentation_ties_use_last_layout_pane_for_status_and_context() {
+        let mut app = AppState::test_new();
+        let mut ws = Workspace::test_new("test");
+        ws.tabs[0].set_custom_name("tie".into());
+        let first_pane = ws.tabs[0].root_pane;
+        let last_pane = ws.test_split(Direction::Horizontal);
+        assert_eq!(ws.tabs[0].layout.pane_ids(), vec![first_pane, last_pane]);
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        set_agent_with_display_agent(
+            &mut app,
+            0,
+            first_pane,
+            AgentState::Working,
+            Some("working 11%·1111"),
+        );
+        set_agent_with_display_agent(
+            &mut app,
+            0,
+            last_pane,
+            AgentState::Working,
+            Some("working 77%·7777"),
+        );
+        app.active = Some(0);
+        app.selected = 0;
+        app.tab_agent_status = true;
+        app.tab_agent_context = true;
+
+        let expected_terminal_id = app.workspaces[0].tabs[0].panes[&last_pane]
+            .attached_terminal_id
+            .clone();
+        let expected_terminal = &app.terminals[&expected_terminal_id];
+        let presentation = tab_agent_presentation(&app.workspaces[0], &app.terminals, 0).unwrap();
+        assert!(std::ptr::eq(presentation.terminal, expected_terminal));
+        assert_eq!(presentation.state, AgentState::Working);
+        assert_eq!(
+            tab_agent_context_suffix(Some(&presentation)).as_deref(),
+            Some("77%")
+        );
+
+        crate::ui::compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        let rect = app.view.tab_hit_areas[0];
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+
+        let status_cell = &terminal.backend().buffer()[(rect.x + 1, rect.y)];
+        let row = buffer_row_text(terminal.backend().buffer(), app.view.tab_bar_rect, rect.y);
+        // Working is `state_dot`'s filled dot; the spinner subsystem is gone.
+        assert_eq!(status_cell.symbol(), "●");
+        assert_eq!(status_cell.style().fg, Some(app.palette.yellow));
+        assert!(row.contains("tie 77%"), "tab row: {row:?}");
+        assert!(!row.contains("11%"), "tab row: {row:?}");
+    }
+
+    #[test]
+    fn single_row_tab_agent_context_updates_centered_scroll_and_suffix_hit_area() {
+        let mut app = AppState::test_new();
+        let mut ws = workspace_with_tabs(6);
+        ws.active_tab = 4;
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+
+        let context_tab = 4;
+        let pane_id = app.workspaces[0].tabs[context_tab].root_pane;
+        set_agent_with_display_agent(
+            &mut app,
+            context_tab,
+            pane_id,
+            AgentState::Working,
+            Some("working 42%·4242"),
+        );
+        let area = Rect::new(0, 0, 18, 1);
+
+        let baseline = compute_tab_bar_view(
+            &app.workspaces[0],
+            &app.terminals,
+            false,
+            false,
+            area,
+            0,
+            true,
+            false,
+        );
+        assert_eq!(baseline.scroll, 3);
+
+        let enabled = compute_tab_bar_view(
+            &app.workspaces[0],
+            &app.terminals,
+            false,
+            true,
+            area,
+            0,
+            true,
+            false,
+        );
+        assert_eq!(enabled.scroll, 4);
+        let context_rect = enabled.tab_hit_areas[context_tab];
+        assert_eq!(
+            context_rect.width,
+            tab_width(&app.workspaces[0], context_tab) + display_width_u16(" 42%")
+        );
+        let suffix_point = (context_rect.right() - 1, context_rect.y);
+        let hit = enabled.tab_hit_areas.iter().position(|rect| {
+            rect.width > 0
+                && suffix_point.0 >= rect.x
+                && suffix_point.0 < rect.right()
+                && suffix_point.1 >= rect.y
+                && suffix_point.1 < rect.bottom()
+        });
+        assert_eq!(hit, Some(context_tab));
+    }
+
+    #[test]
+    fn wrapped_tab_agent_context_updates_rows_width_and_suffix_hit_area() {
+        let mut app = AppState::test_new();
+        app.mobile_width_threshold = 0;
+        app.sidebar_collapsed = true;
+        app.sidebar_collapsed_mode = crate::config::SidebarCollapsedModeConfig::Hidden;
+        app.tab_bar_wrap = true;
+        app.mouse_capture = false;
+        app.workspaces = vec![workspace_with_tabs(4)];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.selected = 0;
+
+        let context_tab = 1;
+        let pane_id = app.workspaces[0].tabs[context_tab].root_pane;
+        set_agent_with_display_agent(
+            &mut app,
+            context_tab,
+            pane_id,
+            AgentState::Working,
+            Some("working 42%·4242 trailing detail"),
+        );
+        app.tab_agent_context = true;
+
+        crate::ui::compute_view(&mut app, Rect::new(0, 0, 18, 10));
+        let context_rect = app.view.tab_hit_areas[context_tab];
+        assert_eq!(app.view.tab_bar_rect.height, 3);
+        assert_eq!(app.view.terminal_area.y, 3);
+        assert_eq!(
+            context_rect.width,
+            tab_width(&app.workspaces[0], context_tab) + display_width_u16(" 42%")
+        );
+        assert!(context_rect.y > app.view.tab_bar_rect.y);
+        let suffix_point = (context_rect.right() - 1, context_rect.y);
+        let hit = app.view.tab_hit_areas.iter().position(|rect| {
+            rect.width > 0
+                && suffix_point.0 >= rect.x
+                && suffix_point.0 < rect.right()
+                && suffix_point.1 >= rect.y
+                && suffix_point.1 < rect.bottom()
+        });
+        assert_eq!(hit, Some(context_tab));
+
+        app.tab_agent_context = false;
+        crate::ui::compute_view(&mut app, Rect::new(0, 0, 18, 10));
+        assert_eq!(app.view.tab_bar_rect.height, 2);
+        assert_eq!(app.view.terminal_area.y, 2);
+        assert_eq!(
+            app.view.tab_hit_areas[context_tab].width,
+            tab_width(&app.workspaces[0], context_tab)
+        );
+    }
+
+    #[test]
     fn wrap_mode_renders_every_tab_without_scroll_chrome() {
         let mut app = AppState::test_new();
         app.tab_bar_wrap = true;
@@ -1194,6 +1801,7 @@ mod tests {
             &app.workspaces[0],
             &app.terminals,
             app.tab_agent_status,
+            app.tab_agent_context,
             30,
             true,
         );
@@ -1203,6 +1811,7 @@ mod tests {
             &app.workspaces[0],
             &app.terminals,
             app.tab_agent_status,
+            app.tab_agent_context,
             app.view.tab_bar_rect,
             true,
         );
@@ -1245,10 +1854,12 @@ mod tests {
         let ws = workspace_with_tabs(10);
         for &width in &[20u16, 30, 45, 80] {
             for with_new_tab in [false, true] {
-                let rows = tab_bar_wrapped_rows(&ws, &HashMap::new(), false, width, with_new_tab);
+                let rows =
+                    tab_bar_wrapped_rows(&ws, &HashMap::new(), false, false, width, with_new_tab);
                 let area = Rect::new(0, 0, width, u16::from(u8::MAX));
+                let tab_widths = tab_layout_widths(&ws, &HashMap::new(), false, false);
                 let (rects, new_tab) =
-                    layout_tab_hit_areas_wrapped(&ws, &HashMap::new(), false, area, with_new_tab);
+                    layout_tab_hit_areas_wrapped(&tab_widths, ws.active_tab, area, with_new_tab);
                 let mut ys: std::collections::BTreeSet<u16> =
                     rects.iter().filter(|r| r.width > 0).map(|r| r.y).collect();
                 if with_new_tab {
@@ -1264,7 +1875,8 @@ mod tests {
     fn wrap_mode_hit_testing_selects_tabs_on_lower_rows() {
         let ws = workspace_with_tabs(7);
         let area = Rect::new(0, 0, 30, 5);
-        let (rects, _) = layout_tab_hit_areas_wrapped(&ws, &HashMap::new(), false, area, true);
+        let tab_widths = tab_layout_widths(&ws, &HashMap::new(), false, false);
+        let (rects, _) = layout_tab_hit_areas_wrapped(&tab_widths, ws.active_tab, area, true);
 
         // A tab that wrapped onto a lower row carries the correct y. Mirror the
         // row-aware point-in-rect test the mouse layer (`AppState::tab_at`) uses
@@ -1308,6 +1920,7 @@ mod tests {
             &app.workspaces[0],
             &app.terminals,
             app.tab_agent_status,
+            app.tab_agent_context,
             width,
             false,
         );
@@ -1316,6 +1929,7 @@ mod tests {
             &app.workspaces[0],
             &app.terminals,
             app.tab_agent_status,
+            app.tab_agent_context,
             app.view.tab_bar_rect,
             false,
         );
@@ -1388,6 +2002,7 @@ mod tests {
             &app.workspaces[0],
             &app.terminals,
             app.tab_agent_status,
+            app.tab_agent_context,
             width,
             false,
         );
@@ -1396,6 +2011,7 @@ mod tests {
             &app.workspaces[0],
             &app.terminals,
             app.tab_agent_status,
+            app.tab_agent_context,
             app.view.tab_bar_rect,
             false,
         );
@@ -1425,7 +2041,8 @@ mod tests {
         // tests; a follow-up selection can re-center the window on them).
         let ws = workspace_with_tabs(40);
         let area = Rect::new(0, 0, 30, 3);
-        let (rects, _) = layout_tab_hit_areas_wrapped(&ws, &HashMap::new(), false, area, false);
+        let tab_widths = tab_layout_widths(&ws, &HashMap::new(), false, false);
+        let (rects, _) = layout_tab_hit_areas_wrapped(&tab_widths, ws.active_tab, area, false);
 
         let visible_rows: std::collections::BTreeSet<u16> =
             rects.iter().filter(|r| r.width > 0).map(|r| r.y).collect();
