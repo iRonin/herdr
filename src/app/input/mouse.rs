@@ -914,6 +914,30 @@ impl AppState {
                             });
                         }
                     }
+                    // ORDER MATTERS: `move_target` is matched before `drop_target`.
+                    // Both arms use `..`, so if a drag ever carries both, matching
+                    // the reorder first would silently downgrade a cross-workspace
+                    // move to an in-bar reorder -- on a live layout holding running
+                    // agents. Today the update path clears one when it sets the
+                    // other, but that invariant lives in a different function, and
+                    // it is the function upstream rewrote in this very window. Do
+                    // not reorder these arms.
+                    Some(DragState {
+                        target:
+                            DragTarget::TabReorder {
+                                ws_idx,
+                                source_tab_idx,
+                                move_target: Some(target_ws_idx),
+                                ..
+                            },
+                    }) => {
+                        self.mode = Mode::Terminal;
+                        return Some(MouseAction::MoveTabToWorkspace {
+                            ws_idx,
+                            source_tab_idx,
+                            target_ws_idx,
+                        });
+                    }
                     Some(DragState {
                         target:
                             DragTarget::TabReorder {
@@ -931,22 +955,6 @@ impl AppState {
                                 insert_idx: drop_target.insert_idx,
                             });
                         }
-                    }
-                    Some(DragState {
-                        target:
-                            DragTarget::TabReorder {
-                                ws_idx,
-                                source_tab_idx,
-                                move_target: Some(target_ws_idx),
-                                ..
-                            },
-                    }) => {
-                        self.mode = Mode::Terminal;
-                        return Some(MouseAction::MoveTabToWorkspace {
-                            ws_idx,
-                            source_tab_idx,
-                            target_ws_idx,
-                        });
                     }
                     Some(_) => {}
                     None => {
@@ -3938,6 +3946,96 @@ mod tests {
             .events_after(0)
             .iter()
             .any(|(_, event)| { matches!(event.event, crate::api::schema::EventKind::TabClosed) }));
+    }
+
+    // The dispatch arms for `DragTarget::TabReorder` both use `..`, so each
+    // matches on one field alone. A drag carrying BOTH outcomes must dispatch
+    // the cross-workspace move, not the in-bar reorder: the pointer is over a
+    // sidebar workspace card, and downgrading it would relocate nothing while
+    // silently reordering a live layout instead. This is the only check that
+    // catches a future refactor re-opening that gap.
+    // The cross-workspace tab drag has exactly ONE entry point: a left mouse-down
+    // on the tab row, which the mode-bar guard returns early from. So on a bottom
+    // tab bar in a mode-bar mode the gesture cannot START -- the swallow here is
+    // structurally impossible to bypass, not merely "would be caught elsewhere".
+    // Asserted rather than assumed, because that guarantee lives in a different
+    // match arm from the drag it protects.
+    #[test]
+    fn bottom_mode_bar_prevents_the_cross_workspace_tab_drag_from_starting() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("one");
+        ws.test_add_tab(Some("two"));
+        app.state.workspaces = vec![ws, Workspace::test_new("other")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.tab_drag_move_workspace = true;
+        app.state.tab_bar_position = crate::config::TabBarPositionConfig::Bottom;
+        app.state.mode = Mode::Prefix;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let tab = app.state.view.tab_hit_areas[1];
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), tab.x, tab.y));
+        assert!(
+            app.state.tab_press.is_none(),
+            "the mode bar must swallow the press that arms the drag"
+        );
+        // Dragging on from a press that never happened must not invent one.
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            1,
+            tab.y.saturating_sub(8),
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            1,
+            tab.y.saturating_sub(8),
+        ));
+
+        assert!(app.state.drag.is_none());
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2, "no tab moved out");
+        assert_eq!(app.state.workspaces[1].tabs.len(), 1, "no tab moved in");
+    }
+
+    #[test]
+    fn tab_drag_carrying_both_outcomes_dispatches_the_workspace_move() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("one");
+        ws.test_add_tab(Some("two"));
+        app.state.workspaces = vec![ws, Workspace::test_new("other")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.tab_drag_move_workspace = true;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+
+        app.state.drag = Some(DragState {
+            target: DragTarget::TabReorder {
+                ws_idx: 0,
+                source_tab_idx: 0,
+                drop_target: Some(crate::app::state::TabDropTarget {
+                    insert_idx: 1,
+                    indicator_position: (0, 0),
+                }),
+                move_target: Some(1),
+            },
+        });
+
+        let mut runtimes = TerminalRuntimeRegistry::new();
+        let action = app.state.handle_mouse(
+            &mut runtimes,
+            mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
+        );
+
+        assert!(
+            matches!(
+                action,
+                Some(MouseAction::MoveTabToWorkspace {
+                    ws_idx: 0,
+                    source_tab_idx: 0,
+                    target_ws_idx: 1
+                })
+            ),
+            "a drag carrying both outcomes must dispatch the cross-workspace move"
+        );
     }
 
     #[test]

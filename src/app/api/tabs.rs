@@ -285,6 +285,29 @@ impl App {
             None => target_tab_count,
         };
 
+        // A move that empties the source workspace closes it. Match the
+        // contract `tab.close` has carried since upstream's a79b3d55 rather than
+        // silently destroying a worktree group: closing the last tab of a
+        // group member returns `confirmation_required` there, and the same
+        // destructive effect must not slip through a different verb.
+        //
+        // Knowable pre-flight, so it belongs above the infallible region.
+        if self
+            .state
+            .workspaces
+            .get(source_ws_idx)
+            .is_some_and(|ws| ws.tabs.len() <= 1)
+            && self
+                .state
+                .confirm_implicit_worktree_group_close(source_ws_idx)
+        {
+            return encode_error(
+                id,
+                "confirmation_required",
+                "moving this tab would close a worktree group",
+            );
+        }
+
         let previous_focus = self.state.current_pane_focus_target();
         let source_pane_ids: Vec<_> = self.state.workspaces[source_ws_idx].tabs[source_tab_idx]
             .panes
@@ -676,6 +699,70 @@ mod tests {
             } if closed_workspace_id == &workspace_id
                 && workspace.workspace_id == workspace_id
         ));
+    }
+
+    // `tab.close` has returned `confirmation_required` for a worktree group's
+    // last tab since upstream's a79b3d55. `tab.move_to_workspace` closes the
+    // source workspace too when the move empties it, so it must honour the same
+    // contract -- otherwise the identical destructive effect slips through a
+    // different verb, and `src/app/api/tabs.rs` merges with zero conflicts so
+    // git never mentions it.
+    #[test]
+    fn tab_move_to_workspace_requires_confirmation_when_it_would_close_a_worktree_group() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![
+            Workspace::test_new("parent"),
+            Workspace::test_new("child"),
+            Workspace::test_new("elsewhere"),
+        ];
+        // Two members sharing a worktree key, the source being the parent
+        // checkout: closing it takes the whole group with it.
+        for (idx, linked) in [(0usize, false), (1usize, true)] {
+            app.state.workspaces[idx].worktree_space =
+                Some(crate::workspace::WorktreeSpaceMembership {
+                    key: "repo-key".into(),
+                    label: "herdr".into(),
+                    repo_root: "/repo/herdr".into(),
+                    checkout_path: if linked {
+                        format!("/repo/worktree-{idx}").into()
+                    } else {
+                        std::path::PathBuf::from("/repo/herdr")
+                    },
+                    is_linked_worktree: linked,
+                });
+        }
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1, "source has one tab");
+
+        let moved_tab_id = app.public_tab_id(0, 0).unwrap();
+        let target_workspace_id = app.public_workspace_id(2);
+        let response = app.handle_tab_move_to_workspace(
+            "req".into(),
+            TabMoveToWorkspaceParams {
+                tab_id: moved_tab_id,
+                workspace_id: target_workspace_id,
+                insert_index: None,
+                focus: false,
+            },
+        );
+
+        assert!(
+            response.contains("confirmation_required"),
+            "response: {response}"
+        );
+        // And nothing moved: the guard is pre-flight, not a post-hoc report.
+        assert_eq!(app.state.workspaces.len(), 3);
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        assert_eq!(app.state.workspaces[2].tabs.len(), 1);
     }
 
     #[test]
