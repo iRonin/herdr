@@ -2818,6 +2818,10 @@ impl AppState {
                 ws.cached_auto_label = result.auto_label;
                 changed |= ws.custom_name.is_none();
             }
+            if ws.cached_auto_label_pinned != result.auto_label_pinned {
+                ws.cached_auto_label_pinned = result.auto_label_pinned;
+                changed |= ws.custom_name.is_none();
+            }
             if ws.cached_git_status_key != result.status_cache_key {
                 ws.cached_git_status_key = result.status_cache_key;
             }
@@ -4179,6 +4183,7 @@ mod tests {
                 status_cache_key: first_cwd,
                 demand: crate::workspace::GitStatusRefreshDemand::ALL,
                 auto_label: "one".into(),
+                auto_label_pinned: false,
                 branch: Some("main".into()),
                 ahead_behind: Some((2, 1)),
                 space: None,
@@ -4208,6 +4213,7 @@ mod tests {
                 status_cache_key: std::path::PathBuf::from("/definitely/not/current"),
                 demand: crate::workspace::GitStatusRefreshDemand::ALL,
                 auto_label: "stale".into(),
+                auto_label_pinned: false,
                 branch: Some("main".into()),
                 ahead_behind: Some((0, 1)),
                 space: None,
@@ -4239,6 +4245,7 @@ mod tests {
                     ahead_behind: true,
                 },
                 auto_label: "one".into(),
+                auto_label_pinned: false,
                 branch: Some("new".into()),
                 ahead_behind: None,
                 space: None,
@@ -4266,6 +4273,7 @@ mod tests {
                 status_cache_key: cwd,
                 demand: crate::workspace::GitStatusRefreshDemand::ALL,
                 auto_label: "one".into(),
+                auto_label_pinned: false,
                 branch: None,
                 ahead_behind: None,
                 space: None,
@@ -4294,6 +4302,7 @@ mod tests {
                 status_cache_key: cwd,
                 demand: crate::workspace::GitStatusRefreshDemand::ALL,
                 auto_label: "other".into(),
+                auto_label_pinned: false,
                 branch: Some("scratch".into()),
                 ahead_behind: None,
                 space: Some(crate::workspace::GitSpaceMetadata {

@@ -19,9 +19,35 @@ pub struct GitWorktreeInfo {
 }
 
 pub fn derive_label_from_cwd(cwd: &Path) -> String {
-    git_repo_root(cwd)
-        .map(|repo_root| automatic_workspace_label(cwd, &repo_root))
-        .unwrap_or_else(|| fallback_label_from_cwd(cwd))
+    workspace_auto_label(cwd, git_repo_root(cwd).as_deref()).0
+}
+
+/// The automatic workspace label for `cwd`, plus whether a project file *pinned*
+/// it rather than it being derived from the filesystem.
+///
+/// A `.herdr/settings.toml` in the working tree (the nearest one found walking up
+/// from `cwd`, capped at `repo_root` so a file cannot leak in from above the
+/// repository) pins the label via `[workspace] name`. When that file is absent,
+/// unreadable, or lacks the field, derivation DELEGATES to upstream's own helpers
+/// and reproduces stock behaviour exactly -- including the linked-worktree rule
+/// `automatic_workspace_label` implements. Do not inline that logic here.
+///
+/// Callers that already hold the repository root MUST pass it: this function does
+/// no repository discovery of its own, so it adds no `git` invocation at the two
+/// identity-fill sites.
+///
+/// The `pinned` flag must be carried, never inferred by comparing the returned
+/// string to the directory basename -- a pinned name may legitimately equal it.
+pub(crate) fn workspace_auto_label(cwd: &Path, repo_root: Option<&Path>) -> (String, bool) {
+    if let Some(name) = project_workspace_name(cwd, repo_root) {
+        return (name, true);
+    }
+
+    let label = match repo_root {
+        Some(repo_root) => automatic_workspace_label(cwd, repo_root),
+        None => fallback_label_from_cwd(cwd),
+    };
+    (label, false)
 }
 
 pub fn fallback_label_from_cwd(cwd: &Path) -> String {
@@ -37,6 +63,58 @@ pub fn fallback_label_from_cwd(cwd: &Path) -> String {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| cwd.display().to_string())
+}
+
+/// Reads `[workspace] name` from the nearest `.herdr/settings.toml` found by
+/// walking up from `cwd`. When `repo_root` is given, the search stops there so a
+/// project file cannot leak in from above the repository; otherwise it walks to
+/// the filesystem root. Returns `None` when no file is found, the file is
+/// unreadable, the table is absent, or the name is empty/whitespace.
+fn project_workspace_name(cwd: &Path, repo_root: Option<&Path>) -> Option<String> {
+    let mut current = if cwd.is_dir() {
+        cwd.to_path_buf()
+    } else {
+        cwd.parent()?.to_path_buf()
+    };
+
+    loop {
+        if let Some(name) = read_workspace_name(&current.join(".herdr/settings.toml")) {
+            return Some(name);
+        }
+        if Some(current.as_path()) == repo_root {
+            break;
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+
+    None
+}
+
+fn read_workspace_name(path: &Path) -> Option<String> {
+    if !path.is_file() {
+        return None;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Settings {
+        #[serde(default)]
+        workspace: WorkspaceSettings,
+    }
+
+    #[derive(Default, serde::Deserialize)]
+    struct WorkspaceSettings {
+        name: Option<String>,
+    }
+
+    let contents = std::fs::read_to_string(path).ok()?;
+    let settings: Settings = toml::from_str(&contents).ok()?;
+    settings
+        .workspace
+        .name
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
 }
 
 pub fn git_worktree_info(cwd: &Path) -> Option<GitWorktreeInfo> {
@@ -475,6 +553,58 @@ mod tests {
         let label = root.file_name().and_then(|name| name.to_str()).unwrap();
 
         assert_eq!(derive_label_from_cwd(Path::new(&root)), label);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn write_git_repo_marker(root: &Path) {
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    #[test]
+    fn derive_label_falls_back_when_settings_name_absent_or_empty() {
+        let root = temp_test_dir("settings-fallback");
+        write_git_repo_marker(&root);
+        std::fs::create_dir_all(root.join(".herdr")).unwrap();
+        let expected = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+
+        // No [workspace] table.
+        std::fs::write(root.join(".herdr/settings.toml"), "[other]\nkey = 1\n").unwrap();
+        assert_eq!(derive_label_from_cwd(&root), expected);
+
+        // Empty/whitespace name.
+        std::fs::write(
+            root.join(".herdr/settings.toml"),
+            "[workspace]\nname = \"  \"\n",
+        )
+        .unwrap();
+        assert_eq!(derive_label_from_cwd(&root), expected);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn derive_label_ignores_malformed_settings() {
+        let root = temp_test_dir("settings-malformed");
+        write_git_repo_marker(&root);
+        std::fs::create_dir_all(root.join(".herdr")).unwrap();
+        std::fs::write(
+            root.join(".herdr/settings.toml"),
+            "[workspace\nname = \"x\n",
+        )
+        .unwrap();
+
+        let expected = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        assert_eq!(derive_label_from_cwd(&root), expected);
 
         std::fs::remove_dir_all(root).unwrap();
     }

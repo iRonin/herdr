@@ -6,9 +6,9 @@ use crate::workspace::{GitSpaceMetadata, WorkspaceGitStatusSnapshot};
 use super::{
     config::{read_branch_config, upstream_full_ref},
     discovery::{
-        automatic_workspace_label, canonicalize_best_effort_path, fallback_label_from_cwd,
-        git_ref_storage_is_reftable, git_rev_parse_verify, git_space_metadata_from_info,
-        git_symbolic_head_full, git_worktree_info, read_ref_oid, GitWorktreeInfo,
+        canonicalize_best_effort_path, git_ref_storage_is_reftable, git_rev_parse_verify,
+        git_space_metadata_from_info, git_symbolic_head_full, git_worktree_info, read_ref_oid,
+        workspace_auto_label, GitWorktreeInfo,
     },
 };
 
@@ -96,8 +96,13 @@ pub fn git_status_snapshot_for_cwd_with_demand(
     }
 
     let Some(info) = git_worktree_info(cwd) else {
+        // Non-git cwd: still honour a project pin. `.herdr/settings.toml` is
+        // supported outside a repository, and this early return is the path a
+        // non-git workspace takes on every refresh.
+        let (auto_label, auto_label_pinned) = workspace_auto_label(cwd, None);
         let snapshot = WorkspaceGitStatusSnapshot {
-            auto_label: fallback_label_from_cwd(cwd),
+            auto_label,
+            auto_label_pinned,
             branch: None,
             ahead_behind: None,
             space: None,
@@ -111,7 +116,8 @@ pub fn git_status_snapshot_for_cwd_with_demand(
             }),
         );
     };
-    let auto_label = automatic_workspace_label(cwd, &info.repo_root);
+    // `info.repo_root` is already discovered -- pass it so no extra `git` runs.
+    let (auto_label, auto_label_pinned) = workspace_auto_label(cwd, Some(&info.repo_root));
     let space = git_space_metadata_from_info(&info);
 
     if !demand.ahead_behind {
@@ -127,6 +133,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
         return (
             WorkspaceGitStatusSnapshot {
                 auto_label,
+                auto_label_pinned,
                 branch,
                 ahead_behind: None,
                 space: Some(space),
@@ -139,6 +146,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
         return (
             WorkspaceGitStatusSnapshot {
                 auto_label,
+                auto_label_pinned,
                 branch: None,
                 ahead_behind: None,
                 space: Some(space),
@@ -151,6 +159,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
     if let Some(cached) = cached.filter(|entry| entry.fingerprint.as_ref() == Some(&fingerprint)) {
         let snapshot = WorkspaceGitStatusSnapshot {
             auto_label,
+            auto_label_pinned,
             branch,
             ahead_behind: cached.snapshot.ahead_behind,
             space: Some(space),
@@ -171,6 +180,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
         .and_then(|(head_oid, upstream_oid)| git_ahead_behind_between(cwd, head_oid, upstream_oid));
     let snapshot = WorkspaceGitStatusSnapshot {
         auto_label,
+        auto_label_pinned,
         branch,
         ahead_behind,
         space: Some(space),
@@ -433,6 +443,7 @@ mod tests {
             retry_after: None,
             snapshot: WorkspaceGitStatusSnapshot {
                 auto_label: "repo".into(),
+                auto_label_pinned: false,
                 branch: Some("main".into()),
                 ahead_behind: Some((2, 1)),
                 space: git_space_metadata(&root),
@@ -458,6 +469,7 @@ mod tests {
             retry_after: None,
             snapshot: WorkspaceGitStatusSnapshot {
                 auto_label: "repo".into(),
+                auto_label_pinned: false,
                 branch: Some("main".into()),
                 ahead_behind: Some((4, 0)),
                 space: git_space_metadata(&root),
@@ -493,6 +505,7 @@ mod tests {
             retry_after: None,
             snapshot: WorkspaceGitStatusSnapshot {
                 auto_label: "repo".into(),
+                auto_label_pinned: false,
                 branch: Some("main".into()),
                 ahead_behind: Some((0, 3)),
                 space: git_space_metadata(&root),
@@ -525,6 +538,49 @@ mod tests {
             fingerprint.upstream.unwrap().oid.as_deref(),
             Some("2222222222222222222222222222222222222222")
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // THE REFRESH PATH. The periodic/identity refresh recomputes the label on a
+    // background thread and writes it back over the cache. If the pin is not
+    // honoured here, a pinned workspace reverts to the repo basename the first
+    // time a refresh runs -- a delayed failure a creation-time-only test misses.
+    #[test]
+    fn refresh_snapshot_pins_label_from_project_settings() {
+        let root = temp_test_dir("refresh-pinned-label");
+        write_fake_tracked_repo(&root);
+        std::fs::create_dir_all(root.join(".herdr")).unwrap();
+        std::fs::write(
+            root.join(".herdr/settings.toml"),
+            "[workspace]\nname = \"pinned-label\"\n",
+        )
+        .unwrap();
+
+        let (snapshot, _) = git_status_snapshot_for_cwd(&root, None);
+
+        assert_eq!(snapshot.auto_label, "pinned-label");
+        assert!(snapshot.auto_label_pinned);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // NON-GIT cwd through the refresh path: a project file outside a repository
+    // is supported, and that case takes the early return, not the main path.
+    #[test]
+    fn refresh_snapshot_pins_label_outside_a_repository() {
+        let root = temp_test_dir("refresh-pinned-nogit");
+        std::fs::create_dir_all(root.join(".herdr")).unwrap();
+        std::fs::write(
+            root.join(".herdr/settings.toml"),
+            "[workspace]\nname = \"plain-pin\"\n",
+        )
+        .unwrap();
+
+        let (snapshot, _) = git_status_snapshot_for_cwd(&root, None);
+
+        assert_eq!(snapshot.auto_label, "plain-pin");
+        assert!(snapshot.auto_label_pinned);
 
         std::fs::remove_dir_all(root).unwrap();
     }

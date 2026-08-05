@@ -2381,6 +2381,7 @@ mod tests {
                 status_cache_key: resolved_identity_cwd,
                 demand: crate::workspace::GitStatusRefreshDemand::ALL,
                 auto_label: "one".into(),
+                auto_label_pinned: false,
                 branch: Some("render-dirty-test".into()),
                 ahead_behind: Some((1, 0)),
                 space: None,

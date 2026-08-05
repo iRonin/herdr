@@ -47,6 +47,9 @@ pub struct WorkspaceGitStatus {
     pub status_cache_key: PathBuf,
     pub demand: GitStatusRefreshDemand,
     pub auto_label: String,
+    /// Whether `auto_label` was pinned by a project `.herdr/settings.toml`
+    /// rather than derived from the directory.
+    pub auto_label_pinned: bool,
     pub branch: Option<String>,
     pub ahead_behind: Option<(usize, usize)>,
     pub space: Option<GitSpaceMetadata>,
@@ -55,6 +58,9 @@ pub struct WorkspaceGitStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceGitStatusSnapshot {
     pub auto_label: String,
+    /// Whether `auto_label` was pinned by a project `.herdr/settings.toml`
+    /// rather than derived from the directory.
+    pub auto_label_pinned: bool,
     pub branch: Option<String>,
     pub ahead_behind: Option<(usize, usize)>,
     pub space: Option<GitSpaceMetadata>,
@@ -62,17 +68,16 @@ pub struct WorkspaceGitStatusSnapshot {
 
 pub(crate) fn discover_workspace_git_identity(
     cwd: &std::path::Path,
-) -> (Option<GitSpaceMetadata>, String, PathBuf) {
+) -> (Option<GitSpaceMetadata>, String, bool, PathBuf) {
     let space = git_space_metadata(cwd);
-    let auto_label = space
-        .as_ref()
-        .map(|space| self::git::automatic_workspace_label(cwd, &space.repo_root))
-        .unwrap_or_else(|| fallback_label_from_cwd(cwd));
+    // `space.repo_root` is already discovered -- pass it so no extra `git` runs.
+    let (auto_label, auto_label_pinned) =
+        self::git::workspace_auto_label(cwd, space.as_ref().map(|space| space.repo_root.as_path()));
     let status_cache_key = space
         .as_ref()
         .map(git_status_cache_key_for_space)
         .unwrap_or_else(|| cwd.to_path_buf());
-    (space, auto_label, status_cache_key)
+    (space, auto_label, auto_label_pinned, status_cache_key)
 }
 
 impl WorkspaceGitStatusSnapshot {
@@ -89,6 +94,7 @@ impl WorkspaceGitStatusSnapshot {
             status_cache_key,
             demand,
             auto_label: self.auto_label,
+            auto_label_pinned: self.auto_label_pinned,
             branch: self.branch,
             ahead_behind: self.ahead_behind,
             space: self.space,
@@ -179,6 +185,9 @@ pub struct Workspace {
     pub(crate) cached_identity_cwd: PathBuf,
     /// Automatic workspace label cached outside the render path.
     pub(crate) cached_auto_label: String,
+    /// Whether `cached_auto_label` was pinned by a project `.herdr/settings.toml`
+    /// rather than derived from `cached_identity_cwd`.
+    pub(crate) cached_auto_label_pinned: bool,
     /// Cache key for periodic Git status associated with `cached_identity_cwd`.
     pub(crate) cached_git_status_key: PathBuf,
     /// Cached current git branch for the workspace repo.
@@ -242,7 +251,7 @@ impl Workspace {
         let tab = Tab::from_existing_pane(1, tab_label, moved, events, render_notify, render_dirty);
         let mut public_pane_numbers = HashMap::new();
         public_pane_numbers.insert(root_pane, 1);
-        let (cached_git_space, cached_auto_label, cached_git_status_key) =
+        let (cached_git_space, cached_auto_label, cached_auto_label_pinned, cached_git_status_key) =
             discover_workspace_git_identity(&identity_cwd);
         Self {
             id,
@@ -250,6 +259,7 @@ impl Workspace {
             identity_cwd: identity_cwd.clone(),
             cached_identity_cwd: identity_cwd.clone(),
             cached_auto_label,
+            cached_auto_label_pinned,
             cached_git_status_key,
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,
@@ -440,7 +450,7 @@ impl Workspace {
         };
         let mut public_pane_numbers = HashMap::new();
         public_pane_numbers.insert(tab.root_pane, 1);
-        let (cached_git_space, cached_auto_label, cached_git_status_key) =
+        let (cached_git_space, cached_auto_label, cached_auto_label_pinned, cached_git_status_key) =
             discover_workspace_git_identity(&initial_cwd);
         Ok((
             Self {
@@ -449,6 +459,7 @@ impl Workspace {
                 identity_cwd: initial_cwd.clone(),
                 cached_identity_cwd: initial_cwd.clone(),
                 cached_auto_label,
+                cached_auto_label_pinned,
                 cached_git_status_key,
                 cached_git_branch: git_branch(&initial_cwd),
                 cached_git_ahead_behind: None,
@@ -1206,7 +1217,19 @@ impl Workspace {
     }
 
     fn automatic_display_name_for_cwd(&self, cwd: &std::path::Path) -> String {
-        if cwd == self.cached_identity_cwd {
+        // A project-pinned label identifies the WORKSPACE, not the directory a
+        // pane currently sits in, so it stays correct while the cwd drifts
+        // inside the project (`/proj` -> `/proj/src/deep`). Without this the
+        // pinned name flickers to a raw basename until the next identity
+        // refresh lands.
+        //
+        // This is a cache READ, not a lookup: no filesystem access and no
+        // `git`, so #1842's discovery caching is preserved, not eroded.
+        //
+        // Deliberately NOT applied when the label is unpinned: upstream's
+        // behaviour for a drifted cwd is reproduced exactly for anyone who has
+        // not opted in.
+        if cwd == self.cached_identity_cwd || self.cached_auto_label_pinned {
             self.cached_auto_label.clone()
         } else {
             fallback_label_from_cwd(cwd)
@@ -1343,6 +1366,7 @@ impl Workspace {
             identity_cwd: identity_cwd.clone(),
             cached_identity_cwd: identity_cwd.clone(),
             cached_auto_label: fallback_label_from_cwd(&identity_cwd),
+            cached_auto_label_pinned: false,
             cached_git_status_key: identity_cwd.clone(),
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,
@@ -1751,12 +1775,94 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove test repo");
     }
 
+    // The label the sidebar renders comes from the CACHED identity fill, not from
+    // `derive_label_from_cwd`. These assert through that path, so they can return
+    // the failure the deleted `derive_label_*` tests structurally could not: a
+    // project pin that never reaches the cache.
+    #[test]
+    fn discover_workspace_git_identity_pins_label_from_project_settings() {
+        let root = self::git::test_support::temp_test_dir("identity-pinned-label");
+        let nested = root.join("a/b");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(root.join(".herdr")).unwrap();
+        std::fs::write(
+            root.join(".herdr/settings.toml"),
+            "[workspace]\nname = \"pinned-label\"\n",
+        )
+        .unwrap();
+
+        let (_, auto_label, pinned, _) = discover_workspace_git_identity(&nested);
+
+        assert_eq!(auto_label, "pinned-label");
+        assert!(pinned, "a project file must mark the label as pinned");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // NEGATIVE CONTROL. Without a project file the pin must be OFF and the label
+    // must be exactly what upstream produces. This is what fails if the
+    // discovery.rs seam is ever "fixed" by inlining our own fallback instead of
+    // delegating to upstream's `automatic_workspace_label`.
+    #[test]
+    fn discover_workspace_git_identity_is_unpinned_and_upstream_exact_without_settings() {
+        let root = self::git::test_support::temp_test_dir("identity-unpinned-label");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let expected = root.file_name().unwrap().to_str().unwrap().to_string();
+
+        let (_, auto_label, pinned, _) = discover_workspace_git_identity(&root);
+
+        assert_eq!(auto_label, expected);
+        assert!(!pinned, "no project file means no pin");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // A pinned label identifies the workspace, so it survives a pane cwd drift
+    // INSIDE the project, with no filesystem access on the render path.
+    #[test]
+    fn pinned_label_survives_pane_cwd_drift() {
+        let mut ws = Workspace::test_new("drift");
+        ws.custom_name = None;
+        ws.cached_identity_cwd = PathBuf::from("/proj");
+        ws.cached_auto_label = "pinned-label".into();
+        ws.cached_auto_label_pinned = true;
+
+        assert_eq!(ws.display_name(), "pinned-label");
+        assert_eq!(
+            ws.automatic_display_name_for_cwd(std::path::Path::new("/proj/src/deep")),
+            "pinned-label"
+        );
+    }
+
+    // DEFAULT-PRESERVATION. An UNPINNED workspace keeps upstream's exact drifted-cwd
+    // behaviour; this is what stops the line above from becoming a silent change for
+    // anyone who never opted in.
+    #[test]
+    fn unpinned_label_still_falls_back_on_pane_cwd_drift() {
+        let mut ws = Workspace::test_new("drift");
+        ws.custom_name = None;
+        ws.cached_identity_cwd = PathBuf::from("/proj");
+        ws.cached_auto_label = "proj".into();
+        ws.cached_auto_label_pinned = false;
+
+        assert_eq!(
+            ws.automatic_display_name_for_cwd(std::path::Path::new("/proj/src/deep")),
+            "deep",
+            "upstream behaviour must be reproduced exactly when unpinned"
+        );
+    }
+
     #[test]
     fn linked_worktree_auto_label_uses_checkout_name_not_repo_name() {
         let (base, repo, checkout) =
             self::git::test_support::create_repo_with_linked_worktree("linked-auto-label");
 
-        let (space, auto_label, _) = discover_workspace_git_identity(&checkout);
+        // ARITY ONLY: this is upstream's guard against reverting e16d7d8c.
+        // The assertions must stay exactly as upstream wrote them.
+        let (space, auto_label, _, _) = discover_workspace_git_identity(&checkout);
 
         assert_eq!(
             space.unwrap().repo_name,
