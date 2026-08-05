@@ -408,6 +408,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # a Herdr server restart. Requires official integrations that report session refs.
 # resume_agents_on_restore = true
 
+# Maximum time in milliseconds for `herdr server stop` to wait for shutdown.
+# Zero uses the 15000ms default; values above 300000ms (5 minutes) are capped.
+# stop_timeout_ms = 15000
+
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.
 # When true (default), herdr runs remote ssh through a generated config that

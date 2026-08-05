@@ -31,7 +31,8 @@ fn server_stop(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     }
 
-    match crate::session::stop_active_server() {
+    let timeout = load_server_stop_timeout();
+    match crate::session::stop_active_server(timeout) {
         Ok(()) => Ok(0),
         Err(err) => {
             eprintln!("{err}");
@@ -46,7 +47,9 @@ fn server_restart(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     }
 
+    let config = crate::config::Config::load().config;
     match restart_server_with(
+        &config,
         |name| std::env::var_os(name),
         crate::session::active_api_socket_path,
         crate::session::stop_active_server,
@@ -61,9 +64,10 @@ fn server_restart(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn restart_server_with(
+    config: &crate::config::Config,
     get_env: impl FnOnce(&str) -> Option<std::ffi::OsString>,
     resolve_target_socket: impl FnOnce() -> std::path::PathBuf,
-    stop_server: impl FnOnce() -> Result<(), String>,
+    stop_server: impl FnOnce(std::time::Duration) -> Result<(), String>,
     start_and_attach: impl FnOnce() -> std::io::Result<()>,
 ) -> Result<(), String> {
     if let Some(hosting_socket) = get_env(crate::api::SOCKET_PATH_ENV_VAR) {
@@ -74,8 +78,23 @@ fn restart_server_with(
         }
     }
 
-    stop_server()
-        .map_err(|err| format!("server restart aborted: {err}\nThe server was not restarted."))?;
+    let timeout = server_stop_timeout(config);
+    stop_server(timeout).map_err(|err| {
+        let mut message = format!("server restart aborted: {err}\nThe server was not restarted.");
+        if err.contains("did not stop within") {
+            let max_timeout =
+                std::time::Duration::from_millis(crate::config::MAX_STOP_WAIT_TIMEOUT_MS);
+            if timeout < max_timeout {
+                message.push_str("\nRaise session.stop_timeout_ms and try again.");
+            } else {
+                message.push_str(&format!(
+                    "\nsession.stop_timeout_ms is already at its {}ms maximum.",
+                    crate::config::MAX_STOP_WAIT_TIMEOUT_MS
+                ));
+            }
+        }
+        message
+    })?;
 
     start_and_attach()
         .map_err(|err| format!("server stopped but failed to restart and attach: {err}"))
@@ -86,6 +105,21 @@ fn canonical_socket_paths_match(left: &std::path::Path, right: &std::path::Path)
         (Ok(left), Ok(right)) => left == right,
         _ => false,
     }
+}
+
+fn load_server_stop_timeout() -> std::time::Duration {
+    let config = crate::config::Config::load().config;
+    server_stop_timeout(&config)
+}
+
+fn server_stop_timeout(config: &crate::config::Config) -> std::time::Duration {
+    let configured_ms = config.session.stop_timeout_ms;
+    let timeout_ms = if configured_ms == 0 {
+        crate::config::DEFAULT_STOP_WAIT_TIMEOUT_MS
+    } else {
+        configured_ms.min(crate::config::MAX_STOP_WAIT_TIMEOUT_MS)
+    };
+    std::time::Duration::from_millis(timeout_ms)
 }
 
 fn server_reload_config(args: &[String]) -> std::io::Result<i32> {
@@ -322,11 +356,14 @@ mod tests {
     #[test]
     fn server_restart_stops_before_starting_and_attaching() {
         let events = std::cell::RefCell::new(Vec::new());
+        let config = crate::config::Config::default();
 
         restart_server_with(
+            &config,
             |_| None,
             || panic!("target socket is irrelevant outside a hosted pane"),
-            || {
+            |timeout| {
+                assert_eq!(timeout, std::time::Duration::from_millis(15_000));
                 events.borrow_mut().push("stop");
                 Ok(())
             },
@@ -342,6 +379,7 @@ mod tests {
 
     #[test]
     fn server_restart_refuses_when_target_server_hosts_current_pane() {
+        let config = crate::config::Config::default();
         let target_socket = std::env::current_dir().unwrap().canonicalize().unwrap();
         let hosting_socket = target_socket.join("src").join("..");
         assert_ne!(
@@ -352,12 +390,13 @@ mod tests {
         let start_called = std::cell::Cell::new(false);
 
         let error = restart_server_with(
+            &config,
             |name| {
                 assert_eq!(name, crate::api::SOCKET_PATH_ENV_VAR);
                 Some(hosting_socket.clone().into_os_string())
             },
             || target_socket.clone(),
-            || {
+            |_| {
                 stop_called.set(true);
                 Ok(())
             },
@@ -378,15 +417,17 @@ mod tests {
 
     #[test]
     fn server_restart_proceeds_when_hosting_socket_is_unset() {
+        let config = crate::config::Config::default();
         let events = std::cell::RefCell::new(Vec::new());
 
         restart_server_with(
+            &config,
             |name| {
                 assert_eq!(name, crate::api::SOCKET_PATH_ENV_VAR);
                 None
             },
             || std::env::current_dir().unwrap(),
-            || {
+            |_| {
                 events.borrow_mut().push("stop");
                 Ok(())
             },
@@ -402,6 +443,7 @@ mod tests {
 
     #[test]
     fn server_restart_proceeds_when_hosted_by_a_different_server() {
+        let config = crate::config::Config::default();
         let hosting_socket = std::env::current_dir().unwrap().canonicalize().unwrap();
         let target_socket = hosting_socket
             .parent()
@@ -410,9 +452,10 @@ mod tests {
         let events = std::cell::RefCell::new(Vec::new());
 
         restart_server_with(
+            &config,
             |_| Some(hosting_socket.clone().into_os_string()),
             || target_socket.clone(),
-            || {
+            |_| {
                 events.borrow_mut().push("stop");
                 Ok(())
             },
@@ -427,13 +470,21 @@ mod tests {
     }
 
     #[test]
-    fn server_restart_does_not_start_when_stop_fails() {
+    fn server_restart_timeout_does_not_start_and_suggests_raising_timeout() {
+        let config: crate::config::Config =
+            toml::from_str("[session]\nstop_timeout_ms = 25\n").unwrap();
         let start_called = std::cell::Cell::new(false);
 
         let error = restart_server_with(
+            &config,
             |_| None,
             || panic!("target socket is irrelevant outside a hosted pane"),
-            || Err("server did not stop within 15000ms".to_string()),
+            |timeout| {
+                Err(format!(
+                    "server did not stop within {}ms; sockets are still reachable",
+                    timeout.as_millis()
+                ))
+            },
             || {
                 start_called.set(true);
                 Ok(())
@@ -445,32 +496,165 @@ mod tests {
             !start_called.get(),
             "restart must not start over a live server"
         );
+        assert!(error.contains("server restart aborted"), "{error}");
+        assert!(error.contains("server was not restarted"), "{error}");
+        assert!(error.contains("Raise session.stop_timeout_ms"), "{error}");
+    }
+
+    #[test]
+    fn server_restart_timeout_at_cap_does_not_suggest_impossible_raise() {
+        let config: crate::config::Config =
+            toml::from_str("[session]\nstop_timeout_ms = 500000\n").unwrap();
+
+        let error = restart_server_with(
+            &config,
+            |_| None,
+            || panic!("target socket is irrelevant outside a hosted pane"),
+            |timeout| {
+                Err(format!(
+                    "server did not stop within {}ms; sockets are still reachable",
+                    timeout.as_millis()
+                ))
+            },
+            || panic!("restart must not start over a live server"),
+        )
+        .unwrap_err();
+
+        assert!(!error.contains("Raise session.stop_timeout_ms"), "{error}");
+        assert!(error.contains("300000ms maximum"), "{error}");
+    }
+
+    #[test]
+    fn server_restart_succeeds_with_raised_stop_timeout() {
+        let config: crate::config::Config =
+            toml::from_str("[session]\nstop_timeout_ms = 45000\n").unwrap();
+        let observed_timeout = std::cell::Cell::new(std::time::Duration::ZERO);
+        let start_called = std::cell::Cell::new(false);
+
+        restart_server_with(
+            &config,
+            |_| None,
+            || panic!("target socket is irrelevant outside a hosted pane"),
+            |timeout| {
+                observed_timeout.set(timeout);
+                Ok(())
+            },
+            || {
+                start_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
         assert_eq!(
-            error,
-            "server restart aborted: server did not stop within 15000ms\nThe server was not restarted."
+            observed_timeout.get(),
+            std::time::Duration::from_millis(45_000)
+        );
+        assert!(start_called.get());
+    }
+
+    #[test]
+    fn server_stop_timeout_uses_configured_value_and_default() {
+        let default_config = crate::config::Config::default();
+        assert_eq!(
+            server_stop_timeout(&default_config),
+            std::time::Duration::from_millis(crate::config::DEFAULT_STOP_WAIT_TIMEOUT_MS)
+        );
+
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[session]
+stop_timeout_ms = 5000
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            server_stop_timeout(&config),
+            std::time::Duration::from_millis(5_000)
         );
     }
 
     #[test]
-    fn server_restart_reports_attach_failure_after_stop() {
-        let stop_called = std::cell::Cell::new(false);
+    fn server_stop_timeout_defaults_zero_and_clamps_oversized_values() {
+        assert_eq!(crate::config::MAX_STOP_WAIT_TIMEOUT_MS, 300_000);
 
-        let error = restart_server_with(
-            |_| None,
-            || panic!("target socket is irrelevant outside a hosted pane"),
-            || {
-                stop_called.set(true);
-                Ok(())
-            },
-            || Err(std::io::Error::other("attach failed")),
-        )
-        .unwrap_err();
-
-        assert!(stop_called.get());
+        let mut config = crate::config::Config::default();
+        config.session.stop_timeout_ms = 0;
         assert_eq!(
-            error,
-            "server stopped but failed to restart and attach: attach failed"
+            server_stop_timeout(&config),
+            std::time::Duration::from_millis(crate::config::DEFAULT_STOP_WAIT_TIMEOUT_MS)
         );
+
+        config.session.stop_timeout_ms = i64::MAX as u64;
+        assert_eq!(
+            server_stop_timeout(&config),
+            std::time::Duration::from_millis(crate::config::MAX_STOP_WAIT_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn load_server_stop_timeout_reads_config_and_defaults_when_absent() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-server-stop-config-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        assert_eq!(
+            load_server_stop_timeout(),
+            std::time::Duration::from_millis(crate::config::DEFAULT_STOP_WAIT_TIMEOUT_MS)
+        );
+
+        std::fs::write(&path, "[session]\nstop_timeout_ms = 5000\n").unwrap();
+        assert_eq!(
+            load_server_stop_timeout(),
+            std::time::Duration::from_millis(5_000)
+        );
+
+        std::fs::write(&path, "[session]\nstop_timeout_ms = 0\n").unwrap();
+        assert_eq!(
+            load_server_stop_timeout(),
+            std::time::Duration::from_millis(crate::config::DEFAULT_STOP_WAIT_TIMEOUT_MS)
+        );
+
+        std::fs::write(
+            &path,
+            format!(
+                "[session]\nstop_timeout_ms = {}\n",
+                crate::config::MAX_STOP_WAIT_TIMEOUT_MS + 1
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            load_server_stop_timeout(),
+            std::time::Duration::from_millis(crate::config::MAX_STOP_WAIT_TIMEOUT_MS)
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn server_stop_timeout_falls_back_when_config_is_invalid() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-server-stop-invalid-config-{}.toml",
+            std::process::id()
+        ));
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let invalid_config = "[session\nstop_timeout_ms = 'broken'";
+        std::fs::write(&path, invalid_config).unwrap();
+        assert_eq!(
+            load_server_stop_timeout(),
+            std::time::Duration::from_millis(crate::config::DEFAULT_STOP_WAIT_TIMEOUT_MS),
+            "invalid config should fall back: {invalid_config:?}"
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

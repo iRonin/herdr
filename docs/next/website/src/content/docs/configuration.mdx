@@ -443,6 +443,16 @@ Herdr uses that name everywhere it handles Pi, so the executable it starts is th
 For detection the name is matched the same way as the built-in Agent names: case-insensitively, ignoring a `.exe`, `.cmd`, `.bat`, `.ps1`, or `.js` extension, and using the final path component if you give a full path. Starting an Agent uses the value exactly as written, so a full path launches that path.
 
 The default is `"pi"`, which changes nothing. Blank or whitespace-only values also fall back to `"pi"`. A name that already belongs to another Agent, such as `claude`, keeps that Agent, and other Agents always launch under their own executables. Reloading the config applies the new name immediately, to detection, to newly started Agents, and to any resume that has not started yet.
+## Server stop timeout
+
+Set how long `herdr server stop` waits for the server and client sockets to shut down:
+
+```toml
+[session]
+stop_timeout_ms = 15000
+```
+
+The value is in milliseconds and defaults to 15,000 (15 seconds), preserving upstream v0.7.4 behavior when unset. Zero uses the default, and values above 300,000 (5 minutes) are capped at that maximum. This setting applies to `herdr server stop`; named `herdr session stop` commands continue to use the 15-second default.
 
 ## Agent session restore
 
