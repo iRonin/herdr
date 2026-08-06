@@ -341,7 +341,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # tab_agent_status = false
 
 # Mirror the highest-attention agent pane's standalone context percentage on each desktop tab.
-# Recognizes N%·PID and ~N%·PID labels from the Agents pane.
+# Recognizes N%·TAIL and ~N%·TAIL labels from the Agents pane
+# (TAIL is the reporter's model and/or PID segment).
 # tab_agent_context = false
 
 # Agent panel ordering: "spaces" (grouped by space) or "priority" (attention queue).

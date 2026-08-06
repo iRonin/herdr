@@ -70,11 +70,45 @@ fn tab_agent_presentation<'a>(
         })
 }
 
+/// The icon an agent reporter prefixes `display_agent` with. Its lifecycle
+/// marker sits directly after this icon in the first whitespace token. Pinning
+/// the prefix is what lets the tab tell a real reporter marker from any other
+/// leading emoji: the marker glyphs themselves are common, so a position-only
+/// parse would false-positive.
+const AGENT_LABEL_ICON: &str = "\u{1F977}";
+
+/// Lifecycle marker from the reporter's `display_agent` grammar
+/// `{icon}{marker} {~}N%\u{B7}MODEL\u{B7}PID {$cost}`. Bounded set: awaiting-user
+/// (may carry a pending-ask count), ready-to-close, asked-to-stop, done,
+/// agent-driven. Anything else yields `None` so the tab renders exactly as it
+/// does today (fail closed).
+fn extract_tab_agent_lifecycle_marker(display_agent: &str) -> Option<&str> {
+    let first = display_agent.split_whitespace().next()?;
+    let rest = first.strip_prefix(AGENT_LABEL_ICON)?;
+    if rest.is_empty() {
+        return None;
+    }
+    is_lifecycle_marker(rest).then_some(rest)
+}
+
+/// The awaiting-user marker may carry a pending-ask count; the others are bare.
+fn is_lifecycle_marker(s: &str) -> bool {
+    if let Some(count) = s.strip_prefix('\u{2753}') {
+        return count.is_empty() || count.bytes().all(|b| b.is_ascii_digit());
+    }
+    matches!(s, "\u{1F4A4}" | "\u{270B}" | "\u{2705}" | "\u{1F916}")
+}
+
+fn tab_agent_lifecycle_marker(presentation: Option<&TabAgentPresentation<'_>>) -> Option<String> {
+    let display_agent = presentation?.terminal.effective_display_agent()?;
+    extract_tab_agent_lifecycle_marker(&display_agent).map(str::to_owned)
+}
+
 fn extract_tab_agent_context(display_agent: &str) -> Option<&str> {
     let mut found = None;
     for candidate in display_agent.split_whitespace() {
         let body = candidate.strip_prefix('~').unwrap_or(candidate);
-        let Some((percentage, pid)) = body.split_once("%·") else {
+        let Some((percentage, tail)) = body.split_once("%·") else {
             continue;
         };
         if percentage.is_empty()
@@ -83,13 +117,20 @@ fn extract_tab_agent_context(display_agent: &str) -> Option<&str> {
                 .parse::<u16>()
                 .ok()
                 .is_none_or(|value| value > 100)
-            || pid.is_empty()
-            || !pid.bytes().all(|byte| byte.is_ascii_digit())
+            || tail.is_empty()
+            // The reporter's grammar keeps a numeric PID as the LAST
+            // ·-segment; anything between it and the % is the model name.
+            // Requiring the trailing segment to be numeric is what still
+            // rejects a non-reporter label such as "~42%·pid".
+            || !tail
+                .rsplit('·')
+                .next()
+                .is_some_and(|last| !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()))
         {
             continue;
         }
 
-        let percentage_end = candidate.len() - '·'.len_utf8() - pid.len();
+        let percentage_end = candidate.len() - '·'.len_utf8() - tail.len();
         let percentage = &candidate[..percentage_end];
         if found.is_some() {
             return None;
@@ -117,7 +158,13 @@ fn tab_layout_width(
     let context = tab_agent_context
         .then(|| tab_agent_context_suffix(presentation.as_ref()))
         .flatten();
+    // The marker is prefixed to the name, so the tab must be that much wider or
+    // the label overruns and renders corrupted.
+    let marker = tab_agent_context
+        .then(|| tab_agent_lifecycle_marker(presentation.as_ref()))
+        .flatten();
     tab_width(ws, tab_idx)
+        .saturating_add(marker.as_deref().map_or(0, display_width_u16))
         .saturating_add(u16::from(tab_agent_status && presentation.is_some()) * 2)
         .saturating_add(
             context
@@ -555,6 +602,17 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
             .then(|| tab_agent_context_suffix(presentation.as_ref()))
             .flatten();
         let name = tab_chrome_label_with_context(ws, idx, context.as_deref());
+        // Lifecycle marker from the same reporter string as the percentage,
+        // prefixed to the name with no separator. Absent marker => output is
+        // byte-identical to the previous behaviour.
+        let name = match app
+            .tab_agent_context
+            .then(|| tab_agent_lifecycle_marker(presentation.as_ref()))
+            .flatten()
+        {
+            Some(marker) => format!("{marker}{name}"),
+            None => name,
+        };
         // Reserve the last cell of the label background for the close marker;
         // Alt-click there closes the tab (see mouse input).
         let close_marker = app.tab_close_button && app.mouse_capture && width > 0;
@@ -1403,6 +1461,10 @@ mod tests {
         app.tab_agent_context = true;
         crate::ui::compute_view(&mut app, Rect::new(0, 0, 100, 20));
         let enabled_rect = app.view.tab_hit_areas[0];
+        // Exact-buffer assertion: clear first. Without this the row mixes two
+        // frames -- a wide glyph leaves the previous frame's cell behind and the
+        // assertion reads it as real output.
+        terminal.clear().unwrap();
         terminal
             .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
             .unwrap();
@@ -1411,13 +1473,22 @@ mod tests {
             app.view.tab_bar_rect,
             enabled_rect.y,
         );
-        assert_eq!(enabled_row, " Visible Tab ~2% Z");
+        // The fixture's display_agent carries the reporter's done marker, which
+        // now prefixes the name (the glyph is two columns wide, so the name
+        // starts in the third cell -- there is no separator character).
+        assert_eq!(enabled_row, " \u{2705} Visible Tab ~2% Z");
         assert!(!enabled_row.contains("4242"));
         assert!(!enabled_row.contains("$1.23"));
         assert!(!enabled_row.contains("Metadata title"));
+        // Still an exact relationship, now including the marker: the tab must
+        // widen by the marker's DISPLAY width (2 for this glyph), not by 1.
+        // Written with display_width_u16 so it fails if anyone reaches for
+        // .len() or .chars().count() here.
         assert_eq!(
             enabled_rect.width,
-            tab_width(&app.workspaces[0], 0) + display_width_u16(" ~2%")
+            tab_width(&app.workspaces[0], 0)
+                + display_width_u16(" ~2%")
+                + display_width_u16("\u{2705}")
         );
 
         app.tab_agent_status = true;
@@ -2070,5 +2141,44 @@ mod tests {
             visible_rows.contains(&0) || visible_rows.contains(&1) || visible_rows.contains(&2),
             "the window is anchored near the active row"
         );
+    }
+    #[test]
+    fn lifecycle_marker_prefixes_name_and_context_tolerates_model_segment() {
+        // POSITIVE CONTROL: today's format must still yield the percentage.
+        assert_eq!(
+            extract_tab_agent_context("\u{1F977} 17%\u{B7}46223"),
+            Some("17%"),
+            "old format must keep working - the reporter ships AFTER this"
+        );
+        // New format: model inserted between pct and PID.
+        assert_eq!(
+            extract_tab_agent_context("\u{1F977} 17%\u{B7}claude-opus-5:max\u{B7}46223"),
+            Some("17%"),
+            "model segment must not break the percentage"
+        );
+        // Fails closed on an empty tail.
+        assert_eq!(extract_tab_agent_context("\u{1F977} 17%\u{B7}"), None);
+        // Marker extraction, whole bounded set.
+        for (input, want) in [
+            ("\u{1F977}\u{2705} 17%\u{B7}46223", Some("\u{2705}")),
+            ("\u{1F977}\u{1F4A4} 17%\u{B7}46223", Some("\u{1F4A4}")),
+            ("\u{1F977}\u{270B} 17%\u{B7}46223", Some("\u{270B}")),
+            ("\u{1F977}\u{1F916} 17%\u{B7}46223", Some("\u{1F916}")),
+            ("\u{1F977}\u{2753} 17%\u{B7}46223", Some("\u{2753}")),
+            ("\u{1F977}\u{2753}4 17%\u{B7}46223", Some("\u{2753}4")),
+            // absent marker -> None -> tab renders exactly as today
+            ("\u{1F977} 17%\u{B7}46223", None),
+            // no reporter icon -> None (guards against unrelated leading emoji)
+            ("\u{2705} 17%\u{B7}46223", None),
+            // unknown glyph after the icon -> None
+            ("\u{1F977}\u{1F680} 17%\u{B7}46223", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                extract_tab_agent_lifecycle_marker(input),
+                want,
+                "marker extraction for {input:?}"
+            );
+        }
     }
 }
