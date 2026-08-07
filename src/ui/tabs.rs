@@ -111,12 +111,18 @@ fn extract_tab_agent_context(display_agent: &str) -> Option<&str> {
         let Some((percentage, tail)) = body.split_once("%·") else {
             continue;
         };
-        if percentage.is_empty()
-            || !percentage.bytes().all(|byte| byte.is_ascii_digit())
-            || percentage
-                .parse::<u16>()
-                .ok()
-                .is_none_or(|value| value > 100)
+        // `?` is a KNOWN-UNKNOWN reading: the agent has just compacted and has no
+        // context figure yet. Rendering `?%` distinguishes "not known yet" from
+        // an absent segment, which means "nothing reported at all". Without it a
+        // healthy post-compaction agent is indistinguishable from a broken one.
+        let percentage_is_unknown = percentage == "?";
+        if (!percentage_is_unknown
+            && (percentage.is_empty()
+                || !percentage.bytes().all(|byte| byte.is_ascii_digit())
+                || percentage
+                    .parse::<u16>()
+                    .ok()
+                    .is_none_or(|value| value > 100)))
             || tail.is_empty()
             // The reporter's grammar keeps a numeric PID as the LAST
             // ·-segment; anything between it and the % is the model name.
@@ -2142,6 +2148,47 @@ mod tests {
             "the window is anchored near the active row"
         );
     }
+    #[test]
+    fn unknown_context_reading_renders_as_question_mark_not_absence() {
+        // The point of the feature: a just-compacted agent must be
+        // DISTINGUISHABLE from one that reported nothing.
+        assert_eq!(
+            extract_tab_agent_context("\u{1F977} ?%\u{B7}46223"),
+            Some("?%"),
+            "unknown reading must render, not vanish"
+        );
+        assert_eq!(
+            extract_tab_agent_context("\u{1F977} ?%\u{B7}claude-opus-5:max\u{B7}46223"),
+            Some("?%"),
+            "unknown reading must survive the model segment too"
+        );
+        // Absence still means absence -- the other half of the distinction.
+        assert_eq!(extract_tab_agent_context("\u{1F977} \u{B7}46223"), None);
+        // `?` is accepted ONLY as the whole percentage, never as a digit smuggler.
+        for bad in [
+            "?4%\u{B7}1",
+            "4?%\u{B7}1",
+            "??%\u{B7}1",
+            "?%\u{B7}",
+            "101%\u{B7}1",
+        ] {
+            assert_eq!(
+                extract_tab_agent_context(&format!("\u{1F977} {bad}")),
+                None,
+                "must reject {bad:?}"
+            );
+        }
+        // Real readings unaffected.
+        assert_eq!(
+            extract_tab_agent_context("\u{1F977} 42%\u{B7}46223"),
+            Some("42%")
+        );
+        assert_eq!(
+            extract_tab_agent_context("\u{1F977} ~2%\u{B7}46223"),
+            Some("~2%")
+        );
+    }
+
     #[test]
     fn lifecycle_marker_prefixes_name_and_context_tolerates_model_segment() {
         // POSITIVE CONTROL: today's format must still yield the percentage.
