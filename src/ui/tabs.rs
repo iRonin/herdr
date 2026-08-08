@@ -2148,6 +2148,108 @@ mod tests {
             "the window is anchored near the active row"
         );
     }
+
+    /// CROSS-REPO CONTRACT PIN. The agent reporter (a separate repo) emits the
+    /// `display_agent` label this parser consumes. That coupling has no build-time
+    /// enforcement: nobody runs this suite after changing the reporter. This test
+    /// is the durable statement of what herdr accepts, so the reporter side can
+    /// cite it by NAME instead of relying on a code comment to point the way.
+    ///
+    /// Every form asserted here is a form the reporter may legitimately emit.
+    /// If you are changing this test to make a new reporter format pass, that is
+    /// the coordination point -- ping the reporter owners, do not relax it quietly.
+    #[test]
+    fn contract_display_agent_label_forms_accepted_by_herdr() {
+        for (label, want_pct, want_marker, why) in [
+            // Historic form: percentage and PID only.
+            (
+                "\u{1F977} 17%\u{B7}46223",
+                Some("17%"),
+                None,
+                "digits-only tail",
+            ),
+            // Model inserted between percentage and PID.
+            (
+                "\u{1F977} 17%\u{B7}claude-opus-5:max\u{B7}46223",
+                Some("17%"),
+                None,
+                "model segment between pct and PID",
+            ),
+            // Estimate prefix survives both forms.
+            (
+                "\u{1F977} ~2%\u{B7}4242",
+                Some("~2%"),
+                None,
+                "estimate prefix",
+            ),
+            (
+                "\u{1F977} ~2%\u{B7}glm-5.2\u{B7}4242",
+                Some("~2%"),
+                None,
+                "estimate prefix + model",
+            ),
+            // Unknown reading after a compaction.
+            ("\u{1F977} ?%\u{B7}46223", Some("?%"), None, "unknown pct"),
+            // Lifecycle marker rides the same first token.
+            (
+                "\u{1F977}\u{2705} 17%\u{B7}claude-opus-5:max\u{B7}46223",
+                Some("17%"),
+                Some("\u{2705}"),
+                "marker + model + pid",
+            ),
+            (
+                "\u{1F977}\u{2753}4 17%\u{B7}46223",
+                Some("17%"),
+                Some("\u{2753}4"),
+                "pending-ask count",
+            ),
+            // Trailing tokens the reporter may append are IGNORED, not fatal.
+            (
+                "\u{1F977}\u{2705} 17%\u{B7}46223 $1.23",
+                Some("17%"),
+                Some("\u{2705}"),
+                "cost suffix ignored",
+            ),
+            (
+                "\u{1F977}\u{2705} 17%\u{B7}46223 $1.23 \u{25B8}BL-9",
+                Some("17%"),
+                Some("\u{2705}"),
+                "trailing task token ignored",
+            ),
+        ] {
+            assert_eq!(
+                extract_tab_agent_context(label),
+                want_pct,
+                "percentage for {why}: {label:?}"
+            );
+            assert_eq!(
+                extract_tab_agent_lifecycle_marker(label),
+                want_marker,
+                "marker for {why}: {label:?}"
+            );
+        }
+
+        // REJECTED forms. These are the negatives that give the accepted list
+        // its meaning: without them the parser could accept everything and this
+        // test would still pass.
+        for (label, why) in [
+            ("\u{1F977} 17%\u{B7}", "empty tail"),
+            ("\u{1F977} 17%\u{B7}pid", "non-numeric trailing segment"),
+            ("\u{1F977} 101%\u{B7}1", "percentage out of range"),
+            ("\u{1F977} ?4%\u{B7}1", "? mixed with digits"),
+            (
+                "\u{1F977} 17%\u{B7}1 42%\u{B7}2",
+                "two candidates is ambiguous",
+            ),
+        ] {
+            assert_eq!(
+                extract_tab_agent_context(label),
+                None,
+                "must reject {why}: {label:?}"
+            );
+        }
+    }
+
     #[test]
     fn unknown_context_reading_renders_as_question_mark_not_absence() {
         // The point of the feature: a just-compacted agent must be
