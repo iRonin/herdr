@@ -107,8 +107,29 @@ pub fn start_server_with_capabilities(
                     });
                 }
                 Err(err) => {
-                    error!(err = %err, "api listener accept failed");
-                    break;
+                    // NEVER break on an accept error. accept() fails for
+                    // transient, non-fatal reasons -- ECONNABORTED when a client
+                    // vanishes between connect() and accept(), EINTR on a
+                    // signal, EMFILE/ENFILE under fd pressure. Breaking here
+                    // leaves the PROCESS ALIVE with NO LISTENER: the socket file
+                    // remains on disk, every client reports "server not
+                    // running", and nothing ever recovers. That is a worse
+                    // outcome than any of the errors themselves.
+                    if !listener_running.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match err.kind() {
+                        // Resource exhaustion: back off briefly so we do not
+                        // spin at full speed while fds are unavailable.
+                        std::io::ErrorKind::OutOfMemory => {
+                            error!(err = %err, "api listener out of resources, backing off");
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        _ => {
+                            warn!(err = %err, "api listener accept failed, continuing");
+                        }
+                    }
+                    continue;
                 }
             }
         }
