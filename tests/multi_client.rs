@@ -844,8 +844,18 @@ fn multi_client_broadcasts_frame_updates_to_all_clients() {
     let mut client_b = connect_raw_client(&client_socket, 100, 30);
 
     // Ensure we have an active pane that can reflect input changes.
-    let (_workspace_id, pane_id) =
+    let (workspace_id, pane_id) =
         create_workspace_and_root_pane(&api_socket, "broadcast-client-a-to-b");
+    let focused = send_json_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"workspace_focus","method":"workspace.focus","params":{{"workspace_id":"{workspace_id}"}}}}"#
+        ),
+    );
+    assert!(
+        focused.get("error").is_none(),
+        "workspace.focus failed: {focused}"
+    );
 
     // Drain initial frames so we measure the frame caused by new input.
     drain_server_messages(&mut client_a, Duration::from_millis(300));
