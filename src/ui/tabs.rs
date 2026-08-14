@@ -164,13 +164,17 @@ fn tab_layout_width(
     let context = tab_agent_context
         .then(|| tab_agent_context_suffix(presentation.as_ref()))
         .flatten();
-    // The marker is prefixed to the name, so the tab must be that much wider or
-    // the label overruns and renders corrupted.
+    // The marker and its separator are prefixed to the name, so the tab must be
+    // that much wider or the label overruns and renders corrupted.
     let marker = tab_agent_context
         .then(|| tab_agent_lifecycle_marker(presentation.as_ref()))
         .flatten();
     tab_width(ws, tab_idx)
-        .saturating_add(marker.as_deref().map_or(0, display_width_u16))
+        .saturating_add(
+            marker
+                .as_deref()
+                .map_or(0, |value| display_width_u16(value).saturating_add(1)),
+        )
         .saturating_add(u16::from(tab_agent_status && presentation.is_some()) * 2)
         .saturating_add(
             context
@@ -609,14 +613,14 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
             .flatten();
         let name = tab_chrome_label_with_context(ws, idx, context.as_deref());
         // Lifecycle marker from the same reporter string as the percentage,
-        // prefixed to the name with no separator. Absent marker => output is
+        // separated from the pane name by one space. Absent marker => output is
         // byte-identical to the previous behaviour.
         let name = match app
             .tab_agent_context
             .then(|| tab_agent_lifecycle_marker(presentation.as_ref()))
             .flatten()
         {
-            Some(marker) => format!("{marker}{name}"),
+            Some(marker) => format!("{marker} {name}"),
             None => name,
         };
         // Reserve the last cell of the label background for the close marker;
@@ -1479,22 +1483,23 @@ mod tests {
             app.view.tab_bar_rect,
             enabled_rect.y,
         );
-        // The fixture's display_agent carries the reporter's done marker, which
-        // now prefixes the name (the glyph is two columns wide, so the name
-        // starts in the third cell -- there is no separator character).
-        assert_eq!(enabled_row, " \u{2705} Visible Tab ~2% Z");
+        // The fixture's display_agent carries the reporter's done marker. In
+        // this buffer string the first space after the double-width glyph is its
+        // continuation cell; the second is the real marker/name separator.
+        assert_eq!(enabled_row, " \u{2705}  Visible Tab ~2% Z");
         assert!(!enabled_row.contains("4242"));
         assert!(!enabled_row.contains("$1.23"));
         assert!(!enabled_row.contains("Metadata title"));
-        // Still an exact relationship, now including the marker: the tab must
-        // widen by the marker's DISPLAY width (2 for this glyph), not by 1.
-        // Written with display_width_u16 so it fails if anyone reaches for
-        // .len() or .chars().count() here.
+        // Still an exact relationship, now including the marker and separator:
+        // the tab must widen by the marker's DISPLAY width (2 for this glyph),
+        // not by 1. Written with display_width_u16 so it fails if anyone reaches
+        // for .len() or .chars().count() here.
         assert_eq!(
             enabled_rect.width,
             tab_width(&app.workspaces[0], 0)
                 + display_width_u16(" ~2%")
                 + display_width_u16("\u{2705}")
+                + 1
         );
 
         app.tab_agent_status = true;
@@ -2289,6 +2294,63 @@ mod tests {
             extract_tab_agent_context("\u{1F977} ~2%\u{B7}46223"),
             Some("~2%")
         );
+    }
+
+    #[test]
+    fn tab_lifecycle_marker_has_a_separator_before_the_pane_name() {
+        for (display_agent, marker) in [
+            ("\u{1F977}\u{2705} 52%\u{B7}4242", "\u{2705}"),
+            ("\u{1F977}\u{2753}3 52%\u{B7}4242", "\u{2753}3"),
+        ] {
+            let mut app = AppState::test_new();
+            let mut ws = Workspace::test_new("test");
+            ws.tabs[0].set_custom_name("Pane Name".into());
+            let pane_id = ws.tabs[0].root_pane;
+            app.workspaces = vec![ws];
+            app.ensure_test_terminals();
+            set_agent_with_display_agent(
+                &mut app,
+                0,
+                pane_id,
+                AgentState::Idle,
+                Some(display_agent),
+            );
+            app.active = Some(0);
+            app.selected = 0;
+            app.tab_agent_context = true;
+
+            crate::ui::compute_view(&mut app, Rect::new(0, 0, 80, 20));
+            let rect = app.view.tab_hit_areas[0];
+            let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+            terminal
+                .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+
+            // The first cell is tab padding. The marker begins immediately after
+            // it and may be double-width, so inspect the first cell AFTER the
+            // marker's display extent. A wide-glyph continuation cell can look
+            // like a space in extracted text but is not a visual separator.
+            let separator_x = rect.x + 1 + display_width_u16(marker);
+            assert_eq!(
+                buffer[(separator_x, rect.y)].symbol(),
+                " ",
+                "{marker:?} must have a real separator cell before the pane name"
+            );
+            assert_eq!(
+                buffer[(separator_x + 1, rect.y)].symbol(),
+                "P",
+                "the pane name must begin immediately after the separator"
+            );
+            assert_eq!(
+                rect.width,
+                tab_width(&app.workspaces[0], 0)
+                    + display_width_u16(marker)
+                    + 1
+                    + display_width_u16(" 52%"),
+                "the separator must also count toward tab geometry"
+            );
+        }
     }
 
     #[test]
