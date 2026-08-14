@@ -124,6 +124,7 @@ pub enum SpaceSidebarToken {
     Workspace,
     Branch,
     GitStatus,
+    AgentCount,
     Custom(String),
     Styled {
         token: Box<SpaceSidebarToken>,
@@ -252,6 +253,7 @@ fn space_token_name(token: &SpaceSidebarToken) -> String {
         SpaceSidebarToken::Workspace => "workspace".into(),
         SpaceSidebarToken::Branch => "branch".into(),
         SpaceSidebarToken::GitStatus => "git_status".into(),
+        SpaceSidebarToken::AgentCount => "agent_count".into(),
         SpaceSidebarToken::Custom(name) => format!("${name}"),
         SpaceSidebarToken::Styled { token, .. } => space_token_name(token),
     }
@@ -338,6 +340,7 @@ impl<'de> Deserialize<'de> for SpaceSidebarToken {
                 ("workspace", Self::Workspace),
                 ("branch", Self::Branch),
                 ("git_status", Self::GitStatus),
+                ("agent_count", Self::AgentCount),
             ],
         )
         .map_err(serde::de::Error::custom)?;
@@ -417,7 +420,11 @@ impl Default for SpacesSidebarConfig {
         Self {
             rows: vec![
                 vec![SpaceSidebarToken::StateIcon, SpaceSidebarToken::Workspace],
-                vec![SpaceSidebarToken::Branch, SpaceSidebarToken::GitStatus],
+                vec![
+                    SpaceSidebarToken::AgentCount,
+                    SpaceSidebarToken::Branch,
+                    SpaceSidebarToken::GitStatus,
+                ],
             ],
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
         }
@@ -436,7 +443,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_match_the_compact_agent_and_existing_space_layouts() {
+    fn defaults_match_compact_agent_and_agent_count_space_layouts() {
         let config = SidebarConfig::default();
         assert_eq!(
             config.agents.rows,
@@ -455,7 +462,11 @@ mod tests {
             config.spaces.rows,
             vec![
                 vec![SpaceSidebarToken::StateIcon, SpaceSidebarToken::Workspace],
-                vec![SpaceSidebarToken::Branch, SpaceSidebarToken::GitStatus],
+                vec![
+                    SpaceSidebarToken::AgentCount,
+                    SpaceSidebarToken::Branch,
+                    SpaceSidebarToken::GitStatus,
+                ],
             ]
         );
         assert_eq!(config.spaces.row_gap, 0);
@@ -555,6 +566,28 @@ rows = [[{ token = "git_status", fg = "#ff00aa" }], [{ token = "$jj", bold = tru
         let (token, style) = config.ui.sidebar.spaces.rows[1][0].parts();
         assert_eq!(token, &SpaceSidebarToken::Custom("jj".into()));
         assert_eq!(style.bold, Some(true));
+    }
+
+    #[test]
+    fn parses_and_serializes_agent_count_token() {
+        let parsed: crate::config::Config = toml::from_str(
+            r#"[ui.sidebar.spaces]
+rows = [["state_icon", "workspace"], ["agent_count", "branch", "git_status"]]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.ui.sidebar.spaces.rows[1],
+            vec![
+                SpaceSidebarToken::AgentCount,
+                SpaceSidebarToken::Branch,
+                SpaceSidebarToken::GitStatus,
+            ]
+        );
+
+        let emitted = toml::to_string(&parsed.ui.sidebar.spaces).unwrap();
+        let reparsed: SpacesSidebarConfig = toml::from_str(&emitted).unwrap();
+        assert_eq!(reparsed, parsed.ui.sidebar.spaces);
     }
 
     #[test]

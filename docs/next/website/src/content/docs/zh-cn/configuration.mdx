@@ -268,7 +268,7 @@ rows = [
 row_gap = 0
 rows = [
   ["state_icon", "workspace"],
-  ["branch", "git_status"],
+  ["agent_count", "branch", "git_status"],
 ]
 ```
 
@@ -291,6 +291,7 @@ Space 行支持以下内置 token：
 - `workspace` — 工作区名称。
 - `branch` — Git 分支（如有）。
 - `git_status` — 非零时显示 Git ahead 和 behind 数量。
+- `agent_count` — 工作区中已识别的智能体窗格数量，显示为 `🤖N`（包括 `🤖0`）。它是固定宽度 token，因此在窄行中会先截断弹性标签。缩进的 worktree 子项在隐藏 Git 详情时仍显示各自的计数；折叠的 worktree 父项会汇总组内所有工作区。
 - `$name` — 名为 `name` 的自定义工作区元数据。
 
 token 会按配置顺序渲染。Herdr 通常使用 ` · ` 分隔相邻值，并在 `state_icon` 后使用一个空格。缺失值及其分隔符会消失；当一行中的所有 token 都没有值时，该行会消失。每个布局最多可包含 16 行，每行最多可包含 16 个 token。

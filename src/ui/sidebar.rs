@@ -214,6 +214,8 @@ fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, indent
             ahead_behind: ws.git_ahead_behind(),
             tokens: &token_values,
             suppress_git_details: indented,
+            // The count is always present, including zero, so its value cannot change row height.
+            agent_count: 0,
         },
     )
     .len()
@@ -255,6 +257,19 @@ fn space_aggregate_state(app: &AppState, key: &str) -> (AgentState, bool) {
         .map(|ws| ws.aggregate_state(&app.terminals))
         .max_by_key(|(state, seen)| workspace_attention_priority(*state, *seen))
         .unwrap_or((AgentState::Unknown, true))
+}
+
+fn live_agent_count_in_workspace(app: &AppState, workspace: &crate::workspace::Workspace) -> usize {
+    workspace
+        .tabs
+        .iter()
+        .flat_map(|tab| tab.panes.values())
+        .filter(|pane| {
+            app.terminals
+                .get(&pane.attached_terminal_id)
+                .is_some_and(|terminal| terminal.is_agent_terminal())
+        })
+        .count()
 }
 
 pub(crate) fn workspace_parent_group_state(
@@ -1000,6 +1015,7 @@ fn resolved_token_spans(
                     + usize::from(*behind > 0) * display_width(&format!("↓{behind}"))
                     + usize::from(*ahead > 0 && *behind > 0)
             }
+            ResolvedTokenKind::AgentCount(count) => display_width(&format!("🤖{count}")),
             _ => 0,
         })
         .collect::<Vec<_>>();
@@ -1152,6 +1168,12 @@ fn resolved_token_spans(
                     apply_token_style(custom_style, token.style),
                 ));
             }
+            ResolvedTokenKind::AgentCount(count) => {
+                spans.push(Span::styled(
+                    format!("🤖{count}"),
+                    apply_token_style(secondary_style, token.style),
+                ));
+            }
         }
     }
     spans
@@ -1286,6 +1308,19 @@ fn render_workspace_list(
             p.overlay0
         });
         let token_values = ws.metadata_tokens.values();
+        let parent_collapsed_count = parent_group
+            .as_ref()
+            .filter(|(_, collapsed)| *collapsed)
+            .map(|(key, _)| {
+                app.workspaces
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, ws)| ws.worktree_space().is_some_and(|space| space.key == *key))
+                    .map(|(_, workspace)| live_agent_count_in_workspace(app, workspace))
+                    .sum::<usize>()
+            });
+        let agent_count =
+            parent_collapsed_count.unwrap_or_else(|| live_agent_count_in_workspace(app, ws));
         let rows = tokens::space_rows(
             &app.sidebar_spaces,
             SpaceTokenContext {
@@ -1295,6 +1330,7 @@ fn render_workspace_list(
                 ahead_behind: ws.git_ahead_behind(),
                 tokens: &token_values,
                 suppress_git_details: card.indented,
+                agent_count,
             },
         );
 
@@ -1573,11 +1609,18 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     fn row_text(buffer: &ratatui::buffer::Buffer, row: u16, width: u16) -> String {
-        (0..width)
-            .map(|x| buffer[(x, row)].symbol())
-            .collect::<String>()
-            .trim_end()
-            .to_string()
+        let mut output = String::new();
+        let mut skip = 0usize;
+        for x in 0..width {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            let symbol = buffer[(x, row)].symbol();
+            output.push_str(symbol);
+            skip = display_width(symbol).saturating_sub(1);
+        }
+        output.trim_end().to_string()
     }
 
     fn find_symbol_x(buffer: &ratatui::buffer::Buffer, row: u16, width: u16, symbol: &str) -> u16 {
@@ -1703,6 +1746,244 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
             .add_modifier
             .intersects(Modifier::BOLD | Modifier::DIM));
         assert_eq!(inactive.bg, Some(ratatui::style::Color::Reset));
+    }
+
+    #[test]
+    fn default_space_rows_show_per_space_agent_counts_before_git_metadata() {
+        let mut first = Workspace::test_new("one");
+        let first_root = first.tabs[0].root_pane;
+        let first_split = first.test_split(ratatui::layout::Direction::Horizontal);
+        first.cached_git_branch = Some("main".into());
+        first.cached_git_ahead_behind = Some((2, 1));
+
+        let mut second = Workspace::test_new("two");
+        second.cached_git_branch = Some("docs".into());
+
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![first, second];
+        app.ensure_test_terminals();
+        let root_terminal_id = app.workspaces[0].tabs[0].panes[&first_root]
+            .attached_terminal_id
+            .clone();
+        app.terminals
+            .get_mut(&root_terminal_id)
+            .unwrap()
+            .set_agent_name("planner".into());
+        let split_terminal_id = app.workspaces[0].tabs[0].panes[&first_split]
+            .attached_terminal_id
+            .clone();
+        app.terminals
+            .get_mut(&split_terminal_id)
+            .unwrap()
+            .detected_agent = Some(Agent::Claude);
+
+        let area = Rect::new(0, 0, 30, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let first_git_row = app.view.workspace_card_areas[0].rect.y + 1;
+        let second_git_row = app.view.workspace_card_areas[1].rect.y + 1;
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            row_text(buffer, first_git_row, area.width - 1),
+            "   🤖2 · main ↑2 ↓1"
+        );
+        assert_eq!(
+            row_text(buffer, second_git_row, area.width - 1),
+            "   🤖0 · docs"
+        );
+    }
+
+    #[test]
+    fn collapsed_parent_row_sums_agent_count_across_group_members() {
+        let mut parent = Workspace::test_new("main");
+        let parent_root = parent.tabs[0].root_pane;
+        let parent_split = parent.test_split(ratatui::layout::Direction::Horizontal);
+        parent.cached_git_branch = Some("main".into());
+        parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            checkout_path: std::path::PathBuf::from("/repo/herdr"),
+            is_linked_worktree: false,
+        });
+
+        let mut child = Workspace::test_new("issue");
+        let child_root = child.tabs[0].root_pane;
+        child.cached_git_branch = Some("worktree/issue".into());
+        child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            checkout_path: std::path::PathBuf::from("/repo/herdr-issue"),
+            is_linked_worktree: true,
+        });
+
+        let other = Workspace::test_new("notes");
+        let other_root = other.tabs[0].root_pane;
+
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![parent, child, other];
+        app.ensure_test_terminals();
+        for (ws_idx, pane_ids) in [
+            (0usize, vec![parent_root, parent_split]),
+            (1, vec![child_root]),
+            (2, vec![other_root]),
+        ] {
+            for pane_id in pane_ids {
+                let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane_id]
+                    .attached_terminal_id
+                    .clone();
+                app.terminals.get_mut(&terminal_id).unwrap().detected_agent = Some(Agent::Pi);
+            }
+        }
+        app.collapsed_space_keys.insert("repo-key".into());
+
+        let area = Rect::new(0, 0, 30, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let parent_row = app.view.workspace_card_areas[0].rect.y + 1;
+        assert_eq!(
+            row_text(buffer, parent_row, area.width - 1),
+            "   🤖3 · main"
+        );
+    }
+
+    #[test]
+    fn expanded_worktree_child_row_keeps_per_workspace_agent_count() {
+        let mut parent = Workspace::test_new("main");
+        let parent_root = parent.tabs[0].root_pane;
+        parent.cached_git_branch = Some("main".into());
+        parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            checkout_path: std::path::PathBuf::from("/repo/herdr"),
+            is_linked_worktree: false,
+        });
+
+        let mut child = Workspace::test_new("issue");
+        let child_split = child.test_split(ratatui::layout::Direction::Horizontal);
+        let child_root = child.tabs[0]
+            .panes
+            .keys()
+            .find(|id| **id != child_split)
+            .copied()
+            .unwrap();
+        child.cached_git_branch = Some("worktree/issue".into());
+        child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            checkout_path: std::path::PathBuf::from("/repo/herdr-issue"),
+            is_linked_worktree: true,
+        });
+
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![parent, child];
+        app.ensure_test_terminals();
+        let parent_terminal = app.workspaces[0].tabs[0].panes[&parent_root]
+            .attached_terminal_id
+            .clone();
+        app.terminals
+            .get_mut(&parent_terminal)
+            .unwrap()
+            .detected_agent = Some(Agent::Pi);
+        for pane_id in [child_root, child_split] {
+            let terminal_id = app.workspaces[1].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            app.terminals.get_mut(&terminal_id).unwrap().detected_agent = Some(Agent::Claude);
+        }
+
+        let area = Rect::new(0, 0, 30, 30);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let child_card = app
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.indented)
+            .copied()
+            .expect("child card");
+        let child_row = child_card.rect.y + 1;
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(row_text(buffer, child_row, area.width - 1), "        🤖2");
+    }
+
+    #[test]
+    fn narrow_space_row_keeps_agent_count_even_when_branch_dropped() {
+        let mut first = Workspace::test_new("a-very-long-workspace-name");
+        first.cached_git_branch = Some("this-is-a-long-branch-name".into());
+
+        let mut app = crate::app::state::AppState::test_new();
+        let pane_id = first.tabs[0].root_pane;
+        app.workspaces = vec![first];
+        app.ensure_test_terminals();
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&terminal_id).unwrap().detected_agent = Some(Agent::Pi);
+
+        let area = Rect::new(0, 0, 8, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let row_y = app.view.workspace_card_areas[0].rect.y + 1;
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(row_text(buffer, row_y, area.width - 1), "   🤖1");
+    }
+
+    #[test]
+    fn styled_agent_count_token_renders_with_custom_fg() {
+        let config: crate::config::Config = toml::from_str(
+            r##"[ui.sidebar.spaces]
+rows = [[{ token = "agent_count", fg = "#abcdef", bold = true, dim = false }]]
+"##,
+        )
+        .unwrap();
+        let spans = resolved_token_spans(
+            &[ResolvedToken {
+                kind: ResolvedTokenKind::AgentCount(2),
+                style: config.ui.sidebar.spaces.rows[0][0].parts().1,
+            }],
+            ("", Style::default()),
+            Style::default(),
+            Style::default(),
+            Style::default(),
+            Style::default(),
+            &crate::app::state::AppState::test_new().palette,
+            8,
+        );
+
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "🤖2"
+        );
+        assert!(spans
+            .iter()
+            .all(|span| span.style.fg == Some(ratatui::style::Color::Rgb(0xab, 0xcd, 0xef))));
+        assert!(spans
+            .iter()
+            .all(|span| span.style.add_modifier.contains(Modifier::BOLD)));
     }
 
     #[test]

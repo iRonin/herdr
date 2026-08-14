@@ -21,6 +21,7 @@ pub(super) enum ResolvedTokenKind {
     TerminalTitle(String),
     Branch(String),
     GitStatus { ahead: usize, behind: usize },
+    AgentCount(usize),
     Custom(String),
 }
 
@@ -95,6 +96,7 @@ pub(super) struct SpaceTokenContext<'a> {
     pub ahead_behind: Option<(usize, usize)>,
     pub tokens: &'a std::collections::HashMap<String, String>,
     pub suppress_git_details: bool,
+    pub agent_count: usize,
 }
 
 pub(super) fn space_rows(
@@ -126,6 +128,9 @@ pub(super) fn space_rows(
                             .filter(|(ahead, behind)| *ahead > 0 || *behind > 0)
                             .map(|(ahead, behind)| ResolvedTokenKind::GitStatus { ahead, behind }),
                         SpaceSidebarToken::GitStatus => None,
+                        SpaceSidebarToken::AgentCount => {
+                            Some(ResolvedTokenKind::AgentCount(context.agent_count))
+                        }
                         SpaceSidebarToken::Custom(name) => context
                             .tokens
                             .get(name)
@@ -287,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn grouped_children_suppress_all_builtin_git_details() {
+    fn grouped_children_suppress_git_details_but_keep_agent_count() {
         let config = SpacesSidebarConfig::default();
 
         assert_eq!(
@@ -300,12 +305,47 @@ mod tests {
                     ahead_behind: Some((2, 1)),
                     tokens: &std::collections::HashMap::new(),
                     suppress_git_details: true,
+                    agent_count: 3,
                 },
             ),
-            vec![vec![
-                ResolvedToken::unstyled(ResolvedTokenKind::StateIcon),
-                ResolvedToken::unstyled(ResolvedTokenKind::Workspace("feature".into())),
-            ]]
+            vec![
+                vec![
+                    ResolvedToken::unstyled(ResolvedTokenKind::StateIcon),
+                    ResolvedToken::unstyled(ResolvedTokenKind::Workspace("feature".into())),
+                ],
+                vec![ResolvedToken::unstyled(ResolvedTokenKind::AgentCount(3))],
+            ]
+        );
+    }
+
+    #[test]
+    fn space_rows_resolve_agent_count_from_context() {
+        let config = SpacesSidebarConfig::default();
+        let rows = space_rows(
+            &config,
+            SpaceTokenContext {
+                workspace: "repo",
+                branch: Some("main"),
+                state_text: "idle",
+                ahead_behind: Some((0, 0)),
+                tokens: &std::collections::HashMap::new(),
+                suppress_git_details: false,
+                agent_count: 0,
+            },
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    ResolvedToken::unstyled(ResolvedTokenKind::StateIcon),
+                    ResolvedToken::unstyled(ResolvedTokenKind::Workspace("repo".into())),
+                ],
+                vec![
+                    ResolvedToken::unstyled(ResolvedTokenKind::AgentCount(0)),
+                    ResolvedToken::unstyled(ResolvedTokenKind::Branch("main".into())),
+                ],
+            ]
         );
     }
 
@@ -327,6 +367,7 @@ mod tests {
                     ahead_behind: None,
                     tokens: &tokens,
                     suppress_git_details: false,
+                    agent_count: 0,
                 },
             ),
             vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Custom(
