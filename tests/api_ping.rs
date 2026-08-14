@@ -2273,8 +2273,12 @@ fn events_subscribe_streams_output_and_agent_status_events() {
         &socket_path,
         r#"{"id":"req_21","method":"pane.list","params":{}}"#,
     );
-    let pane_id = panes["result"]["panes"][0]["pane_id"]
-        .as_str()
+    let pane_id = panes["result"]["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pane| pane["workspace_id"].as_str() == Some(workspace_id.as_str()))
+        .and_then(|pane| pane["pane_id"].as_str())
         .unwrap()
         .to_string();
     let legacy_pane_id = format!("{workspace_id}-1");
