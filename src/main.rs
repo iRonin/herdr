@@ -370,13 +370,17 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # [ui.sidebar.agents.rows_by_agent]
 # claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent"]]
 
-# Expanded space rows. Built-ins are state_icon, state_text, workspace, branch, and git_status.
+# Expanded space row built-ins: state_icon, state_text, workspace, branch,
+# git_status, and agent_count.
+# agent_count renders recognized agent panes as "🤖N" (including "🤖0"),
+# is fixed-width, so flexible labels truncate first. It sums across a collapsed
+# worktree group and remains visible when indented children hide their Git details.
 # Custom values reported through workspace metadata use a $name token, for example $jj_status.
 # Inline token styles accept strict #RGB/#RRGGBB foregrounds plus bold and dim booleans.
 # [ui.sidebar.spaces]
 # Blank rows between space entries. Set to 1 to restore the previous spacing.
 # row_gap = 0
-# rows = [["state_icon", "workspace"], ["branch", "git_status"]]
+# rows = [["state_icon", "workspace"], ["agent_count", "branch", "git_status"]]
 
 # Accent color for highlights, borders, and navigation UI.
 # Accepts: hex (#89b4fa), named colors (cyan, blue, magenta), or rgb(r,g,b)

@@ -635,6 +635,7 @@ mod tests {
     use crate::{app::state::ViewLayout, layout::PaneInfo, workspace::Workspace};
     use ratatui::style::Color;
     use ratatui::{backend::TestBackend, Terminal};
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn copy_feedback_offset_only_increases_when_toast_rect_overlaps() {
@@ -1146,7 +1147,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_sidebar_workspace_rows_show_state_before_name_without_numbers() {
+    fn expanded_sidebar_workspace_rows_show_state_before_name_without_workspace_indices() {
         let mut app = crate::app::state::AppState::test_new();
         let mut ws = Workspace::test_new("one");
         let repo = temp_git_repo("main");
@@ -1176,7 +1177,7 @@ mod tests {
 
         assert!(line1.starts_with(" · one"));
         assert!(!line1.contains("1 one"));
-        assert_eq!(line2, "   main");
+        assert_eq!(line2, "   🤖0 · main");
 
         std::fs::remove_dir_all(repo).ok();
     }
@@ -1452,11 +1453,18 @@ mod tests {
     }
 
     fn buffer_row_text(buffer: &ratatui::buffer::Buffer, area: Rect, row: u16) -> String {
-        (area.x..area.x + area.width)
-            .map(|x| buffer[(x, row)].symbol())
-            .collect::<String>()
-            .trim_end()
-            .to_string()
+        let mut output = String::new();
+        let mut skip = 0usize;
+        for x in area.x..area.x + area.width {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            let symbol = buffer[(x, row)].symbol();
+            output.push_str(symbol);
+            skip = symbol.width().saturating_sub(1);
+        }
+        output.trim_end().to_string()
     }
 
     fn temp_git_repo(branch: &str) -> std::path::PathBuf {
