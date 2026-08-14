@@ -656,7 +656,7 @@
           "key": "ui.tab_close_button",
           "type": "boolean",
           "default": "false",
-          "description": "Show an x in the last cell of each tab label; Alt-click it to close the tab without confirmation."
+          "description": "Show an x in the last cell of each tab label while mouse capture is enabled; click it with the configured modifier to close the tab without confirmation."
         },
         {
           "key": "ui.tab_close_button_modifier",
@@ -731,7 +731,7 @@
           "key": "ui.tab_agent_status",
           "type": "boolean",
           "default": "false",
-          "description": "Show the highest-attention agent status on each top tab, using the same status marks as the agents panel and the rest of the app: a filled dot for blocked-and-unread (red), working (yellow) and done-and-unread (teal), a hollow dot for blocked-and-read (red) and done-and-read (green), and a middle dot for unknown. Works with both single-row and wrapped tab bars. Disabled by default."
+          "description": "Show the highest-attention agent status on each tab in the desktop tab bar, using the same status marks as the agents panel and the rest of the app: a filled dot for blocked-and-unread (red), working (yellow) and done-and-unread (teal), a hollow dot for blocked-and-read (red) and done-and-read (green), and a middle dot for unknown. Works with both single-row and wrapped tab bars. Disabled by default."
         },
         {
           "key": "ui.tab_agent_context",

@@ -1004,7 +1004,8 @@ pub struct UiConfig {
     pub confirm_close: bool,
     /// Ask for a tab name before creating a new tab. Default: true.
     pub prompt_new_tab_name: bool,
-    /// Show an `x` in the last cell of each tab label; Alt-click it to close the tab. Default: false.
+    /// Show an `x` in the last cell of each tab label while mouse capture is enabled;
+    /// click it with the configured modifier to close the tab. Default: false.
     pub tab_close_button: bool,
     /// Modifier that arms the `ui.tab_close_button` close marker. Default: "alt".
     pub tab_close_button_modifier: TabCloseButtonModifierConfig,
@@ -1034,9 +1035,9 @@ pub struct UiConfig {
     /// Allow dragging a tab from the tab bar onto a sidebar workspace entry to
     /// move the tab (and all its panes) to that workspace. Default: false.
     pub tab_drag_move_workspace: bool,
-    /// Show the highest-attention agent status indicator on each top tab. Default: false.
+    /// Show the highest-attention agent status indicator on each desktop tab. Default: false.
     pub tab_agent_status: bool,
-    /// Show the highest-attention agent pane's context percentage on each top tab.
+    /// Show the highest-attention agent pane's context percentage on each desktop tab.
     /// Default: false.
     pub tab_agent_context: bool,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".

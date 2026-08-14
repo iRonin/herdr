@@ -258,9 +258,9 @@ The sidebar is the main Herdr dashboard. Search `ui.` in the [Config reference](
 
 Set `tab_bar_position = "bottom"` under `[ui]` to place the desktop tab row below the terminal panes. Prefix, Navigate, Copy, and Resize mode bars temporarily replace the bottom tab row while active; with `tab_bar_wrap` the mode bar only covers the bottom-most tab row, so the rows above it stay clickable. The default is `"top"`.
 
-Set `ui.tab_close_button = true` to show an `x` in the last cell of each tab label in the desktop tab bar. Alt/Option-click the `x` to close that tab immediately, without a confirmation prompt; clicking it without Alt activates the tab as usual. Closing the last tab of a workspace closes the workspace and still honors `ui.confirm_close`.
+Set `ui.tab_close_button = true` to show an `x` in the last cell of each tab label in the desktop tab bar while `ui.mouse_capture` is enabled. Click the `x` with the configured modifier (Alt/Option by default) to close that tab immediately, without a confirmation prompt; clicking it without the configured modifier combination activates the tab as usual. Closing the last tab of a workspace closes the workspace and still honors `ui.confirm_close`.
 
-The modifier is configurable via `ui.tab_close_button_modifier`: `"alt"` (default), `"ctrl"`, `"shift"`, or a `+`-separated combination such as `"ctrl+shift"`. Terminal mouse reporting can only encode Shift, Alt, and Ctrl, so Cmd/Super is not accepted — it could never reach the app. Practical notes: on macOS, Ctrl-click is treated by the system as a right-click, and in iTerm2 holding Option bypasses mouse reporting (for text selection), so the effective gesture there is **Cmd-click, which iTerm2 reports to the app as Alt-click** — disable "⌘-Click opens filename/url" (Settings → Pointer) or restrict Semantic History (Settings → Profiles → Advanced) if iTerm2 captures the click to open/download instead.
+The modifier is configurable via `ui.tab_close_button_modifier`: `"alt"` (default), `"ctrl"`, `"shift"`, or a `+`-separated combination such as `"ctrl+shift"`. Terminal mouse reporting can only encode Shift, Alt, and Ctrl, so Cmd/Super is not accepted — it could never reach the app. Practical notes: on macOS, Ctrl-click is treated by the system as a right-click, and in iTerm2 holding Option bypasses mouse reporting (for text selection), so for the default Alt modifier the effective gesture there is **Cmd-click, which iTerm2 reports to the app as Alt-click** — disable "⌘-Click opens filename/url" (Settings → Pointer) or restrict Semantic History (Settings → Profiles → Advanced) if iTerm2 captures the click to open/download instead.
 
 Set `ui.tab_drag_move_workspace = true` to drag a tab from the tab bar onto a sidebar workspace entry, moving the tab (and all its panes) to that workspace as a unit. The hovered entry highlights as the drop target; dropping anywhere else keeps the usual in-bar reorder behavior. The move appends to the destination's tab bar without switching focus.
 
@@ -367,17 +367,15 @@ Sidebar row settings affect only the expanded desktop sidebar. Collapsed and mob
 
 `prompt_new_tab_name` controls whether the new-tab button asks for a label before creating the tab. Alt/Option-click the button to invert that setting for one tab.
 
-Set `tab_bar_wrap = true` under `[ui]` to show tabs across the available rows instead of using the default single scrollable row with `<`/`>` buttons. The tab bar grows downward as needed, up to half of the pane area's height, and the terminal and popup geometry below shrink with it. When the row count reaches that cap, Herdr scrolls the visible row window to keep the active tab visible. The tab bar keeps the placement chosen by `tab_bar_position`, so wrapped rows grow downward from the top edge or upward from the bottom edge. The default is `false`.
+Set `tab_bar_wrap = true` under `[ui]` to show tabs across the available rows instead of using the default single scrollable row with `<`/`>` buttons. The tab bar expands inward from its configured edge as needed, up to half of the pane area's height, and the terminal and popup geometry shrink with it. When the row count reaches that cap, Herdr scrolls the visible row window to keep the active tab visible. The tab bar keeps the placement chosen by `tab_bar_position`, so wrapped rows grow downward from the top edge or upward from the bottom edge. The default is `false`.
 
 Choose how pane scrollbars are shown with `pane_scrollbars = "always"`, `"auto"`, or `"never"` under `[ui]`. `"always"` is the default and reserves one terminal column whenever the pane is wide enough. `"auto"` keeps pane text full-width and briefly overlays the scrollbar on the rightmost text column after scrolling while the pane remains scrolled back; it disappears after about 1.2 seconds of inactivity. `"never"` keeps text full-width and never draws the pane scrollbar. Boolean values remain compatible: `true` means `"always"` and `false` means `"never"`. The earlier `show_scrollbar` spelling is still accepted as an alias for this key; setting both spellings is a parse error.
 
-Set `tab_agent_status = true` under `[ui]` to show the highest-attention agent state on each top tab. The indicator uses the same status marks as the Agent panel and the rest of the app: a filled dot for blocked and unread (red), working (yellow) and done but unread (teal); a hollow dot for blocked and read (red) and done and read (green); and a middle dot for unknown. States are distinguished by colour as well as shape, so a one-cell tab mark relies on colour to separate blocked-unread, working and done-unread. It is disabled by default and works with both single-row and wrapped tab bars.
+Set `tab_agent_status = true` under `[ui]` to show the highest-attention agent state on each tab in the desktop tab bar. The indicator uses the same status marks as the Agent panel and the rest of the app: a filled dot for blocked and unread (red), working (yellow) and done but unread (teal); a hollow dot for blocked and read (red) and done and read (green); and a middle dot for unknown. States are distinguished by colour as well as shape, so a one-cell tab mark relies on colour to separate blocked-unread, working and done-unread. It is disabled by default and works with both single-row and wrapped tab bars.
 
 Set `tab_agent_context = true` under `[ui]` to mirror the standalone context percentage already shown in the Agents pane for that same highest-attention agent pane. Herdr recognizes a standalone `N%·PID` or `~N%·PID` label, appends the exact `N%` or `~N%` portion after the visible tab name and before a ` Z` zoom marker, and omits the suffix when the highest-attention pane has no single valid label. It works independently of `tab_agent_status` and is disabled by default.
 
-Choose how pane scrollbars are shown with `show_scrollbar = "always"`, `"auto"`, or `"never"` under `[ui]`. `"always"` is the default and reserves one terminal column whenever the pane is wide enough. `"auto"` keeps pane text full-width and briefly overlays the scrollbar on the rightmost text column after scrolling while the pane remains scrolled back; it disappears after about 1.2 seconds of inactivity. `"never"` keeps text full-width and never draws the pane scrollbar. Existing boolean values remain compatible: `true` means `"always"` and `false` means `"never"`.
-
-Set `agent_panel_scope = "all"` or `agent_panel_scope = "current"` under `[ui]` to filter the Agent panel to every space or to the active space only. `"current_workspace"` is accepted as an alias for `"current"`. Default is `"all"`. Current scope always sorts by attention priority.
+Set `agent_panel_scope = "all"` or `agent_panel_scope = "current"` under `[ui]` to filter the Agent panel to every space or to the active space only. `"current_workspace"` is accepted as an alias for `"current"`. Default is `"all"`. Current scope sorts by attention priority unless an active Agent view supplies its own sort.
 
 Set `agent_panel_modes = ["priority", "grouped", "space"]` under `[ui]` to control the modes cycled when clicking the Agent panel mode label. Allowed values: `"priority"`, `"grouped"` (`"spaces"` is an alias), and `"space"` (`"current"` and `"current_workspace"` are aliases). Unknown and duplicate entries are ignored. An empty or invalid-only list falls back to all three modes in this default order.
 
@@ -434,22 +432,23 @@ Enable it only when testing terminal image behavior.
 
 ## Pi executable name
 
-Herdr recognizes a Pi Agent by the name of the program running in the pane, and relaunches it under that same name. If you run Pi through a differently named executable, such as a Pi-compatible fork or a wrapper on your `PATH`, name it here:
+Herdr recognizes a Pi Agent by the name of the program running in the pane. If you run Pi through a differently named executable, such as a Pi-compatible fork or a wrapper on your `PATH`, name it here:
 
 ```toml
 [agent]
 pi_program = "custom-pi"
 ```
 
-Herdr uses that name everywhere it handles Pi, so the executable it starts is the same one it recognizes and resumes:
+Herdr uses that name to start and detect Pi, and to replace the native `pi` executable in a Pi resume plan:
 
 - **Starting** a Pi Agent, including `agent.start`, launches `custom-pi`.
 - **Detecting** a pane running `custom-pi` reports it as a Pi Agent, in status, the agents panel, and session restore.
-- **Resuming or relaunching** a Pi session uses `custom-pi`.
+- **Resuming or relaunching** a Pi session uses `custom-pi` when its generated or saved launch command starts with `pi`; a saved command using another program keeps that program.
 
-For detection the name is matched the same way as the built-in Agent names: case-insensitively, ignoring a `.exe`, `.cmd`, `.bat`, `.ps1`, or `.js` extension, and using the final path component if you give a full path. Starting an Agent uses the value exactly as written, so a full path launches that path.
+For detection the name is matched the same way as the built-in Agent names: case-insensitively, ignoring a `.exe`, `.cmd`, `.bat`, `.ps1`, or `.js` extension, and using the final path component if you give a full path. Starting an Agent uses the configured value after trimming surrounding whitespace, so a full path launches that path.
 
-The default is `"pi"`, which changes nothing. Blank or whitespace-only values also fall back to `"pi"`. A name that already belongs to another Agent, such as `claude`, keeps that Agent, and other Agents always launch under their own executables. Reloading the config applies the new name immediately, to detection, to newly started Agents, and to any resume that has not started yet.
+The default is `"pi"`, which changes nothing. Blank or whitespace-only values also fall back to `"pi"`. A name that already belongs to another Agent, such as `claude`, keeps that Agent, and other Agents always launch under their own executables. Reloading the config applies the new name immediately to detection and newly started Agents. A pending Pi resume reads the current setting when it starts, but substitutes it only for a launch command whose program is `pi`.
+
 ## Server stop timeout
 
 Set how long `herdr server stop` waits for the server and client sockets to shut down:
@@ -459,7 +458,7 @@ Set how long `herdr server stop` waits for the server and client sockets to shut
 stop_timeout_ms = 15000
 ```
 
-The value is in milliseconds and defaults to 15,000 (15 seconds), preserving upstream v0.7.4 behavior when unset. Zero uses the default, and values above 300,000 (5 minutes) are capped at that maximum. This setting applies to `herdr server stop`; named `herdr session stop` commands continue to use the 15-second default.
+The value is in milliseconds and defaults to 15,000 (15 seconds), preserving the existing behavior when unset. Zero uses the default, and values above 300,000 (5 minutes) are capped at that maximum. This setting applies to the stop phase of both `herdr server stop` and `herdr server restart`; named `herdr session stop` commands continue to use the 15-second default.
 
 ## Agent session restore
 
@@ -470,7 +469,7 @@ Herdr resumes supported Agent conversations after a server restart by default:
 resume_agents_on_restore = true
 ```
 
-Pi resumes with the executable named by `agent.pi_program`, described under Pi executable name above. Herdr applies the current setting when the deferred resume starts, so a config reload can change a pending Pi resume.
+Pi resumes substitute the current `agent.pi_program` value for a generated or saved native `pi` program when the deferred resume starts; a saved non-`pi` program is preserved.
 
 Only panes with a valid native session reference from an official integration can resume; other panes restore as normal shells. See [Session state and restore](/docs/session-state/) for supported Agents and persistence behavior.
 

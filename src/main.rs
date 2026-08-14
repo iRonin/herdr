@@ -336,11 +336,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # The wrapped bar uses at most half of the pane area's height.
 # tab_bar_wrap = false
 
-# Show the highest-attention agent status on each top tab.
+# Show the highest-attention agent status on each tab in the desktop tab bar.
 # Uses the same status marks as the agents panel.
 # tab_agent_status = false
 
-# Mirror the highest-attention agent pane's standalone context percentage on each top tab.
+# Mirror the highest-attention agent pane's standalone context percentage on each desktop tab.
 # Recognizes N%·PID and ~N%·PID labels from the Agents pane.
 # tab_agent_context = false
 

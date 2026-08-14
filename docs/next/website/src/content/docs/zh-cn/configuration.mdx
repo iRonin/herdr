@@ -252,6 +252,14 @@ yellow = "#f9e2af"
 
 侧边栏是 Herdr 的主仪表盘。在[配置参考](/docs/config-reference/)中搜索 `ui.`，可查看尺寸、折叠模式、Agent 面板排序、鼠标行为、窗格边框和其他显示设置。
 
+在 `[ui]` 下设置 `tab_bar_position = "bottom"` 可将桌面标签行置于终端窗格下方。Prefix、Navigate、Copy 和 Resize 模式栏在激活时会临时替换底部标签行；启用 `tab_bar_wrap` 时，模式栏只覆盖最下面的一行标签，其上方的各行仍可点击。默认值为 `"top"`。
+
+设置 `ui.tab_close_button = true` 后，在启用 `ui.mouse_capture` 的情况下，桌面标签栏中每个标签名称的最后一个单元格会显示一个 `x`。按住配置的修饰键（默认为 Alt/Option）点击 `x` 可立即关闭该标签页，无需确认提示；未按住配置的修饰键组合点击时，则照常激活该标签页。关闭工作区的最后一个标签页会关闭该工作区，且仍遵循 `ui.confirm_close`。
+
+修饰键可通过 `ui.tab_close_button_modifier` 配置：`"alt"`（默认）、`"ctrl"`、`"shift"`，或以 `+` 分隔的组合，例如 `"ctrl+shift"`。终端鼠标上报只能编码 Shift、Alt 和 Ctrl，因此不接受 Cmd/Super——这类按键永远无法传送到应用。实用提示：在 macOS 上，系统会将 Ctrl-click 当作右键点击处理；在 iTerm2 中，按住 Option 会绕过鼠标上报（用于选择文本）。因此，对于默认的 Alt 修饰键，在 iTerm2 中实际有效的手势是**Cmd-click——iTerm2 会将其作为 Alt-click 上报给应用**。如果 iTerm2 截获该点击并转而打开/下载文件，请禁用 "⌘-Click opens filename/url"（Settings → Pointer），或限制 Semantic History（Settings → Profiles → Advanced）。
+
+设置 `ui.tab_drag_move_workspace = true` 后，可以将标签栏中的标签页拖到侧边栏的工作区条目上，将该标签页（及其所有窗格）作为一个整体移动到该工作区。悬停的条目会高亮显示为放置目标；拖放到其他位置则保持通常的栏内重排行为。移动时标签页会追加到目标工作区标签栏的末尾，且不切换焦点。
+
 ### 侧边栏行布局
 
 展开的桌面侧边栏会将 `rows` 中的每个内层数组渲染为一行。以下是完整的默认布局：
@@ -353,6 +361,20 @@ herdr pane report-metadata <pane_id> \
 
 侧边栏行设置仅影响展开的桌面侧边栏。折叠视图和移动视图仍使用紧凑布局。
 
+`prompt_new_tab_name` 控制新建标签页按钮在创建标签页之前是否询问名称。按住 Alt/Option 点击该按钮，可为单个标签页临时反转该设置。
+
+在 `[ui]` 下设置 `tab_bar_wrap = true` 后，标签会分布在可用的多行中显示，而不是使用默认的带 `<`/`>` 按钮的单行滚动方式。标签栏会根据需要从配置的边缘向内扩展，最多达到窗格区域高度的一半；终端和弹窗的几何布局会随之收缩。当行数达到该上限时，Herdr 会滚动可见的行窗口，以保持活动标签可见。标签栏保持由 `tab_bar_position` 选择的放置位置，因此换行的标签行会从顶边向下增长，或从底边向上增长。默认值为 `false`。
+
+在 `[ui]` 下通过 `pane_scrollbars = "always"`、`"auto"` 或 `"never"` 选择窗格滚动条的显示方式。`"always"` 是默认值，只要窗格足够宽，就会预留一个终端列。`"auto"` 让窗格文本保持全宽；在窗格处于回滚状态时滚动后，会在最右侧的文本列上短暂覆盖显示滚动条，约 1.2 秒无操作后消失。`"never"` 让文本保持全宽，且从不绘制窗格滚动条。布尔值仍然兼容：`true` 等同于 `"always"`，`false` 等同于 `"never"`。早期的 `show_scrollbar` 拼写仍被接受作为该键的别名；同时设置两种拼写会导致解析错误。
+
+在 `[ui]` 下设置 `tab_agent_status = true` 后，桌面标签栏中的每个标签会显示关注度最高的智能体状态。该指示符使用与 Agent 面板及应用其他部分相同的状态标记：实心圆点表示受阻未读（红色）、工作中（黄色）以及完成未读（蓝绿色）；空心圆点表示受阻已读（红色）和完成已读（绿色）；中点表示未知。状态不仅靠形状区分，也靠颜色区分，因此单格标签标记依靠颜色来区分受阻未读、工作中与完成未读这三种状态。该功能默认禁用，单行和换行标签栏均可使用。
+
+在 `[ui]` 下设置 `tab_agent_context = true` 后，会在标签上镜像显示同一关注度最高智能体窗格在 Agent 面板中已经显示的独立上下文百分比。Herdr 会识别独立的 `N%·PID` 或 `~N%·PID` 标签，将其中精确的 `N%` 或 `~N%` 部分追加到可见标签名称之后、` Z` 缩放标记之前；当关注度最高的窗格没有单一有效标签时，则省略该后缀。它独立于 `tab_agent_status` 工作，默认禁用。
+
+在 `[ui]` 下设置 `agent_panel_scope = "all"` 或 `agent_panel_scope = "current"`，可将 Agent 面板筛选为显示所有 Space 或仅显示活动 Space。`"current_workspace"` 被接受为 `"current"` 的别名。默认值为 `"all"`。`current` 范围按关注度优先级排序，除非活动的 Agent 视图提供了自己的排序。
+
+在 `[ui]` 下设置 `agent_panel_modes = ["priority", "grouped", "space"]`，可控制点击 Agent 面板模式标签时循环切换的模式。允许的值：`"priority"`、`"grouped"`（`"spaces"` 是其别名）和 `"space"`（`"current"` 和 `"current_workspace"` 是其别名）。未知和重复的条目会被忽略。空列表或仅含无效值的列表会回退为按此默认顺序循环全部三种模式。
+
 ## 通知
 
 当后台智能体完成任务或需要输入时，Herdr 可以通知你：
@@ -404,6 +426,36 @@ kitty_graphics = true
 
 仅在测试终端图像行为时启用。
 
+## Pi 可执行文件名
+
+Herdr 通过窗格中运行程序的名称来识别 Pi 智能体。如果你通过一个名称不同的可执行文件运行 Pi，例如兼容 Pi 的分支版本或你 `PATH` 上的包装器，请在此指定其名称：
+
+```toml
+[agent]
+pi_program = "custom-pi"
+```
+
+Herdr 使用该名称来启动和检测 Pi，并在 Pi 恢复计划中替换原生的 `pi` 可执行文件：
+
+- **启动** Pi 智能体（包括 `agent.start`）时会启动 `custom-pi`。
+- **检测**到运行 `custom-pi` 的窗格时，会在状态、智能体面板和会话恢复中将其报告为 Pi 智能体。
+- **恢复或重新启动** Pi 会话时，如果其生成的或保存的启动命令以 `pi` 开头，则使用 `custom-pi`；保存的命令使用其他程序时，保持该程序不变。
+
+检测时，该名称的匹配方式与内置智能体名称相同：不区分大小写，忽略 `.exe`、`.cmd`、`.bat`、`.ps1` 或 `.js` 扩展名；如果给出完整路径，则使用最后的路径组件。启动智能体时使用去除首尾空白后的配置值，因此完整路径会启动该路径。
+
+默认值为 `"pi"`，不改变任何行为。空白或仅含空白的值也会回退到 `"pi"`。如果名称已属于其他智能体（例如 `claude`），则保持该智能体不变，其他智能体始终使用自己的可执行文件启动。重载配置后，新名称会立即应用于检测和新启动的智能体。待处理的 Pi 恢复在启动时读取当前设置，但只替换程序为 `pi` 的启动命令。
+
+## 服务器停止超时
+
+设置 `herdr server stop` 等待服务器和客户端 socket 关闭的时长：
+
+```toml
+[session]
+stop_timeout_ms = 15000
+```
+
+该值以毫秒为单位，默认为 15000（15 秒），未设置时保持现有行为。零会使用默认值，超过 300000（5 分钟）的值会被限制为该最大值。此设置同时适用于 `herdr server stop` 和 `herdr server restart` 的停止阶段；针对命名会话的 `herdr session stop` 命令仍使用 15 秒默认值。
+
 ## 智能体会话恢复
 
 默认情况下，Herdr 会在服务器重启后恢复受支持的智能体对话：
@@ -412,6 +464,8 @@ kitty_graphics = true
 [session]
 resume_agents_on_restore = true
 ```
+
+延迟恢复启动时，Pi 恢复会用当前的 `agent.pi_program` 值替换生成的或保存的原生 `pi` 程序；保存的非 `pi` 程序会被保留。
 
 只有通过官方集成获得有效原生会话引用的窗格才能恢复；其他窗格会作为普通 shell 恢复。有关受支持的智能体和持久化行为，请参阅[会话状态与恢复](/docs/session-state/)。
 
@@ -449,6 +503,7 @@ switch_ascii_input_source_in_prefix = true
 | `HERDR_CONFIG_PATH` | 覆盖配置文件路径。 |
 | `HERDR_SESSION` | 为 CLI 命令选择命名会话。 |
 | `HERDR_SOCKET_PATH` | 覆盖底层 socket 路径。 |
+| `HERDR_PROCESS_DETECTION` | Linux 进程检测策略：`native`（默认）或需手动启用的 `child-groups`。 |
 | `HERDR_LOG` | 设置日志过滤，例如 `HERDR_LOG=herdr=debug`。 |
 | `HERDR_DISABLE_SOUND` | 即使 `[ui.sound] enabled = true` 也禁用声音播放。 |
 
