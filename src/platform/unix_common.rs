@@ -220,13 +220,37 @@ pub(super) fn read_terminal_grid_size() -> std::io::Result<(u16, u16)> {
 }
 
 fn set_sigpipe_disposition(handler: libc::sighandler_t) {
-    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-    action.sa_sigaction = handler;
-    unsafe {
-        libc::sigemptyset(&mut action.sa_mask);
-        // Rust starts with SIGPIPE ignored. If this best-effort transition
-        // fails, stdout retains the existing Rust behavior.
-        libc::sigaction(libc::SIGPIPE, &action, std::ptr::null_mut());
+    // The disposition is PROCESS-WIDE, and `begin_cli_output` is reached from
+    // the `print!`/`println!` macros in src/cli.rs -- so any code in the CLI
+    // module tree that prints changes it for everything running alongside.
+    //
+    // That is correct for a CLI process, which prints and exits. It is wrong
+    // for the TEST BINARY, which is long-lived: one printing test under `cli::`
+    // leaves SIGPIPE fatal, and every later test that writes to a closed socket
+    // is KILLED rather than getting EPIPE. That aborts the whole run, so the
+    // suite cannot complete and the gate cannot verify anything.
+    //
+    // Measured on stock upstream v0.9.0, no fork commits: the full suite dies
+    // at `client_writer_closes_queue_after_socket_write_failure`; skipping the
+    // `cli::` module alone gives 2910 passed / 0 failed with that same test
+    // running and passing.
+    //
+    // Production behaviour is deliberately unchanged -- this is compiled out
+    // only under `cfg(test)`.
+    #[cfg(test)]
+    {
+        let _ = handler;
+    }
+    #[cfg(not(test))]
+    {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = handler;
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            // Rust starts with SIGPIPE ignored. If this best-effort transition
+            // fails, stdout retains the existing Rust behavior.
+            libc::sigaction(libc::SIGPIPE, &action, std::ptr::null_mut());
+        }
     }
 }
 
@@ -473,5 +497,62 @@ mod tests {
     fn remote_ssh_config_dir_rejects_overlong_control_socket_name() {
         let err = create_remote_ssh_config_dir(&"x".repeat(200)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// CLI output must never make SIGPIPE fatal for the test binary.
+    ///
+    /// `begin_cli_output` is reached from the `print!`/`println!` macros in
+    /// src/cli.rs, and the disposition it sets is process-wide. In a CLI that
+    /// prints and exits that is intended. In the test binary it is fatal: one
+    /// printing test under `cli::` makes every later test that writes to a
+    /// closed socket die by signal, killing the whole run. That is not a test
+    /// failure anyone can debug -- the process is simply gone, and the harness
+    /// reports only "signal: 13".
+    ///
+    /// This asserts the guard in `set_sigpipe_disposition` is still in place.
+    /// Remove the `cfg(test)` arm and this test fails, instead of the suite
+    /// aborting somewhere unrelated hours later.
+    #[test]
+    fn cli_output_does_not_make_sigpipe_fatal_in_tests() {
+        fn current_sigpipe_handler() -> libc::sighandler_t {
+            let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+            unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut current) };
+            current.sa_sigaction
+        }
+
+        // Establish the starting state rather than ASSERTING it. Tests share
+        // one process and one signal table, so asserting "SIGPIPE is ignored
+        // on entry" makes this test fail whenever an unrelated earlier test
+        // changed it -- reporting a defect in this unit that belongs to some
+        // other one. Set it, then measure only what begin_cli_output does.
+        let restore = current_sigpipe_handler();
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = libc::SIG_IGN;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(libc::SIGPIPE, &action, std::ptr::null_mut());
+        }
+        assert_eq!(
+            current_sigpipe_handler(),
+            libc::SIG_IGN,
+            "could not establish the starting disposition; the assertion below \
+             would then prove nothing"
+        );
+
+        begin_cli_output();
+
+        assert_eq!(
+            current_sigpipe_handler(),
+            libc::SIG_IGN,
+            "begin_cli_output made SIGPIPE fatal for the whole test binary; \
+             later tests that write to a closed socket will be killed by signal"
+        );
+
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = restore;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(libc::SIGPIPE, &action, std::ptr::null_mut());
+        }
     }
 }
