@@ -401,6 +401,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Milliseconds between automatic agent restores; 0 starts them without spacing.
 # startup_per_agent_delay_ms = 100
 
+# Maximum time in milliseconds for `herdr server stop` to wait for shutdown.
+# Zero uses the 15000ms default; values above 300000ms (5 minutes) are capped.
+# stop_timeout_ms = 15000
+
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.
 # When true (default), herdr runs remote ssh through a generated config that
