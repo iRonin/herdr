@@ -617,7 +617,7 @@ fn config_check_accepts_log_retained_files_and_reports_a_bad_value_for_that_key_
         ),
     ] {
         let (code, stdout) = check(&format!(
-            "[session]\nlog_retained_files = {bad}\nstop_timeout_ms = 5000\n"
+            "[session]\nlog_retained_files = {bad}\nstop_timeout_ms = 5000\n[agent]\npi_program = \"custom-pi\"\n"
         ));
         assert_eq!(code, Some(1), "log_retained_files = {bad}: {stdout}");
         assert!(stdout.contains(expected), "{bad}: {stdout}");

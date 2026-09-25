@@ -238,6 +238,7 @@ impl App {
             return false;
         }
 
+        let plan = plan.with_pi_program(&self.state.pi_program);
         let Some(resume_command) = shell_command_from_argv(&plan.argv) else {
             tracing::warn!(
                 pane = pane_id.raw(),
@@ -427,6 +428,7 @@ mod tests {
                     agent: "codex".into(),
                     argv: vec!["codex".into()],
                     dedupe_key: terminal.id.to_string(),
+                    reported: false,
                 });
             }
             let now = Instant::now();
@@ -522,6 +524,7 @@ mod tests {
                 agent: "codex".into(),
                 argv: long_running_test_argv(),
                 dedupe_key: "resume-test".into(),
+                reported: false,
             });
             app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true);
             assert!(app.terminal_runtimes.get(&terminal_id).is_none());
@@ -558,6 +561,7 @@ mod tests {
             agent: "codex".into(),
             argv: marker_resume_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+            reported: false,
         });
 
         assert!(!app.start_pending_agent_resumes(Instant::now(), false));
@@ -636,6 +640,7 @@ mod tests {
             agent: "codex".into(),
             argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+            reported: false,
         });
 
         app.sync_pending_agent_resume_deadline(std::time::Instant::now());
@@ -687,6 +692,7 @@ mod tests {
                 agent: "codex".into(),
                 argv: long_running_test_argv(),
                 dedupe_key: format!("herdr:codex\0codex\0Id\0{terminal_id}"),
+                reported: false,
             });
         }
         app.pending_agent_resume_deadline =
@@ -757,6 +763,7 @@ mod tests {
             agent: "codex".into(),
             argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0inactive-tab-session".into(),
+            reported: false,
         });
 
         assert!(app.start_pending_agent_resumes(Instant::now(), false));
@@ -818,6 +825,7 @@ mod tests {
             agent: "codex".into(),
             argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0zoom-hidden-session".into(),
+            reported: false,
         });
 
         assert!(app.start_pending_agent_resumes(Instant::now(), false));
@@ -876,6 +884,7 @@ mod tests {
             agent: "codex".into(),
             argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+            reported: false,
         });
 
         app.sync_pending_agent_resume_deadline(std::time::Instant::now());
@@ -937,6 +946,7 @@ mod tests {
             agent: "codex".into(),
             argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+            reported: false,
         });
 
         assert!(app.start_pending_agent_resumes(Instant::now(), false));

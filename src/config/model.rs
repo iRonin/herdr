@@ -385,6 +385,44 @@ pub struct TerminalConfig {
     pub kitty_graphics: Option<bool>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    /// Name of the Pi executable on this machine. Pi agents are started with it,
+    /// panes running it are detected as Pi agents, and it is the program used to
+    /// resume or relaunch them. Blank values fall back to `pi`.
+    #[serde(
+        default = "default_pi_program",
+        deserialize_with = "deserialize_pi_program"
+    )]
+    pub pi_program: String,
+}
+
+fn default_pi_program() -> String {
+    "pi".to_string()
+}
+
+fn deserialize_pi_program<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let program = String::deserialize(deserializer)?;
+    let program = program.trim();
+    Ok(if program.is_empty() {
+        default_pi_program()
+    } else {
+        program.to_string()
+    })
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            pi_program: default_pi_program(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct SessionConfig {
@@ -450,6 +488,8 @@ pub struct Config {
     pub onboarding: Option<bool>,
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
+    #[serde(default)]
+    pub agent: AgentConfig,
     pub session: SessionConfig,
     pub server: ServerConfig,
     pub update: UpdateConfig,
@@ -1619,6 +1659,39 @@ manifest_check = false
     }
 
     #[test]
+    fn pi_program_defaults_to_pi_and_parses_override() {
+        let default_config: Config = toml::from_str("").unwrap();
+        assert_eq!(default_config.agent.pi_program, "pi");
+
+        let config: Config = toml::from_str(
+            r#"
+[agent]
+pi_program = "custom-pi"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.agent.pi_program, "custom-pi");
+    }
+
+    #[test]
+    fn pi_program_normalizes_whitespace_and_defaults_blank_values_to_pi() {
+        for value in ["", "   ", "\t\n"] {
+            let config: Config =
+                toml::from_str(&format!("[agent]\npi_program = {:?}\n", value)).unwrap();
+            assert_eq!(config.agent.pi_program, "pi");
+        }
+
+        let config: Config = toml::from_str(
+            r#"
+[agent]
+pi_program = "  custom-pi  "
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.agent.pi_program, "custom-pi");
+    }
+
+    #[test]
     fn terminal_default_shell_defaults_empty_and_parses() {
         let default_config = Config::default();
         assert!(default_config.terminal.default_shell.is_empty());
@@ -1725,11 +1798,12 @@ stop_timeout_ms = 5000
             ("1979-05-27", 0),
             ("{ files = 3 }", 0),
         ] {
-            let toml = format!("[session]\nlog_retained_files = {value}\nstop_timeout_ms = 5000\n");
+            let toml = format!("[session]\nlog_retained_files = {value}\nstop_timeout_ms = 5000\n[agent]\npi_program = \"custom-pi\"\n");
             let config: Config = toml::from_str(&toml)
                 .unwrap_or_else(|err| panic!("{value} must not fail the whole config: {err}"));
             assert_eq!(config.session.log_retained_files.files(), kept, "{value}");
             assert_eq!(config.session.stop_timeout_ms, 5000, "{value}");
+            assert_eq!(config.agent.pi_program, "custom-pi", "{value}");
             let diagnostics = config.collect_diagnostics();
             assert_eq!(diagnostics.len(), 1, "{value}: {diagnostics:?}");
             assert!(
