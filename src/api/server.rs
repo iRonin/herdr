@@ -227,6 +227,7 @@ fn handle_connection_with_stop(
                     method,
                     "stream_closed",
                     changes_ui,
+                    None,
                 ),
                 Err(err) => {
                     crate::logging::api_request_failed(&request_id, method, &err.to_string())
@@ -249,6 +250,7 @@ fn handle_connection_with_stop(
                     method,
                     "stream_closed",
                     changes_ui,
+                    None,
                 ),
                 Err(err) => {
                     crate::logging::api_request_failed(&request_id, method, &err.to_string())
@@ -314,6 +316,7 @@ fn handle_connection_with_stop(
                     method,
                     api_response_outcome(&response),
                     changes_ui,
+                    api_response_error_detail(&response).as_deref(),
                 ),
                 Err(err) => {
                     crate::logging::api_request_failed(&request_id, method, &err.to_string())
@@ -337,6 +340,7 @@ fn finish_wait_response(
             method,
             "client_disconnected",
             changes_ui,
+            None,
         );
         return Ok(());
     };
@@ -347,6 +351,7 @@ fn finish_wait_response(
             method,
             api_response_outcome(&response),
             changes_ui,
+            api_response_error_detail(&response).as_deref(),
         ),
         Err(err) => crate::logging::api_request_failed(request_id, method, &err.to_string()),
     }
@@ -514,6 +519,23 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PluginPaneFocus(_) => "plugin.pane.focus",
         Method::PluginPaneClose(_) => "plugin.pane.close",
     }
+}
+
+/// The error code and message from an API response, for logging.
+///
+/// Returns None for successful responses. The response has already been
+/// serialised by this point, so this costs one extra parse only on the logging
+/// path; the value is that a failing client can be diagnosed from the log alone.
+fn api_response_error_detail(response: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(response).ok()?;
+    let error = value.get("error")?;
+    let code = error.get("code").and_then(|c| c.as_str()).unwrap_or("?");
+    let message = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
+    Some(if message.is_empty() {
+        code.to_string()
+    } else {
+        format!("{code}: {message}")
+    })
 }
 
 fn api_response_outcome(response: &str) -> &'static str {
@@ -1139,6 +1161,38 @@ mod tests {
         drop(_listener);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A failing client must be diagnosable FROM THE LOG ALONE. herdr previously
+    /// logged that a request errored but never why, and the client (fire-and-
+    /// forget) discarded the response body -- so one method failed 4405 times in
+    /// a row, for weeks, with the cause recorded nowhere on either side.
+    #[test]
+    fn error_detail_carries_the_reason_the_client_was_given() {
+        let real = r#"{"id":"m1","error":{"code":"invalid_metadata_request","message":"missing metadata field to set or clear"}}"#;
+        assert_eq!(
+            api_response_error_detail(real).as_deref(),
+            Some("invalid_metadata_request: missing metadata field to set or clear"),
+            "the actionable reason must reach the log, not just the fact of failure"
+        );
+
+        // Negatives: without these the function could return Some(_) for
+        // everything and the assertion above would still pass.
+        assert_eq!(
+            api_response_error_detail(r#"{"id":"c1","result":{"type":"ok"}}"#),
+            None,
+            "a success must not be logged as carrying an error"
+        );
+        assert_eq!(
+            api_response_error_detail("not json at all"),
+            None,
+            "an unparseable response must not fabricate a detail"
+        );
+        assert_eq!(
+            api_response_error_detail(r#"{"id":"x","error":{"code":"boom"}}"#).as_deref(),
+            Some("boom"),
+            "a code with no message must still be reported"
+        );
     }
 
     #[test]
