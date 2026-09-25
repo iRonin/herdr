@@ -91,14 +91,38 @@ pub(crate) fn api_request_completed(
     method: &'static str,
     outcome: &'static str,
     changes_ui: bool,
+    // The error the client was actually sent. Without this the log records THAT
+    // a request failed but never WHY, which is unactionable: a client failing
+    // 100% of the time is indistinguishable from one that is fine. A real case
+    // ran 4405 consecutive failures of one method for weeks, with the cause
+    // (an unknown field, so nothing left to set) present in every response and
+    // recorded nowhere.
+    detail: Option<&str>,
 ) {
     let event = "api.request.complete";
     let subsystem = "api";
     let message = "api request completed";
+    let detail = detail.unwrap_or_default();
     if outcome != "ok" || (changes_ui && !is_routine_api_method(method)) {
-        tracing::info!(event, subsystem, outcome, request_id, method, "{message}");
+        tracing::info!(
+            event,
+            subsystem,
+            outcome,
+            request_id,
+            method,
+            detail,
+            "{message}"
+        );
     } else {
-        tracing::debug!(event, subsystem, outcome, request_id, method, "{message}");
+        tracing::debug!(
+            event,
+            subsystem,
+            outcome,
+            request_id,
+            method,
+            detail,
+            "{message}"
+        );
     }
 }
 
