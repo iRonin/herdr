@@ -556,6 +556,7 @@ fn restore_tab(
                 saved_agent_resume,
                 &cwd,
                 saved_history,
+                saved_launch_argv.as_deref(),
                 &mut agent_restore,
             )
         };
@@ -597,6 +598,11 @@ fn restore_tab(
             let terminal_id = TerminalId::alloc();
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan);
+            // Carry the original launch command forward so replayed flags survive
+            // repeated restarts. Native resume does not enable handoff respawn.
+            if let Some(argv) = saved_launch_argv.clone() {
+                terminal = terminal.with_launch_argv(argv);
+            }
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -819,6 +825,7 @@ fn pane_restore_startup<'a>(
     reported_resume: Option<&PaneAgentResumeSnapshot>,
     cwd: &std::path::Path,
     history: Option<&'a PaneHistorySnapshot>,
+    launch_argv: Option<&[String]>,
     agent_restore: &mut AgentRestoreState<'_>,
 ) -> PaneRestoreStartup<'a> {
     // Native agent resume owns the conversation history. If a pane has a
@@ -828,9 +835,10 @@ fn pane_restore_startup<'a>(
     let restore_plan = if !agent_restore.enabled {
         None
     } else if let Some(resume) = reported_resume {
+        // A command the agent reported itself wins over everything the server can rebuild.
         Some(reported_resume_from_snapshot(resume).plan(cwd))
     } else {
-        session.and_then(|session| restore_plan_for_snapshot(session, true))
+        session.and_then(|session| restore_plan_for_snapshot(session, true, launch_argv))
     };
     let has_native_agent_restore = restore_plan.is_some();
     // Reserve before spawning so later panes in the same restore pass cannot
@@ -885,12 +893,18 @@ fn reported_resume_from_snapshot(
 fn restore_plan_for_snapshot(
     session: &PaneAgentSessionSnapshot,
     resume_agents_on_restore: bool,
+    launch_argv: Option<&[String]>,
 ) -> Option<crate::agent_resume::AgentResumePlan> {
     if !resume_agents_on_restore {
         return None;
     }
     let persisted = persisted_agent_session_from_snapshot(session)?;
-    crate::agent_resume::plan(&session.source, &session.agent, &persisted.session_ref)
+    crate::agent_resume::plan_replaying_launch_argv(
+        &session.source,
+        &session.agent,
+        &persisted.session_ref,
+        launch_argv,
+    )
 }
 
 fn persisted_agent_session_from_snapshot(
@@ -918,9 +932,10 @@ fn restored_terminal_agent_session(
 fn take_restore_plan_for_snapshot(
     session: &PaneAgentSessionSnapshot,
     resume_agents_on_restore: bool,
+    launch_argv: Option<&[String]>,
     resumed_agent_sessions: &mut HashSet<String>,
 ) -> Option<crate::agent_resume::AgentResumePlan> {
-    restore_plan_for_snapshot(session, resume_agents_on_restore)
+    restore_plan_for_snapshot(session, resume_agents_on_restore, launch_argv)
         .filter(|plan| resumed_agent_sessions.insert(plan.dedupe_key.clone()))
 }
 
@@ -1182,9 +1197,11 @@ mod tests {
             value: pi_session_path.clone(),
         };
 
-        assert!(restore_plan_for_snapshot(&session, false).is_none());
+        assert!(restore_plan_for_snapshot(&session, false, None).is_none());
         assert_eq!(
-            restore_plan_for_snapshot(&session, true).unwrap().argv,
+            restore_plan_for_snapshot(&session, true, None)
+                .unwrap()
+                .argv,
             vec!["pi", "--session", pi_session_path.as_str()]
         );
 
@@ -1194,7 +1211,7 @@ mod tests {
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("claude-session"),
         };
-        assert!(restore_plan_for_snapshot(&unsupported_path, true).is_none());
+        assert!(restore_plan_for_snapshot(&unsupported_path, true, None).is_none());
     }
 
     #[test]
@@ -1208,16 +1225,16 @@ mod tests {
         };
         let mut resumed = HashSet::new();
 
-        assert!(take_restore_plan_for_snapshot(&session, false, &mut resumed).is_none());
+        assert!(take_restore_plan_for_snapshot(&session, false, None, &mut resumed).is_none());
         assert!(resumed.is_empty());
 
-        let first = take_restore_plan_for_snapshot(&session, true, &mut resumed)
+        let first = take_restore_plan_for_snapshot(&session, true, None, &mut resumed)
             .expect("first restore should get a plan");
         assert_eq!(
             first.argv,
             vec!["pi", "--session", pi_session_path.as_str()]
         );
-        assert!(take_restore_plan_for_snapshot(&session, true, &mut resumed).is_none());
+        assert!(take_restore_plan_for_snapshot(&session, true, None, &mut resumed).is_none());
     }
 
     #[test]
@@ -1243,6 +1260,7 @@ mod tests {
             None,
             std::path::Path::new("/a"),
             Some(&history),
+            None,
             &mut agent_restore,
         );
 
@@ -1274,6 +1292,7 @@ mod tests {
             None,
             std::path::Path::new("/a"),
             Some(&history),
+            None,
             &mut agent_restore,
         );
         let duplicate = pane_restore_startup(
@@ -1281,6 +1300,7 @@ mod tests {
             None,
             std::path::Path::new("/a"),
             Some(&history),
+            None,
             &mut agent_restore,
         );
 
@@ -1326,6 +1346,7 @@ mod tests {
             Some(&resume),
             project_a,
             Some(&history),
+            None,
             &mut agent_restore,
         );
         let plan = startup.restore_plan.expect("reported resume plan");
@@ -1338,13 +1359,32 @@ mod tests {
             agent: "prime-agent".into(),
             argv: vec!["prime-agent".into(), "--continue".into()],
         };
-        let first = pane_restore_startup(None, Some(&custom), project_a, None, &mut agent_restore);
+        let first = pane_restore_startup(
+            None,
+            Some(&custom),
+            project_a,
+            None,
+            None,
+            &mut agent_restore,
+        );
         assert_eq!(first.restore_plan.unwrap().argv, custom.argv);
-        let other_project =
-            pane_restore_startup(None, Some(&custom), project_b, None, &mut agent_restore);
+        let other_project = pane_restore_startup(
+            None,
+            Some(&custom),
+            project_b,
+            None,
+            None,
+            &mut agent_restore,
+        );
         assert!(other_project.restore_plan.is_some());
-        let duplicate =
-            pane_restore_startup(None, Some(&custom), project_a, None, &mut agent_restore);
+        let duplicate = pane_restore_startup(
+            None,
+            Some(&custom),
+            project_a,
+            None,
+            None,
+            &mut agent_restore,
+        );
         assert!(duplicate.restore_plan.is_none());
         assert!(duplicate.duplicate_agent_session);
 
@@ -1358,6 +1398,7 @@ mod tests {
             Some(&custom),
             project_a,
             Some(&history),
+            None,
             &mut disabled,
         );
         assert!(startup.restore_plan.is_none());
@@ -1387,6 +1428,7 @@ mod tests {
             None,
             std::path::Path::new("/a"),
             Some(&history),
+            None,
             &mut agent_restore,
         );
 
@@ -1421,8 +1463,8 @@ mod tests {
             value: test_session_path("pi-session.jsonl"),
         };
         let mut resumed = HashSet::new();
-        assert!(take_restore_plan_for_snapshot(&session, true, &mut resumed).is_some());
-        assert!(take_restore_plan_for_snapshot(&session, true, &mut resumed).is_none());
+        assert!(take_restore_plan_for_snapshot(&session, true, None, &mut resumed).is_some());
+        assert!(take_restore_plan_for_snapshot(&session, true, None, &mut resumed).is_none());
 
         assert!(restored_terminal_agent_session(Some(&session), true).is_none());
     }
@@ -2230,5 +2272,140 @@ mod tests {
         };
         history.layout_fingerprint = super::super::snapshot::layout_fingerprint(&snapshot);
         (snapshot, history)
+    }
+
+    #[test]
+    fn restore_plan_replays_launch_argv_when_present() {
+        // A pi pane launched as `custom-pi --session <old> --model opus` must
+        // resume as that program with the flags preserved and exactly one fresh
+        // `--session`.
+        let old_path = test_session_path("pi-old.jsonl");
+        let new_path = test_session_path("pi-new.jsonl");
+        let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Path,
+            value: new_path.clone(),
+        };
+        let launch_argv = vec![
+            "custom-pi".to_string(),
+            "--session".to_string(),
+            old_path,
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        assert_eq!(
+            restore_plan_for_snapshot(&session, true, Some(&launch_argv))
+                .unwrap()
+                .argv,
+            vec![
+                "custom-pi",
+                "--model",
+                "opus",
+                "--session",
+                new_path.as_str()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_replays_launch_argv_and_carries_it_onto_resumed_terminal() {
+        let cwd = std::env::current_dir().unwrap();
+        let pi_session_path = test_session_path("pi-resume-session.jsonl");
+        let launch_argv = vec![
+            "custom-pi".to_string(),
+            "--session".to_string(),
+            "/old/pi-session.jsonl".to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:pi".into(),
+                                agent: "pi".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Path,
+                                value: pi_session_path.clone(),
+                            }),
+                            agent_resume: None,
+                            launch_argv: Some(launch_argv.clone()),
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        // resume_agents_on_restore = true so the pane produces a pending resume.
+        let (_workspaces, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let terminal = terminals
+            .values()
+            .next()
+            .expect("restored terminal should exist");
+        let plan = terminal
+            .pending_agent_resume_plan
+            .as_ref()
+            .expect("resume-enabled pi pane should defer a resume plan");
+        // Replays the original `custom-pi` program + `--model opus`, strips the
+        // stale `--session /old`, appends exactly one fresh `--session`.
+        assert_eq!(
+            plan.argv,
+            vec![
+                "custom-pi",
+                "--model",
+                "opus",
+                "--session",
+                pi_session_path.as_str()
+            ]
+        );
+        // The ORIGINAL launch command is carried onto the resumed terminal so it
+        // re-persists and survives repeated restarts.
+        assert_eq!(
+            terminal.launch_argv.as_deref(),
+            Some(launch_argv.as_slice())
+        );
+        // No handoff respawn lifecycle is attached by the native resume path.
+        assert!(!terminal.respawn_shell_on_exit);
     }
 }
