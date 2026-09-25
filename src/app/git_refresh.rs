@@ -260,6 +260,7 @@ mod tests {
             retry_after: Some(Instant::now() + std::time::Duration::from_secs(30)),
             snapshot: crate::workspace::WorkspaceGitStatusSnapshot {
                 auto_label: "/".into(),
+                auto_label_pinned: false,
                 branch: Some("main".into()),
                 ahead_behind: None,
                 space: Some(crate::workspace::GitSpaceMetadata {
@@ -349,6 +350,7 @@ mod tests {
             retry_after: None,
             snapshot: crate::workspace::WorkspaceGitStatusSnapshot {
                 auto_label: "stale".into(),
+                auto_label_pinned: false,
                 branch: None,
                 ahead_behind: None,
                 space: None,
