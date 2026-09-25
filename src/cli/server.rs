@@ -54,7 +54,17 @@ fn server_restart(args: &[String]) -> std::io::Result<i32> {
         |name| std::env::var_os(name),
         crate::session::active_api_socket_path,
         crate::session::stop_active_server,
-        crate::server::autodetect::auto_detect_launch,
+        || {
+            // v0.9.0 added this parameter: with saved SSH machines enabled, a
+            // failed LOCAL startup must not abort, so the remote machines stay
+            // reachable. Compute it exactly as the normal launch path does
+            // (src/main.rs) rather than hardcoding false -- hardcoding would
+            // make `server restart` fail hard in a session where a plain
+            // launch would have succeeded.
+            let saved_federation = crate::client::endpoint::EndpointCatalog::load()
+                .is_ok_and(|catalog| catalog.has_enabled_ssh());
+            crate::server::autodetect::auto_detect_launch(saved_federation)
+        },
     ) {
         Ok(()) => Ok(0),
         Err(err) => {
