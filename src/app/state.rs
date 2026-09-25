@@ -848,6 +848,7 @@ pub struct AppState {
     /// DECSCUSR shape parameter (1–6) for the IME anchor cursor.
     pub cjk_ime_cursor_shape: u8,
     pub kitty_graphics_enabled: bool,
+    pub pi_program: String,
     pub default_shell: String,
     pub shell_mode: crate::config::ShellModeConfig,
     pub new_terminal_cwd: NewTerminalCwdConfig,
@@ -1070,6 +1071,7 @@ impl AppState {
             cjk_ime_agents: Vec::new(),
             cjk_ime_cursor_shape: 2, // steady_block
             kitty_graphics_enabled: false,
+            pi_program: "pi".to_string(),
             default_shell: String::new(),
             shell_mode: crate::config::ShellModeConfig::Auto,
             new_terminal_cwd: NewTerminalCwdConfig::Follow,
