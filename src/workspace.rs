@@ -86,16 +86,22 @@ impl WorkspaceGitStatusSnapshot {
         status_cache_key: PathBuf,
         demand: GitStatusRefreshDemand,
     ) -> WorkspaceGitStatus {
-        // The label (and its project pin) is carried from the identity fill,
-        // not recomputed here -- recomputing would lose a `.herdr/settings.toml`
-        // pin discovered by `discover_workspace_git_identity`.
+        // One cache entry can serve several workspaces sharing a repository
+        // root, so the label is re-derived for each workspace's own cwd --
+        // through the pin-aware seam, so a `.herdr/settings.toml` pin is
+        // honoured while the unpinned case reproduces upstream's
+        // per-workspace fallback exactly.
+        let (auto_label, auto_label_pinned) = self::git::workspace_auto_label(
+            &resolved_identity_cwd,
+            self.space.as_ref().map(|space| space.repo_root.as_path()),
+        );
         WorkspaceGitStatus {
             workspace_id,
             resolved_identity_cwd,
             status_cache_key,
             demand,
-            auto_label: self.auto_label,
-            auto_label_pinned: self.auto_label_pinned,
+            auto_label,
+            auto_label_pinned,
             branch: self.branch,
             ahead_behind: self.ahead_behind,
             space: self.space,
