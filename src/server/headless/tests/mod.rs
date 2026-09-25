@@ -78,6 +78,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         client_socket_path: socket_path,
         client_socket_identity,
         clients: HashMap::new(),
+        startup_feedback_pending: false,
         #[cfg(unix)]
         next_client_id: 1,
         foreground_client_id: None,
@@ -710,6 +711,121 @@ async fn client_shell_attach_seeds_workspace() {
     assert_eq!(server.app.state.mode, crate::app::Mode::Terminal);
     assert_eq!(server.app.state.workspaces.len(), 1);
     assert_eq!(server.app.state.active, Some(0));
+    shutdown_test_runtimes(&mut server);
+}
+
+#[test]
+fn first_full_app_client_receives_startup_banner_notification() {
+    // The first attaching client shell receives one-shot fork branding. The
+    // server no longer renders UI, so the banner rides the semantic-
+    // notification lane instead of the deleted server-side copy feedback.
+    let mut server = test_headless_server();
+    server.startup_feedback_pending = true;
+    let (writer, control_rx, _render_rx) = test_client_writer();
+
+    assert!(server.handle_server_event(ServerEvent::ClientShellConnected {
+        client_id: 7,
+        surface_cols: 80,
+        surface_rows: 23,
+        cell_width_px: 0,
+        cell_height_px: 0,
+        pixel_mouse: false,
+        direct_graphics: false,
+        endpoint_keybindings: false,
+        mouse_capture: false,
+        surface_active: true,
+        writer,
+    }));
+
+    assert!(!server.startup_feedback_pending);
+    let mut banners = 0;
+    while let Ok(bytes) = control_rx.recv_timeout(Duration::from_millis(100)) {
+        if let ServerMessage::SemanticNotification(notification) = read_server_message(bytes) {
+            if notification.title == "herdr · iRonin fork" {
+                assert_eq!(
+                    notification.kind,
+                    protocol::SemanticNotificationKind::Custom
+                );
+                assert_eq!(notification.sound, None, "branding must stay silent");
+                banners += 1;
+            }
+        }
+    }
+    assert_eq!(banners, 1, "the first shell attach must deliver the banner");
+    shutdown_test_runtimes(&mut server);
+}
+
+#[test]
+fn startup_banner_waits_for_full_app_client_and_does_not_repeat() {
+    let mut server = test_headless_server();
+    server.startup_feedback_pending = true;
+    let (direct_writer, _direct_control_rx, _direct_render_rx) = test_client_writer();
+
+    // A terminal-ANSI client is not a full-app client: the banner stays armed.
+    assert!(!server.handle_server_event(ServerEvent::ClientConnected {
+        client_id: 6,
+        cols: 80,
+        rows: 24,
+        cell_width_px: 0,
+        cell_height_px: 0,
+        pixel_mouse: false,
+        writer: direct_writer,
+    }));
+    assert!(server.startup_feedback_pending);
+
+    // The first shell client consumes it.
+    let (first_writer, first_control_rx, _first_render_rx) = test_client_writer();
+    assert!(server.handle_server_event(ServerEvent::ClientShellConnected {
+        client_id: 7,
+        surface_cols: 80,
+        surface_rows: 23,
+        cell_width_px: 0,
+        cell_height_px: 0,
+        pixel_mouse: false,
+        direct_graphics: false,
+        endpoint_keybindings: false,
+        mouse_capture: false,
+        surface_active: true,
+        writer: first_writer,
+    }));
+    assert!(!server.startup_feedback_pending);
+    let first_banner = first_control_rx
+        .recv_timeout(Duration::from_millis(100))
+        .into_iter()
+        .map(read_server_message)
+        .any(|message| {
+            matches!(
+                message,
+                ServerMessage::SemanticNotification(ref notification)
+                    if notification.title == "herdr · iRonin fork"
+            )
+        });
+    assert!(first_banner, "the first shell client must receive the banner");
+
+    // A later shell client gets no banner.
+    assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 7 }));
+    let (second_writer, second_control_rx, _second_render_rx) = test_client_writer();
+    assert!(server.handle_server_event(ServerEvent::ClientShellConnected {
+        client_id: 8,
+        surface_cols: 80,
+        surface_rows: 23,
+        cell_width_px: 0,
+        cell_height_px: 0,
+        pixel_mouse: false,
+        direct_graphics: false,
+        endpoint_keybindings: false,
+        mouse_capture: false,
+        surface_active: true,
+        writer: second_writer,
+    }));
+    while let Ok(bytes) = second_control_rx.recv_timeout(Duration::from_millis(100)) {
+        if let ServerMessage::SemanticNotification(notification) = read_server_message(bytes) {
+            assert_ne!(
+                notification.title, "herdr · iRonin fork",
+                "the startup banner must not repeat for later clients"
+            );
+        }
+    }
     shutdown_test_runtimes(&mut server);
 }
 
