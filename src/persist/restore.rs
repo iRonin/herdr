@@ -418,8 +418,10 @@ fn restore_workspace(
             identity_cwd: snap.identity_cwd.clone(),
             cached_identity_cwd: snap.identity_cwd.clone(),
             // Repository metadata is optional and may block on unavailable
-            // storage. The app refreshes it after restoring the session.
+            // storage. The app refreshes it after restoring the session; a
+            // `.herdr/settings.toml` pinned label arrives with that refresh.
             cached_auto_label: crate::workspace::fallback_label_from_cwd(&snap.identity_cwd),
+            cached_auto_label_pinned: false,
             cached_git_status_key: snap.identity_cwd.clone(),
             cached_git_branch: None,
             cached_git_ahead_behind: None,
