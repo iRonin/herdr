@@ -8,6 +8,7 @@ pub(super) mod test_support;
 
 pub(crate) use self::discovery::workspace_auto_label;
 
+pub(crate) use self::discovery::persist_workspace_name;
 pub use self::{
     discovery::{
         derive_label_from_cwd, fallback_label_from_cwd, git_branch, git_space_metadata,
