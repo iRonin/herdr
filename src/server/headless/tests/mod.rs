@@ -714,8 +714,8 @@ async fn client_shell_attach_seeds_workspace() {
     shutdown_test_runtimes(&mut server);
 }
 
-#[test]
-fn first_full_app_client_receives_startup_banner_notification() {
+#[tokio::test]
+async fn first_full_app_client_receives_startup_banner_notification() {
     // The first attaching client shell receives one-shot fork branding. The
     // server no longer renders UI, so the banner rides the semantic-
     // notification lane instead of the deleted server-side copy feedback.
@@ -723,19 +723,21 @@ fn first_full_app_client_receives_startup_banner_notification() {
     server.startup_feedback_pending = true;
     let (writer, control_rx, _render_rx) = test_client_writer();
 
-    assert!(server.handle_server_event(ServerEvent::ClientShellConnected {
-        client_id: 7,
-        surface_cols: 80,
-        surface_rows: 23,
-        cell_width_px: 0,
-        cell_height_px: 0,
-        pixel_mouse: false,
-        direct_graphics: false,
-        endpoint_keybindings: false,
-        mouse_capture: false,
-        surface_active: true,
-        writer,
-    }));
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellConnected {
+            client_id: 7,
+            surface_cols: 80,
+            surface_rows: 23,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_mouse: false,
+            direct_graphics: false,
+            endpoint_keybindings: false,
+            mouse_capture: false,
+            surface_active: true,
+            writer,
+        })
+    );
 
     assert!(!server.startup_feedback_pending);
     let mut banners = 0;
@@ -755,8 +757,8 @@ fn first_full_app_client_receives_startup_banner_notification() {
     shutdown_test_runtimes(&mut server);
 }
 
-#[test]
-fn startup_banner_waits_for_full_app_client_and_does_not_repeat() {
+#[tokio::test]
+async fn startup_banner_waits_for_full_app_client_and_does_not_repeat() {
     let mut server = test_headless_server();
     server.startup_feedback_pending = true;
     let (direct_writer, _direct_control_rx, _direct_render_rx) = test_client_writer();
@@ -775,49 +777,53 @@ fn startup_banner_waits_for_full_app_client_and_does_not_repeat() {
 
     // The first shell client consumes it.
     let (first_writer, first_control_rx, _first_render_rx) = test_client_writer();
-    assert!(server.handle_server_event(ServerEvent::ClientShellConnected {
-        client_id: 7,
-        surface_cols: 80,
-        surface_rows: 23,
-        cell_width_px: 0,
-        cell_height_px: 0,
-        pixel_mouse: false,
-        direct_graphics: false,
-        endpoint_keybindings: false,
-        mouse_capture: false,
-        surface_active: true,
-        writer: first_writer,
-    }));
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellConnected {
+            client_id: 7,
+            surface_cols: 80,
+            surface_rows: 23,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_mouse: false,
+            direct_graphics: false,
+            endpoint_keybindings: false,
+            mouse_capture: false,
+            surface_active: true,
+            writer: first_writer,
+        })
+    );
     assert!(!server.startup_feedback_pending);
-    let first_banner = first_control_rx
-        .recv_timeout(Duration::from_millis(100))
-        .into_iter()
-        .map(read_server_message)
-        .any(|message| {
-            matches!(
-                message,
-                ServerMessage::SemanticNotification(ref notification)
-                    if notification.title == "herdr · iRonin fork"
-            )
-        });
-    assert!(first_banner, "the first shell client must receive the banner");
+    let mut first_banner = false;
+    while let Ok(bytes) = first_control_rx.recv_timeout(Duration::from_millis(100)) {
+        if let ServerMessage::SemanticNotification(notification) = read_server_message(bytes) {
+            if notification.title == "herdr · iRonin fork" {
+                first_banner = true;
+            }
+        }
+    }
+    assert!(
+        first_banner,
+        "the first shell client must receive the banner"
+    );
 
     // A later shell client gets no banner.
     assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 7 }));
     let (second_writer, second_control_rx, _second_render_rx) = test_client_writer();
-    assert!(server.handle_server_event(ServerEvent::ClientShellConnected {
-        client_id: 8,
-        surface_cols: 80,
-        surface_rows: 23,
-        cell_width_px: 0,
-        cell_height_px: 0,
-        pixel_mouse: false,
-        direct_graphics: false,
-        endpoint_keybindings: false,
-        mouse_capture: false,
-        surface_active: true,
-        writer: second_writer,
-    }));
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellConnected {
+            client_id: 8,
+            surface_cols: 80,
+            surface_rows: 23,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_mouse: false,
+            direct_graphics: false,
+            endpoint_keybindings: false,
+            mouse_capture: false,
+            surface_active: true,
+            writer: second_writer,
+        })
+    );
     while let Ok(bytes) = second_control_rx.recv_timeout(Duration::from_millis(100)) {
         if let ServerMessage::SemanticNotification(notification) = read_server_message(bytes) {
             assert_ne!(
