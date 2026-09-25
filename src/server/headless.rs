@@ -204,6 +204,8 @@ pub struct HeadlessServer {
     native_graphics: native_graphics::NativeGraphics,
     interactive_input_deadlines: HashMap<crate::layout::PaneId, Instant>,
     interactive_render_budget: Option<(Instant, u8)>,
+    /// One-shot in-UI fork branding, armed until the first full-app client attaches.
+    startup_feedback_pending: bool,
     #[cfg(unix)]
     next_client_id: u64,
     /// The client currently driving session-wide host presentation and side effects.
@@ -361,6 +363,7 @@ impl HeadlessServer {
             native_graphics: Default::default(),
             interactive_input_deadlines: HashMap::new(),
             interactive_render_budget: None,
+            startup_feedback_pending: true,
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
@@ -2025,6 +2028,24 @@ impl HeadlessServer {
                 }
                 if first_app_client {
                     self.app.mark_git_status_refresh_due(Instant::now());
+                    if std::mem::take(&mut self.startup_feedback_pending) {
+                        // One-shot fork branding for the first attaching shell.
+                        // v0.9.0 removed the server-side copy-feedback channel,
+                        // so the banner rides the semantic-notification lane.
+                        self.send_to_client_shells(ServerMessage::SemanticNotification(
+                            protocol::SemanticNotification {
+                                kind: protocol::SemanticNotificationKind::Custom,
+                                title: "herdr · iRonin fork".to_owned(),
+                                body: None,
+                                sound: None,
+                                agent: None,
+                                workspace_id: None,
+                                tab_id: None,
+                                pane_id: None,
+                                position: None,
+                            },
+                        ));
+                    }
                 }
                 self.sync_foreground_client_state();
                 self.claim_unowned_shell_tab_geometry(client_id, true);
