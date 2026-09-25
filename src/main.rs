@@ -118,6 +118,13 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Render pane images in Kitty graphics-compatible outer terminals.
 # kitty_graphics = true
 
+[agent]
+# Name of the Pi executable on this machine, for example a Pi-compatible fork.
+# Pi agents are started with it, panes running it are detected as Pi agents, and
+# it is the program used to resume or relaunch them. Blank values fall back to
+# `pi`.
+# pi_program = "pi"
+
 [update]
 # Update channel used by background version checks and `herdr update`.
 # Stable builds default to "stable". Windows preview builds default to "preview"
