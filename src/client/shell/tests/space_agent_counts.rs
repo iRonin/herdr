@@ -1,6 +1,24 @@
 use super::*;
 use crate::protocol::ClientShellWorktree;
 
+/// The count token is not part of the default layout; these tests opt in with the rows the
+/// feature documents, so they keep exercising the rendering path rather than the default.
+fn space_count_config() -> Config {
+    let mut config = Config::default();
+    config.ui.sidebar.spaces.rows = vec![
+        vec![
+            crate::config::SpaceSidebarToken::StateIcon,
+            crate::config::SpaceSidebarToken::Workspace,
+        ],
+        vec![
+            crate::config::SpaceSidebarToken::AgentCount,
+            crate::config::SpaceSidebarToken::Branch,
+            crate::config::SpaceSidebarToken::GitStatus,
+        ],
+    ];
+    config
+}
+
 fn grouped_snapshot(parent_count: usize, child_count: usize) -> ClientShellSnapshot {
     let mut snapshot = snapshot();
     snapshot.workspaces[0].label = "repo".into();
@@ -75,7 +93,7 @@ fn agent_badges(frame: &FrameData) -> Vec<usize> {
 /// never renders it, which is exactly the dead-config-key failure this feature had to avoid.
 #[test]
 fn space_rows_render_the_agent_count_from_the_wire() {
-    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&space_count_config()));
     let mut projected = snapshot();
     projected.workspaces[0].agent_count = 4;
     state.set_snapshot(Box::new(projected));
@@ -111,7 +129,7 @@ fn space_rows_render_the_agent_count_from_the_wire() {
 /// than report only its own panes -- otherwise collapsing a group appears to lose agents.
 #[test]
 fn a_collapsed_group_parent_sums_the_agent_counts_of_its_members() {
-    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&space_count_config()));
     state.set_snapshot(Box::new(grouped_snapshot(2, 3)));
     state.set_pane_surface(surface());
 
@@ -165,7 +183,7 @@ fn a_collapsed_group_sums_only_its_own_members() {
         agent_status: AgentStatus::Idle,
     });
 
-    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&space_count_config()));
     state.collapsed_groups.insert("repo".into());
     state.set_snapshot(Box::new(projected));
     state.set_pane_surface(surface());
@@ -219,7 +237,7 @@ fn a_collapsed_group_on_a_saved_machine_sums_the_agent_counts_of_its_members() {
         enabled: true,
     };
     let endpoint_id = ClientEndpointId::Ssh(profile.id.clone());
-    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&space_count_config()));
     state.set_endpoint_catalog(&[profile]);
     state.set_endpoint_status(&endpoint_id, ClientEndpointStatus::Online);
     // Local carries a count no remote row can produce, so every badge on screen is attributable.

@@ -549,12 +549,39 @@ rows = [[{ token = "$load", rules = [{ lt = 50, hide = true }] }], ["workspace"]
         );
     }
 
-    /// Upstream's test, updated to the fork's intended behaviour rather than reverted. A grouped
-    /// child still suppresses branch and git status, but KEEPS its agent count: the count is what
-    /// that row exists to show, and suppressing it would make a child space look empty of agents.
     #[test]
-    fn grouped_children_suppress_git_details_but_keep_agent_count() {
+    fn grouped_children_suppress_all_builtin_git_details() {
         let config = SpacesSidebarConfig::default();
+
+        assert_eq!(
+            space_rows(
+                &config,
+                SpaceTokenContext {
+                    workspace: "feature",
+                    branch: Some("worktree/feature"),
+                    state_text: "idle",
+                    ahead_behind: Some((2, 1)),
+                    tokens: &std::collections::HashMap::new(),
+                    suppress_git_details: true,
+                    agent_count: 0,
+                },
+            ),
+            vec![vec![
+                ResolvedToken::unstyled(ResolvedTokenKind::StateIcon),
+                ResolvedToken::unstyled(ResolvedTokenKind::Workspace("feature".into())),
+            ]]
+        );
+    }
+
+    /// A grouped child keeps its agent count even though branch and git status are suppressed:
+    /// the count is what that row exists to show, and suppressing it would make a child space look
+    /// empty of agents. The count token is opt-in, so the layout is configured explicitly.
+    #[test]
+    fn grouped_children_keep_their_agent_count_when_configured() {
+        let config: SpacesSidebarConfig = toml::from_str(
+            r#"rows = [["state_icon", "workspace"], ["agent_count", "branch", "git_status"]]"#,
+        )
+        .unwrap();
 
         assert_eq!(
             space_rows(
@@ -580,11 +607,14 @@ rows = [[{ token = "$load", rules = [{ lt = 50, hide = true }] }], ["workspace"]
     }
 
     /// The count reaches the resolved row from the context, and sits before the git metadata in
-    /// the default layout. Zero is rendered rather than omitted, which is what keeps a space row's
+    /// the opt-in layout. Zero is rendered rather than omitted, which is what keeps a space row's
     /// height independent of how many agents happen to be running.
     #[test]
     fn space_rows_resolve_agent_count_from_context_including_zero() {
-        let config = SpacesSidebarConfig::default();
+        let config: SpacesSidebarConfig = toml::from_str(
+            r#"rows = [["state_icon", "workspace"], ["agent_count", "branch", "git_status"]]"#,
+        )
+        .unwrap();
 
         assert_eq!(
             space_rows(
