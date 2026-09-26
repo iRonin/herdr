@@ -474,11 +474,7 @@ impl Default for SpacesSidebarConfig {
         Self {
             rows: vec![
                 vec![SpaceSidebarToken::StateIcon, SpaceSidebarToken::Workspace],
-                vec![
-                    SpaceSidebarToken::AgentCount,
-                    SpaceSidebarToken::Branch,
-                    SpaceSidebarToken::GitStatus,
-                ],
+                vec![SpaceSidebarToken::Branch, SpaceSidebarToken::GitStatus],
             ],
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
         }
@@ -517,11 +513,7 @@ mod tests {
             config.spaces.rows,
             vec![
                 vec![SpaceSidebarToken::StateIcon, SpaceSidebarToken::Workspace],
-                vec![
-                    SpaceSidebarToken::AgentCount,
-                    SpaceSidebarToken::Branch,
-                    SpaceSidebarToken::GitStatus,
-                ],
+                vec![SpaceSidebarToken::Branch, SpaceSidebarToken::GitStatus],
             ]
         );
         assert_eq!(config.spaces.row_gap, 0);

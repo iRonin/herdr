@@ -668,19 +668,6 @@ fn expanded_machine_sidebar_reveals_newly_focused_workspace() {
 fn expanded_machine_sidebar_applies_space_row_gap_within_each_machine() {
     let (mut state, remote_id) = state_with_remote();
     state.config.spaces.row_gap = 1;
-    // The fork's default layout adds an always-valued `agent_count` token to every space's second
-    // row, so each entry is two rows tall. This test's scrolled-frame height budget assumes
-    // upstream's one-row entries; give it upstream's default rows so it keeps testing row gaps.
-    state.config.spaces.rows = vec![
-        vec![
-            crate::config::SpaceSidebarToken::StateIcon,
-            crate::config::SpaceSidebarToken::Workspace,
-        ],
-        vec![
-            crate::config::SpaceSidebarToken::Branch,
-            crate::config::SpaceSidebarToken::GitStatus,
-        ],
-    ];
 
     let add_second_workspace = |snapshot: &mut ClientShellSnapshot| {
         let mut workspace = snapshot.workspaces[0].clone();
