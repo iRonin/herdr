@@ -564,6 +564,8 @@ fn event_envelope_round_trips() {
                 workspace_id: "w_1".into(),
                 insert_index: 1,
                 tabs: vec![],
+                previous_tab_id: None,
+                previous_workspace_id: None,
             },
         },
         EventEnvelope {

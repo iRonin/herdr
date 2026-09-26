@@ -192,10 +192,13 @@ herdr tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--env
 herdr tab get <tab_id>
 herdr tab focus <tab_id>
 herdr tab rename <tab_id> <label>
+herdr tab move <tab_id> [--index N] [--workspace <workspace_id>] [--focus|--no-focus]
 herdr tab close <tab_id>
 ```
 
 A tab is another terminal layout inside a workspace. Without `--workspace`, `tab create` uses the active workspace and fails if none exists. Its JSON response exposes `.result.tab.tab_id` and `.result.root_pane.pane_id`. Closing a workspace's last tab also closes the workspace, matching the TUI close-tab action. If `confirm_close` is enabled and closing the tab would also close a whole worktree group, `tab close` returns a `confirmation_required` error instead.
+
+`tab move --index N` reorders a tab inside its workspace (the plain `tab.move` API method). With `--workspace <workspace_id>` it moves the whole tab — every pane, the split layout, the label, zoom state, and the running terminals — to that workspace as a unit (the `tab.move_to_workspace` API method); `--index` then positions it in the target's tab bar and defaults to appending. A move that empties the source workspace closes it, and honours the same worktree-group `confirmation_required` contract as `tab close`. On a cross-workspace move the destination workspace reassigns public tab and pane ids; the response's `pane_id_map` lists the reassignment and old public pane ids keep resolving as aliases.
 
 Workspace and tab creation, and pane splitting, leave focus unchanged by default. `--focus` selects the new layout; `--no-focus` states the default explicitly. Without `--cwd`, new terminals follow the configured `terminal.new_cwd` policy, which follows the source pane or workspace by default. Each `--env KEY=VALUE` adds or replaces that variable in the new root shell.
 

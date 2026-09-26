@@ -485,6 +485,12 @@ pub enum EventData {
         workspace_id: String,
         insert_index: usize,
         tabs: Vec<TabInfo>,
+        /// Set when the tab moved here from another workspace, linking the new
+        /// identity to the one that disappeared from the source workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_tab_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_workspace_id: Option<String>,
     },
     TabFocused {
         tab_id: String,
