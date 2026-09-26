@@ -371,6 +371,7 @@ fn mobile_background_workspace_uses_its_own_active_tab_status() {
         tokens: Vec::new(),
         worktree: None,
         focused: false,
+        agent_count: 0,
         agent_status: AgentStatus::Idle,
     });
     for (number, tab_id, label) in [(1, "tab_2", "one"), (7, "tab_3", "two")] {
@@ -570,6 +571,7 @@ fn mobile_previous_workspace_action_wraps_across_expanded_entries() {
             tokens: Vec::new(),
             worktree: None,
             focused: false,
+            agent_count: 0,
             agent_status: AgentStatus::Idle,
         });
     }
@@ -610,6 +612,7 @@ fn mobile_switcher_scroll_close_and_width_transition_clear_mobile_hits() {
             tokens: Vec::new(),
             worktree: None,
             focused: false,
+            agent_count: 0,
             agent_status: AgentStatus::Idle,
         });
     }

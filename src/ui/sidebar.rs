@@ -122,6 +122,9 @@ pub(crate) fn resolved_token_spans(
                     + usize::from(*behind > 0) * display_width(&format!("↓{behind}"))
                     + usize::from(*ahead > 0 && *behind > 0)
             }
+            // Fixed rather than flexible: the count is short and must never be truncated away,
+            // and it is always present (including zero) so it cannot change a row's height.
+            ResolvedTokenKind::AgentCount(count) => display_width(&format!("🤖{count}")),
             _ => 0,
         })
         .collect::<Vec<_>>();
@@ -267,6 +270,12 @@ pub(crate) fn resolved_token_spans(
                 spans.push(Span::styled(
                     truncate_end(text, budgets[index]),
                     apply_token_style(custom_style, token.style),
+                ));
+            }
+            ResolvedTokenKind::AgentCount(count) => {
+                spans.push(Span::styled(
+                    format!("🤖{count}"),
+                    apply_token_style(secondary_style, token.style),
                 ));
             }
         }
