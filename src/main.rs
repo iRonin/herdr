@@ -340,6 +340,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Uses the same status marks as the agents panel.
 # tab_agent_status = false
 
+# Mirror the highest-attention agent pane's context percentage and lifecycle
+# marker on each top tab. Recognizes N%/~N%/?% readings and the reporter's
+# lifecycle markers from the Agents pane.
+# tab_agent_context = false
+
 # Ordered status entries at the right edge of the desktop tab bar.
 # Supported types: zoom, hostname, datetime, text, and command.
 # Hostname, datetime, and command entries resolve on the Herdr server.

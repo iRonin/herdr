@@ -261,6 +261,7 @@ mod new_tab_prompt_inversion;
 mod popup_focus_projection;
 mod space_agent_counts;
 mod startup_overlays;
+mod tab_agent_context;
 mod tab_agent_status;
 mod tab_bar_wrap;
 mod tab_close_button;
