@@ -1005,11 +1005,12 @@ claude = [["terminal_title"]]
     }
 
     #[test]
-    fn load_live_config_accepts_legacy_agent_panel_scope_without_warning() {
+    fn load_live_config_applies_agent_panel_scope_and_modes_without_warning() {
         let loaded = load_live_config_from_str(
             r#"
 [ui]
 agent_panel_scope = "current"
+agent_panel_modes = ["priority", "space"]
 agent_panel_sort = "priority"
 "#,
         )
@@ -1020,6 +1021,17 @@ agent_panel_sort = "priority"
         assert_eq!(
             loaded.config.ui.agent_panel_sort,
             super::super::AgentPanelSortConfig::Priority
+        );
+        assert_eq!(
+            loaded.config.ui.agent_panel_scope,
+            super::super::AgentPanelScopeConfig::Current
+        );
+        assert_eq!(
+            loaded.config.ui.agent_panel_modes,
+            [
+                super::super::AgentPanelModeConfig::Priority,
+                super::super::AgentPanelModeConfig::Space,
+            ]
         );
     }
 
@@ -1041,13 +1053,17 @@ mouse_captur = true
     }
 
     #[test]
-    fn startup_config_accepts_legacy_agent_panel_scope_without_warning() {
+    fn startup_config_applies_owner_agent_panel_lines_without_warning() {
         let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let path = std::env::temp_dir().join(format!(
-            "herdr-config-legacy-agent-panel-scope-{}.toml",
+            "herdr-config-agent-panel-{}.toml",
             std::process::id()
         ));
-        std::fs::write(&path, "[ui]\nagent_panel_scope = \"all\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "[ui]\nagent_panel_scope = \"current\"\nagent_panel_modes = [\"priority\", \"space\"]\n",
+        )
+        .unwrap();
         std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
 
         let loaded = Config::load();
@@ -1056,6 +1072,17 @@ mouse_captur = true
         let _ = std::fs::remove_file(path);
 
         assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert_eq!(
+            loaded.config.ui.agent_panel_scope,
+            super::super::AgentPanelScopeConfig::Current
+        );
+        assert_eq!(
+            loaded.config.ui.agent_panel_modes,
+            [
+                super::super::AgentPanelModeConfig::Priority,
+                super::super::AgentPanelModeConfig::Space,
+            ]
+        );
     }
 
     #[test]

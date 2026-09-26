@@ -530,6 +530,7 @@ fn agent_navigation_keeps_scroll_when_target_is_visible() {
         &state.endpoints,
         &state.active_endpoint_id,
         state.config.agent_panel_sort,
+        state.config.agent_panel_scope,
     );
     let index = targets
         .iter()
@@ -1664,6 +1665,51 @@ fn selected_custom_sort_orders_rendering_and_indexed_navigation() {
 }
 
 #[test]
+fn current_scope_filters_selected_cross_machine_view_before_custom_sort() {
+    use crate::api::schema::{
+        AgentStatus, AgentViewBuiltinSortField, AgentViewSort, AgentViewSortField,
+        AgentViewSortOrder,
+    };
+
+    let (mut state, endpoint_id) = state_with_remote();
+    let mut local = snapshot();
+    local.agent_view_label = Some("recent".into());
+    let local_current = agent("local current", AgentStatus::Idle, 1);
+    let mut local_other = agent("local other", AgentStatus::Blocked, 9);
+    local_other.pane_id = "pane_2".into();
+    local_other.workspace_id = "ws_2".into();
+    local.agents = vec![local_current, local_other];
+    state.set_snapshot(Box::new(local));
+
+    let mut remote = snapshot();
+    remote.boot_id = "remote-boot".into();
+    let mut remote_agent = agent("remote current", AgentStatus::Blocked, 10);
+    remote_agent.pane_id = "remote_pane".into();
+    remote.agents = vec![remote_agent];
+    state.set_endpoint_snapshot(&endpoint_id, Box::new(remote));
+
+    let mut view = current_workspace_view();
+    view.label = Some("recent".into());
+    view.filter = None;
+    view.sort = vec![AgentViewSort {
+        field: AgentViewSortField::Builtin(AgentViewBuiltinSortField::StateChangeSeq),
+        order: AgentViewSortOrder::Desc,
+    }];
+    state.set_test_endpoint_agent_view(&ClientEndpointId::Local, Some(view));
+
+    let names = aggregate_navigation::aggregate_agent_rows(
+        &state.endpoints,
+        &state.active_endpoint_id,
+        crate::config::AgentPanelSortConfig::Priority,
+        crate::config::AgentPanelScopeConfig::Current,
+    )
+    .into_iter()
+    .map(|row| row.agent.name.as_deref().expect("agent name"))
+    .collect::<Vec<_>>();
+    assert_eq!(names, ["local current"]);
+}
+
+#[test]
 fn selected_position_sort_uses_public_tab_and_pane_numbers() {
     use crate::api::schema::{
         AgentStatus, AgentViewBuiltinSortField, AgentViewSort, AgentViewSortField,
@@ -1723,6 +1769,7 @@ fn selected_position_sort_uses_public_tab_and_pane_numbers() {
         &state.endpoints,
         &state.active_endpoint_id,
         crate::config::AgentPanelSortConfig::Priority,
+        crate::config::AgentPanelScopeConfig::All,
     )
     .into_iter()
     .map(|row| row.agent.name.as_deref().expect("agent name"))

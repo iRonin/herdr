@@ -53,10 +53,33 @@ pub(super) struct AggregateAgentTarget {
     pub(super) pane_id: String,
 }
 
+fn retain_current_scope(
+    rows: &mut Vec<AggregateAgentRow<'_>>,
+    endpoints: &[ClientShellEndpoint],
+    active_index: Option<usize>,
+    scope: crate::config::AgentPanelScopeConfig,
+) {
+    if scope != crate::config::AgentPanelScopeConfig::Current {
+        return;
+    }
+    if let Some((endpoint_index, workspace_id)) = active_index.and_then(|index| {
+        endpoints[index]
+            .snapshot
+            .as_deref()
+            .and_then(|snapshot| snapshot.focused_workspace_id.as_deref())
+            .map(|workspace_id| (index, workspace_id))
+    }) {
+        rows.retain(|row| {
+            row.endpoint.endpoint_index == endpoint_index && row.agent.workspace_id == workspace_id
+        });
+    }
+}
+
 pub(super) fn aggregate_agent_rows<'a>(
     endpoints: &'a [ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     sort: crate::config::AgentPanelSortConfig,
+    scope: crate::config::AgentPanelScopeConfig,
 ) -> Vec<AggregateAgentRow<'a>> {
     let active_index = endpoints
         .iter()
@@ -98,6 +121,7 @@ pub(super) fn aggregate_agent_rows<'a>(
                     })
             })
             .collect::<Vec<_>>();
+        retain_current_scope(&mut rows, endpoints, active_index, scope);
         if let Some(view) = view {
             let context = active_index
                 .and_then(|index| endpoints[index].snapshot.as_deref())
@@ -126,41 +150,50 @@ pub(super) fn aggregate_agent_rows<'a>(
                 return rows;
             }
         }
-        sort_aggregate_rows(&mut rows, sort);
+        sort_aggregate_rows(&mut rows, sort, scope);
         return rows;
     }
 
     let mut rows = cached_endpoint_snapshots(endpoints)
         .flat_map(|endpoint| {
-            super::agent_sidebar::ordered_agent_pane_ids(endpoint.snapshot, sort)
-                .into_iter()
-                .filter_map(move |pane_id| {
-                    let agent = endpoint
-                        .snapshot
-                        .agents
-                        .iter()
-                        .find(|agent| agent.pane_id == pane_id)?;
-                    Some(AggregateAgentRow {
-                        recency: endpoint
-                            .agent_recency
-                            .get(&pane_id)
-                            .copied()
-                            .unwrap_or_default(),
-                        endpoint,
-                        agent,
-                    })
+            super::agent_sidebar::ordered_agent_pane_ids(
+                endpoint.snapshot,
+                sort,
+                crate::config::AgentPanelScopeConfig::All,
+                None,
+            )
+            .into_iter()
+            .filter_map(move |pane_id| {
+                let agent = endpoint
+                    .snapshot
+                    .agents
+                    .iter()
+                    .find(|agent| agent.pane_id == pane_id)?;
+                Some(AggregateAgentRow {
+                    recency: endpoint
+                        .agent_recency
+                        .get(&pane_id)
+                        .copied()
+                        .unwrap_or_default(),
+                    endpoint,
+                    agent,
                 })
+            })
         })
         .collect::<Vec<_>>();
-    sort_aggregate_rows(&mut rows, sort);
+    retain_current_scope(&mut rows, endpoints, active_index, scope);
+    sort_aggregate_rows(&mut rows, sort, scope);
     rows
 }
 
 fn sort_aggregate_rows(
     rows: &mut [AggregateAgentRow<'_>],
     sort: crate::config::AgentPanelSortConfig,
+    scope: crate::config::AgentPanelScopeConfig,
 ) {
-    if sort == crate::config::AgentPanelSortConfig::Priority {
+    if sort == crate::config::AgentPanelSortConfig::Priority
+        || scope == crate::config::AgentPanelScopeConfig::Current
+    {
         rows.sort_by_key(|row| {
             (
                 row.endpoint.stale(),
@@ -264,8 +297,9 @@ pub(super) fn online_agent_targets(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     sort: crate::config::AgentPanelSortConfig,
+    scope: crate::config::AgentPanelScopeConfig,
 ) -> Vec<AggregateAgentTarget> {
-    aggregate_agent_rows(endpoints, active_endpoint_id, sort)
+    aggregate_agent_rows(endpoints, active_endpoint_id, sort, scope)
         .into_iter()
         .filter(|row| !row.endpoint.stale())
         .map(|row| AggregateAgentTarget {

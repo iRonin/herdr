@@ -1092,6 +1092,27 @@
           ]
         },
         {
+          "key": "ui.agent_panel_scope",
+          "type": "enum",
+          "default": "\"all\"",
+          "description": "Agent sidebar scope. all lists every space; current filters the panel to the active space. current_workspace is accepted as an alias for current.",
+          "values": [
+            "all",
+            "current"
+          ]
+        },
+        {
+          "key": "ui.agent_panel_modes",
+          "type": "list",
+          "default": "[\"priority\", \"grouped\"]",
+          "description": "Modes cycled by clicking the Agent panel label, in order. Values: priority, grouped (spaces is an alias), and space (current and current_workspace are aliases). Add space explicitly to opt into current-space mode. Unknown and duplicate entries are ignored; an empty or invalid-only list uses the default pair.",
+          "values": [
+            "priority",
+            "grouped",
+            "space"
+          ]
+        },
+        {
           "key": "ui.status_indicators",
           "type": "enum",
           "default": "\"dots\"",
