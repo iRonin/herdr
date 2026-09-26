@@ -121,6 +121,7 @@ impl ClientShellConfig {
             mobile_width_threshold: config.ui.mobile_width_threshold,
             tab_bar_position: config.ui.tab_bar_position,
             tab_bar_wrap: config.ui.tab_bar_wrap,
+            tab_agent_status: config.ui.tab_agent_status,
             hide_tab_bar_when_single_tab: config.ui.hide_tab_bar_when_single_tab,
             spaces: config.ui.sidebar.spaces.clone(),
             agents: config.ui.sidebar.agents.clone(),
@@ -326,6 +327,7 @@ impl ClientShellConfig {
                 self.mobile_width_threshold = ui.mobile_width_threshold;
                 self.tab_bar_position = ui.tab_bar_position;
                 self.tab_bar_wrap = ui.tab_bar_wrap;
+                self.tab_agent_status = ui.tab_agent_status;
                 self.hide_tab_bar_when_single_tab = ui.hide_tab_bar_when_single_tab;
                 self.spaces = ui.sidebar.spaces.clone();
                 self.agents = ui.sidebar.agents.clone();
@@ -406,7 +408,12 @@ impl ClientShellConfig {
         } else if self.tab_bar_wrap {
             snapshot
                 .map(|snapshot| {
-                    super::render::wrapped_tab_bar_rows(snapshot, main.width, self.mouse_capture)
+                    super::render::wrapped_tab_bar_rows(
+                        snapshot,
+                        self,
+                        main.width,
+                        self.mouse_capture,
+                    )
                 })
                 .unwrap_or(1)
                 // Keep at least half of the height available to panes.

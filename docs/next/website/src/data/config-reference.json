@@ -1039,6 +1039,12 @@
           "description": "Wrap tabs onto multiple rows instead of using a single scrollable row."
         },
         {
+          "key": "ui.tab_agent_status",
+          "type": "boolean",
+          "default": "false",
+          "description": "Show the highest-attention agent status mark at the head of each top tab that holds an agent, using the same status marks and colours as the agents panel. Works with both single-row and wrapped tab bars. Disabled by default."
+        },
+        {
           "key": "ui.tab_bar_right",
           "type": "array",
           "default": "[]",

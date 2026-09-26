@@ -336,6 +336,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # The wrapped bar uses at most half of the available height.
 # tab_bar_wrap = false
 
+# Show the highest-attention agent status on each top tab.
+# Uses the same status marks as the agents panel.
+# tab_agent_status = false
+
 # Ordered status entries at the right edge of the desktop tab bar.
 # Supported types: zoom, hostname, datetime, text, and command.
 # Hostname, datetime, and command entries resolve on the Herdr server.
