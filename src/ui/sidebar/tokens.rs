@@ -393,6 +393,7 @@ rows = [[{ token = "$load", rules = [{ lt = 50, hide = true }] }], ["workspace"]
                     ahead_behind: None,
                     suppress_git_details: false,
                     tokens: &entry.tokens,
+                    agent_count: 0,
                 },
             );
             assert_eq!(rows.len(), count);

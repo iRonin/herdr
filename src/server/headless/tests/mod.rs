@@ -725,6 +725,8 @@ async fn first_full_app_client_receives_startup_banner_notification() {
 
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
             client_id: 7,
             surface_cols: 80,
             surface_rows: 23,
@@ -779,6 +781,8 @@ async fn startup_banner_waits_for_full_app_client_and_does_not_repeat() {
     let (first_writer, first_control_rx, _first_render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
             client_id: 7,
             surface_cols: 80,
             surface_rows: 23,
@@ -811,6 +815,8 @@ async fn startup_banner_waits_for_full_app_client_and_does_not_repeat() {
     let (second_writer, second_control_rx, _second_render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
             client_id: 8,
             surface_cols: 80,
             surface_rows: 23,
