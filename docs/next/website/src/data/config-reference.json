@@ -1045,6 +1045,12 @@
           "description": "Show the highest-attention agent status mark at the head of each top tab that holds an agent, using the same status marks and colours as the agents panel. Works with both single-row and wrapped tab bars. Disabled by default."
         },
         {
+          "key": "ui.tab_agent_context",
+          "type": "boolean",
+          "default": "false",
+          "description": "Show the highest-attention agent pane's context percentage (N%, ~N% estimate, or ?% unknown) after the pane name and the reporter's lifecycle marker before it, on each top tab. Tabs without a reporting agent render as stock. Disabled by default."
+        },
+        {
           "key": "ui.tab_bar_right",
           "type": "array",
           "default": "[]",

@@ -92,7 +92,7 @@ pub(crate) fn render_tab_bar(
     let mut first_visible = None;
     let mut last_visible = None;
     for (index, tab) in tabs.iter().enumerate().skip(*tab_scroll) {
-        let name = tab_label(tab);
+        let name = decorated_tab_label(config, snapshot, tab);
         let desired = desired_widths[index];
         let remaining = tab_right.saturating_sub(x);
         let width = desired.min(remaining);
@@ -243,6 +243,77 @@ fn tab_status_prefix_width(
     u16::from(tab_status_prefix(config, snapshot, tab).is_some()) * 2
 }
 
+/// The icon an agent reporter prefixes `display_agent` with. Its lifecycle
+/// marker sits directly after this icon in the first whitespace token. Pinning
+/// the prefix is what lets the tab tell a real reporter marker from any other
+/// leading emoji: the marker glyphs themselves are common, so a position-only
+/// parse would false-positive.
+const AGENT_LABEL_ICON: &str = "\u{1F977}";
+
+/// Lifecycle marker from the reporter's `display_agent` grammar
+/// `{icon}{marker} {~}N%\u{B7}MODEL\u{B7}PID {$cost}`. Bounded set: awaiting-user
+/// (may carry a pending-ask count), ready-to-close, asked-to-stop, done,
+/// agent-driven. Anything else yields `None` so the tab renders exactly as it
+/// does today (fail closed).
+fn extract_tab_agent_lifecycle_marker(display_agent: &str) -> Option<&str> {
+    let first = display_agent.split_whitespace().next()?;
+    let rest = first.strip_prefix(AGENT_LABEL_ICON)?;
+    if rest.is_empty() {
+        return None;
+    }
+    is_lifecycle_marker(rest).then_some(rest)
+}
+
+/// The awaiting-user marker may carry a pending-ask count; the others are bare.
+fn is_lifecycle_marker(s: &str) -> bool {
+    if let Some(count) = s.strip_prefix('\u{2753}') {
+        return count.is_empty() || count.bytes().all(|b| b.is_ascii_digit());
+    }
+    matches!(s, "\u{1F4A4}" | "\u{270B}" | "\u{2705}" | "\u{1F916}")
+}
+
+fn extract_tab_agent_context(display_agent: &str) -> Option<&str> {
+    let mut found = None;
+    for candidate in display_agent.split_whitespace() {
+        let body = candidate.strip_prefix('~').unwrap_or(candidate);
+        let Some((percentage, tail)) = body.split_once("%\u{b7}") else {
+            continue;
+        };
+        // `?` is a KNOWN-UNKNOWN reading: the agent has just compacted and has no
+        // context figure yet. Rendering `?%` distinguishes "not known yet" from
+        // an absent segment, which means "nothing reported at all". Without it a
+        // healthy post-compaction agent is indistinguishable from a broken one.
+        let percentage_is_unknown = percentage == "?";
+        if (!percentage_is_unknown
+            && (percentage.is_empty()
+                || !percentage.bytes().all(|byte| byte.is_ascii_digit())
+                || percentage
+                    .parse::<u16>()
+                    .ok()
+                    .is_none_or(|value| value > 100)))
+            || tail.is_empty()
+            // The reporter's grammar keeps a numeric PID as the LAST
+            // \u{b7}-segment; anything between it and the % is the model name.
+            // Requiring the trailing segment to be numeric is what still
+            // rejects a non-reporter label such as "~42%\u{b7}pid".
+            || !tail
+                .rsplit('\u{b7}')
+                .next()
+                .is_some_and(|last| !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+
+        let percentage_end = candidate.len() - '\u{b7}'.len_utf8() - tail.len();
+        let percentage = &candidate[..percentage_end];
+        if found.is_some() {
+            return None;
+        }
+        found = Some(percentage);
+    }
+    found
+}
+
 fn tab_desired_widths(
     snapshot: &ClientShellSnapshot,
     tabs: &[&ClientShellTab],
@@ -250,7 +321,7 @@ fn tab_desired_widths(
 ) -> Vec<u16> {
     tabs.iter()
         .map(|tab| {
-            let label = tab_label(tab);
+            let label = decorated_tab_label(config, snapshot, tab);
             // The minimum applies to the stock label alone: the mark is ADDED on top of it,
             // never absorbed into it — a one-character tab keeps its stock width and gains the
             // mark's two cells, rather than paying for the mark out of its own padding.
@@ -431,7 +502,14 @@ fn render_wrapped_tabs(
         let rect = Rect::new(content.x.saturating_add(x), area.y + offset_row, width, 1);
         match tabs.get(item) {
             Some(tab) => {
-                put_tab(buffer, rect, &tab_label(tab), tab, snapshot, config);
+                put_tab(
+                    buffer,
+                    rect,
+                    &decorated_tab_label(config, snapshot, tab),
+                    tab,
+                    snapshot,
+                    config,
+                );
                 hits.tabs.push((rect, tab.tab_id.clone()));
             }
             None => {
@@ -627,17 +705,40 @@ fn max_tab_scroll(widths: &[u16], available: u16) -> usize {
     start
 }
 
-fn tab_label(tab: &ClientShellTab) -> String {
+/// The tab's full label text: the pane name, then the `ui.tab_agent_context` decorations — the
+/// reporter's lifecycle marker prefixed with one separator space and the context percentage
+/// appended with one — then the zoom suffix. All three come from the SAME highest-attention
+/// agent the status mark reads, so one agent's reading labels the tab. With the key off (or no
+/// agent, or a non-reporter label) this is byte-identical to the stock label.
+fn decorated_tab_label(
+    config: &ClientShellConfig,
+    snapshot: &ClientShellSnapshot,
+    tab: &ClientShellTab,
+) -> String {
+    let mut name = tab.label.clone();
+    if config.tab_agent_context {
+        if let Some(display_agent) =
+            tab_agent(snapshot, tab).and_then(|agent| agent.display_agent.as_deref())
+        {
+            if let Some(context) = extract_tab_agent_context(display_agent) {
+                name.push(' ');
+                name.push_str(context);
+            }
+            if let Some(marker) = extract_tab_agent_lifecycle_marker(display_agent) {
+                name = format!("{marker} {name}");
+            }
+        }
+    }
     if tab.zoomed {
-        format!("{} Z", tab.label)
+        format!("{name} Z")
     } else {
-        tab.label.clone()
+        name
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::max_tab_scroll;
+    use super::*;
 
     #[test]
     fn trailing_scroll_limit_accounts_for_full_widths_and_separators() {
@@ -655,6 +756,237 @@ mod tests {
                 max_tab_scroll(widths, available),
                 expected,
                 "widths={widths:?}, available={available}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_agent_context_extracts_current_producer_format() {
+        assert_eq!(
+            extract_tab_agent_context("\u{1F977}\u{2705} ~42%\u{B7}4242 $1.23"),
+            Some("~42%")
+        );
+    }
+
+    #[test]
+    fn tab_agent_context_tolerates_variable_prefix_and_suffix() {
+        for (display_agent, expected) in [
+            ("0%\u{B7}1", "0%"),
+            ("working 100%\u{B7}999999 trailing", "100%"),
+            ("\u{1F527} ready ~7%\u{B7}0042 cost=unknown", "~7%"),
+        ] {
+            assert_eq!(
+                extract_tab_agent_context(display_agent),
+                Some(expected),
+                "display agent: {display_agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_agent_context_rejects_absent_malformed_and_out_of_range_labels() {
+        assert_eq!(
+            extract_tab_agent_context("\u{1F977}\u{2705} working $1.23"),
+            None
+        );
+        for display_agent in [
+            "~%\u{B7}4242",
+            "~42%4242",
+            "~42%\u{B7}",
+            "~42%\u{B7}pid",
+            "101%\u{B7}4242",
+            "~999%\u{B7}4242",
+            "-1%\u{B7}4242",
+            "42%\u{B7}-1",
+            "x42%\u{B7}4242",
+            "42%\u{B7}4242x",
+        ] {
+            assert_eq!(
+                extract_tab_agent_context(display_agent),
+                None,
+                "display agent: {display_agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_context_reading_renders_as_question_mark_not_absence() {
+        // The point of the feature: a just-compacted agent must be
+        // DISTINGUISHABLE from one that reported nothing.
+        assert_eq!(
+            extract_tab_agent_context("\u{1F977} ?%\u{B7}46223"),
+            Some("?%"),
+            "unknown reading must render, not vanish"
+        );
+        assert_eq!(
+            extract_tab_agent_context("\u{1F977} ?%\u{B7}claude-opus-5:max\u{B7}46223"),
+            Some("?%"),
+            "unknown reading must survive the model segment too"
+        );
+        // Absence still means absence -- the other half of the distinction.
+        assert_eq!(extract_tab_agent_context("\u{1F977} \u{B7}46223"), None);
+        // `?` is accepted ONLY as the whole percentage, never as a digit smuggler.
+        for bad in [
+            "?4%\u{B7}1",
+            "4?%\u{B7}1",
+            "??%\u{B7}1",
+            "?%\u{B7}",
+            "101%\u{B7}1",
+        ] {
+            assert_eq!(
+                extract_tab_agent_context(&format!("\u{1F977} {bad}")),
+                None,
+                "must reject {bad:?}"
+            );
+        }
+        // Real readings unaffected.
+        assert_eq!(
+            extract_tab_agent_context("\u{1F977} 42%\u{B7}46223"),
+            Some("42%")
+        );
+        assert_eq!(
+            extract_tab_agent_context("\u{1F977} ~2%\u{B7}46223"),
+            Some("~2%")
+        );
+    }
+
+    #[test]
+    fn lifecycle_marker_prefixes_name_and_context_tolerates_model_segment() {
+        // POSITIVE CONTROL: today's format must still yield the percentage.
+        assert_eq!(
+            extract_tab_agent_context("\u{1F977} 17%\u{B7}46223"),
+            Some("17%"),
+            "old format must keep working - reporters may adopt the new one later"
+        );
+        // New format: model inserted between pct and PID.
+        assert_eq!(
+            extract_tab_agent_context("\u{1F977} 17%\u{B7}claude-opus-5:max\u{B7}46223"),
+            Some("17%"),
+            "model segment must not break the percentage"
+        );
+        // Fails closed on an empty tail.
+        assert_eq!(extract_tab_agent_context("\u{1F977} 17%\u{B7}"), None);
+        // Marker extraction, whole bounded set.
+        for (input, want) in [
+            ("\u{1F977}\u{2705} 17%\u{B7}46223", Some("\u{2705}")),
+            ("\u{1F977}\u{1F4A4} 17%\u{B7}46223", Some("\u{1F4A4}")),
+            ("\u{1F977}\u{270B} 17%\u{B7}46223", Some("\u{270B}")),
+            ("\u{1F977}\u{1F916} 17%\u{B7}46223", Some("\u{1F916}")),
+            ("\u{1F977}\u{2753} 17%\u{B7}46223", Some("\u{2753}")),
+            ("\u{1F977}\u{2753}4 17%\u{B7}46223", Some("\u{2753}4")),
+            // absent marker -> None -> tab renders exactly as today
+            ("\u{1F977} 17%\u{B7}46223", None),
+            // no reporter icon -> None (guards against unrelated leading emoji)
+            ("\u{2705} 17%\u{B7}46223", None),
+            // unknown glyph after the icon -> None
+            ("\u{1F977}\u{1F680} 17%\u{B7}46223", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                extract_tab_agent_lifecycle_marker(input),
+                want,
+                "marker extraction for {input:?}"
+            );
+        }
+    }
+
+    /// REPORTER CONTRACT PIN. The agent reporter emits the
+    /// `display_agent` label this parser consumes. That coupling has no build-time
+    /// enforcement: nobody runs this suite after changing the reporter. This test
+    /// is the durable statement of what herdr accepts, so the reporter side can
+    /// cite it by NAME instead of relying on a code comment to point the way.
+    ///
+    /// Every form asserted here is a form the reporter may legitimately emit.
+    /// If you are changing this test to make a new reporter format pass, that is
+    /// the coordination point -- agree it with the reporter side; do not relax it quietly.
+    #[test]
+    fn contract_display_agent_label_forms_accepted_by_herdr() {
+        for (label, want_pct, want_marker, why) in [
+            // Historic form: percentage and PID only.
+            (
+                "\u{1F977} 17%\u{B7}46223",
+                Some("17%"),
+                None,
+                "digits-only tail",
+            ),
+            // Model inserted between percentage and PID.
+            (
+                "\u{1F977} 17%\u{B7}claude-opus-5:max\u{B7}46223",
+                Some("17%"),
+                None,
+                "model segment between pct and PID",
+            ),
+            // Estimate prefix survives both forms.
+            (
+                "\u{1F977} ~2%\u{B7}4242",
+                Some("~2%"),
+                None,
+                "estimate prefix",
+            ),
+            (
+                "\u{1F977} ~2%\u{B7}glm-5.2\u{B7}4242",
+                Some("~2%"),
+                None,
+                "estimate prefix + model",
+            ),
+            // Unknown reading after a compaction.
+            ("\u{1F977} ?%\u{B7}46223", Some("?%"), None, "unknown pct"),
+            // Lifecycle marker rides the same first token.
+            (
+                "\u{1F977}\u{2705} 17%\u{B7}claude-opus-5:max\u{B7}46223",
+                Some("17%"),
+                Some("\u{2705}"),
+                "marker + model + pid",
+            ),
+            (
+                "\u{1F977}\u{2753}4 17%\u{B7}46223",
+                Some("17%"),
+                Some("\u{2753}4"),
+                "pending-ask count",
+            ),
+            // Trailing tokens the reporter may append are IGNORED, not fatal.
+            (
+                "\u{1F977}\u{2705} 17%\u{B7}46223 $1.23",
+                Some("17%"),
+                Some("\u{2705}"),
+                "cost suffix ignored",
+            ),
+            (
+                "\u{1F977}\u{2705} 17%\u{B7}46223 $1.23 \u{25B8}BL-9",
+                Some("17%"),
+                Some("\u{2705}"),
+                "trailing task token ignored",
+            ),
+        ] {
+            assert_eq!(
+                extract_tab_agent_context(label),
+                want_pct,
+                "percentage for {why}: {label:?}"
+            );
+            assert_eq!(
+                extract_tab_agent_lifecycle_marker(label),
+                want_marker,
+                "marker for {why}: {label:?}"
+            );
+        }
+
+        // REJECTED forms. These are the negatives that give the accepted list
+        // its meaning: without them the parser could accept everything and this
+        // test would still pass.
+        for (label, why) in [
+            ("\u{1F977} 17%\u{B7}", "empty tail"),
+            ("\u{1F977} 17%\u{B7}pid", "non-numeric trailing segment"),
+            ("\u{1F977} 101%\u{B7}1", "percentage out of range"),
+            ("\u{1F977} ?4%\u{B7}1", "? mixed with digits"),
+            (
+                "\u{1F977} 17%\u{B7}1 42%\u{B7}2",
+                "two candidates is ambiguous",
+            ),
+        ] {
+            assert_eq!(
+                extract_tab_agent_context(label),
+                None,
+                "must reject {why}: {label:?}"
             );
         }
     }
