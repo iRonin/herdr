@@ -959,6 +959,12 @@
           "description": "Ask for a tab name before creating a new tab."
         },
         {
+          "key": "ui.tab_close_button",
+          "type": "boolean",
+          "default": "false",
+          "description": "Show an x in the last cell of each tab label and close that tab when it is Alt-clicked."
+        },
+        {
           "key": "ui.prompt_new_workspace_name",
           "type": "boolean",
           "default": "false",
