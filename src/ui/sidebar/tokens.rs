@@ -21,6 +21,7 @@ pub(crate) enum ResolvedTokenKind {
     TerminalTitle(String),
     Branch(String),
     GitStatus { ahead: usize, behind: usize },
+    AgentCount(usize),
     Custom(String),
 }
 
@@ -36,7 +37,9 @@ impl ResolvedTokenKind {
             | Self::TerminalTitle(value)
             | Self::Branch(value)
             | Self::Custom(value) => Some(value),
-            Self::StateIcon | Self::GitStatus { .. } => None,
+            // Not text-valued, so sidebar styling rules cannot key on it -- which is why
+            // `agent_count` is rejected alongside the other two where rules are parsed.
+            Self::StateIcon | Self::GitStatus { .. } | Self::AgentCount(_) => None,
         }
     }
 }
@@ -128,6 +131,9 @@ pub(crate) struct SpaceTokenContext<'a> {
     pub(crate) ahead_behind: Option<(usize, usize)>,
     pub(crate) tokens: &'a std::collections::HashMap<String, String>,
     pub(crate) suppress_git_details: bool,
+    /// Live agent panes in this space. For a collapsed worktree-group parent this is the sum
+    /// across the group, which is why it is supplied rather than derived here.
+    pub(crate) agent_count: usize,
 }
 
 pub(crate) fn space_rows(
@@ -159,6 +165,11 @@ pub(crate) fn space_rows(
                             .filter(|(ahead, behind)| *ahead > 0 || *behind > 0)
                             .map(|(ahead, behind)| ResolvedTokenKind::GitStatus { ahead, behind }),
                         SpaceSidebarToken::GitStatus => None,
+                        // Deliberately NOT suppressed for a collapsed group parent: the summed
+                        // count is exactly what that row is for.
+                        SpaceSidebarToken::AgentCount => {
+                            Some(ResolvedTokenKind::AgentCount(context.agent_count))
+                        }
                         SpaceSidebarToken::Custom(name) => context
                             .tokens
                             .get(name)
@@ -331,6 +342,7 @@ rows = [[{ token = "$load", rules = [{ lt = 50, dim = true }] }]]
                     state_text: "working",
                     ahead_behind: None,
                     suppress_git_details: false,
+                    agent_count: 0,
                     tokens: &entry.tokens,
                 },
             );
@@ -536,8 +548,11 @@ rows = [[{ token = "$load", rules = [{ lt = 50, hide = true }] }], ["workspace"]
         );
     }
 
+    /// Upstream's test, updated to the fork's intended behaviour rather than reverted. A grouped
+    /// child still suppresses branch and git status, but KEEPS its agent count: the count is what
+    /// that row exists to show, and suppressing it would make a child space look empty of agents.
     #[test]
-    fn grouped_children_suppress_all_builtin_git_details() {
+    fn grouped_children_suppress_git_details_but_keep_agent_count() {
         let config = SpacesSidebarConfig::default();
 
         assert_eq!(
@@ -550,12 +565,49 @@ rows = [[{ token = "$load", rules = [{ lt = 50, hide = true }] }], ["workspace"]
                     ahead_behind: Some((2, 1)),
                     tokens: &std::collections::HashMap::new(),
                     suppress_git_details: true,
+                    agent_count: 3,
                 },
             ),
-            vec![vec![
-                ResolvedToken::unstyled(ResolvedTokenKind::StateIcon),
-                ResolvedToken::unstyled(ResolvedTokenKind::Workspace("feature".into())),
-            ]]
+            vec![
+                vec![
+                    ResolvedToken::unstyled(ResolvedTokenKind::StateIcon),
+                    ResolvedToken::unstyled(ResolvedTokenKind::Workspace("feature".into())),
+                ],
+                vec![ResolvedToken::unstyled(ResolvedTokenKind::AgentCount(3))],
+            ]
+        );
+    }
+
+    /// The count reaches the resolved row from the context, and sits before the git metadata in
+    /// the default layout. Zero is rendered rather than omitted, which is what keeps a space row's
+    /// height independent of how many agents happen to be running.
+    #[test]
+    fn space_rows_resolve_agent_count_from_context_including_zero() {
+        let config = SpacesSidebarConfig::default();
+
+        assert_eq!(
+            space_rows(
+                &config,
+                SpaceTokenContext {
+                    workspace: "repo",
+                    branch: Some("main"),
+                    state_text: "idle",
+                    ahead_behind: Some((0, 0)),
+                    tokens: &std::collections::HashMap::new(),
+                    suppress_git_details: false,
+                    agent_count: 0,
+                },
+            ),
+            vec![
+                vec![
+                    ResolvedToken::unstyled(ResolvedTokenKind::StateIcon),
+                    ResolvedToken::unstyled(ResolvedTokenKind::Workspace("repo".into())),
+                ],
+                vec![
+                    ResolvedToken::unstyled(ResolvedTokenKind::AgentCount(0)),
+                    ResolvedToken::unstyled(ResolvedTokenKind::Branch("main".into())),
+                ],
+            ]
         );
     }
 
@@ -577,6 +629,7 @@ rows = [[{ token = "$load", rules = [{ lt = 50, hide = true }] }], ["workspace"]
                     ahead_behind: None,
                     tokens: &tokens,
                     suppress_git_details: false,
+                    agent_count: 0,
                 },
             ),
             vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Custom(

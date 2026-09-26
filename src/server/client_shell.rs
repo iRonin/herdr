@@ -3,6 +3,25 @@ use ratatui::layout::Rect;
 use crate::app;
 use crate::protocol::{self, FrameData};
 
+/// Live agent panes in a space: panes whose attached terminal is an agent terminal.
+///
+/// Computed server-side because only the server holds the terminal registry. A collapsed
+/// worktree-group parent sums this across its members, which the client does -- it is the side
+/// that knows which groups are collapsed.
+fn live_agent_pane_count(app: &app::App, workspace: &crate::workspace::Workspace) -> usize {
+    workspace
+        .tabs
+        .iter()
+        .flat_map(|tab| tab.panes.values())
+        .filter(|pane| {
+            app.state
+                .terminals
+                .get(&pane.attached_terminal_id)
+                .is_some_and(|terminal| terminal.is_agent_terminal())
+        })
+        .count()
+}
+
 pub(super) fn snapshot(
     app: &app::App,
     boot_id: &str,
@@ -64,6 +83,7 @@ pub(super) fn snapshot(
                 branch: state.branch(),
                 git_ahead_behind: state.git_ahead_behind(),
                 tokens,
+                agent_count: live_agent_pane_count(app, state),
                 worktree: workspace
                     .worktree
                     .map(|worktree| protocol::ClientShellWorktree {
@@ -542,6 +562,61 @@ fn split_hit_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wire count is computed server-side, because only the server holds the terminal
+    /// registry. The client-shell tests build their snapshots by hand, so they are structurally
+    /// incapable of catching a server that stops counting -- which would leave the config key
+    /// rendering a permanent zero, the exact dead-key failure this feature had to avoid.
+    #[test]
+    fn snapshot_counts_only_live_agent_panes_per_space() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+
+        let mut with_agents = crate::workspace::Workspace::test_new("one");
+        let root = with_agents.tabs[0].root_pane;
+        let split = with_agents.test_split(ratatui::layout::Direction::Horizontal);
+        let without_agents = crate::workspace::Workspace::test_new("two");
+        app.state.workspaces = vec![with_agents, without_agents];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+
+        // Two panes in the first space, but only one of them is an agent.
+        let agent_terminal = app.state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&agent_terminal)
+            .expect("agent terminal")
+            .set_agent_name("planner".into());
+        let plain_terminal = app.state.workspaces[0].tabs[0].panes[&split]
+            .attached_terminal_id
+            .clone();
+        assert!(
+            !app.state.terminals[&plain_terminal].is_agent_terminal(),
+            "control: the split pane must NOT be an agent, or 'counts agents' and 'counts panes' \
+             would be indistinguishable here"
+        );
+
+        let snapshot = snapshot(&app, "boot", 1, None, None);
+
+        assert_eq!(
+            snapshot
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.agent_count)
+                .collect::<Vec<_>>(),
+            vec![1, 0],
+            "one agent pane in the first space, none in the second"
+        );
+    }
 
     #[test]
     fn snapshot_projects_cached_release_and_update_facts() {
