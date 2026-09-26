@@ -197,7 +197,7 @@ fn sort_aggregate_rows(
         rows.sort_by_key(|row| {
             (
                 row.endpoint.stale(),
-                std::cmp::Reverse(status_priority(row.agent.agent_status)),
+                std::cmp::Reverse(agent_status_priority(row.agent)),
                 std::cmp::Reverse(row.recency),
             )
         });
@@ -289,7 +289,7 @@ impl crate::agent_view_eval::AgentViewEntry for ClientAgentViewEntry<'_> {
     }
 
     fn attention(&self) -> u64 {
-        u64::from(status_priority(self.agent.agent_status))
+        u64::from(agent_status_priority(self.agent))
     }
 }
 
@@ -309,13 +309,35 @@ pub(super) fn online_agent_targets(
         .collect()
 }
 
+fn navigator_filter_matches_agent(
+    filter: Option<ClientNavigatorFilter>,
+    agent: &ClientShellAgent,
+) -> bool {
+    match filter {
+        Some(ClientNavigatorFilter::Blocked) => {
+            agent.agent_status == crate::api::schema::AgentStatus::Blocked
+                && !agent_is_blocked_read(agent)
+        }
+        Some(ClientNavigatorFilter::Working) => {
+            agent.agent_status == crate::api::schema::AgentStatus::Working
+        }
+        Some(ClientNavigatorFilter::Idle) => {
+            agent.agent_status == crate::api::schema::AgentStatus::Idle
+        }
+        Some(ClientNavigatorFilter::Done) => {
+            agent.agent_status == crate::api::schema::AgentStatus::Done
+        }
+        None => true,
+    }
+}
+
 pub(super) fn navigator_rows(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     navigator: &ClientNavigatorOverlay,
 ) -> Vec<ClientNavigatorRow> {
     let query = navigator.query.trim().to_lowercase();
-    let filter = |status| match navigator.filter {
+    let filter_status = |status| match navigator.filter {
         Some(ClientNavigatorFilter::Blocked) => status == crate::api::schema::AgentStatus::Blocked,
         Some(ClientNavigatorFilter::Working) => status == crate::api::schema::AgentStatus::Working,
         Some(ClientNavigatorFilter::Idle) => status == crate::api::schema::AgentStatus::Idle,
@@ -368,8 +390,12 @@ pub(super) fn navigator_rows(
                             .clone()
                             .or_else(|| pane.cwd.clone())
                             .unwrap_or_default();
+                        let pane_filter_matches = agent.map_or_else(
+                            || filter_status(status),
+                            |agent| navigator_filter_matches_agent(navigator.filter, agent),
+                        );
                         if !filtering
-                            || filter(status)
+                            || pane_filter_matches
                                 && (endpoint_query_matches || text(&label) || text(&meta))
                         {
                             panes.push(ClientNavigatorRow {
@@ -377,6 +403,15 @@ pub(super) fn navigator_rows(
                                 label,
                                 meta,
                                 status: Some(status),
+                                status_icon: Some(agent.map_or_else(
+                                    || status_dot(status),
+                                    |agent| {
+                                        agent_status_icon(
+                                            agent,
+                                            crate::config::StatusIndicatorStyle::Dots,
+                                        )
+                                    },
+                                )),
                                 stale,
                                 current: endpoint.endpoint_id == *active_endpoint_id
                                     && snapshot.focused_pane_id.as_deref() == Some(&pane.pane_id),
@@ -387,8 +422,17 @@ pub(super) fn navigator_rows(
                             });
                         }
                     }
+                    let tab_filter_matches =
+                        if navigator.filter == Some(ClientNavigatorFilter::Blocked) {
+                            snapshot.agents.iter().any(|agent| {
+                                agent.tab_id == tab.tab_id
+                                    && navigator_filter_matches_agent(navigator.filter, agent)
+                            })
+                        } else {
+                            filter_status(tab.agent_status)
+                        };
                     if !filtering
-                        || filter(tab.agent_status) && (endpoint_query_matches || text(&tab.label))
+                        || tab_filter_matches && (endpoint_query_matches || text(&tab.label))
                         || !panes.is_empty()
                     {
                         children.push(ClientNavigatorRow {
@@ -403,6 +447,7 @@ pub(super) fn navigator_rows(
                                     .count()
                             ),
                             status: None,
+                            status_icon: None,
                             stale,
                             current: false,
                             target: ClientNavigatorTarget::Tab {
@@ -413,7 +458,16 @@ pub(super) fn navigator_rows(
                         children.extend(panes);
                     }
                 }
-                let workspace_matches = filter(workspace.agent_status)
+                let workspace_filter_matches =
+                    if navigator.filter == Some(ClientNavigatorFilter::Blocked) {
+                        snapshot.agents.iter().any(|agent| {
+                            agent.workspace_id == workspace.workspace_id
+                                && navigator_filter_matches_agent(navigator.filter, agent)
+                        })
+                    } else {
+                        filter_status(workspace.agent_status)
+                    };
+                let workspace_matches = workspace_filter_matches
                     && (endpoint_query_matches || text(&workspace.label) || text(&workspace_meta));
                 if !filtering || workspace_matches || !children.is_empty() {
                     let key = (endpoint.endpoint_id.clone(), workspace.workspace_id.clone());
@@ -422,6 +476,7 @@ pub(super) fn navigator_rows(
                         label: workspace.label.clone(),
                         meta: workspace_meta,
                         status: None,
+                        status_icon: None,
                         stale,
                         current: false,
                         target: ClientNavigatorTarget::Workspace {
@@ -442,6 +497,7 @@ pub(super) fn navigator_rows(
                     label: endpoint.label.to_owned(),
                     meta: String::new(),
                     status: None,
+                    status_icon: None,
                     stale,
                     current: false,
                     target: ClientNavigatorTarget::Machine {
@@ -470,4 +526,46 @@ pub(super) fn selected_navigator_target(
     navigator: &ClientNavigatorOverlay,
 ) -> Option<ClientNavigatorTarget> {
     navigator_selected_index(rows, navigator).map(|index| rows[index].target.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blocked_agent(tokens: Vec<(String, String)>) -> ClientShellAgent {
+        ClientShellAgent {
+            pane_id: "pane".into(),
+            workspace_id: "workspace".into(),
+            tab_id: "tab".into(),
+            name: None,
+            display_agent: None,
+            agent: None,
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_status: crate::api::schema::AgentStatus::Blocked,
+            state_change_seq: 1,
+            state_labels: Vec::new(),
+            tokens,
+            focused: false,
+        }
+    }
+
+    #[test]
+    fn navigator_blocked_filter_excludes_acknowledged_blocked_agent() {
+        let unread = blocked_agent(Vec::new());
+        let read = blocked_agent(vec![(
+            crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
+            "1".into(),
+        )]);
+
+        assert!(navigator_filter_matches_agent(
+            Some(ClientNavigatorFilter::Blocked),
+            &unread
+        ));
+        assert!(!navigator_filter_matches_agent(
+            Some(ClientNavigatorFilter::Blocked),
+            &read
+        ));
+    }
 }

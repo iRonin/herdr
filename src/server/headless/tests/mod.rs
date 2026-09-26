@@ -3219,7 +3219,7 @@ async fn client_shell_release_under_popup_renders_when_it_resets_scrollback() {
 }
 
 #[tokio::test]
-async fn client_shell_text_input_renders_only_when_resetting_scrollback() {
+async fn client_shell_text_input_renders_when_resetting_scrollback_or_acknowledging_blocked() {
     let mut server = test_headless_server();
     let mut workspace = crate::workspace::Workspace::test_new("scrolled-input");
     let pane_id = workspace.tabs[0].root_pane;
@@ -3239,6 +3239,19 @@ async fn client_shell_text_input_renders_only_when_resetting_scrollback() {
     server.app.state.workspaces = vec![workspace];
     server.app.state.active = Some(0);
     server.app.state.selected = 0;
+    server.app.state.ensure_test_terminals();
+    let terminal_id = server.app.state.terminal_id_for_pane(0, pane_id).unwrap();
+    server
+        .app
+        .state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .state = crate::detect::AgentState::Blocked;
+    server.app.state.workspaces[0]
+        .pane_state_mut(pane_id)
+        .unwrap()
+        .seen = false;
     let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
     server.clients.insert(
         11,
@@ -3276,19 +3289,58 @@ async fn client_shell_text_input_renders_only_when_resetting_scrollback() {
             .map(|metrics| metrics.offset_from_bottom),
         Some(0)
     );
+    assert!(
+        server.app.state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .seen,
+        "forwarded client-shell text acknowledges the targeted blocked pane"
+    );
+    assert_eq!(
+        server.app.state.terminals[&terminal_id].state,
+        crate::detect::AgentState::Blocked
+    );
+
+    server.app.state.workspaces[0]
+        .pane_state_mut(pane_id)
+        .unwrap()
+        .seen = false;
+    let render_impact =
+        server.handle_server_event_with_render_impact(ServerEvent::ClientShellPaneInput {
+            client_id: 11,
+            pane_id: public_pane_id.clone(),
+            events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+                "y".to_owned(),
+            )],
+        });
+    assert_eq!(
+        render_impact,
+        RenderImpact::Full,
+        "acknowledging blocked must repaint even when scrollback stays at the bottom"
+    );
+    assert_eq!(
+        input_rx.try_recv().expect("second text must reach the PTY"),
+        Bytes::from_static(b"y")
+    );
+    assert!(
+        server.app.state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .seen
+    );
 
     let render_impact =
         server.handle_server_event_with_render_impact(ServerEvent::ClientShellPaneInput {
             client_id: 11,
             pane_id: public_pane_id,
             events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
-                "y".to_owned(),
+                "z".to_owned(),
             )],
         });
     assert_eq!(render_impact, RenderImpact::None);
     assert_eq!(
-        input_rx.try_recv().expect("second text must reach the PTY"),
-        Bytes::from_static(b"y")
+        input_rx.try_recv().expect("third text must reach the PTY"),
+        Bytes::from_static(b"z")
     );
     shutdown_test_runtimes(&mut server);
 }
@@ -5394,6 +5446,87 @@ async fn headless_scheduled_tasks_start_pending_agent_resume_without_foreground_
         .pending_agent_resume_plan
         .is_none());
     shutdown_test_runtimes(&mut server);
+}
+
+#[test]
+fn direct_terminal_input_acknowledges_its_blocked_pane_after_forwarding() {
+    with_terminal_session_test_server(|server, terminal_id, terminal_id_string, public_pane_id| {
+        let (_, pane_id) = server
+            .app
+            .parse_pane_id(&public_pane_id)
+            .expect("public pane id");
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .state = crate::detect::AgentState::Blocked;
+        server.app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .seen = false;
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        server.clients.insert(
+            1,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::TerminalAttach {
+                    terminal_id: terminal_id_string,
+                },
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                1,
+                RenderEncoding::TerminalAnsi,
+                None,
+            ),
+        );
+
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: b"answer".to_vec(),
+        }));
+        assert_eq!(input_rx.try_recv().unwrap(), Bytes::from_static(b"answer"));
+        assert!(
+            server.app.state.workspaces[0]
+                .pane_state(pane_id)
+                .unwrap()
+                .seen
+        );
+        assert_eq!(
+            server.app.state.terminals[&terminal_id].state,
+            crate::detect::AgentState::Blocked
+        );
+
+        server.app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .seen = false;
+        assert!(server.paste_client_clipboard_image_path(
+            1,
+            crate::protocol::ClientClipboardImageTarget::DirectTerminal,
+            "/tmp/client-image.png".into(),
+        ));
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            Bytes::from_static(b"/tmp/client-image.png")
+        );
+        assert!(
+            server.app.state.workspaces[0]
+                .pane_state(pane_id)
+                .unwrap()
+                .seen,
+            "a forwarded terminal-attach image path must acknowledge Blocked"
+        );
+        assert_eq!(
+            server.app.state.terminals[&terminal_id].state,
+            crate::detect::AgentState::Blocked
+        );
+    });
 }
 
 #[test]

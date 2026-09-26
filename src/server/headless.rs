@@ -1256,11 +1256,25 @@ impl HeadlessServer {
                 else {
                     return false;
                 };
-                if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
+                let terminal_id = terminal_id.clone();
+                let runtime_terminal_id = self.terminal_id_by_string(&terminal_id);
+                let mut forwarded = false;
+                if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
                     let payload = paste_payload_for_runtime(runtime, &path);
-                    if let Err(err) = runtime.try_send_bytes(Bytes::from(payload)) {
-                        warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed");
+                    if payload.is_empty() {
+                        return true;
                     }
+                    match runtime.try_send_bytes(Bytes::from(payload)) {
+                        Ok(()) => forwarded = true,
+                        Err(err) => {
+                            warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed");
+                        }
+                    }
+                }
+                if let Some(terminal_id) = runtime_terminal_id.as_ref().filter(|_| forwarded) {
+                    self.app
+                        .state
+                        .mark_terminal_acknowledged_if_blocked(terminal_id);
                 }
                 true
             }
@@ -1293,11 +1307,19 @@ impl HeadlessServer {
                 ) else {
                     return foreground_changed | geometry_changed;
                 };
-                if let Err(err) = apply_client_pane_input_events(
+                match apply_client_pane_input_events(
                     runtime,
                     &[protocol::ClientPaneInputEvent::Paste(path)],
                 ) {
-                    warn!(client_id, pane_id, err = %err, "client shell clipboard image paste failed");
+                    Ok(true) => {
+                        self.app
+                            .state
+                            .mark_pane_acknowledged_if_blocked(workspace_index, runtime_pane_id);
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        warn!(client_id, pane_id, err = %err, "client shell clipboard image paste failed");
+                    }
                 }
                 true
             }
@@ -2171,9 +2193,29 @@ impl HeadlessServer {
                 else {
                     return false;
                 };
-                if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
-                    if let Err(err) = apply_terminal_attach_input(runtime, data) {
-                        warn!(client_id, terminal_id = %terminal_id, err = %err);
+                let terminal_id = terminal_id.clone();
+                let input_nonempty = !data.is_empty();
+                let forwarded =
+                    if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
+                        match apply_terminal_attach_input(runtime, data) {
+                            Ok(()) => true,
+                            Err(err) => {
+                                warn!(client_id, terminal_id = %terminal_id, err = %err);
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                // Terminal-attach input is an opaque byte stream, so unlike
+                // structured client-shell events it cannot distinguish encoded
+                // mouse reports from keyboard input. Any forwarded nonempty
+                // payload therefore counts as direct interaction.
+                if forwarded && input_nonempty {
+                    if let Some(terminal_id) = self.terminal_id_by_string(&terminal_id) {
+                        self.app
+                            .state
+                            .mark_terminal_acknowledged_if_blocked(&terminal_id);
                     }
                 }
                 true
@@ -2491,6 +2533,9 @@ impl HeadlessServer {
                         );
                     }
                     let scroll_before = runtime.scroll_metrics();
+                    // These releases only finish key presses begun while the pane
+                    // was visible; they are not fresh interaction and must not
+                    // acknowledge a newly Blocked pane after navigation.
                     if let Err(err) = apply_client_pane_input_events(runtime, &releases) {
                         warn!(client_id, pane_id, err = %err, "targeted client shell release failed");
                     }
@@ -2513,10 +2558,20 @@ impl HeadlessServer {
                     return foreground_changed | geometry_changed;
                 };
                 let scroll_before = runtime.scroll_metrics();
-                if let Err(err) = apply_client_pane_input_events(runtime, &events) {
-                    warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
-                }
-                foreground_changed | geometry_changed || runtime.scroll_metrics() != scroll_before
+                let input_forwarded = match apply_client_pane_input_events(runtime, &events) {
+                    Ok(input_forwarded) => input_forwarded,
+                    Err(err) => {
+                        warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
+                        false
+                    }
+                };
+                let scroll_changed = runtime.scroll_metrics() != scroll_before;
+                let acknowledged = input_forwarded
+                    && self
+                        .app
+                        .state
+                        .mark_pane_acknowledged_if_blocked(workspace_index, runtime_pane_id);
+                foreground_changed | geometry_changed | scroll_changed | acknowledged
             }
             ServerEvent::ClientShellPopupInput {
                 client_id,

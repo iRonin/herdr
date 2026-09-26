@@ -195,6 +195,27 @@ fn status_icon(
     }
 }
 
+pub(super) fn agent_is_blocked_read(agent: &crate::protocol::ClientShellAgent) -> bool {
+    agent.agent_status == crate::api::schema::AgentStatus::Blocked
+        && agent.tokens.iter().any(|(key, value)| {
+            key == crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN && value == "1"
+        })
+}
+
+/// Read-aware status mark for a concrete agent. Every case delegates to the
+/// upstream status vocabulary except acknowledged Blocked, which uses the
+/// existing hollow mark in both indicator styles while retaining Blocked color.
+pub(super) fn agent_status_icon(
+    agent: &crate::protocol::ClientShellAgent,
+    style: crate::config::StatusIndicatorStyle,
+) -> &'static str {
+    if agent_is_blocked_read(agent) {
+        "○"
+    } else {
+        status_icon(agent.agent_status, style)
+    }
+}
+
 fn status_dot(status: crate::api::schema::AgentStatus) -> &'static str {
     status_icon(status, crate::config::StatusIndicatorStyle::Dots)
 }
@@ -207,6 +228,16 @@ fn status_priority(status: crate::api::schema::AgentStatus) -> u8 {
         AgentStatus::Working => 2,
         AgentStatus::Idle => 1,
         AgentStatus::Unknown => 0,
+    }
+}
+
+/// Read-aware attention priority for a concrete agent. Acknowledged Blocked
+/// sinks to Idle priority without changing its wire status.
+pub(super) fn agent_status_priority(agent: &crate::protocol::ClientShellAgent) -> u8 {
+    if agent_is_blocked_read(agent) {
+        status_priority(crate::api::schema::AgentStatus::Idle)
+    } else {
+        status_priority(agent.agent_status)
     }
 }
 
