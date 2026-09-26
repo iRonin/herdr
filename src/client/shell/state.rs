@@ -870,6 +870,10 @@ pub(crate) struct ClientShellState {
     pub(super) reveal_mobile_workspace: bool,
     pub(super) mobile_switcher_suspended: bool,
     pub(super) reveal_focused_tab: bool,
+    /// Set for exactly one keybind action to invert `ui.prompt_new_tab_name`, by Alt-clicking the
+    /// new-tab button. `record_binding` takes it whatever the action turns out to be, so it can
+    /// never stay armed for a later one.
+    pub(super) invert_new_tab_prompt: bool,
     pub(super) last_tab_bar_width: Option<u16>,
     pub(super) last_composed_size: Option<(u16, u16)>,
     pub(super) last_composed_at: Option<std::time::Instant>,
@@ -1032,6 +1036,7 @@ impl ClientShellState {
             reveal_mobile_workspace: false,
             mobile_switcher_suspended: false,
             reveal_focused_tab: true,
+            invert_new_tab_prompt: false,
             last_tab_bar_width: None,
             last_composed_size: None,
             last_composed_at: None,

@@ -20,6 +20,12 @@ impl ClientShellState {
                 self.persist_chrome_preferences(outcome);
             }
             crate::input::KeybindMatch::Action(action) => {
+                // `ui.prompt_new_tab_name`, inverted for one action by an Alt-click on the new-tab
+                // button. Taken unconditionally: an armed override is always consumed by the very
+                // next action, so it cannot survive into an unrelated one. This must stay ahead of
+                // every early return below, including the blocked-preview refusal.
+                let prompt_new_tab_name = self.config.prompt_new_tab_name
+                    != std::mem::take(&mut self.invert_new_tab_prompt);
                 if self.workspace_preview_action_blocked()
                     && matches!(
                         action,
@@ -124,8 +130,7 @@ impl ClientShellState {
                     outcome.repaint = true;
                     return;
                 }
-                if action == crate::input::KeybindAction::NewTab && self.config.prompt_new_tab_name
-                {
+                if action == crate::input::KeybindAction::NewTab && prompt_new_tab_name {
                     self.open_new_tab_overlay();
                     outcome.repaint = true;
                     return;
@@ -163,7 +168,7 @@ impl ClientShellState {
                 if self.handle_endpoint_navigation(action, outcome) {
                     return;
                 }
-                if let Some(method) = self.endpoint_method_for_action(action) {
+                if let Some(method) = self.endpoint_method_for_action(action, prompt_new_tab_name) {
                     self.push_endpoint_method(method, outcome);
                     return;
                 }
@@ -819,6 +824,7 @@ impl ClientShellState {
     pub(super) fn endpoint_method_for_action(
         &mut self,
         action: crate::input::KeybindAction,
+        prompt_new_tab_name: bool,
     ) -> Option<crate::api::schema::Method> {
         use crate::api::schema::{
             Method, PaneDirection, PaneFocusDirectionParams, PaneResizeParams, PaneSplitParams,
@@ -976,7 +982,7 @@ impl ClientShellState {
                     insert_index,
                 }))
             }
-            KeybindAction::NewTab if !self.config.prompt_new_tab_name => {
+            KeybindAction::NewTab if !prompt_new_tab_name => {
                 Some(Method::TabCreate(TabCreateParams {
                     workspace_id: Some(focused_workspace),
                     cwd: None,
