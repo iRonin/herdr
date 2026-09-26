@@ -1076,6 +1076,11 @@ pub struct ClientShellPane {
     pub right_click_passthrough: bool,
 }
 
+/// Reserved client-shell-only marker for an acknowledged blocked agent.
+/// It is injected after the public API snapshot is built and is not a
+/// user-reportable metadata key because report keys cannot contain dots.
+pub const CLIENT_SHELL_BLOCKED_READ_TOKEN: &str = "herdr.blocked_read";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientShellAgent {
     pub pane_id: String,

@@ -1809,8 +1809,13 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let input_nonempty = !params.text.is_empty();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
             return encode_error(id, "pane_send_failed", err.to_string());
+        }
+        if input_nonempty {
+            self.state
+                .mark_pane_acknowledged_if_blocked(ws_idx, pane_id);
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -1835,8 +1840,13 @@ impl App {
             Ok(bytes) => bytes,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
+        let input_nonempty = !bytes.is_empty();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "pane_send_failed", err.to_string());
+        }
+        if input_nonempty {
+            self.state
+                .mark_pane_acknowledged_if_blocked(ws_idx, pane_id);
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -1929,10 +1939,16 @@ impl App {
             Ok(encoded_keys) => encoded_keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
+        let mut input_forwarded = false;
         for bytes in encoded_keys {
+            input_forwarded |= !bytes.is_empty();
             if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
                 return encode_error(id, "pane_send_failed", err.to_string());
             }
+        }
+        if input_forwarded {
+            self.state
+                .mark_pane_acknowledged_if_blocked(ws_idx, pane_id);
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -2779,6 +2795,13 @@ mod tests {
         app.lookup_runtime_sender(0, internal_pane_id)
             .unwrap()
             .test_process_pty_bytes(b"\x1b[?2004h");
+        let terminal_id = app.state.terminal_id_for_pane(0, internal_pane_id).unwrap();
+        app.state.terminals.get_mut(&terminal_id).unwrap().state =
+            crate::detect::AgentState::Blocked;
+        app.state.workspaces[0]
+            .pane_state_mut(internal_pane_id)
+            .unwrap()
+            .seen = false;
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
@@ -2796,6 +2819,18 @@ mod tests {
             bytes::Bytes::from_static(b"\x1b[200~A != B\x1b[201~\r")
         );
         assert!(rx.try_recv().is_err());
+        assert!(
+            app.state.workspaces[0]
+                .pane_state(internal_pane_id)
+                .unwrap()
+                .seen,
+            "successfully forwarded API input acknowledges a blocked pane"
+        );
+        assert_eq!(
+            app.state.terminals[&terminal_id].state,
+            crate::detect::AgentState::Blocked,
+            "acknowledging input must preserve raw lifecycle state"
+        );
     }
 
     #[tokio::test]

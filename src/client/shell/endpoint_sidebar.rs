@@ -152,17 +152,18 @@ pub(super) fn render_collapsed(
                     })
                     .add_modifier(dim),
             );
+            let status = super::sidebar::workspace_status(snapshot, workspace);
             put_text(
                 buffer,
                 rect.x.saturating_add(number_width),
                 rect.y,
                 rect.width.saturating_sub(number_width),
-                status_icon(workspace.agent_status, config.status_indicators),
+                status.icon(config.status_indicators),
                 Style::default()
                     .fg(if stale {
                         palette.overlay0
                     } else {
-                        status_color(workspace.agent_status, palette)
+                        status_color(status.status(), palette)
                     })
                     .add_modifier(dim),
             );
@@ -301,7 +302,8 @@ pub(super) fn render_expanded(
                                     snapshot,
                                     workspace,
                                     collapsed_groups,
-                                ),
+                                )
+                                .status(),
                                 entry.indented,
                                 super::sidebar::displayed_workspace_agent_count(
                                     snapshot,
@@ -432,7 +434,7 @@ pub(super) fn render_expanded(
                 );
                 let tokens = super::sidebar::workspace_rows(
                     workspace,
-                    status,
+                    status.status(),
                     entry.indented,
                     super::sidebar::displayed_workspace_agent_count(
                         snapshot,

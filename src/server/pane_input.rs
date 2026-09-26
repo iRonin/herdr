@@ -203,14 +203,14 @@ pub(super) fn apply_terminal_attach_input(
 pub(super) fn apply_client_pane_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
-) -> Result<(), String> {
+) -> Result<bool, String> {
     apply_client_terminal_input_events(runtime, events, true)
 }
 
 pub(super) fn apply_client_popup_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
-) -> Result<(), String> {
+) -> Result<bool, String> {
     apply_client_terminal_input_events(runtime, events, false)
 }
 
@@ -218,7 +218,8 @@ fn apply_client_terminal_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
     host_page_keys: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    let mut non_mouse_input_forwarded = false;
     for event in events {
         if let ClientPaneInputEvent::Mouse {
             kind,
@@ -316,6 +317,7 @@ fn apply_client_terminal_input_events(
                     runtime
                         .try_send_bytes(Bytes::from(bytes))
                         .map_err(|err| format!("targeted pane key input failed: {err}"))?;
+                    non_mouse_input_forwarded = true;
                 }
             }
             crate::raw_input::RawInputEvent::Text(text) => {
@@ -323,12 +325,15 @@ fn apply_client_terminal_input_events(
                 runtime
                     .try_send_bytes(Bytes::copy_from_slice(text.as_str().as_bytes()))
                     .map_err(|err| format!("targeted pane text input failed: {err}"))?;
+                non_mouse_input_forwarded |= !text.as_str().is_empty();
             }
             crate::raw_input::RawInputEvent::Paste(text) => {
                 runtime.scroll_reset();
+                let nonempty = !text.is_empty();
                 runtime
                     .try_send_paste(text)
                     .map_err(|err| format!("targeted pane paste failed: {err}"))?;
+                non_mouse_input_forwarded |= nonempty;
             }
             crate::raw_input::RawInputEvent::Mouse(_)
             | crate::raw_input::RawInputEvent::OuterFocusGained
@@ -342,7 +347,7 @@ fn apply_client_terminal_input_events(
             }
         }
     }
-    Ok(())
+    Ok(non_mouse_input_forwarded)
 }
 
 #[cfg(test)]
@@ -479,6 +484,32 @@ mod tests {
                 ..
             }] if *current == position
         ));
+    }
+
+    #[tokio::test]
+    async fn targeted_pane_input_reports_only_forwarded_non_mouse_input_for_acknowledgment() {
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 2);
+        let forwarded = apply_client_pane_input_events(
+            &runtime,
+            &[ClientPaneInputEvent::TextCommit("answer".into())],
+        )
+        .unwrap();
+        assert!(forwarded);
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"answer"));
+
+        let mouse_only = apply_client_pane_input_events(
+            &runtime,
+            &[ClientPaneInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                position: crate::protocol::ClientMousePosition::Cell { column: 1, row: 1 },
+                geometry: None,
+                modifiers: 0,
+                lines: 1,
+            }],
+        )
+        .unwrap();
+        assert!(!mouse_only);
     }
 
     #[test]

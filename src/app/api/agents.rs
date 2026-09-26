@@ -365,8 +365,13 @@ impl App {
             }
         };
         let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
+        let input_nonempty = !bytes.is_empty();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "agent_send_keys_failed", err.to_string());
+        }
+        if input_nonempty {
+            self.state
+                .mark_pane_acknowledged_if_blocked(resolved.ws_idx, resolved.pane_id);
         }
 
         encode_success(id, ResponseResult::Ok {})
