@@ -302,6 +302,10 @@ The sidebar is the main Herdr dashboard. Search `ui.` in the [Config reference](
 
 `ui.pane_borders` accepts `"auto"` (the default, borders only for split panes), `"always"` (also frame a single pane), or `"off"`. A single-pane frame requires `ui.pane_outer_borders = true`, because all its edges are outer edges. Existing boolean values remain valid: `true` means `"auto"` and `false` means `"off"`.
 
+Set `agent_panel_scope = "current"` under `[ui]` to show only agents in the active space. The default, `"all"`, shows agents from every space. When no Agent view supplies its own sort, current-space mode orders the visible agents by attention, while the mobile header's global summary still counts every space.
+
+`agent_panel_modes` controls the modes cycled by clicking the Agent panel label. Its default, `["priority", "grouped"]`, preserves the standard attention and grouped views. Add `"space"` explicitly to opt into the current-space view; for example, `["priority", "space"]` switches directly between the attention queue and the active space. Unknown and duplicate entries are ignored, and an empty or invalid-only list uses the default pair.
+
 Set `tab_bar_position = "bottom"` under `[ui]` to place the desktop tab row below the terminal panes. Prefix, Navigate, Copy, and Resize mode bars temporarily replace the bottom tab row while active. The default is `"top"`.
 
 `ui.pane_scrollbars` accepts `"always"` (the default), `"auto"`, or `"never"`. `"always"` reserves a column beside the pane for the scrollbar. `"never"` reclaims that column, which widens the pane and keeps its text out of a terminal-native selection, but removes the scroll position indicator entirely. `"auto"` is the middle setting: the pane keeps its full width, and the scrollbar appears briefly over the rightmost text column after you scroll, staying while the pane is scrolled back and fading once you stop. Existing boolean values remain valid: `true` means `"always"` and `false` means `"never"`. The earlier `show_scrollbar` spelling is accepted as an alias for the same key.

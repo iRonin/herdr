@@ -363,6 +363,15 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # "workspaces" is accepted as an alias for "spaces".
 # agent_panel_sort = "spaces"
 
+# Agent panel scope: "all" shows every space; "current" shows the active space only.
+# "current_workspace" is accepted as an alias for "current".
+# agent_panel_scope = "all"
+
+# Modes cycled by clicking the agent-panel mode label, in order.
+# Values: "priority", "grouped", and "space". Unknown and duplicate entries are ignored.
+# Add "space" explicitly to opt into the current-space mode.
+# agent_panel_modes = ["priority", "grouped"]
+
 # Agent status indicators: "dots" preserves the compact color marks; "symbols" uses
 # distinct static glyphs for blocked, working, done, idle, and unknown states.
 # status_indicators = "dots"

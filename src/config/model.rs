@@ -103,11 +103,83 @@ pub enum AgentPanelSortConfig {
     Priority,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
-enum LegacyAgentPanelScopeConfig {
-    Current,
+pub enum AgentPanelScopeConfig {
+    #[default]
     All,
+    #[serde(alias = "current_workspace")]
+    Current,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentPanelModeConfig {
+    Priority,
+    #[serde(alias = "spaces")]
+    Grouped,
+    #[serde(alias = "current", alias = "current_workspace")]
+    Space,
+}
+
+impl AgentPanelModeConfig {
+    pub const DEFAULT: [Self; 2] = [Self::Priority, Self::Grouped];
+
+    pub(crate) fn from_state(sort: AgentPanelSortConfig, scope: AgentPanelScopeConfig) -> Self {
+        match scope {
+            AgentPanelScopeConfig::Current => Self::Space,
+            AgentPanelScopeConfig::All => match sort {
+                AgentPanelSortConfig::Priority => Self::Priority,
+                AgentPanelSortConfig::Spaces => Self::Grouped,
+            },
+        }
+    }
+
+    pub(crate) fn to_state(self) -> (AgentPanelSortConfig, AgentPanelScopeConfig) {
+        match self {
+            Self::Priority => (AgentPanelSortConfig::Priority, AgentPanelScopeConfig::All),
+            Self::Grouped => (AgentPanelSortConfig::Spaces, AgentPanelScopeConfig::All),
+            Self::Space => (
+                AgentPanelSortConfig::Priority,
+                AgentPanelScopeConfig::Current,
+            ),
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "priority" => Some(Self::Priority),
+            "grouped" | "spaces" => Some(Self::Grouped),
+            "space" | "current" | "current_workspace" => Some(Self::Space),
+            _ => None,
+        }
+    }
+}
+
+fn default_agent_panel_modes() -> Vec<AgentPanelModeConfig> {
+    AgentPanelModeConfig::DEFAULT.to_vec()
+}
+
+fn deserialize_agent_panel_modes<'de, D>(
+    deserializer: D,
+) -> Result<Vec<AgentPanelModeConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    let mut modes = Vec::with_capacity(values.len());
+    for value in values {
+        if let Some(mode) = AgentPanelModeConfig::parse(&value) {
+            if !modes.contains(&mode) {
+                modes.push(mode);
+            }
+        }
+    }
+    if modes.is_empty() {
+        Ok(default_agent_panel_modes())
+    } else {
+        Ok(modes)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -1135,9 +1207,16 @@ pub struct UiConfig {
     pub window_title: String,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
-    /// Retired setting that Herdr wrote before the workspace filter was removed.
-    #[serde(rename = "agent_panel_scope")]
-    _legacy_agent_panel_scope: Option<LegacyAgentPanelScopeConfig>,
+    /// Agent sidebar scope. Saved values are "all" or "current"; "current_workspace"
+    /// is accepted as an alias for "current". Default: "all".
+    pub agent_panel_scope: AgentPanelScopeConfig,
+    /// Ordered modes for the clickable agent-panel toggle. Unknown and duplicate
+    /// entries are ignored. Default: ["priority", "grouped"].
+    #[serde(
+        default = "default_agent_panel_modes",
+        deserialize_with = "deserialize_agent_panel_modes"
+    )]
+    pub agent_panel_modes: Vec<AgentPanelModeConfig>,
     /// Agent status indicator style. Saved values are "dots" or "symbols". Default: "dots".
     pub status_indicators: StatusIndicatorStyle,
     /// Expanded sidebar row composition.
@@ -1368,7 +1447,8 @@ impl Default for UiConfig {
             tab_bar_right_separator: " ".into(),
             window_title: super::window_title::default_window_title(),
             agent_panel_sort: AgentPanelSortConfig::Spaces,
-            _legacy_agent_panel_scope: None,
+            agent_panel_scope: AgentPanelScopeConfig::All,
+            agent_panel_modes: default_agent_panel_modes(),
             status_indicators: StatusIndicatorStyle::Dots,
             sidebar: SidebarConfig::default(),
             accent: "cyan".into(),
@@ -1667,13 +1747,66 @@ agent_panel_sort = "workspaces"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.ui.agent_panel_sort, AgentPanelSortConfig::Spaces);
+    }
 
-        let toml = r#"
+    #[test]
+    fn agent_panel_scope_config_parses_alias_and_defaults() {
+        assert_eq!(
+            Config::default().ui.agent_panel_scope,
+            AgentPanelScopeConfig::All
+        );
+
+        for (value, expected) in [
+            ("current", AgentPanelScopeConfig::Current),
+            ("current_workspace", AgentPanelScopeConfig::Current),
+            ("all", AgentPanelScopeConfig::All),
+        ] {
+            let toml = format!("[ui]\nagent_panel_scope = \"{value}\"\n");
+            let config: Config = toml::from_str(&toml).unwrap();
+            assert_eq!(config.ui.agent_panel_scope, expected);
+        }
+    }
+
+    #[test]
+    fn agent_panel_modes_parse_a_two_mode_cycle_and_sanitize_other_values() {
+        assert_eq!(
+            Config::default().ui.agent_panel_modes,
+            AgentPanelModeConfig::DEFAULT
+        );
+
+        let two_modes: Config = toml::from_str(
+            r#"
 [ui]
-agent_panel_scope = "current"
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.ui.agent_panel_sort, AgentPanelSortConfig::Spaces);
+agent_panel_modes = ["priority", "space"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            two_modes.ui.agent_panel_modes,
+            [AgentPanelModeConfig::Priority, AgentPanelModeConfig::Space]
+        );
+
+        let sanitized: Config = toml::from_str(
+            r#"
+[ui]
+agent_panel_modes = ["space", "unknown", "priority", "space", "grouped", "priority"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            sanitized.ui.agent_panel_modes,
+            [
+                AgentPanelModeConfig::Space,
+                AgentPanelModeConfig::Priority,
+                AgentPanelModeConfig::Grouped,
+            ]
+        );
+
+        for values in ["[]", "[\"unknown\"]"] {
+            let toml = format!("[ui]\nagent_panel_modes = {values}\n");
+            let config: Config = toml::from_str(&toml).unwrap();
+            assert_eq!(config.ui.agent_panel_modes, AgentPanelModeConfig::DEFAULT);
+        }
     }
 
     #[test]

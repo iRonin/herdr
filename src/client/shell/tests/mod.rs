@@ -258,6 +258,7 @@ mod link_hover;
 mod mobile;
 mod mouse_selection;
 mod new_tab_prompt_inversion;
+mod panel_scope;
 mod popup_focus_projection;
 mod space_agent_counts;
 mod startup_overlays;

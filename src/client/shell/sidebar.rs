@@ -28,6 +28,7 @@ pub(crate) fn render_collapsed_sidebar(
     buffer: &mut Buffer,
     area: Rect,
     snapshot: &ClientShellSnapshot,
+    agent_view: Option<&crate::api::schema::AgentViewSetParams>,
     config: &ClientShellConfig,
     selected_workspace_id: Option<&str>,
     hits: &mut ShellHitMap,
@@ -111,10 +112,15 @@ pub(crate) fn render_collapsed_sidebar(
         detail_area.width,
         detail_area.height.saturating_sub(1),
     );
-    for (index, pane_id) in super::ordered_agent_pane_ids(snapshot, config.agent_panel_sort)
-        .into_iter()
-        .take(detail_content.height as usize)
-        .enumerate()
+    for (index, pane_id) in super::ordered_agent_pane_ids(
+        snapshot,
+        config.agent_panel_sort,
+        config.agent_panel_scope,
+        agent_view,
+    )
+    .into_iter()
+    .take(detail_content.height as usize)
+    .enumerate()
     {
         let Some(agent) = snapshot
             .agents
@@ -430,10 +436,15 @@ pub(crate) fn render_sidebar(
         }
     }
 
+    let agent_view = super::agent_sidebar::active_agent_view_projection(
+        state.endpoints,
+        state.active_endpoint_id,
+    );
     super::render_agent_panel(
         buffer,
         detail_area,
         snapshot,
+        agent_view,
         config,
         state.agent_scroll,
         hits,
