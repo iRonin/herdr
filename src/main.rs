@@ -289,6 +289,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Set false to create tabs immediately with generated names.
 # prompt_new_tab_name = true
 
+# Show an "x" in the last cell of each tab label in the desktop tab row.
+# Alt-click the marker to close that tab; a plain click still activates it.
+# tab_close_button = false
+
 # Ask for a workspace name before interactive creation.
 # prompt_new_workspace_name = false
 

@@ -450,6 +450,19 @@ impl ClientShellState {
         ((pointer + grab_offset - origin) as f32 / f32::from(length.max(1))).clamp(0.1, 0.9)
     }
 
+    /// Tab whose close marker — the last cell of its label, drawn when `ui.tab_close_button` is on
+    /// — is at `point`. The marker only exists on tabs at least two cells wide, matching what the
+    /// renderer draws, so a click can never resolve to a marker the user cannot see.
+    fn tab_close_marker_at(&self, point: (u16, u16)) -> Option<String> {
+        self.hits.tabs.iter().find_map(|(rect, tab_id)| {
+            (rect.width >= 2
+                && rect.height > 0
+                && point.1 == rect.y
+                && point.0 == rect.right().saturating_sub(1))
+            .then(|| tab_id.clone())
+        })
+    }
+
     fn tab_drop_index_at(&self, point: (u16, u16)) -> Option<usize> {
         let snapshot = self.snapshot.as_deref()?;
         let workspace_id = snapshot.focused_workspace_id.as_deref()?;
@@ -2068,6 +2081,21 @@ impl ClientShellState {
                 if let Some(workspace_press) = workspace_press {
                     self.workspace_press = Some(workspace_press);
                     return;
+                }
+                if self.config.tab_close_button
+                    && mouse
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::ALT)
+                {
+                    if let Some(tab_id) = self.tab_close_marker_at(point) {
+                        self.push_endpoint_method(
+                            crate::api::schema::Method::TabClose(crate::api::schema::TabTarget {
+                                tab_id,
+                            }),
+                            outcome,
+                        );
+                        return;
+                    }
                 }
                 let tab_press = self
                     .config

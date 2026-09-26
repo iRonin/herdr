@@ -304,6 +304,8 @@ The sidebar is the main Herdr dashboard. Search `ui.` in the [Config reference](
 
 Set `tab_bar_position = "bottom"` under `[ui]` to place the desktop tab row below the terminal panes. Prefix, Navigate, Copy, and Resize mode bars temporarily replace the bottom tab row while active. The default is `"top"`.
 
+Set `tab_close_button = true` under `[ui]` to draw an `x` in the last cell of every tab's label. Alt-clicking that cell closes the tab straight away, with no confirmation prompt; a plain click there still activates the tab, and Alt-clicking anywhere else on the label keeps the usual click-and-drag behaviour. Closing a background tab does not focus it first, and closing a workspace's last tab closes the workspace, still subject to the worktree-group confirmation. The marker needs mouse capture and a tab at least two cells wide. The default is `false`, which leaves the tab row exactly as it renders without it.
+
 Set `tab_bar_wrap = true` under `[ui]` to wrap tabs onto multiple rows instead of scrolling them along a single row. Every tab stays visible, so the `<` and `>` overflow controls are not drawn, and the terminal panes shrink by however many rows the tabs need. The bar takes at most half the available height; past that the rows scroll to keep the active tab in view. Position is independent: a wrapped bar can sit at the top or the bottom, and at the bottom a mode bar covers only its last row, leaving the rows above it clickable. The default is `false`, which keeps the single scrollable row.
 
 Configure an ordered tmux-style status area at the right edge of the tab row:
