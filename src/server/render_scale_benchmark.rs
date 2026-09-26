@@ -54,7 +54,7 @@ impl RenderPipeline {
         app.state.workspaces = workspaces;
         app.state.active = Some(0);
         app.state.selected = 0;
-        app.state.pane_scrollbars = true;
+        app.state.pane_scrollbars = crate::config::ScrollbarMode::Always;
 
         let mut client = ClientShellState::new(ClientShellConfig::from_config(config));
         client.set_snapshot(Box::new(super::client_shell::snapshot(

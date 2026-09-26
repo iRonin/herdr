@@ -183,6 +183,35 @@ pub(crate) fn render_pane_scrollbar_buffer(
     );
 }
 
+/// Track the pane scrollbar occupies, or `None` when it is not drawn.
+///
+/// `Always` uses the reserved gutter beside the pane. `Auto` reserves nothing, so while the overlay
+/// is up it borrows the rightmost column of the pane's own text; that column is text the terminal
+/// owns, which is why the retained fast path is disabled while an overlay is visible.
+pub(crate) fn pane_scrollbar_track(
+    app: &AppState,
+    info: &PaneInfo,
+    metrics: crate::pane::ScrollMetrics,
+    now: std::time::Instant,
+) -> Option<Rect> {
+    match app.pane_scrollbars {
+        crate::config::ScrollbarMode::Always => pane_scrollbar_rect(info),
+        crate::config::ScrollbarMode::Auto => (app
+            .pane_scrollbar_overlay_visible(info.id, metrics, now)
+            && info.inner_rect.width > 0
+            && info.inner_rect.height > 0)
+            .then(|| {
+                Rect::new(
+                    info.inner_rect.x + info.inner_rect.width - 1,
+                    info.inner_rect.y,
+                    1,
+                    info.inner_rect.height,
+                )
+            }),
+        crate::config::ScrollbarMode::Never => None,
+    }
+}
+
 pub(super) fn render_pane_scrollbar(
     app: &AppState,
     frame: &mut Frame,
@@ -192,7 +221,7 @@ pub(super) fn render_pane_scrollbar(
     let Some(metrics) = rt.scroll_metrics() else {
         return;
     };
-    let Some(track) = pane_scrollbar_rect(info) else {
+    let Some(track) = pane_scrollbar_track(app, info, metrics, std::time::Instant::now()) else {
         return;
     };
     render_pane_scrollbar_buffer(
