@@ -17,31 +17,69 @@ pub(super) struct AgentRow {
     pub(super) rows: Vec<Vec<crate::ui::ResolvedToken>>,
 }
 
+pub(super) fn active_agent_view_projection<'a>(
+    endpoints: &'a [ClientShellEndpoint],
+    active_endpoint_id: &ClientEndpointId,
+) -> Option<&'a crate::api::schema::AgentViewSetParams> {
+    let endpoint = endpoints
+        .iter()
+        .find(|endpoint| &endpoint.endpoint_id == active_endpoint_id)?;
+    ClientShellState::endpoint_agent_view(endpoint)?
+        .as_ref()
+        .ok()?
+        .as_ref()
+}
+
+fn sort_agents_by_attention(agents: &mut [&crate::protocol::ClientShellAgent]) {
+    agents.sort_by_key(|agent| {
+        (
+            std::cmp::Reverse(status_priority(agent.agent_status)),
+            std::cmp::Reverse(agent.state_change_seq),
+        )
+    });
+}
+
 pub(super) fn ordered_agent_pane_ids(
     snapshot: &ClientShellSnapshot,
     sort: crate::config::AgentPanelSortConfig,
+    scope: crate::config::AgentPanelScopeConfig,
+    agent_view: Option<&crate::api::schema::AgentViewSetParams>,
 ) -> Vec<String> {
+    let focused_workspace = (scope == crate::config::AgentPanelScopeConfig::Current)
+        .then_some(snapshot.focused_workspace_id.as_deref())
+        .flatten();
     if snapshot.agent_view_label.is_some() {
-        return snapshot
+        let mut agents = snapshot
             .agent_order
             .iter()
-            .filter(|pane_id| {
-                snapshot
-                    .agents
-                    .iter()
-                    .any(|agent| agent.pane_id == pane_id.as_str())
+            .filter_map(|pane_id| {
+                snapshot.agents.iter().find(|agent| {
+                    agent.pane_id == pane_id.as_str()
+                        && focused_workspace
+                            .is_none_or(|workspace_id| agent.workspace_id == workspace_id)
+                })
             })
-            .cloned()
+            .collect::<Vec<_>>();
+        // Older endpoints publish only the final ID order. Preserve that order when the
+        // projection is unavailable; otherwise a no-sort view inherits Current's attention order.
+        if scope == crate::config::AgentPanelScopeConfig::Current
+            && agent_view.is_some_and(|view| view.sort.is_empty())
+        {
+            sort_agents_by_attention(&mut agents);
+        }
+        return agents
+            .into_iter()
+            .map(|agent| agent.pane_id.clone())
             .collect();
     }
     let mut agents = snapshot.agents.iter().collect::<Vec<_>>();
-    if sort == crate::config::AgentPanelSortConfig::Priority {
-        agents.sort_by_key(|agent| {
-            (
-                std::cmp::Reverse(status_priority(agent.agent_status)),
-                std::cmp::Reverse(agent.state_change_seq),
-            )
-        });
+    if let Some(workspace_id) = focused_workspace {
+        agents.retain(|agent| agent.workspace_id == workspace_id);
+    }
+    if sort == crate::config::AgentPanelSortConfig::Priority
+        || scope == crate::config::AgentPanelScopeConfig::Current
+    {
+        sort_agents_by_attention(&mut agents);
     }
     agents
         .into_iter()
@@ -49,10 +87,49 @@ pub(super) fn ordered_agent_pane_ids(
         .collect()
 }
 
+fn agent_panel_mode_label(config: &ClientShellConfig) -> &'static str {
+    match config.agent_panel_scope {
+        crate::config::AgentPanelScopeConfig::Current => "space",
+        crate::config::AgentPanelScopeConfig::All => match config.agent_panel_sort {
+            crate::config::AgentPanelSortConfig::Spaces => "grouped",
+            crate::config::AgentPanelSortConfig::Priority => "priority",
+        },
+    }
+}
+
+pub(super) fn next_agent_panel_mode(
+    config: &ClientShellConfig,
+) -> Option<(
+    crate::config::AgentPanelSortConfig,
+    crate::config::AgentPanelScopeConfig,
+)> {
+    let default_modes;
+    let modes = if config.agent_panel_modes.is_empty() {
+        default_modes = crate::config::AgentPanelModeConfig::DEFAULT;
+        default_modes.as_slice()
+    } else {
+        &config.agent_panel_modes
+    };
+    if modes.len() == 1 {
+        return None;
+    }
+    let current = crate::config::AgentPanelModeConfig::from_state(
+        config.agent_panel_sort,
+        config.agent_panel_scope,
+    );
+    let next = modes
+        .iter()
+        .position(|mode| *mode == current)
+        .map_or(modes[0], |index| modes[(index + 1) % modes.len()]);
+    let next = next.to_state();
+    (next != (config.agent_panel_sort, config.agent_panel_scope)).then_some(next)
+}
+
 pub(super) fn render_agent_panel(
     buffer: &mut Buffer,
     area: Rect,
     snapshot: &ClientShellSnapshot,
+    agent_view: Option<&crate::api::schema::AgentViewSetParams>,
     config: &ClientShellConfig,
     agent_scroll: &mut usize,
     hits: &mut ShellHitMap,
@@ -67,7 +144,7 @@ pub(super) fn render_agent_panel(
         return;
     }
 
-    let rows = agent_rows(snapshot, config, None);
+    let rows = agent_rows(snapshot, agent_view, config, None);
     render_agent_list(
         buffer,
         area,
@@ -118,10 +195,7 @@ pub(super) fn render_agent_panel_header(
             .fg(config.palette.overlay0)
             .add_modifier(Modifier::BOLD),
     );
-    let sort_label = agent_view_label.unwrap_or(match config.agent_panel_sort {
-        crate::config::AgentPanelSortConfig::Spaces => "grouped",
-        crate::config::AgentPanelSortConfig::Priority => "priority",
-    });
+    let sort_label = agent_view_label.unwrap_or_else(|| agent_panel_mode_label(config));
     let sort_width = display_width(sort_label).min(area.width as usize) as u16;
     let sort_rect = Rect::new(
         area.right().saturating_sub(sort_width),
@@ -236,13 +310,19 @@ pub(super) fn render_agent_list<T>(
 
 pub(super) fn agent_rows(
     snapshot: &ClientShellSnapshot,
+    agent_view: Option<&crate::api::schema::AgentViewSetParams>,
     config: &ClientShellConfig,
     machine: Option<&str>,
 ) -> Vec<AgentRow> {
-    ordered_agent_pane_ids(snapshot, config.agent_panel_sort)
-        .into_iter()
-        .filter_map(|pane_id| agent_row(snapshot, &pane_id, config, machine))
-        .collect()
+    ordered_agent_pane_ids(
+        snapshot,
+        config.agent_panel_sort,
+        config.agent_panel_scope,
+        agent_view,
+    )
+    .into_iter()
+    .filter_map(|pane_id| agent_row(snapshot, &pane_id, config, machine))
+    .collect()
 }
 
 pub(super) fn agent_row(

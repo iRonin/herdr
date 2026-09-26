@@ -81,6 +81,7 @@ fn rendered_agent_panel_mark(
         &mut buffer,
         area,
         projected,
+        None,
         config,
         &mut agent_scroll,
         &mut hits,

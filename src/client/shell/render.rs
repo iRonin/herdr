@@ -290,10 +290,15 @@ pub(super) fn render_shell(
                 );
             }
         } else if state.sidebar_collapsed {
+            let agent_view = super::agent_sidebar::active_agent_view_projection(
+                state.endpoints,
+                state.active_endpoint_id,
+            );
             render_collapsed_sidebar(
                 buffer,
                 layout.sidebar,
                 snapshot,
+                agent_view,
                 config,
                 state
                     .selected_workspace_id
