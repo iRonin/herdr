@@ -123,6 +123,7 @@ impl ClientShellConfig {
             tab_bar_wrap: config.ui.tab_bar_wrap,
             tab_agent_status: config.ui.tab_agent_status,
             tab_agent_context: config.ui.tab_agent_context,
+            tab_drag_move_workspace: config.ui.tab_drag_move_workspace,
             hide_tab_bar_when_single_tab: config.ui.hide_tab_bar_when_single_tab,
             spaces: config.ui.sidebar.spaces.clone(),
             agents: config.ui.sidebar.agents.clone(),
@@ -330,6 +331,7 @@ impl ClientShellConfig {
                 self.tab_bar_wrap = ui.tab_bar_wrap;
                 self.tab_agent_status = ui.tab_agent_status;
                 self.tab_agent_context = ui.tab_agent_context;
+                self.tab_drag_move_workspace = ui.tab_drag_move_workspace;
                 self.hide_tab_bar_when_single_tab = ui.hide_tab_bar_when_single_tab;
                 self.spaces = ui.sidebar.spaces.clone();
                 self.agents = ui.sidebar.agents.clone();

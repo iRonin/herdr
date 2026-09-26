@@ -1123,6 +1123,9 @@ pub struct UiConfig {
     /// Show the highest-attention agent pane's context percentage and lifecycle marker
     /// on each top tab. Default: false.
     pub tab_agent_context: bool,
+    /// Allow dragging a tab from the tab row onto a sidebar workspace entry to
+    /// move the tab (and all its panes) to that workspace. Default: false.
+    pub tab_drag_move_workspace: bool,
     /// Ordered entries shown at the right edge of the desktop tab row. Empty by default.
     pub tab_bar_right: Vec<TabBarRightEntryConfig>,
     /// Text inserted between visible right-side tab bar entries. Default: one space.
@@ -1360,6 +1363,7 @@ impl Default for UiConfig {
             tab_bar_wrap: false,
             tab_agent_status: false,
             tab_agent_context: false,
+            tab_drag_move_workspace: false,
             tab_bar_right: Vec::new(),
             tab_bar_right_separator: " ".into(),
             window_title: super::window_title::default_window_title(),
