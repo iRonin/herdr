@@ -271,3 +271,66 @@ fn the_close_marker_works_on_a_wrapped_lower_row() {
     let outcome = state.handle_raw_events(click_at(rect.right() - 1, rect.y, KeyModifiers::ALT));
     assert_eq!(closed_tab_id(&outcome).as_deref(), Some(tab_id.as_str()));
 }
+
+/// The modifier is configurable, and configuring it must move the gesture rather than add to it:
+/// the new modifier has to fire and the old one has to stop firing, or a user who chose ctrl still
+/// closes tabs by accident with Alt.
+#[test]
+fn the_configured_modifier_arms_the_marker_and_the_default_stops_firing() {
+    let mut state = close_button_state(3, true);
+    state.config.tab_close_button_modifier = KeyModifiers::CONTROL;
+    state.compose(106, 20).expect("tab bar with close markers");
+    let rect = state
+        .hits
+        .tabs
+        .iter()
+        .find(|(_, tab_id)| tab_id == "tab_3")
+        .map(|(rect, _)| *rect)
+        .expect("third tab");
+    let marker = (rect.right() - 1, rect.y);
+
+    let with_alt = state.handle_raw_events(click_at(marker.0, marker.1, KeyModifiers::ALT));
+    assert_eq!(
+        closed_tab_id(&with_alt),
+        None,
+        "Alt must no longer close once ctrl is configured"
+    );
+    assert_eq!(
+        focused_tab_id(&with_alt).as_deref(),
+        Some("tab_3"),
+        "it falls through to the ordinary press instead"
+    );
+
+    let with_ctrl = state.handle_raw_events(click_at(marker.0, marker.1, KeyModifiers::CONTROL));
+    assert_eq!(closed_tab_id(&with_ctrl).as_deref(), Some("tab_3"));
+}
+
+/// A combination must require every modifier in it, not any one of them.
+#[test]
+fn a_combination_modifier_requires_all_of_its_parts() {
+    let mut state = close_button_state(3, true);
+    state.config.tab_close_button_modifier = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    state.compose(106, 20).expect("tab bar with close markers");
+    let rect = state
+        .hits
+        .tabs
+        .iter()
+        .find(|(_, tab_id)| tab_id == "tab_3")
+        .map(|(rect, _)| *rect)
+        .expect("third tab");
+    let marker = (rect.right() - 1, rect.y);
+
+    let partial = state.handle_raw_events(click_at(marker.0, marker.1, KeyModifiers::CONTROL));
+    assert_eq!(
+        closed_tab_id(&partial),
+        None,
+        "ctrl alone is not ctrl+shift"
+    );
+
+    let both = state.handle_raw_events(click_at(
+        marker.0,
+        marker.1,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(closed_tab_id(&both).as_deref(), Some("tab_3"));
+}
