@@ -623,7 +623,7 @@ pub(in crate::client::shell) fn displayed_workspace_status(
 /// Agent count a space row should show. A collapsed worktree-group parent stands in for its whole
 /// group, so it sums their counts; this mirrors `displayed_workspace_status`, which aggregates the
 /// same set for the status glyph.
-pub(super) fn displayed_workspace_agent_count(
+pub(in crate::client::shell) fn displayed_workspace_agent_count(
     snapshot: &ClientShellSnapshot,
     workspace: &ClientShellWorkspace,
     collapsed_groups: &HashSet<String>,
