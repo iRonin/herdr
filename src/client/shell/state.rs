@@ -23,6 +23,7 @@ pub(crate) struct ClientShellConfig {
     pub(super) tab_bar_wrap: bool,
     pub(super) tab_agent_status: bool,
     pub(super) tab_agent_context: bool,
+    pub(super) tab_drag_move_workspace: bool,
     pub(super) hide_tab_bar_when_single_tab: bool,
     pub(super) spaces: SpacesSidebarConfig,
     pub(super) agents: crate::config::AgentsSidebarConfig,
@@ -211,6 +212,13 @@ pub(super) enum ClientChromeDrag {
         tab_id: String,
         workspace_id: String,
         insert_index: Option<usize>,
+        /// Sidebar workspace entry currently hovered while dragging a tab, when
+        /// `ui.tab_drag_move_workspace` is enabled. Only ever set for entries of
+        /// the dragged tab's own endpoint (another machine's server cannot take
+        /// the tab) other than the tab's own workspace. While set, dropping
+        /// moves the tab to that workspace instead of reordering it, and
+        /// `insert_index` stays `None`.
+        move_target: Option<String>,
     },
     Workspace {
         source_workspace_id: String,
