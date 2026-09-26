@@ -423,4 +423,13 @@ mod tests {
             assert!(validate_machine_command(&input).is_ok(), "{input:?}");
         }
     }
+
+    #[test]
+    fn machine_commands_refuse_server_restart() {
+        // `server restart` is a fork-only command that stops and starts the LOCAL server; it has no
+        // remote implementation. Under `--machine` it must be refused before anything runs, never
+        // restart Local while the user named another machine.
+        let input = args(&["herdr", "server", "restart"]);
+        assert!(validate_machine_command(&input).is_err(), "{input:?}");
+    }
 }
