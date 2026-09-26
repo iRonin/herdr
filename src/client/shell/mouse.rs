@@ -468,24 +468,29 @@ impl ClientShellState {
                     .map(|index| (index, *rect))
             })
             .collect::<Vec<_>>();
-        let (first_index, first_rect) = *visible.first()?;
-        let (last_index, last_rect) = *visible.last()?;
-        let on_tab_row = point.1 == first_rect.y;
-        if !on_tab_row {
-            return None;
-        }
         if super::contains(self.hits.tab_scroll_left, point) {
             return Some(0);
         }
         if super::contains(self.hits.tab_scroll_right, point) {
             return Some(tabs.len());
         }
-        let left_edge = if first_index == 0 {
+        // A wrapped bar spans several rows, so the drop is computed within the row under the
+        // pointer. On a single-row bar this is every visible tab, exactly as before.
+        let row = visible
+            .iter()
+            .copied()
+            .filter(|(_, rect)| rect.y == point.1)
+            .collect::<Vec<_>>();
+        let (first_index, first_rect) = *row.first()?;
+        let (last_index, last_rect) = *row.last()?;
+        // The scroll buttons only exist on a single-row bar; without them the row's own tabs are
+        // its edges.
+        let left_edge = if first_index == 0 || self.hits.tab_scroll_left.width == 0 {
             first_rect.x
         } else {
             self.hits.tab_scroll_left.right()
         };
-        let right_edge = if last_index + 1 >= tabs.len() {
+        let right_edge = if last_index + 1 >= tabs.len() || self.hits.tab_scroll_right.width == 0 {
             last_rect.right()
         } else {
             self.hits.tab_scroll_right.x.saturating_sub(1)
@@ -496,7 +501,7 @@ impl ClientShellState {
         if point.0 >= right_edge {
             return Some(last_index + 1);
         }
-        for (index, rect) in visible {
+        for (index, rect) in row {
             let midpoint = rect.x + rect.width / 2;
             if point.0 < midpoint {
                 return Some(index);

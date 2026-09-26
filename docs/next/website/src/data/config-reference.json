@@ -1004,6 +1004,12 @@
           ]
         },
         {
+          "key": "ui.tab_bar_wrap",
+          "type": "boolean",
+          "default": "false",
+          "description": "Wrap tabs onto multiple rows instead of using a single scrollable row."
+        },
+        {
           "key": "ui.tab_bar_right",
           "type": "array",
           "default": "[]",
