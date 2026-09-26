@@ -286,6 +286,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Alt-click the marker to close that tab; a plain click still activates it.
 # tab_close_button = false
 
+# Modifier that arms the close marker: "alt"/"option", "ctrl"/"control",
+# "shift", or a + separated combination such as "ctrl+shift". Mouse reporting
+# cannot encode cmd/super/meta/hyper, so those are rejected.
+# tab_close_button_modifier = "alt"
+
 # Ask for a workspace name before interactive creation.
 # prompt_new_workspace_name = false
 

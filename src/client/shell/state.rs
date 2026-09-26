@@ -41,6 +41,7 @@ pub(crate) struct ClientShellConfig {
     pub(super) keybinding_source: ClientShellKeybindingSource,
     pub(super) prompt_new_tab_name: bool,
     pub(super) tab_close_button: bool,
+    pub(super) tab_close_button_modifier: crossterm::event::KeyModifiers,
     pub(super) prompt_new_workspace_name: bool,
     pub(super) confirm_close: bool,
     pub(super) mouse_capture: bool,
