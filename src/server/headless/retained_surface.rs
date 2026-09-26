@@ -99,7 +99,7 @@ fn retained_scrollbar_patch(
 ) -> Option<Vec<protocol::PaneSurfacePatchRow>> {
     let next_rect = metrics
         .filter(|metrics| metrics.max_offset_from_bottom > 0)
-        .filter(|_| app.state.pane_scrollbars && !alternate_screen_active)
+        .filter(|_| app.state.pane_scrollbars.reserves_gutter() && !alternate_screen_active)
         .and_then(|_| {
             let rect = protocol::SurfaceRect {
                 x: pane.inner_rect.x.checked_add(pane.inner_rect.width)?,
@@ -237,6 +237,15 @@ impl HeadlessServer {
             || self.app.state.reveal_hidden_cursor_for_cjk_ime
         {
             fallback!("unsafe_state");
+        }
+        // An `Auto` overlay sits ON the pane's rightmost text column, so a patch of terminal rows
+        // would paint straight over it. Take the complete renderer for the ~1.2s it is up.
+        if self
+            .app
+            .state
+            .any_pane_scrollbar_overlay_visible(std::time::Instant::now())
+        {
+            fallback!("scrollbar_overlay");
         }
         let mut targets = render_targets(&self.clients, self.foreground_client_id);
         targets.retain(|(client_id, _, _, _, mode)| {

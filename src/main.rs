@@ -295,9 +295,13 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Disable for tmux-style internal splitters without an outside frame.
 # pane_outer_borders = true
 
-# Draw interactive scrollbars beside terminal panes.
-# Set false to reclaim the scrollbar column and keep it out of terminal-native selections.
-# pane_scrollbars = true
+# Pane scrollback scrollbar: "always", "auto", or "never".
+# "always" reserves a column beside the pane. "auto" keeps pane text full width
+# and briefly overlays the rightmost text column after scrolling, while the pane
+# stays scrolled back. "never" reclaims the column entirely, which keeps pane
+# text out of terminal-native selections. Booleans still parse: true is
+# "always", false is "never". The earlier "show_scrollbar" spelling is accepted.
+# pane_scrollbars = "always"
 
 # Keep split panes visually separated instead of sharing divider borders.
 # pane_gaps = true

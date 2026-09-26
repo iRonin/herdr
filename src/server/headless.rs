@@ -444,6 +444,18 @@ impl HeadlessServer {
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.metadata_expiry");
             }
+            if self.app.observe_pane_scroll_activity(Instant::now()) {
+                needs_render = true;
+                needs_full_render = true;
+                crate::render_prof::event("full_render_cause.scrollbar_overlay");
+            }
+            // The overlay borrows a column of pane text, so erasing it needs a full repaint: the
+            // retained path only rewrites rows the terminal itself dirtied.
+            if self.app.state.expire_scrollbar_auto_hide(Instant::now()) {
+                needs_render = true;
+                needs_full_render = true;
+                crate::render_prof::event("full_render_cause.scrollbar_overlay_expiry");
+            }
 
             // 3. Drain API requests.
             if self.pane_graphics_runtime_active() {

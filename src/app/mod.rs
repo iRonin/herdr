@@ -492,6 +492,8 @@ impl App {
             pane_borders: config.ui.pane_borders,
             pane_outer_borders: config.ui.pane_outer_borders,
             pane_scrollbars: config.ui.pane_scrollbars,
+            pane_scroll_activity: std::collections::HashMap::new(),
+            pane_scrollbar_overlay_shown: false,
             pane_gaps: config.ui.pane_gaps,
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
             tab_bar_right: Vec::new(),
@@ -1728,6 +1730,56 @@ mod tests {
         assert_eq!(toast.kind, crate::app::state::ToastKind::UpdateInstalled);
         assert_eq!(toast.title, "reloaded config");
         assert_eq!(toast.context, "using config.toml");
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The `show_scrollbar` spelling predates the rename to upstream's `pane_scrollbars`, and live
+    /// configs still use it. This drives the real disk-load path so it fails if EITHER the serde
+    /// alias is dropped as tidy-up OR the value stops being copied into live state -- a parse-only
+    /// test would keep passing through the second of those, with the setting silently reverted to
+    /// `always`.
+    #[test]
+    fn reload_config_applies_auto_scrollbars_through_the_show_scrollbar_alias() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-show-scrollbar-alias");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[ui]\nshow_scrollbar = \"auto\"\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        // Control: the default really is `Always`, so the assertion below cannot pass by accident.
+        assert_eq!(
+            app.state.pane_scrollbars,
+            crate::config::ScrollbarMode::Always
+        );
+
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(
+            app.state.config_diagnostic.is_none(),
+            "the alias must not be reported as an unknown key: {:?}",
+            app.state.config_diagnostic
+        );
+        assert_eq!(
+            app.state.pane_scrollbars,
+            crate::config::ScrollbarMode::Auto,
+            "the pre-rename spelling still selects auto"
+        );
+
+        // And the canonical spelling reaches the same place, so the alias is a synonym rather than
+        // a second setting.
+        std::fs::write(&path, "[ui]\npane_scrollbars = \"auto\"\n").unwrap();
+        assert_eq!(
+            app.reload_config().status,
+            crate::config::ConfigReloadStatus::Applied
+        );
+        assert_eq!(
+            app.state.pane_scrollbars,
+            crate::config::ScrollbarMode::Auto
+        );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

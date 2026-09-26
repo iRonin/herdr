@@ -13,6 +13,7 @@ use super::text::truncate_end;
 use super::widgets::panel_contrast_fg;
 use crate::app::state::Palette;
 use crate::app::AppState;
+use crate::config::ScrollbarMode;
 use crate::layout::PaneInfo;
 use crate::popup_size::resolve_popup_geometry;
 use crate::terminal::{TerminalRuntime, TerminalRuntimeRegistry};
@@ -33,8 +34,14 @@ fn pane_border_title(label: &str, pane_width: u16, _focused: bool) -> Option<Str
 
 // Full view computation reaches this helper for active and background panes.
 // Keep terminal queries narrow, allocation-free, and short under the core lock.
-fn terminal_inner_rect(rt: &TerminalRuntime, pane_inner: Rect, pane_scrollbars: bool) -> Rect {
-    if !pane_scrollbars || pane_inner.width <= 4 || rt.alternate_screen_active() {
+fn terminal_inner_rect(
+    rt: &TerminalRuntime,
+    pane_inner: Rect,
+    pane_scrollbars: ScrollbarMode,
+) -> Rect {
+    // Only `Always` narrows the pane. `Auto` keeps the text full width and overlays instead, which
+    // is the whole point of the mode; `Never` reclaims the column exactly as upstream's `false`.
+    if !pane_scrollbars.reserves_gutter() || pane_inner.width <= 4 || rt.alternate_screen_active() {
         return pane_inner;
     }
 
@@ -184,7 +191,7 @@ fn runtime_for_tab_pane<'a>(
 fn stable_scrollbar_gutter(
     rt: &TerminalRuntime,
     pane_inner: Rect,
-    pane_scrollbars: bool,
+    pane_scrollbars: ScrollbarMode,
 ) -> (Rect, Option<Rect>) {
     let inner_rect = terminal_inner_rect(rt, pane_inner, pane_scrollbars);
     if inner_rect == pane_inner {
@@ -1359,7 +1366,10 @@ mod tests {
         assert_eq!(info.scrollbar_rect, Some(Rect::new(49, 3, 1, 8)));
         assert_eq!(info.inner_rect, Rect::new(10, 3, 39, 8));
 
-        app.pane_scrollbars = false;
+        // Upstream's own test, re-homed onto the tri-state. `Never` is exactly upstream's
+        // `pane_scrollbars = false`, so this keeps proving the widening reproduces upstream
+        // behaviour bit for bit. Fix the VALUE here at a rebase, never the assertions.
+        app.pane_scrollbars = ScrollbarMode::Never;
         let infos = compute_pane_infos(
             &app,
             &terminal_runtimes,
@@ -1372,6 +1382,186 @@ mod tests {
         assert_eq!(info.rect, area);
         assert_eq!(info.scrollbar_rect, None);
         assert_eq!(info.inner_rect, area);
+    }
+
+    /// The point of `auto` and `never` is that pane text keeps the column `always` reserves. If
+    /// the gutter were still reserved, `auto` would be a strictly worse `always` -- narrower pane
+    /// AND no permanent indicator.
+    #[tokio::test]
+    async fn auto_and_never_scrollbar_modes_free_the_gutter_column_for_pane_text() {
+        let mut app = AppState::test_new();
+        let mut workspace = Workspace::test_new("test");
+        let root_pane = workspace.tabs[0].root_pane;
+        workspace.tabs[0].runtimes.insert(
+            root_pane,
+            TerminalRuntime::test_with_scrollback_bytes(
+                40,
+                8,
+                1024,
+                b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
+            ),
+        );
+        app.workspaces = vec![workspace];
+        app.active = Some(0);
+
+        let area = Rect::new(10, 3, 40, 8);
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        let pane_info = |app: &AppState| {
+            compute_pane_infos(
+                app,
+                &terminal_runtimes,
+                area,
+                false,
+                crate::kitty_graphics::HostCellSize::default(),
+            )
+            .into_iter()
+            .next()
+            .expect("pane info")
+        };
+
+        // Control: `Always` is upstream's `true` and must still reserve the column, or the
+        // assertions below would pass for a build where the setting does nothing at all.
+        app.pane_scrollbars = ScrollbarMode::Always;
+        let reserved = pane_info(&app);
+        assert_eq!(reserved.scrollbar_rect, Some(Rect::new(49, 3, 1, 8)));
+        assert_eq!(reserved.inner_rect, Rect::new(10, 3, 39, 8));
+
+        for mode in [ScrollbarMode::Auto, ScrollbarMode::Never] {
+            app.pane_scrollbars = mode;
+            let info = pane_info(&app);
+            assert_eq!(info.rect, area, "{mode:?}");
+            assert_eq!(info.scrollbar_rect, None, "{mode:?}");
+            assert_eq!(info.inner_rect, area, "{mode:?} keeps the pane full width");
+        }
+    }
+
+    /// The overlay's visibility window, asserted at explicit instants rather than by sleeping.
+    #[test]
+    fn auto_overlay_needs_auto_mode_a_scrolled_back_pane_and_recent_movement() {
+        let mut app = AppState::test_new();
+        let pane_id = PaneId::from_raw(42);
+        let scrolled_back = crate::pane::ScrollMetrics {
+            offset_from_bottom: 1,
+            max_offset_from_bottom: 10,
+            viewport_rows: 8,
+        };
+        let live_bottom = crate::pane::ScrollMetrics {
+            offset_from_bottom: 0,
+            ..scrolled_back
+        };
+        let start = std::time::Instant::now();
+        app.pane_scrollbars = ScrollbarMode::Auto;
+
+        // First sight of a pane is not a scroll; only a later change is.
+        assert!(!app.observe_pane_scroll_offset(pane_id, 0, start));
+        assert!(!app.pane_scrollbar_overlay_visible(pane_id, live_bottom, start));
+        assert!(app.observe_pane_scroll_offset(pane_id, 1, start));
+
+        let after = |millis: u64| start + std::time::Duration::from_millis(millis);
+        assert!(app.pane_scrollbar_overlay_visible(pane_id, scrolled_back, after(500)));
+        assert!(
+            !app.pane_scrollbar_overlay_visible(pane_id, scrolled_back, after(1500)),
+            "the overlay expires rather than staying up forever"
+        );
+        assert!(
+            !app.pane_scrollbar_overlay_visible(pane_id, live_bottom, after(500)),
+            "a pane scrolled back to the live bottom has nothing to indicate"
+        );
+
+        // Neither other mode may ever show it: `Always` has a real gutter and `Never` opted out.
+        for mode in [ScrollbarMode::Always, ScrollbarMode::Never] {
+            app.pane_scrollbars = mode;
+            assert!(
+                !app.pane_scrollbar_overlay_visible(pane_id, scrolled_back, after(500)),
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// Expiry has to be reported exactly once, on the tick it happens, because that is what buys
+    /// the full repaint that erases the overlay. Reporting it never leaves a stale glyph on screen.
+    #[test]
+    fn auto_overlay_expiry_is_reported_once_on_the_tick_it_expires() {
+        let mut app = AppState::test_new();
+        app.pane_scrollbars = ScrollbarMode::Auto;
+        let pane_id = PaneId::from_raw(7);
+        let start = std::time::Instant::now();
+        let after = |millis: u64| start + std::time::Duration::from_millis(millis);
+
+        assert!(!app.observe_pane_scroll_offset(pane_id, 0, start));
+        assert!(app.observe_pane_scroll_offset(pane_id, 3, start));
+
+        assert!(!app.expire_scrollbar_auto_hide(after(100)), "still visible");
+        assert!(app.any_pane_scrollbar_overlay_visible(after(100)));
+        assert!(
+            app.expire_scrollbar_auto_hide(after(1300)),
+            "the tick it stops being visible owes a repaint"
+        );
+        assert!(
+            !app.expire_scrollbar_auto_hide(after(1400)),
+            "and only that tick does"
+        );
+        assert!(!app.any_pane_scrollbar_overlay_visible(after(1400)));
+    }
+
+    /// `auto` draws over the pane's own last text column, not a reserved gutter. Getting the
+    /// column wrong would either clip a character permanently or paint outside the pane.
+    #[tokio::test]
+    async fn auto_overlay_draws_on_the_last_text_column_while_scrolled_back() {
+        let mut app = AppState::test_new();
+        app.pane_scrollbars = ScrollbarMode::Auto;
+        let mut workspace = Workspace::test_new("test");
+        let root_pane = workspace.tabs[0].root_pane;
+        let runtime = TerminalRuntime::test_with_scrollback_bytes(
+            40,
+            8,
+            1024,
+            b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
+        );
+        runtime.scroll_up(1);
+        workspace.tabs[0].runtimes.insert(root_pane, runtime);
+        app.workspaces = vec![workspace];
+        app.active = Some(0);
+        let now = std::time::Instant::now();
+        assert!(!app.observe_pane_scroll_offset(root_pane, 0, now));
+        assert!(app.observe_pane_scroll_offset(root_pane, 1, now));
+
+        let area = Rect::new(0, 0, 40, 8);
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        let info = compute_pane_infos(
+            &app,
+            &terminal_runtimes,
+            area,
+            false,
+            crate::kitty_graphics::HostCellSize::default(),
+        )
+        .into_iter()
+        .next()
+        .expect("pane info");
+        let runtime = app.workspaces[0].tabs[0]
+            .runtimes
+            .get(&root_pane)
+            .expect("runtime for pane");
+        let metrics = runtime.scroll_metrics().expect("scroll metrics");
+
+        let track = super::super::scrollbar::pane_scrollbar_track(&app, &info, metrics, now)
+            .expect("auto overlay track");
+        assert_eq!(info.inner_rect, area, "the pane is still full width");
+        assert_eq!(info.scrollbar_rect, None, "no reserved gutter to drag");
+        assert_eq!(
+            track,
+            Rect::new(area.right() - 1, area.y, 1, area.height),
+            "the overlay borrows the pane's own last text column"
+        );
+
+        // Once the window closes there is no track at all, which is what lets the text return.
+        assert!(super::super::scrollbar::pane_scrollbar_track(
+            &app,
+            &info,
+            metrics,
+            now + std::time::Duration::from_millis(1500)
+        )
+        .is_none());
     }
 
     #[test]

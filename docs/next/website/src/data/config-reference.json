@@ -971,9 +971,14 @@
         },
         {
           "key": "ui.pane_scrollbars",
-          "type": "boolean",
-          "default": "true",
-          "description": "Draw interactive scrollbars beside terminal panes. Disable to reclaim the scrollbar column and keep it out of terminal-native selections."
+          "type": "enum",
+          "default": "\"always\"",
+          "description": "Pane scrollback scrollbar mode. always reserves a column beside the pane, auto keeps the text full width and briefly overlays the rightmost text column after a scroll while the pane stays scrolled back, never hides it and reclaims the column so pane text stays out of terminal-native selections. Legacy booleans still parse: true maps to always and false maps to never. The earlier show_scrollbar spelling is accepted as an alias.",
+          "values": [
+            "always",
+            "auto",
+            "never"
+          ]
         },
         {
           "key": "ui.pane_gaps",
