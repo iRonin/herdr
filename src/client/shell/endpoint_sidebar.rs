@@ -323,6 +323,7 @@ pub(super) fn render_expanded(
                                     collapsed_groups,
                                 ),
                                 entry.indented,
+                                workspace.agent_count,
                                 &config.spaces,
                             )
                             .len()
@@ -451,6 +452,7 @@ pub(super) fn render_expanded(
                     workspace,
                     status,
                     entry.indented,
+                    workspace.agent_count,
                     &config.spaces,
                 );
                 let height = (tokens.len().max(1).min(u16::MAX as usize) as u16).min(body.height);
