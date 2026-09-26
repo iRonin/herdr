@@ -614,6 +614,7 @@ fn mobile_items(
         endpoints,
         active_endpoint_id,
         config.agent_panel_sort,
+        config.agent_panel_scope,
     );
     let agent_view_label = snapshot.agent_view_label.as_deref();
     if !agents.is_empty() || agent_view_label.is_some() {

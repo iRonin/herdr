@@ -302,6 +302,10 @@ The sidebar is the main Herdr dashboard. Search `ui.` in the [Config reference](
 
 `ui.pane_borders` accepts `"auto"` (the default, borders only for split panes), `"always"` (also frame a single pane), or `"off"`. A single-pane frame requires `ui.pane_outer_borders = true`, because all its edges are outer edges. Existing boolean values remain valid: `true` means `"auto"` and `false` means `"off"`.
 
+Set `agent_panel_scope = "current"` under `[ui]` to show only agents in the active space. The default, `"all"`, shows agents from every space. When no Agent view supplies its own sort, current-space mode orders the visible agents by attention, while the mobile header's global summary still counts every space.
+
+Set `agent_panel_modes = ["priority", "grouped", "space"]` under `[ui]` to control the modes cycled when clicking the Agent panel mode label. Allowed values: `"priority"`, `"grouped"` (`"spaces"` is an alias), and `"space"` (`"current"` and `"current_workspace"` are aliases). Unknown and duplicate entries are ignored. An empty or invalid-only list falls back to all three modes in this default order.
+
 Set `tab_bar_position = "bottom"` under `[ui]` to place the desktop tab row below the terminal panes. Prefix, Navigate, Copy, and Resize mode bars temporarily replace the bottom tab row while active. The default is `"top"`.
 
 Configure an ordered tmux-style status area at the right edge of the tab row:

@@ -298,6 +298,10 @@ text = "#cdd6f4"
 
 `ui.pane_borders` 接受 `"auto"`（默认值，仅为分割窗格显示边框）、`"always"`（也为单个窗格显示边框）或 `"off"`。单窗格的所有边都是外边，因此还需要 `ui.pane_outer_borders = true` 才会显示边框。旧的布尔值仍然有效：`true` 对应 `"auto"`，`false` 对应 `"off"`。
 
+在 `[ui]` 下设置 `agent_panel_scope = "current"`，Agent 面板将只显示活动 Space 中的智能体。默认值 `"all"` 会显示所有 Space 的智能体。当 Agent 视图未提供自定义排序时，当前 Space 模式会按关注优先级排列可见智能体，但移动端标题栏的全局汇总仍会统计所有 Space。
+
+在 `[ui]` 下设置 `agent_panel_modes = ["priority", "grouped", "space"]`，可控制点击 Agent 面板模式标签时循环切换的模式。允许的值：`"priority"`、`"grouped"`（`"spaces"` 是其别名）和 `"space"`（`"current"` 和 `"current_workspace"` 是其别名）。未知和重复的条目会被忽略。空列表或仅含无效值的列表会回退为按此默认顺序循环全部三种模式。
+
 在 `[ui]` 下设置 `tab_bar_position = "bottom"`，可将桌面标签栏放到终端窗格下方。Prefix、Navigate、Copy 和 Resize 模式栏会在显示期间临时替换底部标签栏。默认值为 `"top"`。
 
 可在标签栏右侧配置一个类似 tmux 的有序状态区：

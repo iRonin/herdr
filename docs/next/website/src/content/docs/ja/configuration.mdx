@@ -298,6 +298,10 @@ text = "#cdd6f4"
 
 `ui.pane_borders` は `"auto"`（デフォルト。分割ペインだけに境界線を表示）、`"always"`（単独ペインにも枠を表示）、`"off"` を受け付けます。単独ペインの辺はすべて外側の辺なので、枠を表示するには `ui.pane_outer_borders = true` も必要です。従来の真偽値も有効で、`true` は `"auto"`、`false` は `"off"` に対応します。
 
+`[ui]` で `agent_panel_scope = "current"` を設定すると、Agent パネルにはアクティブな Space のエージェントだけが表示されます。デフォルトの `"all"` では、すべての Space のエージェントが表示されます。Agent ビューで独自の並び順が指定されていない場合、現在の Space モードでは表示対象が注意度順に並びますが、モバイルヘッダーのグローバル集計は引き続きすべての Space を数えます。
+
+`[ui]` の下に `agent_panel_modes = ["priority", "grouped", "space"]` を設定すると、Agent パネルのモードラベルをクリックしたときに循環するモードを制御します。許容される値は `"priority"`、`"grouped"`（`"spaces"` はエイリアス）、`"space"`（`"current"` と `"current_workspace"` はエイリアス）です。不明な値と重複する値は無視されます。空のリストや無効な値だけのリストの場合は、このデフォルトの順序ですべてのモードにフォールバックします。
+
 `[ui]` の `tab_bar_position = "bottom"` を設定すると、デスクトップのタブ行をターミナルペインの下に配置できます。Prefix、Navigate、Copy、Resize の各モードバーは、表示中だけ下部のタブ行を置き換えます。デフォルトは `"top"` です。
 
 タブ行の右端に、tmux のような順序付きステータス領域を設定できます:
