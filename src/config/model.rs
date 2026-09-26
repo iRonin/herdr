@@ -962,6 +962,63 @@ impl PaneBordersConfig {
     }
 }
 
+/// Pane scrollback scrollbar presentation. `Always` reserves a gutter column beside the pane,
+/// `Auto` keeps the text full width and briefly overlays the rightmost text column after a scroll
+/// while the pane stays scrolled back, `Never` hides it entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollbarMode {
+    #[default]
+    Always,
+    Auto,
+    Never,
+}
+
+impl ScrollbarMode {
+    /// Whether a column is reserved beside the pane, narrowing its text. Only `Always` does; this
+    /// is the predicate upstream's `pane_scrollbars = true` used to be.
+    pub fn reserves_gutter(self) -> bool {
+        matches!(self, Self::Always)
+    }
+}
+
+impl<'de> Deserialize<'de> for ScrollbarMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ScrollbarModeVisitor;
+
+        impl<'de> de::Visitor<'de> for ScrollbarModeVisitor {
+            type Value = ScrollbarMode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("\"always\", \"auto\", \"never\", or a legacy boolean")
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                // Upstream's own spelling. true/false must keep meaning exactly what they meant
+                // when this key was a bool.
+                Ok(if value {
+                    ScrollbarMode::Always
+                } else {
+                    ScrollbarMode::Never
+                })
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "always" => Ok(ScrollbarMode::Always),
+                    "auto" => Ok(ScrollbarMode::Auto),
+                    "never" => Ok(ScrollbarMode::Never),
+                    other => Err(E::invalid_value(de::Unexpected::Str(other), &self)),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(ScrollbarModeVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for PaneBordersConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -1042,8 +1099,15 @@ pub struct UiConfig {
     pub pane_borders: PaneBordersConfig,
     /// Draw borders along the outside edge of the pane area. Default: true.
     pub pane_outer_borders: bool,
-    /// Draw interactive scrollbars beside terminal panes. Default: true.
-    pub pane_scrollbars: bool,
+    /// Pane scrollback scrollbar mode. `always`/`true` reserves a column beside the pane,
+    /// `auto` keeps the text full width and briefly overlays the rightmost text column after a
+    /// scroll, and `never`/`false` hides it. Default: `always`, which is exactly upstream's
+    /// `pane_scrollbars = true`.
+    ///
+    /// The `show_scrollbar` alias is load-bearing, not tidy-up: it is the spelling this fork
+    /// shipped before the key was renamed to match upstream, and live configs still use it.
+    #[serde(alias = "show_scrollbar")]
+    pub pane_scrollbars: ScrollbarMode,
     /// Keep split panes visually separated instead of sharing divider borders. Default: true.
     pub pane_gaps: bool,
     /// Show agent labels in split pane borders when no manual pane label is set. Default: false.
@@ -1283,7 +1347,7 @@ impl Default for UiConfig {
             prompt_new_workspace_name: false,
             pane_borders: PaneBordersConfig::Auto,
             pane_outer_borders: true,
-            pane_scrollbars: true,
+            pane_scrollbars: ScrollbarMode::Always,
             pane_gaps: true,
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
@@ -1644,11 +1708,65 @@ status_indicators = "symbols"
     }
 
     #[test]
+    fn pane_scrollbars_accepts_booleans_strings_and_the_show_scrollbar_alias() {
+        fn parse(key: &str, value: &str) -> ScrollbarMode {
+            toml::from_str::<Config>(&format!("[ui]\n{key} = {value}\n"))
+                .expect("scrollbar mode should parse")
+                .ui
+                .pane_scrollbars
+        }
+
+        assert_eq!(Config::default().ui.pane_scrollbars, ScrollbarMode::Always);
+        // Upstream's own bool spelling must keep meaning exactly what it meant when this key was
+        // a bool. This is the default-preservation guarantee, not a nicety.
+        assert_eq!(parse("pane_scrollbars", "true"), ScrollbarMode::Always);
+        assert_eq!(parse("pane_scrollbars", "false"), ScrollbarMode::Never);
+        assert_eq!(
+            parse("pane_scrollbars", "\"always\""),
+            ScrollbarMode::Always
+        );
+        assert_eq!(parse("pane_scrollbars", "\"never\""), ScrollbarMode::Never);
+        // The capability upstream's bool cannot express, which is why the fork carries this key.
+        assert_eq!(parse("pane_scrollbars", "\"auto\""), ScrollbarMode::Auto);
+        // The alias is what live configs written before the rename still say. Dropping it as
+        // tidy-up would silently revert those users to `always`.
+        assert_eq!(parse("show_scrollbar", "\"auto\""), ScrollbarMode::Auto);
+        assert_eq!(parse("show_scrollbar", "\"never\""), ScrollbarMode::Never);
+        assert_eq!(parse("show_scrollbar", "true"), ScrollbarMode::Always);
+        assert_eq!(parse("show_scrollbar", "false"), ScrollbarMode::Never);
+
+        let unknown = toml::from_str::<Config>("[ui]\npane_scrollbars = \"sometimes\"")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unknown.contains("\"always\", \"auto\", \"never\", or a legacy boolean"),
+            "a typo must name the accepted values: {unknown}"
+        );
+    }
+
+    #[test]
+    fn pane_scrollbars_rejects_the_canonical_key_and_its_alias_together() {
+        // Ambiguity must fail loudly rather than silently picking one: a config carrying both
+        // spellings is the user's to resolve, not ours to guess.
+        let err = toml::from_str::<Config>(
+            "[ui]\npane_scrollbars = \"always\"\nshow_scrollbar = \"auto\"\n",
+        )
+        .expect_err("both spellings must be rejected");
+        assert!(
+            err.to_string().contains("duplicate field"),
+            "expected a duplicate-field error, got: {err}"
+        );
+    }
+
+    #[test]
     fn pane_appearance_defaults_and_parse() {
         let default_config = Config::default();
         assert_eq!(default_config.ui.pane_borders, PaneBordersConfig::Auto);
         assert!(default_config.ui.pane_outer_borders);
-        assert!(default_config.ui.pane_scrollbars);
+        // Widened from `assert!` because this key is a tri-state in the fork. The TOML fixture
+        // below deliberately keeps upstream's `pane_scrollbars = false` spelling, so this test
+        // doubles as the back-compat check.
+        assert_eq!(default_config.ui.pane_scrollbars, ScrollbarMode::Always);
         assert!(default_config.ui.pane_gaps);
         assert!(!default_config.ui.show_agent_labels_on_pane_borders);
         assert!(!default_config.ui.hide_tab_bar_when_single_tab);
@@ -1682,7 +1800,7 @@ tab_bar_right_separator = " · "
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.ui.pane_borders, PaneBordersConfig::Always);
         assert!(!config.ui.pane_outer_borders);
-        assert!(!config.ui.pane_scrollbars);
+        assert_eq!(config.ui.pane_scrollbars, ScrollbarMode::Never);
         assert!(config.ui.pane_gaps);
         assert!(config.ui.show_agent_labels_on_pane_borders);
         assert!(config.ui.hide_tab_bar_when_single_tab);

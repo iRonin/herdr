@@ -44,6 +44,40 @@ impl App {
         self.agent_metadata_deadline = self.state.next_agent_metadata_expiry();
     }
 
+    /// Notes any movement in the visible panes' scrollback offsets, which starts the `Auto`
+    /// scrollbar overlay's visibility window. Returns whether a repaint is owed.
+    ///
+    /// Costs nothing unless the mode is `Auto`: every other mode returns before touching a pane.
+    pub(crate) fn observe_pane_scroll_activity(&mut self, now: Instant) -> bool {
+        if self.state.pane_scrollbars != crate::config::ScrollbarMode::Auto {
+            return false;
+        }
+        let Some(ws_idx) = self.state.active else {
+            return false;
+        };
+        let Some(tab_idx) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .map(|workspace| workspace.active_tab_index())
+        else {
+            return false;
+        };
+        let mut moved = false;
+        for pane_id in self.state.pane_ids_for_tab(ws_idx, tab_idx) {
+            let Some(offset) = self
+                .state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+                .and_then(|runtime| runtime.scroll_metrics())
+                .map(|metrics| metrics.offset_from_bottom)
+            else {
+                continue;
+            };
+            moved |= self.state.observe_pane_scroll_offset(pane_id, offset, now);
+        }
+        moved
+    }
+
     pub(crate) fn expire_due_metadata(&mut self, now: Instant) -> bool {
         let Some(deadline) = self
             .agent_metadata_deadline
@@ -160,6 +194,7 @@ impl App {
             self.pending_agent_resume_deadline,
             self.session_save_deadline,
             self.next_tab_bar_status_deadline(),
+            self.state.next_scrollbar_auto_hide_deadline(now),
             render_deadline,
         ]
         .into_iter()

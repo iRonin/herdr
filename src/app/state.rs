@@ -1,10 +1,21 @@
-use crate::config::{Keybinds, NewTerminalCwdConfig, SoundConfig, ToastConfig};
+use crate::config::{Keybinds, NewTerminalCwdConfig, ScrollbarMode, SoundConfig, ToastConfig};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 
 use crate::detect::AgentState;
 use crate::layout::{PaneId, PaneInfo};
+
+/// How long an `Auto` scrollbar overlay stays on screen after the pane's scrollback offset moves.
+pub(crate) const SCROLLBAR_AUTO_HIDE_AFTER: std::time::Duration =
+    std::time::Duration::from_millis(1200);
+
+/// A pane's last observed scrollback offset and when it last changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PaneScrollActivity {
+    pub offset_from_bottom: usize,
+    pub changed_at: std::time::Instant,
+}
 
 pub(crate) type InstalledPluginRegistry =
     std::collections::HashMap<String, crate::api::schema::InstalledPluginInfo>;
@@ -833,7 +844,12 @@ pub struct AppState {
     pub confirm_close: bool,
     pub pane_borders: crate::config::PaneBordersConfig,
     pub pane_outer_borders: bool,
-    pub pane_scrollbars: bool,
+    pub pane_scrollbars: ScrollbarMode,
+    /// Per pane, the scrollback offset last observed and when it last changed. Drives the `Auto`
+    /// overlay's visibility window. Only populated while the mode is `Auto`.
+    pub(crate) pane_scroll_activity: std::collections::HashMap<PaneId, PaneScrollActivity>,
+    /// Whether the previous tick left an `Auto` overlay on screen, so its expiry can be detected.
+    pub(crate) pane_scrollbar_overlay_shown: bool,
     pub pane_gaps: bool,
     pub show_agent_labels_on_pane_borders: bool,
     pub tab_bar_right: Vec<TabBarStatusSegment>,
@@ -895,6 +911,102 @@ pub struct AppState {
 impl AppState {
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
+    }
+
+    /// Notes a pane's current scrollback offset and returns whether it moved since the last
+    /// observation, which is what starts the `Auto` overlay's visibility window.
+    ///
+    /// Observing the offset rather than instrumenting each scroll site is deliberate: at v0.9.0 a
+    /// pane's offset is moved from the wheel path, the page-key path, the `pane.scroll` API and
+    /// drag, several of them through free functions with no `App` in scope. One observer catches
+    /// every source, and a missed one degrades to "no overlay" rather than to wrong geometry.
+    pub(crate) fn observe_pane_scroll_offset(
+        &mut self,
+        pane_id: PaneId,
+        offset_from_bottom: usize,
+        now: std::time::Instant,
+    ) -> bool {
+        match self.pane_scroll_activity.get_mut(&pane_id) {
+            Some(activity) => {
+                if activity.offset_from_bottom == offset_from_bottom {
+                    return false;
+                }
+                activity.offset_from_bottom = offset_from_bottom;
+                activity.changed_at = now;
+                true
+            }
+            None => {
+                self.pane_scroll_activity.insert(
+                    pane_id,
+                    PaneScrollActivity {
+                        offset_from_bottom,
+                        changed_at: now,
+                    },
+                );
+                // A pane seen for the first time has not scrolled; only a later change has.
+                false
+            }
+        }
+    }
+
+    /// Whether the `Auto` overlay should be drawn over the pane's rightmost text column: the mode
+    /// is `Auto`, the pane is still scrolled back, and its offset moved recently.
+    pub(crate) fn pane_scrollbar_overlay_visible(
+        &self,
+        pane_id: PaneId,
+        metrics: crate::pane::ScrollMetrics,
+        now: std::time::Instant,
+    ) -> bool {
+        self.pane_scrollbars == ScrollbarMode::Auto
+            && metrics.offset_from_bottom > 0
+            && self
+                .pane_scroll_activity
+                .get(&pane_id)
+                .and_then(|activity| now.checked_duration_since(activity.changed_at))
+                .is_some_and(|elapsed| elapsed < SCROLLBAR_AUTO_HIDE_AFTER)
+    }
+
+    /// True while any pane's `Auto` overlay is on screen. The retained fast path cannot express the
+    /// overlay (it patches terminal rows straight over that column), so this gates it.
+    pub(crate) fn any_pane_scrollbar_overlay_visible(&self, now: std::time::Instant) -> bool {
+        self.pane_scrollbars == ScrollbarMode::Auto
+            && self.pane_scroll_activity.values().any(|activity| {
+                activity.offset_from_bottom > 0
+                    && now
+                        .checked_duration_since(activity.changed_at)
+                        .is_some_and(|elapsed| elapsed < SCROLLBAR_AUTO_HIDE_AFTER)
+            })
+    }
+
+    pub(crate) fn next_scrollbar_auto_hide_deadline(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Instant> {
+        if self.pane_scrollbars != ScrollbarMode::Auto {
+            return None;
+        }
+        self.pane_scroll_activity
+            .values()
+            .filter(|activity| activity.offset_from_bottom > 0)
+            .filter_map(|activity| activity.changed_at.checked_add(SCROLLBAR_AUTO_HIDE_AFTER))
+            .filter(|deadline| *deadline > now)
+            .min()
+    }
+
+    /// Called once per loop tick. Returns true exactly on the tick where the overlay stops being
+    /// visible, which is when a full repaint is owed to erase it -- the retained fast path only
+    /// repaints rows the terminal itself dirtied, so an expired overlay would otherwise linger on
+    /// screen until the underlying text happened to change.
+    pub(crate) fn expire_scrollbar_auto_hide(&mut self, now: std::time::Instant) -> bool {
+        if self.pane_scrollbars != ScrollbarMode::Auto {
+            self.pane_scroll_activity.clear();
+            // A reload away from `Auto` while an overlay was up still owes that repaint.
+            return std::mem::take(&mut self.pane_scrollbar_overlay_shown);
+        }
+        let visible = self.any_pane_scrollbar_overlay_visible(now);
+        let expired = self.pane_scrollbar_overlay_shown && !visible;
+        self.pane_scrollbar_overlay_shown = visible;
+        expired
     }
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
@@ -1061,7 +1173,9 @@ impl AppState {
             confirm_close: true,
             pane_borders: crate::config::PaneBordersConfig::Auto,
             pane_outer_borders: true,
-            pane_scrollbars: true,
+            pane_scrollbars: ScrollbarMode::Always,
+            pane_scroll_activity: std::collections::HashMap::new(),
+            pane_scrollbar_overlay_shown: false,
             pane_gaps: false,
             show_agent_labels_on_pane_borders: false,
             tab_bar_right: Vec::new(),
