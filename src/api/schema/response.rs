@@ -94,6 +94,9 @@ pub enum ResponseResult {
     TabList {
         tabs: Vec<TabInfo>,
     },
+    TabMoveToWorkspace {
+        move_result: super::tabs::TabMoveToWorkspaceResult,
+    },
     AgentInfo {
         agent: AgentInfo,
     },
