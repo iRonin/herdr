@@ -49,10 +49,10 @@ impl Tab {
 
 fn pane_attention_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
-        (AgentState::Blocked, _) => 4,
+        (AgentState::Blocked, false) => 4,
         (AgentState::Idle, false) => 3,
         (AgentState::Working, _) => 2,
-        (AgentState::Idle, true) => 1,
+        (AgentState::Blocked, true) | (AgentState::Idle, true) => 1,
         (AgentState::Unknown, _) => 0,
     }
 }
@@ -92,6 +92,22 @@ mod tests {
 
     fn terminal_for_pane(ws: &Workspace, pane_id: PaneId) -> TerminalState {
         TerminalState::new(ws.terminal_id(pane_id).unwrap().clone(), "/tmp".into())
+    }
+
+    #[test]
+    fn acknowledged_blocked_sinks_below_unread_done_and_working() {
+        assert!(
+            pane_attention_priority(AgentState::Blocked, false)
+                > pane_attention_priority(AgentState::Idle, false)
+        );
+        assert!(
+            pane_attention_priority(AgentState::Blocked, true)
+                < pane_attention_priority(AgentState::Working, true)
+        );
+        assert!(
+            pane_attention_priority(AgentState::Blocked, true)
+                < pane_attention_priority(AgentState::Idle, false)
+        );
     }
 
     #[test]

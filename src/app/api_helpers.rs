@@ -1,10 +1,32 @@
 pub(super) fn tab_attention_priority(state: crate::detect::AgentState, seen: bool) -> u8 {
     match (state, seen) {
-        (crate::detect::AgentState::Blocked, _) => 4,
+        (crate::detect::AgentState::Blocked, false) => 4,
         (crate::detect::AgentState::Idle, false) => 3,
         (crate::detect::AgentState::Working, _) => 2,
-        (crate::detect::AgentState::Idle, true) => 1,
+        (crate::detect::AgentState::Blocked, true) | (crate::detect::AgentState::Idle, true) => 1,
         (crate::detect::AgentState::Unknown, _) => 0,
+    }
+}
+
+#[cfg(test)]
+mod attention_priority_tests {
+    use super::tab_attention_priority;
+    use crate::detect::AgentState;
+
+    #[test]
+    fn acknowledged_blocked_sinks_below_unread_done_and_working() {
+        assert!(
+            tab_attention_priority(AgentState::Blocked, false)
+                > tab_attention_priority(AgentState::Idle, false)
+        );
+        assert!(
+            tab_attention_priority(AgentState::Blocked, true)
+                < tab_attention_priority(AgentState::Working, true)
+        );
+        assert!(
+            tab_attention_priority(AgentState::Blocked, true)
+                < tab_attention_priority(AgentState::Idle, false)
+        );
     }
 }
 

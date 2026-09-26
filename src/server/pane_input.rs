@@ -341,9 +341,12 @@ pub(super) fn apply_client_terminal_input_events(
             }
             crate::raw_input::RawInputEvent::Paste(text) => {
                 runtime.scroll_reset();
+                let nonempty = !text.is_empty();
                 runtime
                     .try_send_paste(text)
                     .map_err(|err| format!("targeted pane paste failed: {err}"))?;
+                // A paste is input a user typed for this pane: it acknowledges a blocked agent too.
+                *keyboard_forwarded |= nonempty;
             }
             crate::raw_input::RawInputEvent::Mouse(_)
             | crate::raw_input::RawInputEvent::OuterFocusGained
@@ -494,6 +497,32 @@ mod tests {
                 ..
             }] if *current == position
         ));
+    }
+
+    #[tokio::test]
+    async fn targeted_pane_input_reports_only_forwarded_non_mouse_input_for_acknowledgment() {
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 2);
+        let forwarded = apply_client_pane_input_events(
+            &runtime,
+            &[ClientPaneInputEvent::TextCommit("answer".into())],
+        )
+        .unwrap();
+        assert!(forwarded);
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"answer"));
+
+        let mouse_only = apply_client_pane_input_events(
+            &runtime,
+            &[ClientPaneInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                position: crate::protocol::ClientMousePosition::Cell { column: 1, row: 1 },
+                geometry: None,
+                modifiers: 0,
+                lines: 1,
+            }],
+        )
+        .unwrap();
+        assert!(!mouse_only);
     }
 
     #[test]

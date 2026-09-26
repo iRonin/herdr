@@ -875,7 +875,7 @@ fn render_navigator_overlay(
         let connector_x = rect.x + padding;
         let indent = format!("{:width$}{connector}", "", width = usize::from(padding));
         let current = if r.current { "◆ " } else { "" };
-        let status = r.status.map(status_dot).unwrap_or_default();
+        let status = r.status_icon.unwrap_or_default();
         let status_separator = if status.is_empty() { "" } else { " " };
         let label = format!("{indent}{current}{status}{status_separator}{}", r.label);
         let st = if r.status.is_none() {
@@ -928,8 +928,8 @@ fn render_navigator_overlay(
                 b,
                 rect.x.saturating_add(display_width(&prefix)),
                 rect.y,
-                display_width(status_dot(status)),
-                status_dot(status),
+                display_width(r.status_icon.unwrap_or_default()),
+                r.status_icon.unwrap_or_default(),
                 status_style,
             );
             let meta_style = if r.stale || ix == selected {

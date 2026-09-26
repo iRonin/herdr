@@ -485,6 +485,63 @@ impl AppState {
         changed
     }
 
+    /// Marks a blocked pane as acknowledged after input was successfully
+    /// forwarded to that exact pane. The underlying agent state stays blocked.
+    pub(crate) fn mark_pane_acknowledged_if_blocked(
+        &mut self,
+        ws_idx: usize,
+        pane_id: PaneId,
+    ) -> bool {
+        let terminal_id = self
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone());
+        let Some(terminal_id) = terminal_id else {
+            return false;
+        };
+        if self
+            .terminals
+            .get(&terminal_id)
+            .is_none_or(|terminal| terminal.state != AgentState::Blocked)
+        {
+            return false;
+        }
+        let Some(pane) = self
+            .workspaces
+            .get_mut(ws_idx)
+            .and_then(|workspace| workspace.pane_state_mut(pane_id))
+        else {
+            return false;
+        };
+        if pane.seen {
+            return false;
+        }
+        pane.seen = true;
+        self.pending_agent_notifications.remove(&pane_id);
+        true
+    }
+
+    pub(crate) fn mark_terminal_acknowledged_if_blocked(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> bool {
+        let target = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(ws_idx, workspace)| {
+                workspace.tabs.iter().find_map(|tab| {
+                    tab.panes.iter().find_map(|(pane_id, pane)| {
+                        (&pane.attached_terminal_id == terminal_id).then_some((ws_idx, *pane_id))
+                    })
+                })
+            });
+        target.is_some_and(|(ws_idx, pane_id)| {
+            self.mark_pane_acknowledged_if_blocked(ws_idx, pane_id)
+        })
+    }
+
     pub fn move_workspace(&mut self, source_idx: usize, insert_idx: usize) -> bool {
         if source_idx >= self.workspaces.len() || insert_idx > self.workspaces.len() {
             return false;
@@ -1847,7 +1904,17 @@ impl AppState {
         };
         if completion_reset {
             self.pending_agent_notifications.remove(&pane_id);
-            self.workspaces[ws_idx].pane_state_mut(pane_id)?.seen = true;
+            // The reset clears the old session's Done mark. A pane that is Blocked has no Done
+            // mark: its read flag belongs to the block, which a session or label change does not
+            // end, so nobody has looked at it yet. (Entering Blocked in the same update is
+            // settled below by the Blocked rule.)
+            if self
+                .terminals
+                .get(&terminal_id)
+                .is_none_or(|terminal| terminal.state != AgentState::Blocked)
+            {
+                self.workspaces[ws_idx].pane_state_mut(pane_id)?.seen = true;
+            }
         }
         if mutation.session_ref_changed || managed_changed || agent_name_changed {
             self.mark_session_dirty();
@@ -1958,7 +2025,19 @@ impl AppState {
             .iter_mut()
             .find_map(|tab| tab.panes.get_mut(&pane_id))?;
 
-        if change.state != AgentState::Idle {
+        if matches!(change.state, AgentState::Working | AgentState::Unknown) {
+            pane.seen = true;
+        } else if change.state == AgentState::Blocked
+            && change.previous_state != AgentState::Blocked
+        {
+            pane.seen = suppress_active_tab_notifications;
+        } else if suppress_completion
+            && change.state == AgentState::Idle
+            && change.previous_state == AgentState::Blocked
+        {
+            // A suppressed Blocked to Idle is not something to come back to: startup noise
+            // during process acquisition, a completion on an `auto_read` pane, or a forced
+            // shutdown. Its Idle must not leave a background pane needing attention.
             pane.seen = true;
         } else if is_completion_transition(change) && (!suppress_completion || auto_read) {
             pane.seen = suppress_active_tab_notifications || auto_read;
@@ -3205,6 +3284,116 @@ mod tests {
     }
 
     #[test]
+    fn state_changed_blocked_in_background_marks_unseen() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.active = Some(0);
+        let pane_id = state.workspaces[1].tabs[0].root_pane;
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Blocked,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+
+        assert!(
+            !state.workspaces[1].panes[&pane_id].seen,
+            "background blocked pane must remain unread until direct interaction"
+        );
+    }
+
+    #[test]
+    fn state_changed_blocked_in_focused_active_tab_marks_seen() {
+        let mut state = app_with_workspaces(&["active"]);
+        state.active = Some(0);
+        state.outer_terminal_focus = Some(true);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        state.workspaces[0].panes.get_mut(&pane_id).unwrap().seen = false;
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Blocked,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+
+        assert!(
+            state.workspaces[0].panes[&pane_id].seen,
+            "a blocked transition already visible to the user is acknowledged"
+        );
+    }
+
+    #[test]
+    fn direct_input_acknowledges_targeted_background_blocked_pane() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        let pane_id = state.workspaces[1].tabs[0].root_pane;
+        let terminal_id = state.terminal_id_for_pane(1, pane_id).unwrap();
+        state.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Blocked;
+        state.workspaces[1].panes.get_mut(&pane_id).unwrap().seen = false;
+
+        assert!(state.mark_pane_acknowledged_if_blocked(1, pane_id));
+        assert!(state.workspaces[1].panes[&pane_id].seen);
+        assert_eq!(state.terminals[&terminal_id].state, AgentState::Blocked);
+        assert!(
+            !state.mark_pane_acknowledged_if_blocked(1, pane_id),
+            "acknowledging an already-read blocked pane is a no-op"
+        );
+    }
+
+    #[test]
+    fn unchanged_blocked_update_preserves_acknowledgment() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        let pane_id = state.workspaces[1].tabs[0].root_pane;
+        let terminal_id = state.terminal_id_for_pane(1, pane_id).unwrap();
+        let change = {
+            let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.state = AgentState::Blocked;
+            terminal.unchanged_effective_state_change_at(Instant::now())
+        };
+        state.workspaces[1].panes.get_mut(&pane_id).unwrap().seen = true;
+
+        let seen = state
+            .apply_pane_state_change(1, pane_id, &change, false)
+            .expect("blocked pane state update");
+
+        assert!(seen, "metadata-only updates must not re-arm attention");
+        assert!(state.workspaces[1].panes[&pane_id].seen);
+    }
+
+    #[test]
+    fn acknowledging_blocked_pane_cancels_delayed_attention_notification() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.toast_config.delay_seconds = 1;
+        let pane_id = state.workspaces[1].tabs[0].root_pane;
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Blocked,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+        let deadline = state.next_pending_agent_notification_deadline().unwrap();
+
+        assert!(state.mark_pane_acknowledged_if_blocked(1, pane_id));
+        assert!(state.drain_due_agent_notifications(deadline).is_empty());
+        assert!(state.toast.is_none());
+    }
+
+    #[test]
     fn state_changed_idle_in_background_marks_unseen() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
@@ -3711,6 +3900,64 @@ mod tests {
         assert!(terminal.last_agent_completion_seq.is_none());
         assert!(app.workspaces[1].panes[&pane_id].seen);
         assert!(!app.pending_agent_notifications.contains_key(&pane_id));
+    }
+
+    /// A session or label change clears the old session's Done mark. A pane that stays Blocked has no
+    /// Done mark: nobody looked at the block, so it stays unread.
+    #[test]
+    fn completion_guard_session_replacement_on_a_blocked_pane_keeps_it_unread() {
+        let mut app = app_with_workspaces(&["active", "background"]);
+        app.active = Some(0);
+        app.toast_config.delay_seconds = 5;
+        let pane_id = app.workspaces[1].tabs[0].root_pane;
+        app.handle_app_event(AppEvent::AgentSessionReported {
+            pane_id,
+            source: "herdr:claude".into(),
+            agent_label: "claude".into(),
+            seq: Some(1),
+            session_ref: crate::agent_resume::AgentSessionRef::id("old-session"),
+            session_start_source: Some("startup".into()),
+        });
+        app.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Claude),
+            state: AgentState::Blocked,
+            visible_blocker: true,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+        assert!(
+            !app.workspaces[1].panes[&pane_id].seen,
+            "a block in a background tab is unread"
+        );
+        assert!(app.pending_agent_notifications.contains_key(&pane_id));
+
+        app.handle_app_event(AppEvent::AgentSessionReported {
+            pane_id,
+            source: "herdr:claude".into(),
+            agent_label: "claude".into(),
+            seq: Some(2),
+            session_ref: crate::agent_resume::AgentSessionRef::id("new-session"),
+            session_start_source: Some("clear".into()),
+        });
+
+        let terminal = &app.terminals[&app.workspaces[1].panes[&pane_id].attached_terminal_id];
+        assert_eq!(terminal.state, AgentState::Blocked);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .unwrap()
+                .session_ref
+                .value,
+            "new-session",
+            "the session did change"
+        );
+        assert!(
+            !app.workspaces[1].panes[&pane_id].seen,
+            "a session change must not mark an unread block read"
+        );
     }
 
     #[test]

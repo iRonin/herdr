@@ -93,14 +93,14 @@ pub(crate) fn render_collapsed_sidebar(
             &format!("{:<2}", index + 1),
             number_style,
         );
-        let status = workspace.agent_status;
+        let status = workspace_status(snapshot, workspace);
         put_text(
             buffer,
             rect.x.saturating_add(2),
             rect.y,
             rect.width.saturating_sub(2),
-            status_icon(status, config.status_indicators),
-            Style::default().fg(status_color(status, palette)),
+            status.icon(config.status_indicators),
+            Style::default().fg(status_color(status.status(), palette)),
         );
         hits.workspaces.push(WorkspaceHit {
             rect,
@@ -171,7 +171,7 @@ pub(crate) fn render_collapsed_sidebar(
             rect.x.saturating_add(2),
             rect.y,
             rect.width.saturating_sub(2),
-            status_icon(agent.agent_status, config.status_indicators),
+            agent_status_icon(agent, config.status_indicators),
             Style::default().fg(status_color(agent.agent_status, palette)),
         );
         hits.agents.push((rect, pane_id));
@@ -251,7 +251,8 @@ pub(crate) fn render_sidebar(
                 .map(|workspace| {
                     workspace_rows(
                         workspace,
-                        displayed_workspace_status(snapshot, workspace, state.collapsed_groups),
+                        displayed_workspace_status(snapshot, workspace, state.collapsed_groups)
+                            .status(),
                         entry.indented,
                         displayed_workspace_agent_count(
                             snapshot,
@@ -319,7 +320,7 @@ pub(crate) fn render_sidebar(
             displayed_workspace_agent_count(snapshot, workspace, state.collapsed_groups);
         let rows = workspace_rows(
             workspace,
-            status,
+            status.status(),
             entry.indented,
             agent_count,
             &config.spaces,
@@ -657,20 +658,66 @@ pub(in crate::client::shell) fn render_parent_group_toggle(
     Some((toggle, key))
 }
 
-pub(in crate::client::shell) fn displayed_workspace_status(
-    snapshot: &ClientShellSnapshot,
+/// A workspace aggregate whose status stays wire-compatible while its icon can
+/// reflect read state from the winning concrete agent (Blocked + read = hollow).
+#[derive(Clone, Copy)]
+pub(in crate::client::shell) struct DisplayedWorkspaceStatus<'a> {
+    status: crate::api::schema::AgentStatus,
+    agent: Option<&'a crate::protocol::ClientShellAgent>,
+}
+
+impl DisplayedWorkspaceStatus<'_> {
+    pub(in crate::client::shell) fn status(self) -> crate::api::schema::AgentStatus {
+        self.status
+    }
+
+    pub(in crate::client::shell) fn icon(
+        self,
+        indicators: crate::config::StatusIndicatorStyle,
+    ) -> &'static str {
+        self.agent.map_or_else(
+            || status_icon(self.status, indicators),
+            |agent| agent_status_icon(agent, indicators),
+        )
+    }
+
+    fn priority(self) -> u8 {
+        self.agent.map_or_else(
+            || status_priority(self.status),
+            super::agent_status_priority,
+        )
+    }
+}
+
+pub(in crate::client::shell) fn workspace_status<'a>(
+    snapshot: &'a ClientShellSnapshot,
+    workspace: &ClientShellWorkspace,
+) -> DisplayedWorkspaceStatus<'a> {
+    let agent = snapshot
+        .agents
+        .iter()
+        .filter(|agent| agent.workspace_id == workspace.workspace_id)
+        .max_by_key(|agent| super::agent_status_priority(agent));
+    DisplayedWorkspaceStatus {
+        status: agent.map_or(workspace.agent_status, |agent| agent.agent_status),
+        agent,
+    }
+}
+
+pub(in crate::client::shell) fn displayed_workspace_status<'a>(
+    snapshot: &'a ClientShellSnapshot,
     workspace: &ClientShellWorkspace,
     collapsed_groups: &HashSet<String>,
-) -> crate::api::schema::AgentStatus {
+) -> DisplayedWorkspaceStatus<'a> {
     let Some(worktree) = workspace
         .worktree
         .as_ref()
         .filter(|worktree| !worktree.is_linked_worktree)
     else {
-        return workspace.agent_status;
+        return workspace_status(snapshot, workspace);
     };
     if !collapsed_groups.contains(&worktree.key) {
-        return workspace.agent_status;
+        return workspace_status(snapshot, workspace);
     }
     snapshot
         .workspaces
@@ -682,9 +729,9 @@ pub(in crate::client::shell) fn displayed_workspace_status(
                         || candidate.workspace_id == workspace.workspace_id)
             })
         })
-        .map(|candidate| candidate.agent_status)
-        .max_by_key(|status| status_priority(*status))
-        .unwrap_or(workspace.agent_status)
+        .map(|candidate| workspace_status(snapshot, candidate))
+        .max_by_key(|status| status.priority())
+        .unwrap_or_else(|| workspace_status(snapshot, workspace))
 }
 
 /// Agent count a space row should show. A collapsed worktree-group parent stands in for its whole
@@ -752,7 +799,7 @@ pub(in crate::client::shell) fn workspace_rows(
 pub(in crate::client::shell) fn render_workspace_rows(
     buffer: &mut Buffer,
     area: Rect,
-    status: crate::api::schema::AgentStatus,
+    status: DisplayedWorkspaceStatus<'_>,
     indicators: crate::config::StatusIndicatorStyle,
     entry: &WorkspaceEntry,
     rows: Vec<Vec<crate::ui::ResolvedToken>>,
@@ -813,10 +860,10 @@ pub(in crate::client::shell) fn render_workspace_rows(
         let spans = crate::ui::resolved_token_spans(
             row,
             (
-                status_icon(status, indicators),
-                Style::default().fg(status_color(status, palette)),
+                status.icon(indicators),
+                Style::default().fg(status_color(status.status(), palette)),
             ),
-            Style::default().fg(status_color(status, palette)),
+            Style::default().fg(status_color(status.status(), palette)),
             workspace_style,
             secondary_style,
             Style::default().fg(palette.overlay1),

@@ -395,6 +395,38 @@ mod tests {
         }
     }
 
+    /// The client evaluator must agree
+    /// (`client::shell::tests::endpoints::seen_agent_view_lists_an_unread_blocked_agent_and_not_a_read_one`):
+    /// an unread block is unseen, a read block is seen.
+    #[test]
+    fn seen_filter_lists_an_unread_block_and_not_a_read_one() {
+        let mut state = state_with_agents();
+        for (ws_idx, seen) in [(0, false), (1, true)] {
+            let pane_id = state.workspaces[ws_idx].tabs[0].root_pane;
+            let terminal_id = state.workspaces[ws_idx].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            state.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Blocked;
+            state.workspaces[ws_idx]
+                .pane_state_mut(pane_id)
+                .unwrap()
+                .seen = seen;
+        }
+        state.agent_view_override = Some(AgentViewSetParams {
+            source: "example.views".to_string(),
+            label: None,
+            filter: Some(AgentViewFilter::Eq {
+                field: AgentViewField::Builtin(AgentViewBuiltinField::Seen),
+                value: AgentViewValue::Bool(false),
+            }),
+            sort: Vec::new(),
+        });
+
+        let entries = projected_entries(&state);
+        assert_eq!(entries.len(), 1, "only the unread block is unseen");
+        assert_eq!(entries[0].ws_idx, 0);
+    }
+
     #[test]
     fn current_workspace_filter_tracks_presented_workspace() {
         let mut state = state_with_agents();
