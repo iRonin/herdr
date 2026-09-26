@@ -146,6 +146,97 @@ fn a_refused_worktree_group_move_surfaces_as_a_notice_not_the_close_overlay() {
     );
 }
 
+/// Composition with group A (ui.tab_agent_status): a marked tab is two cells
+/// wider, so every hit rect after it shifts. A drag from a MARKED tab on a
+/// wrapped lower row must still arm and dispatch the move — the rects the
+/// drag hit-tests are the renderer's, so this fails if either feature's
+/// layout math drifts from the other's. The width assertion is the vacuity
+/// guard: without it the agent could be absent and the test would pass on an
+/// unmarked tab, proving nothing about the composition.
+#[test]
+fn a_status_marked_tab_on_a_wrapped_row_still_moves() {
+    // Two passes: first compose to learn which tab lands on a lower row,
+    // then attach a working agent to THAT tab and recompose.
+    let mut probe = drag_state(9, true, true);
+    probe.compose(80, 20).expect("wrapped probe frame");
+    let top_row = probe
+        .hits
+        .tabs
+        .first()
+        .map(|(rect, _)| rect.y)
+        .expect("at least one tab");
+    let (_, marked_id) = probe
+        .hits
+        .tabs
+        .iter()
+        .find(|(rect, _)| rect.y > top_row)
+        .cloned()
+        .expect("a tab on a wrapped lower row");
+    drop(probe);
+
+    let mut snapshot = two_workspace_snapshot(9);
+    snapshot.agents.push(ClientShellAgent {
+        pane_id: "pane_1".into(),
+        workspace_id: "ws_1".into(),
+        tab_id: marked_id.clone(),
+        name: Some("cli".into()),
+        display_agent: None,
+        agent: Some("claude".into()),
+        title: None,
+        terminal_title: None,
+        terminal_title_stripped: None,
+        agent_status: AgentStatus::Working,
+        state_change_seq: 0,
+        state_labels: Vec::new(),
+        tokens: Vec::new(),
+        focused: false,
+    });
+
+    let build = |marks_on: bool| {
+        let mut config = ClientShellConfig::from_config(&Config::default());
+        config.tab_drag_move_workspace = true;
+        config.tab_bar_wrap = true;
+        config.tab_agent_status = marks_on;
+        let mut state = ClientShellState::new(config);
+        state.set_snapshot(Box::new(snapshot.clone()));
+        state.set_pane_surface(surface());
+        state
+            .compose(80, 20)
+            .expect("wrapped bar with a marked tab");
+        state
+    };
+
+    let mut marked = build(true);
+    let source = marked
+        .hits
+        .tabs
+        .iter()
+        .find(|(_, tab_id)| tab_id == &marked_id)
+        .map(|(rect, _)| *rect)
+        .expect("the marked tab still has a hit rect");
+    let unmarked = build(false);
+    let unmarked_source = unmarked
+        .hits
+        .tabs
+        .iter()
+        .find(|(_, tab_id)| tab_id == &marked_id)
+        .map(|(rect, _)| *rect)
+        .expect("the tab without its mark still has a hit rect");
+    assert!(
+        source.width > unmarked_source.width,
+        "vacuity guard: the mark must actually widen the dragged tab's hit rect"
+    );
+
+    let entry = workspace_entry(&marked, "ws_2");
+    let release = drag_tab_onto_entry(&mut marked, source, entry);
+
+    assert_eq!(
+        moved_tab_target(&release),
+        Some((marked_id, "ws_2".into())),
+        "a marked tab on a wrapped row must still move to the hovered workspace"
+    );
+}
+
 /// The whole feature: press a tab, drag it onto another workspace's sidebar
 /// entry, release — the tab moves to that workspace without taking focus.
 /// Asserts the mid-drag state too, because the drag must arm a *move*, not a
