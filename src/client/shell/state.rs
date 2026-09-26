@@ -20,6 +20,7 @@ pub(crate) struct ClientShellConfig {
     pub(super) sidebar_collapsed_mode: SidebarCollapsedModeConfig,
     pub(super) mobile_width_threshold: u16,
     pub(super) tab_bar_position: TabBarPositionConfig,
+    pub(super) tab_bar_wrap: bool,
     pub(super) hide_tab_bar_when_single_tab: bool,
     pub(super) spaces: SpacesSidebarConfig,
     pub(super) agents: crate::config::AgentsSidebarConfig,
@@ -1185,6 +1186,7 @@ impl ClientShellState {
             self.sidebar_collapsed,
             self.focused_tab_count(),
             self.sidebar_width,
+            self.snapshot.as_deref(),
         )
     }
 

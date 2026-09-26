@@ -120,6 +120,7 @@ impl ClientShellConfig {
             sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
             mobile_width_threshold: config.ui.mobile_width_threshold,
             tab_bar_position: config.ui.tab_bar_position,
+            tab_bar_wrap: config.ui.tab_bar_wrap,
             hide_tab_bar_when_single_tab: config.ui.hide_tab_bar_when_single_tab,
             spaces: config.ui.sidebar.spaces.clone(),
             agents: config.ui.sidebar.agents.clone(),
@@ -322,6 +323,7 @@ impl ClientShellConfig {
                 self.sidebar_collapsed_mode = ui.sidebar_collapsed_mode;
                 self.mobile_width_threshold = ui.mobile_width_threshold;
                 self.tab_bar_position = ui.tab_bar_position;
+                self.tab_bar_wrap = ui.tab_bar_wrap;
                 self.hide_tab_bar_when_single_tab = ui.hide_tab_bar_when_single_tab;
                 self.spaces = ui.sidebar.spaces.clone();
                 self.agents = ui.sidebar.agents.clone();
@@ -364,6 +366,7 @@ impl ClientShellConfig {
         sidebar_collapsed: bool,
         tab_count: usize,
         sidebar_width: u16,
+        snapshot: Option<&ClientShellSnapshot>,
     ) -> ClientShellLayout {
         if cols <= self.mobile_width_threshold {
             let header_height = rows.min(2);
@@ -391,7 +394,22 @@ impl ClientShellConfig {
         .min(cols.saturating_sub(1));
         let main = Rect::new(sidebar_width, 0, cols.saturating_sub(sidebar_width), rows);
         let show_tab_bar = rows > 1 && !(self.hide_tab_bar_when_single_tab && tab_count == 1);
-        let tab_height = u16::from(show_tab_bar);
+        // Height and placement are independent axes: `tab_bar_wrap` decides how many rows the bar
+        // needs, `tab_bar_position` decides which end of the main area it occupies. With wrap off
+        // the height stays 1, so both branches below reduce to upstream's exact geometry.
+        let tab_height = if !show_tab_bar {
+            0
+        } else if self.tab_bar_wrap {
+            snapshot
+                .map(|snapshot| {
+                    super::render::wrapped_tab_bar_rows(snapshot, main.width, self.mouse_capture)
+                })
+                .unwrap_or(1)
+                // Keep at least half of the height available to panes.
+                .clamp(1, (rows / 2).max(1))
+        } else {
+            1
+        };
         let (tab_bar, pane_surface) = match self.tab_bar_position {
             TabBarPositionConfig::Top => (
                 Rect::new(main.x, 0, main.width, tab_height),
@@ -435,7 +453,7 @@ impl ClientShellConfig {
             .unwrap_or(self.sidebar_width)
             .clamp(min_width, max_width);
         let surface = self
-            .layout(cols, rows, sidebar_collapsed, 0, sidebar_width)
+            .layout(cols, rows, sidebar_collapsed, 0, sidebar_width, None)
             .pane_surface;
         ClientSurfaceSize {
             cols: surface.width.max(1),

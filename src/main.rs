@@ -319,6 +319,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Desktop tab row placement: "top" or "bottom".
 # tab_bar_position = "top"
 
+# Wrap tabs onto multiple rows instead of using a single scrollable row.
+# The wrapped bar uses at most half of the available height.
+# tab_bar_wrap = false
+
 # Ordered status entries at the right edge of the desktop tab bar.
 # Supported types: zoom, hostname, datetime, text, and command.
 # Hostname, datetime, and command entries resolve on the Herdr server.

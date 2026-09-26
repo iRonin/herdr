@@ -16,18 +16,16 @@ pub(crate) fn render_tab_bar(
 ) {
     let palette = &config.palette;
     buffer.set_style(area, Style::default().bg(palette.panel_bg));
-    let tabs = snapshot
-        .tabs
-        .iter()
-        .filter(|tab| Some(tab.workspace_id.as_str()) == snapshot.focused_workspace_id.as_deref())
-        .collect::<Vec<_>>();
-    let desired_widths = tabs
-        .iter()
-        .map(|tab| {
-            let label = tab_label(tab);
-            display_width(&label).saturating_add(4).max(MIN_TAB_WIDTH)
-        })
-        .collect::<Vec<_>>();
+    let tabs = focused_tabs(snapshot);
+    if config.tab_bar_wrap {
+        *tab_scroll = 0;
+        *reveal_focused_tab = false;
+        render_wrapped_tabs(buffer, area, snapshot, config, &tabs, hits);
+        render_tab_drop_indicator(buffer, area, palette, &tabs, tab_drag_insert_index, hits);
+        render_tab_bar_status(buffer, area, snapshot, palette);
+        return;
+    }
+    let desired_widths = tab_desired_widths(&tabs);
     let content = tab_bar_content_area(snapshot, area);
     let mouse_chrome = config.mouse_capture;
     let new_tab_width = if mouse_chrome { NEW_TAB_WIDTH } else { 0 };
@@ -100,29 +98,7 @@ pub(crate) fn render_tab_bar(
             break;
         }
         let rect = Rect::new(x, area.y, width, 1);
-        let style = if tab.focused {
-            let base = Style::default()
-                .fg(panel_contrast_fg(palette))
-                .bg(palette.accent);
-            if tab.custom_label {
-                base.add_modifier(Modifier::BOLD)
-            } else {
-                base
-            }
-        } else if tab.custom_label {
-            Style::default().fg(palette.overlay1).bg(palette.surface0)
-        } else {
-            Style::default().fg(palette.overlay0).bg(palette.surface0)
-        };
-        let padding = width.saturating_sub(display_width(&name));
-        let left = padding / 2;
-        let text = format!(
-            "{empty:left$}{name}{empty:right_padding$}",
-            empty = "",
-            left = left as usize,
-            right_padding = padding.saturating_sub(left) as usize,
-        );
-        put_text(buffer, rect.x, rect.y, rect.width, &text, style);
+        put_tab(buffer, rect, &name, tab, palette);
         hits.tabs.push((rect, tab.tab_id.clone()));
         first_visible.get_or_insert(index);
         last_visible = Some(index);
@@ -208,19 +184,189 @@ pub(crate) fn render_tab_bar(
         );
     }
 
-    if let Some(insert_index) = tab_drag_insert_index {
-        if let Some(indicator_x) = tab_drop_indicator_x(hits, &tabs, insert_index) {
-            put_text(
-                buffer,
-                indicator_x.min(content.right().saturating_sub(1)),
-                area.y,
-                1,
-                "│",
-                Style::default().fg(palette.accent),
-            );
+    render_tab_drop_indicator(buffer, area, palette, &tabs, tab_drag_insert_index, hits);
+    render_tab_bar_status(buffer, area, snapshot, palette);
+}
+
+fn focused_tabs(snapshot: &ClientShellSnapshot) -> Vec<&ClientShellTab> {
+    snapshot
+        .tabs
+        .iter()
+        .filter(|tab| Some(tab.workspace_id.as_str()) == snapshot.focused_workspace_id.as_deref())
+        .collect()
+}
+
+fn tab_desired_widths(tabs: &[&ClientShellTab]) -> Vec<u16> {
+    tabs.iter()
+        .map(|tab| {
+            let label = tab_label(tab);
+            display_width(&label).saturating_add(4).max(MIN_TAB_WIDTH)
+        })
+        .collect()
+}
+
+fn put_tab(buffer: &mut Buffer, rect: Rect, name: &str, tab: &ClientShellTab, palette: &Palette) {
+    let style = if tab.focused {
+        let base = Style::default()
+            .fg(panel_contrast_fg(palette))
+            .bg(palette.accent);
+        if tab.custom_label {
+            base.add_modifier(Modifier::BOLD)
+        } else {
+            base
+        }
+    } else if tab.custom_label {
+        Style::default().fg(palette.overlay1).bg(palette.surface0)
+    } else {
+        Style::default().fg(palette.overlay0).bg(palette.surface0)
+    };
+    let padding = rect.width.saturating_sub(display_width(name));
+    let left = padding / 2;
+    let text = format!(
+        "{empty:left$}{name}{empty:right_padding$}",
+        empty = "",
+        left = left as usize,
+        right_padding = padding.saturating_sub(left) as usize,
+    );
+    put_text(buffer, rect.x, rect.y, rect.width, &text, style);
+}
+
+/// Flow `item_widths` left to right with a one-column gap between items, wrapping to a new row when
+/// the next item would overflow `width`. Returns `(x, row, clamped_width)` per item, where `row` is
+/// zero-based and `x` is relative to the left edge. The first item on a row never wraps; an item
+/// wider than `width` is clamped to it. `width` must be non-zero.
+fn wrap_flow(item_widths: impl Iterator<Item = u16>, width: u16) -> Vec<(u16, u16, u16)> {
+    let mut flow = Vec::new();
+    let mut x = 0u16;
+    let mut row = 0u16;
+    for item in item_widths {
+        let item = item.min(width).max(1);
+        if x > 0 && x.saturating_add(item) > width {
+            row = row.saturating_add(1);
+            x = 0;
+        }
+        flow.push((x, row, item));
+        x = x.saturating_add(item.saturating_add(1));
+    }
+    flow
+}
+
+/// Rows a wrapped tab bar needs to show every tab of the focused workspace at `width`. Includes the
+/// trailing new-tab (`+`) control when `mouse_chrome` is set, so the height reserved by the layout
+/// matches the rows [`render_wrapped_tabs`] lays out at the same width.
+pub(crate) fn wrapped_tab_bar_rows(
+    snapshot: &ClientShellSnapshot,
+    width: u16,
+    mouse_chrome: bool,
+) -> u16 {
+    let content = tab_bar_content_area(snapshot, Rect::new(0, 0, width, 1));
+    let tabs = focused_tabs(snapshot);
+    if content.width == 0 || tabs.is_empty() {
+        return 1;
+    }
+    let widths = tab_desired_widths(&tabs)
+        .into_iter()
+        .chain(mouse_chrome.then_some(NEW_TAB_WIDTH));
+    wrap_flow(widths, content.width)
+        .last()
+        .map(|(_, row, _)| row.saturating_add(1))
+        .unwrap_or(1)
+}
+
+/// Lay every tab of the focused workspace across the rows of `area`, wrapping instead of scrolling,
+/// so there are no `<`/`>` controls and no overflow ellipses. Each tab's hit rect carries its own
+/// row, which is all the row-aware hit testing in `mouse.rs` needs.
+///
+/// When the flow needs more rows than `area.height` allows — only possible once the bar height is
+/// clamped, e.g. very many tabs in a short terminal — the visible rows are scrolled so the focused
+/// tab's row stays in view. Tabs outside that window get no hit rect; selecting one by keyboard
+/// re-anchors the window on its row.
+fn render_wrapped_tabs(
+    buffer: &mut Buffer,
+    area: Rect,
+    snapshot: &ClientShellSnapshot,
+    config: &ClientShellConfig,
+    tabs: &[&ClientShellTab],
+    hits: &mut ShellHitMap,
+) {
+    let content = tab_bar_content_area(snapshot, area);
+    if content.width == 0 || area.height == 0 {
+        return;
+    }
+    let palette = &config.palette;
+    let mouse_chrome = config.mouse_capture;
+    let widths = tab_desired_widths(tabs)
+        .into_iter()
+        .chain(mouse_chrome.then_some(NEW_TAB_WIDTH));
+    let flow = wrap_flow(widths, content.width);
+    let total_rows = flow
+        .last()
+        .map(|(_, row, _)| row.saturating_add(1))
+        .unwrap_or(0);
+    let row_offset = if total_rows > area.height {
+        let focused_row = tabs
+            .iter()
+            .position(|tab| tab.focused)
+            .and_then(|index| flow.get(index))
+            .map(|(_, row, _)| *row)
+            .unwrap_or(0);
+        focused_row
+            .saturating_sub(area.height / 2)
+            .min(total_rows.saturating_sub(area.height))
+    } else {
+        0
+    };
+
+    for (item, (x, row, width)) in flow.into_iter().enumerate() {
+        let Some(offset_row) = row.checked_sub(row_offset) else {
+            continue;
+        };
+        if offset_row >= area.height {
+            continue;
+        }
+        let rect = Rect::new(content.x.saturating_add(x), area.y + offset_row, width, 1);
+        match tabs.get(item) {
+            Some(tab) => {
+                put_tab(buffer, rect, &tab_label(tab), tab, palette);
+                hits.tabs.push((rect, tab.tab_id.clone()));
+            }
+            None => {
+                hits.new_tab = rect;
+                put_text(
+                    buffer,
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    " + ",
+                    Style::default().fg(palette.overlay1).bg(palette.panel_bg),
+                );
+            }
         }
     }
-    render_tab_bar_status(buffer, area, snapshot, palette);
+}
+
+fn render_tab_drop_indicator(
+    buffer: &mut Buffer,
+    area: Rect,
+    palette: &Palette,
+    tabs: &[&ClientShellTab],
+    tab_drag_insert_index: Option<usize>,
+    hits: &ShellHitMap,
+) {
+    let Some(insert_index) = tab_drag_insert_index else {
+        return;
+    };
+    let Some((x, y)) = tab_drop_indicator_position(hits, tabs, insert_index) else {
+        return;
+    };
+    put_text(
+        buffer,
+        x.min(area.right().saturating_sub(1)),
+        y.min(area.bottom().saturating_sub(1)),
+        1,
+        "│",
+        Style::default().fg(palette.accent),
+    );
 }
 
 pub(crate) fn tab_bar_status_width(snapshot: &ClientShellSnapshot) -> u16 {
@@ -291,11 +437,14 @@ fn render_tab_bar_status(
     }
 }
 
-fn tab_drop_indicator_x(
+/// Cell the tab-reorder drop indicator belongs in, as `(x, y)`. The row matters because a wrapped
+/// bar spans several of them; on a single-row bar every candidate rect shares `area.y`, so this
+/// reduces to the horizontal-only placement.
+fn tab_drop_indicator_position(
     hits: &ShellHitMap,
     tabs: &[&ClientShellTab],
     insert_index: usize,
-) -> Option<u16> {
+) -> Option<(u16, u16)> {
     let visible = hits
         .tabs
         .iter()
@@ -309,19 +458,22 @@ fn tab_drop_indicator_x(
     let (last_index, last_rect) = *visible.last()?;
     if insert_index == 0 {
         return Some(if first_index == 0 {
-            first_rect.x
+            (first_rect.x, first_rect.y)
         } else {
-            hits.tab_scroll_left.right()
+            (hits.tab_scroll_left.right(), hits.tab_scroll_left.y)
         });
     }
     if let Some((_, rect)) = visible.iter().find(|(index, _)| *index == insert_index) {
-        return Some(rect.x.saturating_sub(1));
+        return Some((rect.x.saturating_sub(1), rect.y));
     }
     if insert_index >= tabs.len() {
         return Some(if last_index + 1 >= tabs.len() {
-            last_rect.right()
+            (last_rect.right(), last_rect.y)
         } else {
-            hits.tab_scroll_right.x.saturating_sub(1)
+            (
+                hits.tab_scroll_right.x.saturating_sub(1),
+                hits.tab_scroll_right.y,
+            )
         });
     }
     None
