@@ -1056,6 +1056,10 @@ impl ClientShellState {
             }
             Some(ClientMobileTarget::NewTab) => {
                 self.mobile_switcher_suspended = true;
+                // Same inversion as the desktop new-tab button.
+                self.invert_new_tab_prompt = mouse
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::ALT);
                 self.record_binding(
                     crate::input::KeybindMatch::Action(crate::input::KeybindAction::NewTab),
                     outcome,

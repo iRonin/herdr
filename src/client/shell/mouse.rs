@@ -1998,6 +1998,11 @@ impl ClientShellState {
                     return;
                 }
                 if super::contains(self.hits.new_tab, point) {
+                    // Alt-click inverts ui.prompt_new_tab_name for this one tab: prompt when the
+                    // setting says don't, skip the prompt when it says do.
+                    self.invert_new_tab_prompt = mouse
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::ALT);
                     self.record_binding(
                         crate::input::KeybindMatch::Action(crate::input::KeybindAction::NewTab),
                         outcome,
