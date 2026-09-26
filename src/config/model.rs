@@ -1120,6 +1120,9 @@ pub struct UiConfig {
     pub tab_bar_wrap: bool,
     /// Show the highest-attention agent status on each top tab. Default: false.
     pub tab_agent_status: bool,
+    /// Show the highest-attention agent pane's context percentage and lifecycle marker
+    /// on each top tab. Default: false.
+    pub tab_agent_context: bool,
     /// Ordered entries shown at the right edge of the desktop tab row. Empty by default.
     pub tab_bar_right: Vec<TabBarRightEntryConfig>,
     /// Text inserted between visible right-side tab bar entries. Default: one space.
@@ -1356,6 +1359,7 @@ impl Default for UiConfig {
             tab_bar_position: TabBarPositionConfig::Top,
             tab_bar_wrap: false,
             tab_agent_status: false,
+            tab_agent_context: false,
             tab_bar_right: Vec::new(),
             tab_bar_right_separator: " ".into(),
             window_title: super::window_title::default_window_title(),
@@ -1854,6 +1858,19 @@ tab_agent_status = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.ui.tab_agent_status);
+    }
+
+    #[test]
+    fn tab_agent_context_defaults_off_and_parses() {
+        let default_config = Config::default();
+        assert!(!default_config.ui.tab_agent_context);
+
+        let toml = r#"
+[ui]
+tab_agent_context = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.ui.tab_agent_context);
     }
 
     #[test]
