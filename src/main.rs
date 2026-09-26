@@ -386,12 +386,13 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 
 # Expanded space rows. Built-ins are state_icon, state_text, workspace, branch, git_status,
 # and agent_count (live agent panes in the space; a collapsed group's parent sums its members).
+# agent_count is opt-in: it is not in the default rows below, so add it to rows to show it.
 # Custom values reported through workspace metadata use a $name token, for example $jj_status.
 # Inline token styles accept strict #RGB/#RRGGBB foregrounds plus bold and dim booleans.
 # [ui.sidebar.spaces]
 # Blank rows between space entries. Set to 1 to restore the previous spacing.
 # row_gap = 0
-# rows = [["state_icon", "workspace"], ["agent_count", "branch", "git_status"]]
+# rows = [["state_icon", "workspace"], ["branch", "git_status"]]
 
 # Background notification popup delivery
 [ui.toast]
