@@ -201,3 +201,63 @@ fn a_space_layout_without_the_token_renders_no_count() {
         sidebar_text(&frame)
     );
 }
+
+/// The machines sidebar (drawn once a saved SSH machine exists) aggregates a collapsed group's
+/// status over its hidden members as of v0.9.1 (#3781). The count has to aggregate the same
+/// members, or a collapsed row can read "blocked" beside a count that ignores the blocked member.
+#[test]
+fn a_collapsed_group_on_a_saved_machine_sums_the_agent_counts_of_its_members() {
+    use crate::client::endpoint::{
+        ClientEndpointId, ClientEndpointStatus, ProfileId, SavedSshEndpoint,
+    };
+
+    let profile = SavedSshEndpoint {
+        id: ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+        label: "Build".into(),
+        target: "dev@build.example".into(),
+        session: "agents".into(),
+        enabled: true,
+    };
+    let endpoint_id = ClientEndpointId::Ssh(profile.id.clone());
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_endpoint_catalog(&[profile]);
+    state.set_endpoint_status(&endpoint_id, ClientEndpointStatus::Online);
+    // Local carries a count no remote row can produce, so every badge on screen is attributable.
+    let mut local = snapshot();
+    local.workspaces[0].agent_count = 7;
+    state.set_snapshot(Box::new(local));
+    state.set_pane_surface(surface());
+    let mut remote = grouped_snapshot(2, 3);
+    remote.boot_id = "remote-boot".into();
+    state.set_endpoint_snapshot(&endpoint_id, Box::new(remote));
+
+    let expanded = state.compose(106, 28).expect("expanded remote group");
+    let badges = agent_badges(&expanded);
+    assert!(
+        badges.contains(&2) && badges.contains(&3) && !badges.contains(&5),
+        "expanded remote rows each show their own count: {badges:?} {:?}",
+        sidebar_text(&expanded)
+    );
+
+    state
+        .remote_collapsed_groups
+        .entry(endpoint_id.clone())
+        .or_default()
+        .insert("repo".into());
+    let mut collapsed_remote = grouped_snapshot(2, 3);
+    collapsed_remote.boot_id = "remote-boot".into();
+    collapsed_remote.revision = 2;
+    state.set_endpoint_snapshot(&endpoint_id, Box::new(collapsed_remote));
+
+    let collapsed = state.compose(106, 28).expect("collapsed remote group");
+    let badges = agent_badges(&collapsed);
+    assert!(
+        badges.contains(&5),
+        "the collapsed remote parent totals its group (2 + 3): {badges:?} {:?}",
+        sidebar_text(&collapsed)
+    );
+    assert!(
+        !badges.contains(&2) && !badges.contains(&3),
+        "neither the parent's own count nor the hidden member's shows once collapsed: {badges:?}"
+    );
+}
