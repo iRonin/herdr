@@ -2085,7 +2085,7 @@ impl ClientShellState {
                 if self.config.tab_close_button
                     && mouse
                         .modifiers
-                        .contains(crossterm::event::KeyModifiers::ALT)
+                        .contains(self.config.tab_close_button_modifier)
                 {
                     if let Some(tab_id) = self.tab_close_marker_at(point) {
                         self.push_endpoint_method(

@@ -169,6 +169,55 @@ impl<'de> Deserialize<'de> for RightClickPassthroughModifierConfig {
     }
 }
 
+/// Modifier(s) that arm the `ui.tab_close_button` close marker. Terminal mouse reporting encodes
+/// only shift/alt/ctrl, so cmd/super/meta/hyper are rejected: they can never reach Herdr in a
+/// mouse event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabCloseButtonModifierConfig(KeyModifiers);
+
+impl TabCloseButtonModifierConfig {
+    pub fn modifiers(self) -> KeyModifiers {
+        self.0
+    }
+}
+
+impl Default for TabCloseButtonModifierConfig {
+    fn default() -> Self {
+        Self(KeyModifiers::ALT)
+    }
+}
+
+impl<'de> Deserialize<'de> for TabCloseButtonModifierConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        parse_tab_close_button_modifier(&value)
+            .map(Self)
+            .ok_or_else(|| {
+                de::Error::custom(
+                    "tab_close_button_modifier must be alt/option, ctrl/control, shift, or a + separated combination of them (mouse reporting cannot encode cmd/super/meta/hyper)",
+                )
+            })
+    }
+}
+
+fn parse_tab_close_button_modifier(value: &str) -> Option<KeyModifiers> {
+    let mut modifiers = KeyModifiers::empty();
+    for token in value.trim().split('+') {
+        let modifier = match token.trim().to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => KeyModifiers::CONTROL,
+            "alt" | "option" => KeyModifiers::ALT,
+            "shift" => KeyModifiers::SHIFT,
+            _ => return None,
+        };
+        modifiers |= modifier;
+    }
+
+    (!modifiers.is_empty()).then_some(modifiers)
+}
+
 fn parse_right_click_passthrough_modifier(value: &str) -> Option<Option<KeyModifiers>> {
     let trimmed = value.trim();
     if trimmed.is_empty()
@@ -981,6 +1030,8 @@ pub struct UiConfig {
     pub prompt_new_tab_name: bool,
     /// Show an `x` in the last cell of each tab label; Alt-click it to close the tab. Default: false.
     pub tab_close_button: bool,
+    /// Modifier that arms the `ui.tab_close_button` close marker. Default: "alt".
+    pub tab_close_button_modifier: TabCloseButtonModifierConfig,
     /// Ask for a workspace name before interactive creation. Default: false.
     pub prompt_new_workspace_name: bool,
     /// Draw borders around split panes. auto draws them only for split panes,
@@ -1228,6 +1279,7 @@ impl Default for UiConfig {
             confirm_close: true,
             prompt_new_tab_name: true,
             tab_close_button: false,
+            tab_close_button_modifier: TabCloseButtonModifierConfig::default(),
             prompt_new_workspace_name: false,
             pane_borders: PaneBordersConfig::Auto,
             pane_outer_borders: true,
@@ -1681,6 +1733,35 @@ tab_close_button = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.ui.tab_close_button);
+    }
+
+    #[test]
+    fn tab_close_button_modifier_defaults_to_alt_and_parses_combinations() {
+        use crossterm::event::KeyModifiers;
+
+        assert_eq!(
+            Config::default().ui.tab_close_button_modifier.modifiers(),
+            KeyModifiers::ALT,
+            "the default reproduces the hardcoded modifier this key replaced"
+        );
+
+        let modifier = |value: &str| {
+            toml::from_str::<Config>(&format!("[ui]\ntab_close_button_modifier = \"{value}\"\n"))
+                .map(|config| config.ui.tab_close_button_modifier.modifiers())
+        };
+        assert_eq!(modifier("option").unwrap(), KeyModifiers::ALT);
+        assert_eq!(modifier("CONTROL").unwrap(), KeyModifiers::CONTROL);
+        assert_eq!(modifier("shift").unwrap(), KeyModifiers::SHIFT);
+        assert_eq!(
+            modifier("ctrl + shift").unwrap(),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        );
+
+        // Mouse reporting cannot encode these, so accepting them would configure a gesture that
+        // can never fire. They must fail at parse time, where the user sees it.
+        for rejected in ["cmd", "command", "super", "meta", "hyper", "", "ctrl+cmd"] {
+            assert!(modifier(rejected).is_err(), "{rejected:?} must be rejected");
+        }
     }
 
     #[test]
