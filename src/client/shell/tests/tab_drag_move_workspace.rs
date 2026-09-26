@@ -100,6 +100,52 @@ fn moved_tab_target(outcome: &ClientShellInput) -> Option<(String, String)> {
     })
 }
 
+/// The server refuses a move that would close a worktree group with
+/// `confirmation_required`. The generic handling for that code opens the
+/// confirm-close overlay — whose confirm button CLOSES the group, which is not
+/// the action being confirmed — so for tab.move_to_workspace the refusal must
+/// surface as a visible notice instead, and no overlay may open.
+#[test]
+fn a_refused_worktree_group_move_surfaces_as_a_notice_not_the_close_overlay() {
+    let mut state = drag_state(3, true, false);
+    let source = state.hits.tabs[0].0;
+    let entry = workspace_entry(&state, "ws_2");
+
+    let release = drag_tab_onto_entry(&mut state, source, entry);
+    let [ClientShellAction::Endpoint { request, .. }] = &release.actions[..] else {
+        panic!("the drag must send exactly one request");
+    };
+    assert!(matches!(
+        &request.method,
+        crate::api::schema::Method::TabMoveToWorkspace(_)
+    ));
+    let request_id = request.id.clone();
+
+    let (repaint, actions) = state.handle_endpoint_result(
+        "boot-1",
+        &request_id,
+        Err(ClientShellEndpointError {
+            code: Some("confirmation_required".into()),
+            message: "moving this tab would close a worktree group".into(),
+        }),
+    );
+
+    assert!(
+        actions.is_empty(),
+        "a refused move must not start anything else"
+    );
+    assert!(repaint, "the refusal must repaint");
+    let notice = state
+        .visible_endpoint_notice
+        .as_ref()
+        .expect("the refusal must be visible");
+    assert!(notice.body.contains("worktree group"));
+    assert!(
+        !matches!(state.overlay, Some(ClientShellOverlay::ConfirmClose(_))),
+        "the confirm-close overlay must NOT open: its confirm button closes the group"
+    );
+}
+
 /// The whole feature: press a tab, drag it onto another workspace's sidebar
 /// entry, release — the tab moves to that workspace without taking focus.
 /// Asserts the mid-drag state too, because the drag must arm a *move*, not a
