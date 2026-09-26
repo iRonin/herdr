@@ -283,6 +283,10 @@ pub(crate) fn wrapped_tab_bar_rows(
     width: u16,
     mouse_chrome: bool,
 ) -> u16 {
+    // Deliberate: `ui.tab_bar_right` renders on the first row only, but every wrapped row reserves
+    // its width, so this and `render_wrapped_tabs` flow against one identical content width and the
+    // height reserved here always equals the rows drawn. Reclaiming that space on rows 2+ would mean
+    // a per-row width, i.e. a geometry discontinuity the drop indicator and hit testing both carry.
     let content = tab_bar_content_area(snapshot, Rect::new(0, 0, width, 1));
     let tabs = focused_tabs(snapshot);
     if content.width == 0 || tabs.is_empty() {
@@ -313,6 +317,8 @@ fn render_wrapped_tabs(
     tabs: &[&ClientShellTab],
     hits: &mut ShellHitMap,
 ) {
+    // Same reserved width on every row as `wrapped_tab_bar_rows` computed the height from; see the
+    // trade recorded there.
     let content = tab_bar_content_area(snapshot, area);
     if content.width == 0 || area.height == 0 {
         return;
