@@ -98,7 +98,7 @@ pub(crate) fn render_tab_bar(
             break;
         }
         let rect = Rect::new(x, area.y, width, 1);
-        put_tab(buffer, rect, &name, tab, palette);
+        put_tab(buffer, rect, &name, tab, config);
         hits.tabs.push((rect, tab.tab_id.clone()));
         first_visible.get_or_insert(index);
         last_visible = Some(index);
@@ -205,7 +205,22 @@ fn tab_desired_widths(tabs: &[&ClientShellTab]) -> Vec<u16> {
         .collect()
 }
 
-fn put_tab(buffer: &mut Buffer, rect: Rect, name: &str, tab: &ClientShellTab, palette: &Palette) {
+/// Cell of a tab's label that carries the `ui.tab_close_button` marker, when it is on and the
+/// tab is wide enough to give a cell up. Rendering and hit testing both derive the cell from here,
+/// so they cannot drift apart.
+fn tab_close_marker_x(rect: Rect, config: &ClientShellConfig) -> Option<u16> {
+    (config.tab_close_button && config.mouse_capture && rect.width >= 2)
+        .then(|| rect.right().saturating_sub(1))
+}
+
+fn put_tab(
+    buffer: &mut Buffer,
+    rect: Rect,
+    name: &str,
+    tab: &ClientShellTab,
+    config: &ClientShellConfig,
+) {
+    let palette = &config.palette;
     let style = if tab.focused {
         let base = Style::default()
             .fg(panel_contrast_fg(palette))
@@ -220,7 +235,13 @@ fn put_tab(buffer: &mut Buffer, rect: Rect, name: &str, tab: &ClientShellTab, pa
     } else {
         Style::default().fg(palette.overlay0).bg(palette.surface0)
     };
-    let padding = rect.width.saturating_sub(display_width(name));
+    // The close marker takes the label's last cell, so the name centres in what is left.
+    let close_marker = tab_close_marker_x(rect, config);
+    let label_width = match close_marker {
+        Some(_) => rect.width.saturating_sub(1),
+        None => rect.width,
+    };
+    let padding = label_width.saturating_sub(display_width(name));
     let left = padding / 2;
     let text = format!(
         "{empty:left$}{name}{empty:right_padding$}",
@@ -228,7 +249,10 @@ fn put_tab(buffer: &mut Buffer, rect: Rect, name: &str, tab: &ClientShellTab, pa
         left = left as usize,
         right_padding = padding.saturating_sub(left) as usize,
     );
-    put_text(buffer, rect.x, rect.y, rect.width, &text, style);
+    put_text(buffer, rect.x, rect.y, label_width, &text, style);
+    if let Some(x) = close_marker {
+        put_text(buffer, x, rect.y, 1, "x", style);
+    }
 }
 
 /// Flow `item_widths` left to right with a one-column gap between items, wrapping to a new row when
@@ -333,7 +357,7 @@ fn render_wrapped_tabs(
         let rect = Rect::new(content.x.saturating_add(x), area.y + offset_row, width, 1);
         match tabs.get(item) {
             Some(tab) => {
-                put_tab(buffer, rect, &tab_label(tab), tab, palette);
+                put_tab(buffer, rect, &tab_label(tab), tab, config);
                 hits.tabs.push((rect, tab.tab_id.clone()));
             }
             None => {
