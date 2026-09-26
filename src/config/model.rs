@@ -999,6 +999,8 @@ pub struct UiConfig {
     pub hide_tab_bar_when_single_tab: bool,
     /// Desktop tab row placement. Default: top.
     pub tab_bar_position: TabBarPositionConfig,
+    /// Wrap tabs onto multiple rows instead of using a single scrollable row. Default: false.
+    pub tab_bar_wrap: bool,
     /// Ordered entries shown at the right edge of the desktop tab row. Empty by default.
     pub tab_bar_right: Vec<TabBarRightEntryConfig>,
     /// Text inserted between visible right-side tab bar entries. Default: one space.
@@ -1231,6 +1233,7 @@ impl Default for UiConfig {
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
             tab_bar_position: TabBarPositionConfig::Top,
+            tab_bar_wrap: false,
             tab_bar_right: Vec::new(),
             tab_bar_right_separator: " ".into(),
             window_title: super::window_title::default_window_title(),
@@ -1598,6 +1601,7 @@ status_indicators = "symbols"
             default_config.ui.tab_bar_position,
             TabBarPositionConfig::Top
         );
+        assert!(!default_config.ui.tab_bar_wrap);
         assert!(default_config.ui.tab_bar_right.is_empty());
         assert_eq!(default_config.ui.tab_bar_right_separator, " ");
 
@@ -1610,6 +1614,7 @@ pane_gaps = true
 show_agent_labels_on_pane_borders = true
 hide_tab_bar_when_single_tab = true
 tab_bar_position = "bottom"
+tab_bar_wrap = true
 tab_bar_right = [
   { type = "zoom" },
   { type = "hostname" },
@@ -1627,6 +1632,7 @@ tab_bar_right_separator = " · "
         assert!(config.ui.show_agent_labels_on_pane_borders);
         assert!(config.ui.hide_tab_bar_when_single_tab);
         assert_eq!(config.ui.tab_bar_position, TabBarPositionConfig::Bottom);
+        assert!(config.ui.tab_bar_wrap);
         assert_eq!(config.ui.tab_bar_right.len(), 5);
         assert!(matches!(
             config.ui.tab_bar_right[1],

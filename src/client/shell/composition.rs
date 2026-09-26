@@ -303,11 +303,25 @@ impl ClientShellState {
                 &self.config.palette,
             )
         };
-        if mode_bar == Some(layout.tab_bar) {
-            self.hits.tabs.clear();
-            self.hits.new_tab = Rect::default();
-            self.hits.tab_scroll_left = Rect::default();
-            self.hits.tab_scroll_right = Rect::default();
+        // The mode bar draws over one row. On a single-row tab bar that is the whole bar, so every
+        // tab hit goes; on a wrapped bar only the covered row is swallowed and the rows still
+        // visible above it stay clickable.
+        if let Some(bar) = mode_bar {
+            if !layout.tab_bar.is_empty()
+                && bar.y >= layout.tab_bar.y
+                && bar.y < layout.tab_bar.bottom()
+            {
+                self.hits.tabs.retain(|(rect, _)| rect.y != bar.y);
+                for rect in [
+                    &mut self.hits.new_tab,
+                    &mut self.hits.tab_scroll_left,
+                    &mut self.hits.tab_scroll_right,
+                ] {
+                    if rect.y == bar.y {
+                        *rect = Rect::default();
+                    }
+                }
+            }
         }
         let mut frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
         let mode_bar_cells = mode_bar.map(|bar| {
