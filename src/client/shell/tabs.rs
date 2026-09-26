@@ -1,4 +1,6 @@
+use super::super::{status_color, status_icon, status_priority};
 use super::*;
+use crate::protocol::ClientShellAgent;
 
 const TAB_SCROLL_BUTTON_WIDTH: u16 = 3;
 const MIN_TAB_STRIP_WIDTH: u16 =
@@ -25,7 +27,7 @@ pub(crate) fn render_tab_bar(
         render_tab_bar_status(buffer, area, snapshot, palette);
         return;
     }
-    let desired_widths = tab_desired_widths(&tabs);
+    let desired_widths = tab_desired_widths(snapshot, &tabs, config);
     let content = tab_bar_content_area(snapshot, area);
     let mouse_chrome = config.mouse_capture;
     let new_tab_width = if mouse_chrome { NEW_TAB_WIDTH } else { 0 };
@@ -98,7 +100,7 @@ pub(crate) fn render_tab_bar(
             break;
         }
         let rect = Rect::new(x, area.y, width, 1);
-        put_tab(buffer, rect, &name, tab, config);
+        put_tab(buffer, rect, &name, tab, snapshot, config);
         hits.tabs.push((rect, tab.tab_id.clone()));
         first_visible.get_or_insert(index);
         last_visible = Some(index);
@@ -196,11 +198,66 @@ fn focused_tabs(snapshot: &ClientShellSnapshot) -> Vec<&ClientShellTab> {
         .collect()
 }
 
-fn tab_desired_widths(tabs: &[&ClientShellTab]) -> Vec<u16> {
+/// The tab's highest-attention live agent, if it has one. The server only admits panes whose
+/// terminal `is_agent_terminal()` to the snapshot's agent list, which is the same "pane with an
+/// agent" gate the v0.8.x tab marks filtered on — so this reproduces that selection from the wire.
+/// `max_by_key` keeps the last maximum, so ties preserve snapshot order.
+fn tab_agent<'a>(
+    snapshot: &'a ClientShellSnapshot,
+    tab: &ClientShellTab,
+) -> Option<&'a ClientShellAgent> {
+    snapshot
+        .agents
+        .iter()
+        .filter(|agent| agent.tab_id == tab.tab_id)
+        .max_by_key(|agent| status_priority(agent.agent_status))
+}
+
+/// Mark and colour the `ui.tab_agent_status` prefix draws at the head of a tab label. The mark
+/// comes from `status_icon` — the one status vocabulary the agent panel, endpoint lists and mobile
+/// header all share — called directly rather than wrapped, so a vocabulary change upstream reaches
+/// the tab bar for free and no second glyph table can drift. `None` when the feature is off or the
+/// tab has no agent, leaving the stock label geometry untouched.
+fn tab_status_prefix(
+    config: &ClientShellConfig,
+    snapshot: &ClientShellSnapshot,
+    tab: &ClientShellTab,
+) -> Option<(&'static str, ratatui::style::Color)> {
+    if !config.tab_agent_status {
+        return None;
+    }
+    let agent = tab_agent(snapshot, tab)?;
+    Some((
+        status_icon(agent.agent_status, config.status_indicators),
+        status_color(agent.agent_status, &config.palette),
+    ))
+}
+
+/// Columns the status prefix adds to a tab: one for the mark, one for the separator before the
+/// name. Both stock paths (off) and agent-less tabs add zero.
+fn tab_status_prefix_width(
+    config: &ClientShellConfig,
+    snapshot: &ClientShellSnapshot,
+    tab: &ClientShellTab,
+) -> u16 {
+    u16::from(tab_status_prefix(config, snapshot, tab).is_some()) * 2
+}
+
+fn tab_desired_widths(
+    snapshot: &ClientShellSnapshot,
+    tabs: &[&ClientShellTab],
+    config: &ClientShellConfig,
+) -> Vec<u16> {
     tabs.iter()
         .map(|tab| {
             let label = tab_label(tab);
-            display_width(&label).saturating_add(4).max(MIN_TAB_WIDTH)
+            // The minimum applies to the stock label alone: the mark is ADDED on top of it,
+            // never absorbed into it — a one-character tab keeps its stock width and gains the
+            // mark's two cells, rather than paying for the mark out of its own padding.
+            display_width(&label)
+                .saturating_add(4)
+                .max(MIN_TAB_WIDTH)
+                .saturating_add(tab_status_prefix_width(config, snapshot, tab))
         })
         .collect()
 }
@@ -218,6 +275,7 @@ fn put_tab(
     rect: Rect,
     name: &str,
     tab: &ClientShellTab,
+    snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
 ) {
     let palette = &config.palette;
@@ -235,12 +293,17 @@ fn put_tab(
     } else {
         Style::default().fg(palette.overlay0).bg(palette.surface0)
     };
-    // The close marker takes the label's last cell, so the name centres in what is left.
+    // The status mark and its separator take the head cells; the close marker takes the label's
+    // last cell. The name centres in what is left, so each decoration claims its own cells and
+    // the geometry and the paint cannot drift apart.
+    let status_prefix = tab_status_prefix(config, snapshot, tab);
+    let status_prefix_width = u16::from(status_prefix.is_some()) * 2;
     let close_marker = tab_close_marker_x(rect, config);
     let label_width = match close_marker {
         Some(_) => rect.width.saturating_sub(1),
         None => rect.width,
-    };
+    }
+    .saturating_sub(status_prefix_width);
     let padding = label_width.saturating_sub(display_width(name));
     let left = padding / 2;
     let text = format!(
@@ -249,7 +312,17 @@ fn put_tab(
         left = left as usize,
         right_padding = padding.saturating_sub(left) as usize,
     );
-    put_text(buffer, rect.x, rect.y, label_width, &text, style);
+    put_text(
+        buffer,
+        rect.x.saturating_add(status_prefix_width),
+        rect.y,
+        label_width,
+        &text,
+        style,
+    );
+    if let Some((mark, color)) = status_prefix {
+        put_text(buffer, rect.x, rect.y, 1, mark, style.fg(color));
+    }
     if let Some(x) = close_marker {
         put_text(buffer, x, rect.y, 1, "x", style);
     }
@@ -280,6 +353,7 @@ fn wrap_flow(item_widths: impl Iterator<Item = u16>, width: u16) -> Vec<(u16, u1
 /// matches the rows [`render_wrapped_tabs`] lays out at the same width.
 pub(crate) fn wrapped_tab_bar_rows(
     snapshot: &ClientShellSnapshot,
+    config: &ClientShellConfig,
     width: u16,
     mouse_chrome: bool,
 ) -> u16 {
@@ -292,7 +366,7 @@ pub(crate) fn wrapped_tab_bar_rows(
     if content.width == 0 || tabs.is_empty() {
         return 1;
     }
-    let widths = tab_desired_widths(&tabs)
+    let widths = tab_desired_widths(snapshot, &tabs, config)
         .into_iter()
         .chain(mouse_chrome.then_some(NEW_TAB_WIDTH));
     wrap_flow(widths, content.width)
@@ -325,7 +399,7 @@ fn render_wrapped_tabs(
     }
     let palette = &config.palette;
     let mouse_chrome = config.mouse_capture;
-    let widths = tab_desired_widths(tabs)
+    let widths = tab_desired_widths(snapshot, tabs, config)
         .into_iter()
         .chain(mouse_chrome.then_some(NEW_TAB_WIDTH));
     let flow = wrap_flow(widths, content.width);
@@ -357,7 +431,7 @@ fn render_wrapped_tabs(
         let rect = Rect::new(content.x.saturating_add(x), area.y + offset_row, width, 1);
         match tabs.get(item) {
             Some(tab) => {
-                put_tab(buffer, rect, &tab_label(tab), tab, config);
+                put_tab(buffer, rect, &tab_label(tab), tab, snapshot, config);
                 hits.tabs.push((rect, tab.tab_id.clone()));
             }
             None => {
