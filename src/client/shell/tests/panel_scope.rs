@@ -193,18 +193,57 @@ fn mobile_header_counts_all_workspaces_while_current_scope_limits_panel_targets(
     let mut config = Config::default();
     config.ui.agent_panel_scope = crate::config::AgentPanelScopeConfig::Current;
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
-    state.set_snapshot(Box::new(snapshot_with_agents_in_two_workspaces()));
+    // The on-screen agent is acknowledged by the client (`acknowledge_surface`), and an
+    // acknowledged block is read and deliberately not counted, as in the fork's previous
+    // release (its `global_agent_counts`). So the ACTIVE workspace carries a Working agent, which counts
+    // whether or not it has been seen, and the off-screen BACKGROUND workspace carries the
+    // unread block: a scope leak drops "1 blocked".
+    let mut snapshot = snapshot_with_agents_in_two_workspaces();
+    for (pane_id, status) in [
+        ("pane_1", AgentStatus::Working),
+        ("pane_2", AgentStatus::Blocked),
+    ] {
+        snapshot
+            .agents
+            .iter_mut()
+            .find(|agent| agent.pane_id == pane_id)
+            .expect("fixture agent")
+            .agent_status = status;
+    }
+    for (workspace_id, status) in [
+        ("ws_1", AgentStatus::Working),
+        ("ws_2", AgentStatus::Blocked),
+    ] {
+        snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .expect("fixture workspace")
+            .agent_status = status;
+    }
+    for (tab_id, status) in [
+        ("tab_1", AgentStatus::Working),
+        ("tab_2", AgentStatus::Blocked),
+    ] {
+        snapshot
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.tab_id == tab_id)
+            .expect("fixture tab")
+            .agent_status = status;
+    }
+    state.set_snapshot(Box::new(snapshot));
     state.set_pane_surface(surface());
 
     let header = state.compose(44, 20).expect("mobile header");
     let header_rows = frame_rows(&header);
     assert!(
-        header_rows[1].contains("1 blocked"),
+        header_rows[1].contains("1 working"),
         "active-workspace agent must be counted: {:?}",
         header_rows[1]
     );
     assert!(
-        header_rows[1].contains("1 working"),
+        header_rows[1].contains("1 blocked"),
         "background-workspace agent must stay in the global count: {:?}",
         header_rows[1]
     );
