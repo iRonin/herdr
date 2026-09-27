@@ -1,4 +1,4 @@
-use super::super::{status_color, status_icon, status_priority};
+use super::super::status_color;
 use super::*;
 use crate::protocol::ClientShellAgent;
 
@@ -210,13 +210,15 @@ fn tab_agent<'a>(
         .agents
         .iter()
         .filter(|agent| agent.tab_id == tab.tab_id)
-        .max_by_key(|agent| status_priority(agent.agent_status))
+        .max_by_key(|agent| super::agent_status_priority(agent))
 }
 
 /// Mark and colour the `ui.tab_agent_status` prefix draws at the head of a tab label. The mark
-/// comes from `status_icon` — the one status vocabulary the agent panel, endpoint lists and mobile
-/// header all share — called directly rather than wrapped, so a vocabulary change upstream reaches
-/// the tab bar for free and no second glyph table can drift. `None` when the feature is off or the
+/// comes from `agent_status_icon` — the one status vocabulary the agent panel, endpoint lists,
+/// workspace rows and mobile header all share: upstream's `status_icon` for every state except a
+/// blocked agent the user has already read, which draws hollow — called directly rather than
+/// wrapped, so a vocabulary change upstream reaches the tab bar for free and no second glyph table
+/// can drift. The colour stays `status_color`: a read block is still a block. `None` when the feature is off or the
 /// tab has no agent, leaving the stock label geometry untouched.
 fn tab_status_prefix(
     config: &ClientShellConfig,
@@ -228,7 +230,7 @@ fn tab_status_prefix(
     }
     let agent = tab_agent(snapshot, tab)?;
     Some((
-        status_icon(agent.agent_status, config.status_indicators),
+        super::agent_status_icon(agent, config.status_indicators),
         status_color(agent.agent_status, &config.palette),
     ))
 }
