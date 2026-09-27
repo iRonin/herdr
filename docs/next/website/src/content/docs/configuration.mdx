@@ -304,7 +304,7 @@ The sidebar is the main Herdr dashboard. Search `ui.` in the [Config reference](
 
 Set `agent_panel_scope = "current"` under `[ui]` to show only agents in the active space. The default, `"all"`, shows agents from every space. When no Agent view supplies its own sort, current-space mode orders the visible agents by attention, while the mobile header's global summary still counts every space.
 
-`agent_panel_modes` controls the modes cycled by clicking the Agent panel label. Its default, `["priority", "grouped"]`, preserves the standard attention and grouped views. Add `"space"` explicitly to opt into the current-space view; for example, `["priority", "space"]` switches directly between the attention queue and the active space. Unknown and duplicate entries are ignored, and an empty or invalid-only list uses the default pair.
+Set `agent_panel_modes = ["priority", "grouped", "space"]` under `[ui]` to control the modes cycled when clicking the Agent panel mode label. Allowed values: `"priority"`, `"grouped"` (`"spaces"` is an alias), and `"space"` (`"current"` and `"current_workspace"` are aliases). Unknown and duplicate entries are ignored. An empty or invalid-only list falls back to all three modes in this default order.
 
 Set `tab_bar_position = "bottom"` under `[ui]` to place the desktop tab row below the terminal panes. Prefix, Navigate, Copy, and Resize mode bars temporarily replace the bottom tab row while active. The default is `"top"`.
 

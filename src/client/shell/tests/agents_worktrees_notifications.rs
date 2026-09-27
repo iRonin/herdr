@@ -785,10 +785,6 @@ fn agent_sort_toggle_is_client_local_and_persists_per_endpoint() {
         state.config.agent_panel_sort,
         crate::config::AgentPanelSortConfig::Priority
     );
-    assert_eq!(
-        state.config.agent_panel_scope,
-        crate::config::AgentPanelScopeConfig::All
-    );
     assert!(click.actions.is_empty());
     let reloaded_config =
         ClientShellConfig::from_config(&Config::default()).with_preferences_path(path.clone());
@@ -797,12 +793,7 @@ fn agent_sort_toggle_is_client_local_and_persists_per_endpoint() {
         reloaded.config.agent_panel_sort,
         crate::config::AgentPanelSortConfig::Priority
     );
-    assert_eq!(
-        reloaded.config.agent_panel_scope,
-        crate::config::AgentPanelScopeConfig::All
-    );
     assert!(reloaded.agent_panel_sort_manual);
-    assert!(reloaded.agent_panel_scope_manual);
     std::fs::remove_file(path).expect("remove agent sort preferences");
 }
 

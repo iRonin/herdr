@@ -224,6 +224,63 @@ fn mobile_header_counts_all_workspaces_while_current_scope_limits_panel_targets(
 }
 
 #[test]
+fn default_mode_cycle_includes_current_scope_and_persists_it() {
+    let path = std::env::temp_dir().join(format!(
+        "herdr-panel-default-mode-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos()
+    ));
+    let config = Config::default();
+    assert_eq!(
+        config.ui.agent_panel_modes,
+        [
+            crate::config::AgentPanelModeConfig::Priority,
+            crate::config::AgentPanelModeConfig::Grouped,
+            crate::config::AgentPanelModeConfig::Space,
+        ]
+    );
+    let shell_config = ClientShellConfig::from_config(&config).with_preferences_path(path.clone());
+    let mut state = ClientShellState::new(shell_config);
+    state.set_snapshot(Box::new(snapshot_with_agents_in_two_workspaces()));
+    state.set_pane_surface(surface());
+
+    state.compose(106, 30).expect("grouped panel");
+    let toggle = state.hits.agent_sort_toggle;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: toggle.x,
+        row: toggle.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    assert_eq!(
+        state.config.agent_panel_sort,
+        crate::config::AgentPanelSortConfig::Priority
+    );
+    assert_eq!(
+        state.config.agent_panel_scope,
+        crate::config::AgentPanelScopeConfig::Current
+    );
+
+    let reloaded = ClientShellState::new(
+        ClientShellConfig::from_config(&config).with_preferences_path(path.clone()),
+    );
+    assert_eq!(
+        reloaded.config.agent_panel_sort,
+        crate::config::AgentPanelSortConfig::Priority
+    );
+    assert_eq!(
+        reloaded.config.agent_panel_scope,
+        crate::config::AgentPanelScopeConfig::Current
+    );
+    assert!(reloaded.agent_panel_sort_manual);
+    assert!(reloaded.agent_panel_scope_manual);
+    std::fs::remove_file(path).expect("remove default panel mode preferences");
+}
+
+#[test]
 fn configured_priority_space_cycle_enters_and_leaves_current_scope() {
     let path = std::env::temp_dir().join(format!(
         "herdr-panel-mode-{}-{}.json",
