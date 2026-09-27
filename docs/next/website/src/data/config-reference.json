@@ -1104,8 +1104,8 @@
         {
           "key": "ui.agent_panel_modes",
           "type": "list",
-          "default": "[\"priority\", \"grouped\"]",
-          "description": "Modes cycled by clicking the Agent panel label, in order. Values: priority, grouped (spaces is an alias), and space (current and current_workspace are aliases). Add space explicitly to opt into current-space mode. Unknown and duplicate entries are ignored; an empty or invalid-only list uses the default pair.",
+          "default": "[\"priority\", \"grouped\", \"space\"]",
+          "description": "Modes cycled by clicking the Agent panel label, in order. Values: priority, grouped (spaces is an alias), and space (current and current_workspace are aliases). Unknown and duplicate entries are ignored. An empty or invalid-only list falls back to all three modes in this default order.",
           "values": [
             "priority",
             "grouped",
