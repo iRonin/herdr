@@ -148,7 +148,7 @@ fn apply_scroll(
             }
             return Ok(());
         }
-        return apply_terminal_attach_input(runtime, input);
+        return apply_terminal_attach_input(runtime, &input).map(|_| ());
     }
 
     match runtime.wheel_routing() {
@@ -186,38 +186,54 @@ fn apply_scroll(
 
 pub(super) fn apply_terminal_attach_input(
     runtime: &crate::terminal::TerminalRuntime,
-    data: Vec<u8>,
-) -> Result<(), String> {
+    data: &[u8],
+) -> Result<bool, String> {
     runtime.scroll_reset();
-    if let Some(text) = crate::raw_input::complete_text_bracketed_paste(&data) {
+    if let Some(text) = crate::raw_input::complete_text_bracketed_paste(data) {
+        let prepared = runtime.prepare_paste(text.to_owned());
+        let bracketed = prepared.bracketed;
         runtime
-            .try_send_paste(text.to_owned())
-            .map_err(|err| format!("terminal attach paste failed: {err}"))
+            .try_send_bytes(prepared.bytes)
+            .map_err(|err| format!("terminal attach paste failed: {err}"))?;
+        Ok(bracketed)
     } else {
+        let bracketed = runtime.bracketed_paste_enabled();
         runtime
-            .try_send_bytes(Bytes::from(data))
-            .map_err(|err| format!("terminal attach input failed: {err}"))
+            .try_send_bytes(Bytes::copy_from_slice(data))
+            .map_err(|err| format!("terminal attach input failed: {err}"))?;
+        Ok(bracketed)
     }
 }
+
+type ForwardedInputCallback<'a> = dyn FnMut(&[u8], bool, Option<&crate::input::TerminalKey>) + 'a;
 
 pub(super) fn apply_client_pane_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
 ) -> Result<bool, String> {
-    apply_client_terminal_input_events(runtime, events, true)
+    apply_client_pane_input_events_with_forwarded_input(runtime, events, |_, _, _| {})
+}
+
+pub(super) fn apply_client_pane_input_events_with_forwarded_input(
+    runtime: &crate::terminal::TerminalRuntime,
+    events: &[ClientPaneInputEvent],
+    mut on_forwarded_input: impl FnMut(&[u8], bool, Option<&crate::input::TerminalKey>),
+) -> Result<bool, String> {
+    apply_client_terminal_input_events(runtime, events, true, &mut on_forwarded_input)
 }
 
 pub(super) fn apply_client_popup_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
 ) -> Result<bool, String> {
-    apply_client_terminal_input_events(runtime, events, false)
+    apply_client_terminal_input_events(runtime, events, false, &mut |_, _, _| {})
 }
 
 fn apply_client_terminal_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
     host_page_keys: bool,
+    on_forwarded_input: &mut ForwardedInputCallback<'_>,
 ) -> Result<bool, String> {
     let mut non_mouse_input_forwarded = false;
     for event in events {
@@ -312,11 +328,12 @@ fn apply_client_terminal_input_events(
                 }
 
                 runtime.scroll_reset();
-                let bytes = runtime.encode_terminal_key(key);
+                let bytes = runtime.encode_terminal_key(key.clone());
                 if !bytes.is_empty() {
                     runtime
-                        .try_send_bytes(Bytes::from(bytes))
+                        .try_send_bytes(Bytes::copy_from_slice(&bytes))
                         .map_err(|err| format!("targeted pane key input failed: {err}"))?;
+                    on_forwarded_input(&bytes, false, Some(&key));
                     non_mouse_input_forwarded = true;
                 }
             }
@@ -325,15 +342,23 @@ fn apply_client_terminal_input_events(
                 runtime
                     .try_send_bytes(Bytes::copy_from_slice(text.as_str().as_bytes()))
                     .map_err(|err| format!("targeted pane text input failed: {err}"))?;
-                non_mouse_input_forwarded |= !text.as_str().is_empty();
+                if !text.as_str().is_empty() {
+                    on_forwarded_input(text.as_str().as_bytes(), false, None);
+                    non_mouse_input_forwarded = true;
+                }
             }
             crate::raw_input::RawInputEvent::Paste(text) => {
                 runtime.scroll_reset();
-                let nonempty = !text.is_empty();
+                let detector_input = text.as_bytes().to_vec();
+                let prepared = runtime.prepare_paste(text);
+                let bracketed = prepared.bracketed;
                 runtime
-                    .try_send_paste(text)
+                    .try_send_bytes(prepared.bytes)
                     .map_err(|err| format!("targeted pane paste failed: {err}"))?;
-                non_mouse_input_forwarded |= nonempty;
+                if !detector_input.is_empty() {
+                    on_forwarded_input(&detector_input, bracketed, None);
+                    non_mouse_input_forwarded = true;
+                }
             }
             crate::raw_input::RawInputEvent::Mouse(_)
             | crate::raw_input::RawInputEvent::OuterFocusGained
@@ -510,6 +535,31 @@ mod tests {
         )
         .unwrap();
         assert!(!mouse_only);
+    }
+
+    #[tokio::test]
+    async fn structured_paste_reports_when_target_uses_bracketed_paste() {
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+        runtime.test_process_pty_bytes(b"\x1b[?2004h");
+        let mut forwarded = Vec::new();
+
+        let accepted = apply_client_pane_input_events_with_forwarded_input(
+            &runtime,
+            &[ClientPaneInputEvent::Paste("notes\n/compact\n".into())],
+            |bytes, bracketed_paste, key| {
+                assert!(key.is_none());
+                forwarded.push((bytes.to_vec(), bracketed_paste));
+            },
+        )
+        .unwrap();
+
+        assert!(accepted);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Bytes::from_static(b"\x1b[200~notes\n/compact\n\x1b[201~")
+        );
+        assert_eq!(forwarded, vec![(b"notes\n/compact\n".to_vec(), true)]);
     }
 
     #[test]

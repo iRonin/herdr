@@ -20,8 +20,8 @@ const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 // submission a deterministic paste boundary regardless of prompt size or delivery speed.
 #[cfg(windows)]
 fn append_codex_paste_boundary(runtime: &crate::terminal::TerminalRuntime, text: &mut Vec<u8>) {
-    let keys = match crate::app::api_helpers::encode_api_keys(runtime, &["right".to_string()]) {
-        Ok(keys) => keys,
+    let keys = match crate::app::api_helpers::parse_api_keys(&["right".to_string()]) {
+        Ok(keys) => crate::app::api_helpers::encode_terminal_keys(runtime, &keys),
         Err(key) => {
             tracing::warn!(key = %key, "failed to encode Codex paste boundary key");
             return;
@@ -212,6 +212,12 @@ impl App {
                 submit_deadline,
             )
             .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
+        // `agent.prompt` is intentionally excluded from optimistic `/compact`
+        // detection, but it still occupies the same serialized PTY input
+        // stream. Prevent tracked fragments on either side from joining across
+        // the queued text+Enter without clearing an overlay already on screen.
+        self.state
+            .reset_pane_compact_command_detector(resolved.ws_idx, resolved.pane_id);
         Ok((id, agent, completion))
     }
 
@@ -358,20 +364,24 @@ impl App {
         if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
             return agent_not_ready(id, &params.target);
         }
-        let encoded = match super::super::api_helpers::encode_api_keys(runtime, &params.keys) {
-            Ok(encoded) => encoded,
+        let keys = match super::super::api_helpers::parse_api_keys(&params.keys) {
+            Ok(keys) => keys,
             Err(key) => {
                 return encode_error(id, "invalid_key", format!("unsupported key {key}"));
             }
         };
-        let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
-        let input_nonempty = !bytes.is_empty();
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+        let encoded = super::super::api_helpers::encode_terminal_keys(runtime, &keys);
+        let input = Bytes::from(encoded.iter().flatten().copied().collect::<Vec<u8>>());
+        let input_nonempty = !input.is_empty();
+        if let Err(err) = runtime.try_send_bytes(input.clone()) {
             return encode_error(id, "agent_send_keys_failed", err.to_string());
         }
         if input_nonempty {
             self.state
                 .mark_pane_acknowledged_if_blocked(resolved.ws_idx, resolved.pane_id);
+            for (key, encoded) in keys.iter().zip(&encoded) {
+                self.track_pane_forwarded_key(resolved.ws_idx, resolved.pane_id, encoded, key);
+            }
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -617,6 +627,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_prompt_breaks_compact_detector_continuity_without_triggering_it() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 4,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let fragment = app.handle_pane_send_text(
+            "fragment".into(),
+            crate::api::schema::PaneSendTextParams {
+                pane_id: public_pane_id.clone(),
+                text: "/com".into(),
+            },
+        );
+        assert!(serde_json::from_str::<SuccessResponse>(&fragment).is_ok());
+        let prompted = run_deferred_agent_prompt(
+            &mut app,
+            "prompt",
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "x".into(),
+                wait: None,
+            },
+        );
+        assert!(serde_json::from_str::<SuccessResponse>(&prompted).is_ok());
+        let suffix = app.handle_pane_send_text(
+            "suffix".into(),
+            crate::api::schema::PaneSendTextParams {
+                pane_id: public_pane_id,
+                text: "pact\r".into(),
+            },
+        );
+        assert!(serde_json::from_str::<SuccessResponse>(&suffix).is_ok());
+
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"/com"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"x"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"pact\r"));
+        assert_eq!(
+            app.state.terminals[&terminal_id].display_state(),
+            AgentState::Idle,
+            "detector fragments must not join across an excluded prompt submission"
+        );
+    }
+
+    #[tokio::test]
     async fn agent_prompt_rejects_blocked_agent_without_writing() {
         let mut app = app_with_agent();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
@@ -726,6 +791,80 @@ mod tests {
         assert!(matches!(success.result, ResponseResult::Ok {}));
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b[A\r"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_send_keys_detects_compact_after_successful_forward() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes(b"\x1b[>15u");
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let response = app.handle_agent_send_keys(
+            "compact".into(),
+            AgentSendKeysParams {
+                target: "reviewer".into(),
+                keys: ["/", "c", "o", "m", "p", "a", "c", "t", "enter"]
+                    .map(str::to_string)
+                    .to_vec(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::Ok {}));
+        let forwarded = rx.try_recv().unwrap();
+        assert!(forwarded.starts_with(b"\x1b[47;1:1u"));
+        assert!(forwarded.ends_with(b"\x1b[13u"));
+        assert!(!forwarded.starts_with(b"/compact"));
+        assert_eq!(app.state.terminals[&terminal_id].state, AgentState::Idle);
+        assert_eq!(
+            app.state.terminals[&terminal_id].display_state(),
+            AgentState::Working
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_send_keys_tracks_only_bytes_forwarded_by_legacy_keys() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let mut keys = ["/", "c", "o", "m", "p", "a", "c", "t"]
+            .map(str::to_string)
+            .to_vec();
+        keys.extend(["f13".into(), "shift+enter".into()]);
+        let response = app.handle_agent_send_keys(
+            "compact-legacy".into(),
+            AgentSendKeysParams {
+                target: "reviewer".into(),
+                keys,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::Ok {}));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Bytes::from_static(b"/compact\r"),
+            "legacy F13 forwards nothing and legacy Shift+Enter collapses to CR"
+        );
+        assert_eq!(
+            app.state.terminals[&terminal_id].display_state(),
+            AgentState::Working,
+            "detector must model exactly the bytes the child received"
+        );
     }
 
     fn started_agent_argv(kind: &str, pi_program: &str) -> Vec<String> {

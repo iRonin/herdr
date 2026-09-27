@@ -6,6 +6,7 @@ mod model;
 pub(crate) mod mouse;
 mod parse;
 
+pub(crate) use encode::text_char_for_key;
 #[allow(unused_imports)]
 pub use encode::{
     encode_cursor_key, encode_key, encode_mouse_button, encode_mouse_scroll, encode_terminal_key,

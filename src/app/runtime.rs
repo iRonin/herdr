@@ -79,11 +79,18 @@ impl App {
     }
 
     pub(crate) fn expire_due_metadata(&mut self, now: Instant) -> bool {
+        // This loop checkpoint also owns the display-only `/compact` TTL. Both
+        // expiries require the same full-surface repaint and API/client refresh.
+        let expired_optimistic_panes = self.state.expire_optimistic_working_at(now);
+        let optimistic_working_expired = !expired_optimistic_panes.is_empty();
+        for (ws_idx, pane_id) in expired_optimistic_panes {
+            self.emit_projected_pane_agent_status_changed(ws_idx, pane_id);
+        }
         let Some(deadline) = self
             .agent_metadata_deadline
             .filter(|deadline| now >= *deadline)
         else {
-            return false;
+            return optimistic_working_expired;
         };
         self.expire_metadata_at(deadline, now);
         true
@@ -195,6 +202,7 @@ impl App {
             self.session_save_deadline,
             self.next_tab_bar_status_deadline(),
             self.state.next_scrollbar_auto_hide_deadline(now),
+            self.state.next_optimistic_working_deadline(),
             render_deadline,
         ]
         .into_iter()
@@ -263,6 +271,47 @@ mod tests {
         assert!(retain_detached_process_after_wait(42, Err(interrupted)));
     }
 
+    #[test]
+    fn compact_overlay_deadline_wakes_the_loop_and_expiry_requests_repaint() {
+        let (mut app, pane_id) = test_app_with_pane();
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        let now = Instant::now();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("worker".into());
+        terminal.state = crate::detect::AgentState::Idle;
+        assert!(terminal.note_forwarded_input_at(b"/compact\r", now));
+        let deadline = terminal.optimistic_working_deadline().unwrap();
+
+        assert_eq!(
+            app.next_headless_loop_deadline_with_git_refresh(now, false, false),
+            Some(deadline),
+            "the display TTL must wake an otherwise idle headless loop"
+        );
+        assert!(!app.expire_due_metadata(deadline - Duration::from_millis(1)));
+        assert!(app.event_hub.events_after(0).is_empty());
+        assert!(
+            app.expire_due_metadata(deadline),
+            "expiry must request a repaint even without metadata deadlines"
+        );
+        assert_eq!(
+            app.state.terminals[&terminal_id].display_state_at(deadline),
+            crate::detect::AgentState::Idle
+        );
+        assert!(app.state.terminals[&terminal_id]
+            .optimistic_working_deadline()
+            .is_none());
+        let events = app.event_hub.events_after(0);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0].1.data,
+            crate::api::schema::EventData::PaneAgentStatusChanged {
+                agent_status: crate::api::schema::AgentStatus::Idle,
+                ..
+            }
+        ));
+        assert!(app.state.toast.is_none());
+    }
+
     fn test_app_with_pane() -> (super::super::App, crate::layout::PaneId) {
         let mut app = super::super::App::new(
             &crate::config::Config::default(),
@@ -274,6 +323,7 @@ mod tests {
         let ws = Workspace::test_new("test");
         let pane_id = ws.tabs[0].root_pane;
         app.state.workspaces.push(ws);
+        app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.view.pane_infos.push(crate::layout::PaneInfo {
             id: pane_id,
