@@ -33,6 +33,7 @@ use tracing::error;
 use tracing::{debug, info, warn};
 
 use base64::Engine;
+#[cfg(test)]
 use bytes::Bytes;
 
 use crate::api;
@@ -64,9 +65,10 @@ use crate::server::notifications::{
     should_forward_toast_to_clients, toast_message_from_state_change, toast_notify_kind,
 };
 use crate::server::pane_input::{
-    apply_client_pane_input_events, apply_client_popup_input_events,
-    apply_client_terminal_input_events, apply_terminal_attach_input, apply_terminal_attach_scroll,
-    terminal_attach_mouse_position,
+    apply_client_pane_input_events, apply_client_pane_input_events_with_forwarded_input,
+    apply_client_popup_input_events, apply_client_terminal_input_events,
+    apply_terminal_attach_input, apply_terminal_attach_scroll,
+    forwarded_input_answers_blocked_agent, terminal_attach_mouse_position,
 };
 use crate::server::shutdown::{ServerStop, ShutdownReason};
 use crate::server::socket_paths::{
@@ -1205,23 +1207,32 @@ impl HeadlessServer {
                 };
                 let terminal_id = terminal_id.clone();
                 let runtime_terminal_id = self.terminal_id_by_string(&terminal_id);
-                let mut forwarded = false;
+                let mut forwarded_bracketed = None;
                 if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
-                    let payload = paste_payload_for_runtime(runtime, &path);
-                    if payload.is_empty() {
+                    let prepared = paste_payload_for_runtime(runtime, &path);
+                    if prepared.bytes.is_empty() {
                         return true;
                     }
-                    match runtime.try_send_bytes(Bytes::from(payload)) {
-                        Ok(()) => forwarded = true,
+                    match runtime.try_send_bytes(prepared.bytes) {
+                        Ok(()) => forwarded_bracketed = Some(prepared.bracketed),
                         Err(err) => {
                             warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed");
                         }
                     }
                 }
-                if let Some(terminal_id) = runtime_terminal_id.as_ref().filter(|_| forwarded) {
+                if let (Some(terminal_id), Some(bracketed)) =
+                    (runtime_terminal_id.as_ref(), forwarded_bracketed)
+                {
                     self.app
                         .state
                         .mark_terminal_acknowledged_if_blocked(terminal_id);
+                    if bracketed {
+                        self.app
+                            .track_terminal_forwarded_bracketed_paste(terminal_id, path.as_bytes());
+                    } else {
+                        self.app
+                            .track_terminal_forwarded_input(terminal_id, path.as_bytes());
+                    }
                 }
                 true
             }
@@ -1254,11 +1265,37 @@ impl HeadlessServer {
                 ) else {
                     return foreground_changed | geometry_changed;
                 };
-                match apply_client_pane_input_events(
+                let mut forwarded_input = Vec::new();
+                match apply_client_pane_input_events_with_forwarded_input(
                     runtime,
                     &[protocol::ClientPaneInputEvent::Paste(path)],
+                    |bytes, bracketed_paste, key| {
+                        forwarded_input.push((bytes.to_vec(), bracketed_paste, key.cloned()));
+                    },
                 ) {
                     Ok(true) => {
+                        for (bytes, bracketed_paste, key) in forwarded_input {
+                            if let Some(key) = key {
+                                self.app.track_pane_forwarded_key(
+                                    workspace_index,
+                                    runtime_pane_id,
+                                    &bytes,
+                                    &key,
+                                );
+                            } else if bracketed_paste {
+                                self.app.track_pane_forwarded_bracketed_paste(
+                                    workspace_index,
+                                    runtime_pane_id,
+                                    &bytes,
+                                );
+                            } else {
+                                self.app.track_pane_forwarded_input(
+                                    workspace_index,
+                                    runtime_pane_id,
+                                    &bytes,
+                                );
+                            }
+                        }
                         self.app
                             .state
                             .mark_pane_acknowledged_if_blocked(workspace_index, runtime_pane_id);
@@ -2172,10 +2209,14 @@ impl HeadlessServer {
                 };
                 let terminal_id = terminal_id.clone();
                 let input_nonempty = !data.is_empty();
+                let mut bracketed_paste_enabled = false;
                 let forwarded =
                     if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
-                        match apply_terminal_attach_input(runtime, data) {
-                            Ok(()) => true,
+                        match apply_terminal_attach_input(runtime, &data) {
+                            Ok(bracketed) => {
+                                bracketed_paste_enabled = bracketed;
+                                true
+                            }
                             Err(err) => {
                                 warn!(client_id, terminal_id = %terminal_id, err = %err);
                                 false
@@ -2193,6 +2234,32 @@ impl HeadlessServer {
                         self.app
                             .state
                             .mark_terminal_acknowledged_if_blocked(&terminal_id);
+                        if bracketed_paste_enabled {
+                            for input in crate::raw_input::split_text_bracketed_pastes(&data) {
+                                match input {
+                                    crate::raw_input::TextInputSegment::Bytes(bytes) => {
+                                        self.app.track_terminal_forwarded_encoded_input(
+                                            &terminal_id,
+                                            bytes,
+                                        );
+                                    }
+                                    crate::raw_input::TextInputSegment::BracketedPaste(text) => {
+                                        self.app.track_terminal_forwarded_bracketed_paste(
+                                            &terminal_id,
+                                            text.as_bytes(),
+                                        );
+                                    }
+                                }
+                            }
+                        } else if let Some(text) =
+                            crate::raw_input::complete_text_bracketed_paste(&data)
+                        {
+                            self.app
+                                .track_terminal_forwarded_input(&terminal_id, text.as_bytes());
+                        } else {
+                            self.app
+                                .track_terminal_forwarded_encoded_input(&terminal_id, &data);
+                        }
                     }
                 }
                 true
@@ -2535,32 +2602,63 @@ impl HeadlessServer {
                     return foreground_changed | geometry_changed;
                 };
                 let scroll_before = runtime.scroll_metrics();
+                let mut forwarded_input = Vec::new();
+                // Bytes the pane accepted before a later event failed (a full queue) still reached
+                // the child: they keep their interactive priority, acknowledge a blocked agent and
+                // feed the compact detector, so the flag outlives the error.
                 let mut keyboard_forwarded = false;
+                let mut answered_blocked_agent = false;
                 let input_result = apply_client_terminal_input_events(
                     runtime,
                     &events,
                     true,
                     &mut keyboard_forwarded,
+                    &mut |bytes, bracketed_paste, key| {
+                        answered_blocked_agent |= forwarded_input_answers_blocked_agent(bytes, key);
+                        forwarded_input.push((bytes.to_vec(), bracketed_paste, key.cloned()));
+                    },
                 );
                 let scroll_changed = runtime.scroll_metrics() != scroll_before;
+                if let Err(err) = input_result {
+                    warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
+                }
                 if keyboard_forwarded {
                     self.note_interactive_input(runtime_pane_id, Instant::now());
                 }
+                let mut compact_started = false;
+                for (bytes, bracketed_paste, key) in forwarded_input {
+                    if let Some(key) = key {
+                        compact_started |= self.app.track_pane_forwarded_key(
+                            workspace_index,
+                            runtime_pane_id,
+                            &bytes,
+                            &key,
+                        );
+                    } else if bracketed_paste {
+                        self.app.track_pane_forwarded_bracketed_paste(
+                            workspace_index,
+                            runtime_pane_id,
+                            &bytes,
+                        );
+                    } else {
+                        compact_started |= self.app.track_pane_forwarded_input(
+                            workspace_index,
+                            runtime_pane_id,
+                            &bytes,
+                        );
+                    }
+                }
                 // Input that reached the pane answers a blocked agent: it stays blocked, but it is read now.
-                let acknowledged = match input_result {
-                    Ok(()) => {
-                        keyboard_forwarded
-                            && self
-                                .app
-                                .state
-                                .mark_pane_acknowledged_if_blocked(workspace_index, runtime_pane_id)
-                    }
-                    Err(err) => {
-                        warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
-                        false
-                    }
-                };
-                foreground_changed | geometry_changed | scroll_changed | acknowledged
+                let acknowledged = answered_blocked_agent
+                    && self
+                        .app
+                        .state
+                        .mark_pane_acknowledged_if_blocked(workspace_index, runtime_pane_id);
+                foreground_changed
+                    | geometry_changed
+                    | scroll_changed
+                    | acknowledged
+                    | compact_started
             }
             ServerEvent::ClientShellPopupInput {
                 client_id,
@@ -2641,6 +2739,7 @@ impl HeadlessServer {
                     &events,
                     false,
                     &mut keyboard_forwarded,
+                    &mut |_, _, _| {},
                 );
                 let scroll_changed = runtime.scroll_metrics() != scroll_before;
                 if keyboard_forwarded {

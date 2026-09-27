@@ -187,6 +187,9 @@ pub struct PaneStateUpdate {
     pub agent_name_changed: bool,
     pub agent_released: bool,
     pub agent_release_status: Option<crate::api::schema::AgentStatus>,
+    /// A real state update ended a display-only overlay (a submitted compact command shown as working), so clients
+    /// must repaint the pane even though no state changed.
+    pub display_projection_cleared: bool,
     /// Whether the client-facing COMPLETION notification for this update is
     /// suppressed: process-acquisition noise OR a completion on a pane that
     /// carries the `auto_read` metadata token. Every server→client forwarder
@@ -336,6 +339,7 @@ impl AppState {
                     agent_name_changed: false,
                     agent_released: false,
                     agent_release_status: None,
+                    display_projection_cleared: false,
                     suppress_completion: false,
                 };
                 Some(update)
@@ -522,12 +526,103 @@ impl AppState {
         true
     }
 
-    pub(crate) fn mark_terminal_acknowledged_if_blocked(
+    /// Feeds bytes only after their PTY write was accepted. The detector lives
+    /// with the terminal so split input from every control surface shares one
+    /// bounded line buffer without pane-id collisions.
+    pub(crate) fn note_pane_forwarded_input(
+        &mut self,
+        ws_idx: usize,
+        pane_id: PaneId,
+        bytes: &[u8],
+    ) -> bool {
+        let terminal_id = self
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone());
+        terminal_id
+            .is_some_and(|terminal_id| self.note_terminal_forwarded_input(&terminal_id, bytes))
+    }
+
+    pub(crate) fn note_terminal_forwarded_input(
         &mut self,
         terminal_id: &crate::terminal::TerminalId,
+        bytes: &[u8],
     ) -> bool {
-        let target = self
+        self.terminals
+            .get_mut(terminal_id)
+            .is_some_and(|terminal| terminal.note_forwarded_input(bytes))
+    }
+
+    pub(crate) fn note_pane_forwarded_key(
+        &mut self,
+        ws_idx: usize,
+        pane_id: PaneId,
+        encoded: &[u8],
+        key: &crate::input::TerminalKey,
+    ) -> bool {
+        let terminal_id = self
             .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone());
+        terminal_id
+            .is_some_and(|terminal_id| self.note_terminal_forwarded_key(&terminal_id, encoded, key))
+    }
+
+    pub(crate) fn note_terminal_forwarded_key(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        encoded: &[u8],
+        key: &crate::input::TerminalKey,
+    ) -> bool {
+        self.terminals
+            .get_mut(terminal_id)
+            .is_some_and(|terminal| terminal.note_forwarded_key(encoded, key))
+    }
+
+    pub(crate) fn reset_pane_compact_command_detector(&mut self, ws_idx: usize, pane_id: PaneId) {
+        let terminal_id = self
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone());
+        if let Some(terminal) = terminal_id.and_then(|id| self.terminals.get_mut(&id)) {
+            terminal.reset_compact_command_detector();
+        }
+    }
+
+    pub(crate) fn note_pane_forwarded_bracketed_paste(
+        &mut self,
+        ws_idx: usize,
+        pane_id: PaneId,
+        bytes: &[u8],
+    ) {
+        let terminal_id = self
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone());
+        if let Some(terminal_id) = terminal_id {
+            self.note_terminal_forwarded_bracketed_paste(&terminal_id, bytes);
+        }
+    }
+
+    pub(crate) fn note_terminal_forwarded_bracketed_paste(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        bytes: &[u8],
+    ) {
+        if let Some(terminal) = self.terminals.get_mut(terminal_id) {
+            terminal.note_forwarded_bracketed_paste(bytes);
+        }
+    }
+
+    pub(crate) fn pane_target_for_terminal(
+        &self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> Option<(usize, PaneId)> {
+        self.workspaces
             .iter()
             .enumerate()
             .find_map(|(ws_idx, workspace)| {
@@ -536,10 +631,17 @@ impl AppState {
                         (&pane.attached_terminal_id == terminal_id).then_some((ws_idx, *pane_id))
                     })
                 })
-            });
-        target.is_some_and(|(ws_idx, pane_id)| {
-            self.mark_pane_acknowledged_if_blocked(ws_idx, pane_id)
-        })
+            })
+    }
+
+    pub(crate) fn mark_terminal_acknowledged_if_blocked(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> bool {
+        self.pane_target_for_terminal(terminal_id)
+            .is_some_and(|(ws_idx, pane_id)| {
+                self.mark_pane_acknowledged_if_blocked(ws_idx, pane_id)
+            })
     }
 
     pub fn move_workspace(&mut self, source_idx: usize, insert_idx: usize) -> bool {
@@ -1865,11 +1967,14 @@ impl AppState {
             agent_name_changed,
             unchanged_change,
             suppress_acquisition_completion,
+            display_projection_cleared,
             completion_reset,
         ) = {
             let terminal = self.terminals.get_mut(&terminal_id)?;
             let previous_agent_name = terminal.agent_name.clone();
             let had_completion = terminal.last_agent_completion_seq.is_some() || !previous_seen;
+            let had_display_projection = terminal.optimistic_working_deadline().is_some()
+                && terminal.state != AgentState::Working;
             let resume_revision = terminal.reported_resume_revision();
             let mutation = update(terminal);
             terminal.reconcile_reported_resume();
@@ -1887,10 +1992,13 @@ impl AppState {
                 terminal.last_agent_completion_seq = None;
             }
             let managed_changed = terminal.reconcile_managed_agent_at(now, false);
+            let display_projection_cleared =
+                had_display_projection && terminal.optimistic_working_deadline().is_none();
             let suppress_acquisition_completion = terminal.finish_agent_process_acquisition();
             let agent_name_changed = terminal.agent_name != previous_agent_name;
             let unchanged_change = (mutation.agent_released
                 || agent_name_changed
+                || display_projection_cleared
                 || (completion_reset && had_completion))
                 .then(|| terminal.unchanged_effective_state_change_at(now));
             (
@@ -1899,6 +2007,7 @@ impl AppState {
                 agent_name_changed,
                 unchanged_change,
                 suppress_acquisition_completion,
+                display_projection_cleared,
                 completion_reset,
             )
         };
@@ -1964,6 +2073,7 @@ impl AppState {
             agent_name_changed,
             agent_released,
             agent_release_status: agent_released.then(|| pane_agent_status(change.state, seen)),
+            display_projection_cleared,
             suppress_completion,
         };
         Some(update)

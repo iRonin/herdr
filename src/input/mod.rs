@@ -4,6 +4,7 @@ mod lease;
 mod model;
 pub(crate) mod mouse;
 mod parse;
+mod text_char;
 
 pub(crate) use keybind_help::{
     filter_keybind_help_groups, keybind_help_groups, keybind_help_text_char,
@@ -23,3 +24,4 @@ pub use model::{
 #[cfg(any(unix, test))]
 pub use model::{MouseProtocolEncoding, MouseProtocolMode};
 pub use parse::parse_terminal_key_sequence;
+pub(crate) use text_char::text_char_for_key;

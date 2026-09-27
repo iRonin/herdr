@@ -148,7 +148,7 @@ fn apply_scroll(
             }
             return Ok(());
         }
-        return apply_terminal_attach_input(runtime, input);
+        return apply_terminal_attach_input(runtime, &input).map(|_| ());
     }
 
     match runtime.wheel_routing() {
@@ -186,17 +186,22 @@ fn apply_scroll(
 
 pub(super) fn apply_terminal_attach_input(
     runtime: &crate::terminal::TerminalRuntime,
-    data: Vec<u8>,
-) -> Result<(), String> {
+    data: &[u8],
+) -> Result<bool, String> {
     runtime.scroll_reset();
-    if let Some(text) = crate::raw_input::complete_text_bracketed_paste(&data) {
+    if let Some(text) = crate::raw_input::complete_text_bracketed_paste(data) {
+        let prepared = runtime.prepare_paste(text.to_owned());
+        let bracketed = prepared.bracketed;
         runtime
-            .try_send_paste(text.to_owned())
-            .map_err(|err| format!("terminal attach paste failed: {err}"))
+            .try_send_bytes(prepared.bytes)
+            .map_err(|err| format!("terminal attach paste failed: {err}"))?;
+        Ok(bracketed)
     } else {
+        let bracketed = runtime.bracketed_paste_enabled();
         runtime
-            .try_send_bytes(Bytes::from(data))
-            .map_err(|err| format!("terminal attach input failed: {err}"))
+            .try_send_bytes(Bytes::copy_from_slice(data))
+            .map_err(|err| format!("terminal attach input failed: {err}"))?;
+        Ok(bracketed)
     }
 }
 
@@ -208,13 +213,44 @@ pub(crate) fn test_apply_client_pane_input_events(
     apply_client_pane_input_events(runtime, events)
 }
 
+type ForwardedInputCallback<'a> = dyn FnMut(&[u8], bool, Option<&crate::input::TerminalKey>) + 'a;
+
 pub(super) fn apply_client_pane_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
 ) -> Result<bool, String> {
+    apply_client_pane_input_events_with_forwarded_input(runtime, events, |_, _, _| {})
+}
+
+/// Whether bytes forwarded to a pane answer a blocked agent: the child received something that is
+/// not a key release. A paste answers it too, although it is not `keyboard_forwarded`: that flag
+/// stays what upstream defines it as (typing opens the interactive render window, a paste does not).
+pub(super) fn forwarded_input_answers_blocked_agent(
+    bytes: &[u8],
+    key: Option<&crate::input::TerminalKey>,
+) -> bool {
+    !bytes.is_empty() && key.is_none_or(|key| key.as_key_event().kind != KeyEventKind::Release)
+}
+
+/// Applies pane input and returns whether it answers a blocked agent.
+pub(super) fn apply_client_pane_input_events_with_forwarded_input(
+    runtime: &crate::terminal::TerminalRuntime,
+    events: &[ClientPaneInputEvent],
+    mut on_forwarded_input: impl FnMut(&[u8], bool, Option<&crate::input::TerminalKey>),
+) -> Result<bool, String> {
     let mut keyboard_forwarded = false;
-    apply_client_terminal_input_events(runtime, events, true, &mut keyboard_forwarded)?;
-    Ok(keyboard_forwarded)
+    let mut answered = false;
+    apply_client_terminal_input_events(
+        runtime,
+        events,
+        true,
+        &mut keyboard_forwarded,
+        &mut |bytes, bracketed_paste, key| {
+            answered |= forwarded_input_answers_blocked_agent(bytes, key);
+            on_forwarded_input(bytes, bracketed_paste, key);
+        },
+    )?;
+    Ok(answered)
 }
 
 pub(super) fn apply_client_popup_input_events(
@@ -222,7 +258,13 @@ pub(super) fn apply_client_popup_input_events(
     events: &[ClientPaneInputEvent],
 ) -> Result<bool, String> {
     let mut keyboard_forwarded = false;
-    apply_client_terminal_input_events(runtime, events, false, &mut keyboard_forwarded)?;
+    apply_client_terminal_input_events(
+        runtime,
+        events,
+        false,
+        &mut keyboard_forwarded,
+        &mut |_, _, _| {},
+    )?;
     Ok(keyboard_forwarded)
 }
 
@@ -231,6 +273,7 @@ pub(super) fn apply_client_terminal_input_events(
     events: &[ClientPaneInputEvent],
     host_page_keys: bool,
     keyboard_forwarded: &mut bool,
+    on_forwarded_input: &mut ForwardedInputCallback<'_>,
 ) -> Result<(), String> {
     for event in events {
         if let ClientPaneInputEvent::Mouse {
@@ -324,12 +367,13 @@ pub(super) fn apply_client_terminal_input_events(
                 }
 
                 runtime.scroll_reset();
-                let bytes = runtime.encode_terminal_key(key);
+                let bytes = runtime.encode_terminal_key(key.clone());
                 if !bytes.is_empty() {
                     runtime
-                        .try_send_bytes(Bytes::from(bytes))
+                        .try_send_bytes(Bytes::copy_from_slice(&bytes))
                         .map_err(|err| format!("targeted pane key input failed: {err}"))?;
                     *keyboard_forwarded |= key_event.kind != KeyEventKind::Release;
+                    on_forwarded_input(&bytes, false, Some(&key));
                 }
             }
             crate::raw_input::RawInputEvent::Text(text) => {
@@ -337,16 +381,22 @@ pub(super) fn apply_client_terminal_input_events(
                 runtime
                     .try_send_bytes(Bytes::copy_from_slice(text.as_str().as_bytes()))
                     .map_err(|err| format!("targeted pane text input failed: {err}"))?;
-                *keyboard_forwarded |= !text.as_str().is_empty();
+                if !text.as_str().is_empty() {
+                    on_forwarded_input(text.as_str().as_bytes(), false, None);
+                    *keyboard_forwarded = true;
+                }
             }
             crate::raw_input::RawInputEvent::Paste(text) => {
                 runtime.scroll_reset();
-                let nonempty = !text.is_empty();
+                let detector_input = text.as_bytes().to_vec();
+                let prepared = runtime.prepare_paste(text);
+                let bracketed = prepared.bracketed;
                 runtime
-                    .try_send_paste(text)
+                    .try_send_bytes(prepared.bytes)
                     .map_err(|err| format!("targeted pane paste failed: {err}"))?;
-                // A paste is input a user typed for this pane: it acknowledges a blocked agent too.
-                *keyboard_forwarded |= nonempty;
+                if !detector_input.is_empty() {
+                    on_forwarded_input(&detector_input, bracketed, None);
+                }
             }
             crate::raw_input::RawInputEvent::Mouse(_)
             | crate::raw_input::RawInputEvent::OuterFocusGained
@@ -523,6 +573,62 @@ mod tests {
         )
         .unwrap();
         assert!(!mouse_only);
+    }
+
+    /// A paste answers a blocked agent but is not typing: upstream's `keyboard_forwarded` stays false
+    /// for it, so a paste (into a pane or a popup) does not open the interactive render window.
+    #[tokio::test]
+    async fn a_paste_answers_a_blocked_agent_without_counting_as_keyboard_input() {
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 4);
+        let mut keyboard_forwarded = false;
+        let mut answered = false;
+        apply_client_terminal_input_events(
+            &runtime,
+            &[ClientPaneInputEvent::Paste("yes\n".into())],
+            true,
+            &mut keyboard_forwarded,
+            &mut |bytes, _, key| answered |= forwarded_input_answers_blocked_agent(bytes, key),
+        )
+        .unwrap();
+
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"yes\n"));
+        assert!(!keyboard_forwarded, "a paste is not typing");
+        assert!(answered, "a paste still answers a blocked agent");
+        assert!(!forwarded_input_answers_blocked_agent(b"", None));
+        let release = crate::input::TerminalKey::new(KeyCode::Enter, KeyModifiers::empty())
+            .with_kind(KeyEventKind::Release);
+        assert!(!forwarded_input_answers_blocked_agent(
+            b"\x1b[13;1:3u",
+            Some(&release)
+        ));
+        let press = crate::input::TerminalKey::new(KeyCode::Enter, KeyModifiers::empty());
+        assert!(forwarded_input_answers_blocked_agent(b"\r", Some(&press)));
+    }
+
+    #[tokio::test]
+    async fn structured_paste_reports_when_target_uses_bracketed_paste() {
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+        runtime.test_process_pty_bytes(b"\x1b[?2004h");
+        let mut forwarded = Vec::new();
+
+        let accepted = apply_client_pane_input_events_with_forwarded_input(
+            &runtime,
+            &[ClientPaneInputEvent::Paste("notes\n/compact\n".into())],
+            |bytes, bracketed_paste, key| {
+                assert!(key.is_none());
+                forwarded.push((bytes.to_vec(), bracketed_paste));
+            },
+        )
+        .unwrap();
+
+        assert!(accepted);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Bytes::from_static(b"\x1b[200~notes\n/compact\n\x1b[201~")
+        );
+        assert_eq!(forwarded, vec![(b"notes\n/compact\n".to_vec(), true)]);
     }
 
     #[test]
