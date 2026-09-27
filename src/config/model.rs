@@ -123,7 +123,7 @@ pub enum AgentPanelModeConfig {
 }
 
 impl AgentPanelModeConfig {
-    pub const DEFAULT: [Self; 2] = [Self::Priority, Self::Grouped];
+    pub const ALL: [Self; 3] = [Self::Priority, Self::Grouped, Self::Space];
 
     pub(crate) fn from_state(sort: AgentPanelSortConfig, scope: AgentPanelScopeConfig) -> Self {
         match scope {
@@ -157,7 +157,7 @@ impl AgentPanelModeConfig {
 }
 
 fn default_agent_panel_modes() -> Vec<AgentPanelModeConfig> {
-    AgentPanelModeConfig::DEFAULT.to_vec()
+    AgentPanelModeConfig::ALL.to_vec()
 }
 
 fn deserialize_agent_panel_modes<'de, D>(
@@ -1211,7 +1211,7 @@ pub struct UiConfig {
     /// is accepted as an alias for "current". Default: "all".
     pub agent_panel_scope: AgentPanelScopeConfig,
     /// Ordered modes for the clickable agent-panel toggle. Unknown and duplicate
-    /// entries are ignored. Default: ["priority", "grouped"].
+    /// entries are ignored. Default: ["priority", "grouped", "space"].
     #[serde(
         default = "default_agent_panel_modes",
         deserialize_with = "deserialize_agent_panel_modes"
@@ -1771,7 +1771,7 @@ agent_panel_sort = "workspaces"
     fn agent_panel_modes_parse_a_two_mode_cycle_and_sanitize_other_values() {
         assert_eq!(
             Config::default().ui.agent_panel_modes,
-            AgentPanelModeConfig::DEFAULT
+            AgentPanelModeConfig::ALL
         );
 
         let two_modes: Config = toml::from_str(
@@ -1805,7 +1805,7 @@ agent_panel_modes = ["space", "unknown", "priority", "space", "grouped", "priori
         for values in ["[]", "[\"unknown\"]"] {
             let toml = format!("[ui]\nagent_panel_modes = {values}\n");
             let config: Config = toml::from_str(&toml).unwrap();
-            assert_eq!(config.ui.agent_panel_modes, AgentPanelModeConfig::DEFAULT);
+            assert_eq!(config.ui.agent_panel_modes, AgentPanelModeConfig::ALL);
         }
     }
 

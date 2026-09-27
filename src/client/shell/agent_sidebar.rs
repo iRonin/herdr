@@ -105,7 +105,7 @@ pub(super) fn next_agent_panel_mode(
 )> {
     let default_modes;
     let modes = if config.agent_panel_modes.is_empty() {
-        default_modes = crate::config::AgentPanelModeConfig::DEFAULT;
+        default_modes = crate::config::AgentPanelModeConfig::ALL;
         default_modes.as_slice()
     } else {
         &config.agent_panel_modes
