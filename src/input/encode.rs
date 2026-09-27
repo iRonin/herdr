@@ -397,7 +397,7 @@ fn encode_text_input(key: &TerminalKey) -> Option<Vec<u8>> {
     Some(ch.encode_utf8(&mut buf).as_bytes().to_vec())
 }
 
-fn text_char_for_key(key: &TerminalKey) -> Option<char> {
+pub(crate) fn text_char_for_key(key: &TerminalKey) -> Option<char> {
     if key.kind == crossterm::event::KeyEventKind::Release {
         return None;
     }

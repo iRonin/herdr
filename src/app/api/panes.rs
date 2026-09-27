@@ -23,8 +23,9 @@ use crate::app::Mode;
 use crate::layout::{find_in_direction, NavDirection, PaneId};
 
 use super::super::api_helpers::{
-    detect_state_from_api, encode_api_keys, normalize_metadata_source, normalize_metadata_tokens,
-    normalize_metadata_ttl, normalize_reported_agent_label, MAX_METADATA_TOKEN_KEYS_PER_RESOURCE,
+    detect_state_from_api, encode_terminal_keys, normalize_metadata_source,
+    normalize_metadata_tokens, normalize_metadata_ttl, normalize_reported_agent_label,
+    parse_api_keys, MAX_METADATA_TOKEN_KEYS_PER_RESOURCE,
 };
 #[cfg(test)]
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
@@ -1809,16 +1810,36 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        let input_nonempty = !params.text.is_empty();
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
+        let input = Bytes::from(params.text);
+        let input_nonempty = !input.is_empty();
+        if let Err(err) = runtime.try_send_bytes(input.clone()) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
         if input_nonempty {
             self.state
                 .mark_pane_acknowledged_if_blocked(ws_idx, pane_id);
+            self.track_pane_forwarded_input(ws_idx, pane_id, input.as_ref());
         }
 
         encode_success(id, ResponseResult::Ok {})
+    }
+
+    fn track_forwarded_api_input(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        text: &[u8],
+        text_bracketed: bool,
+        keys: &[super::super::api_helpers::EncodedTerminalKey],
+    ) {
+        if text_bracketed {
+            self.track_pane_forwarded_bracketed_paste(ws_idx, pane_id, text);
+        } else {
+            self.track_pane_forwarded_input(ws_idx, pane_id, text);
+        }
+        for encoded_key in keys {
+            self.track_pane_forwarded_key(ws_idx, pane_id, &encoded_key.bytes, &encoded_key.key);
+        }
     }
 
     pub(super) fn handle_pane_send_input(
@@ -1832,21 +1853,30 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        let bytes = match super::super::api_helpers::encode_api_input(
+        let encoded_input = match super::super::api_helpers::encode_api_input(
             runtime,
             &params.text,
             &params.keys,
         ) {
-            Ok(bytes) => bytes,
+            Ok(encoded) => encoded,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
-        let input_nonempty = !bytes.is_empty();
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+        let detector_text = params.text.into_bytes();
+        let input = Bytes::from(encoded_input.bytes);
+        let input_nonempty = !input.is_empty();
+        if let Err(err) = runtime.try_send_bytes(input) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
         if input_nonempty {
             self.state
                 .mark_pane_acknowledged_if_blocked(ws_idx, pane_id);
+            self.track_forwarded_api_input(
+                ws_idx,
+                pane_id,
+                &detector_text,
+                encoded_input.text_bracketed,
+                &encoded_input.keys,
+            );
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -1935,18 +1965,32 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        let encoded_keys = match encode_api_keys(runtime, &params.keys) {
-            Ok(encoded_keys) => encoded_keys,
+        let keys = match parse_api_keys(&params.keys) {
+            Ok(keys) => keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
-        let mut input_forwarded = false;
-        for bytes in encoded_keys {
-            input_forwarded |= !bytes.is_empty();
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
-                return encode_error(id, "pane_send_failed", err.to_string());
+        let encoded_keys = encode_terminal_keys(runtime, &keys);
+        let mut forwarded_keys = Vec::new();
+        let mut send_error = None;
+        for (key, bytes) in keys.into_iter().zip(encoded_keys) {
+            if bytes.is_empty() {
+                continue;
+            }
+            match runtime.try_send_bytes(Bytes::copy_from_slice(&bytes)) {
+                Ok(()) => forwarded_keys.push((key, bytes)),
+                Err(err) => {
+                    send_error = Some(err);
+                    break;
+                }
             }
         }
-        if input_forwarded {
+        for (key, encoded) in &forwarded_keys {
+            self.track_pane_forwarded_key(ws_idx, pane_id, encoded, key);
+        }
+        if let Some(err) = send_error {
+            return encode_error(id, "pane_send_failed", err.to_string());
+        }
+        if !forwarded_keys.is_empty() {
             self.state
                 .mark_pane_acknowledged_if_blocked(ws_idx, pane_id);
         }
@@ -2831,6 +2875,345 @@ mod tests {
             crate::detect::AgentState::Blocked,
             "acknowledging input must preserve raw lifecycle state"
         );
+    }
+
+    #[tokio::test]
+    async fn pane_send_input_detects_compact_through_bracketed_paste_encoding() {
+        let (mut app, public_pane_id, mut rx) = app_with_send_key_runtime(1);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("worker".into());
+            terminal.state = crate::detect::AgentState::Idle;
+        }
+        app.lookup_runtime_sender(0, pane_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[?2004h\x1b[>15u");
+
+        let response = app.handle_pane_send_input(
+            "compact".into(),
+            PaneSendInputParams {
+                pane_id: public_pane_id,
+                text: "/compact".into(),
+                keys: vec!["enter".into()],
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[200~/compact\x1b[201~\x1b[13u")
+        );
+        assert_eq!(
+            app.state.terminals[&terminal_id].state,
+            crate::detect::AgentState::Idle
+        );
+        assert_eq!(
+            app.state.terminals[&terminal_id].display_state(),
+            crate::detect::AgentState::Working
+        );
+        assert!(app.event_hub.events_after(0).iter().any(|(_, event)| {
+            matches!(
+                &event.data,
+                EventData::PaneAgentStatusChanged {
+                    agent_status: crate::api::schema::AgentStatus::Working,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn pane_send_input_tracks_only_bytes_forwarded_by_legacy_keys() {
+        let (mut app, public_pane_id, mut rx) = app_with_send_key_runtime(1);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("worker".into());
+            terminal.state = crate::detect::AgentState::Idle;
+        }
+
+        let response = app.handle_pane_send_input(
+            "compact".into(),
+            PaneSendInputParams {
+                pane_id: public_pane_id,
+                text: "/compact".into(),
+                keys: vec!["f13".into(), "shift+enter".into()],
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"/compact\r"),
+            "legacy F13 forwards nothing and legacy Shift+Enter collapses to CR"
+        );
+        assert_eq!(
+            app.state.terminals[&terminal_id].display_state(),
+            crate::detect::AgentState::Working,
+            "detector must model exactly the bytes the child received"
+        );
+    }
+
+    #[tokio::test]
+    async fn encoded_api_input_keeps_paste_classification_across_mode_flip() {
+        let (mut app, _public_pane_id, mut rx) = app_with_send_key_runtime(1);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("worker".into());
+            terminal.state = crate::detect::AgentState::Idle;
+        }
+        let runtime = app.lookup_runtime_sender(0, pane_id).unwrap();
+        runtime.test_process_pty_bytes(b"\x1b[?2004h");
+        let detector_text = b"notes\n/compact\n";
+        let encoded_input = crate::app::api_helpers::encode_api_input(
+            runtime,
+            std::str::from_utf8(detector_text).unwrap(),
+            &["enter".into()],
+        )
+        .unwrap();
+        assert!(encoded_input.text_bracketed);
+        assert_eq!(
+            encoded_input.bytes,
+            b"\x1b[200~notes\n/compact\n\x1b[201~\r"
+        );
+
+        runtime.test_process_pty_bytes(b"\x1b[?2004l");
+        assert!(!runtime.bracketed_paste_enabled());
+        runtime
+            .try_send_bytes(bytes::Bytes::copy_from_slice(&encoded_input.bytes))
+            .unwrap();
+        app.track_forwarded_api_input(
+            0,
+            pane_id,
+            detector_text,
+            encoded_input.text_bracketed,
+            &encoded_input.keys,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[200~notes\n/compact\n\x1b[201~\r")
+        );
+        assert_eq!(
+            app.state.terminals[&terminal_id].display_state(),
+            crate::detect::AgentState::Idle,
+            "classification must follow the payload decision, not the terminal's later mode"
+        );
+
+        app.track_forwarded_api_input(0, pane_id, detector_text, false, &encoded_input.keys);
+        assert_eq!(
+            app.state.terminals[&terminal_id].display_state(),
+            crate::detect::AgentState::Working,
+            "negative control: re-sampling the disabled mode would create the false projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_send_input_does_not_submit_compact_inside_multiline_bracketed_paste() {
+        let (mut app, public_pane_id, mut rx) = app_with_send_key_runtime(1);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("worker".into());
+            terminal.state = crate::detect::AgentState::Idle;
+        }
+        app.lookup_runtime_sender(0, pane_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[?2004h");
+
+        let response = app.handle_pane_send_input(
+            "pasted-transcript".into(),
+            PaneSendInputParams {
+                pane_id: public_pane_id,
+                text: "notes\n/compact\n".into(),
+                keys: vec!["enter".into()],
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[200~notes\n/compact\n\x1b[201~\r")
+        );
+        assert_eq!(
+            app.state.terminals[&terminal_id].display_state(),
+            crate::detect::AgentState::Idle,
+            "a line inside bracketed paste was inserted, not submitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_state_process_exit_emits_compact_overlay_clear_status() {
+        let (mut app, public_pane_id, mut rx) = app_with_send_key_runtime(1);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("worker".into());
+            terminal.state = crate::detect::AgentState::Idle;
+        }
+
+        let response = app.handle_pane_send_text(
+            "compact".into(),
+            PaneSendTextParams {
+                pane_id: public_pane_id,
+                text: "/compact\r".into(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"/compact\r")
+        );
+        assert_eq!(
+            app.state.terminals[&terminal_id].display_state(),
+            crate::detect::AgentState::Working
+        );
+
+        let before_exit = app.event_hub.current_sequence();
+        app.handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: Some(crate::detect::Agent::Pi),
+            state: crate::detect::AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: std::time::Instant::now(),
+        });
+        let visible_status = app.pane_info(0, pane_id).unwrap().agent_status;
+        let status_events = app
+            .event_hub
+            .events_after(before_exit)
+            .into_iter()
+            .filter_map(|(_, event)| match event.data {
+                EventData::PaneAgentStatusChanged { agent_status, .. } => Some(agent_status),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            status_events,
+            vec![visible_status],
+            "clearing Working without changing raw Idle must resynchronize status-only consumers"
+        );
+        assert_ne!(visible_status, crate::api::schema::AgentStatus::Working);
+    }
+
+    #[tokio::test]
+    async fn compact_overlay_only_tracks_successfully_forwarded_api_input() {
+        let (mut app, public_pane_id, mut rx) = app_with_send_key_runtime(2);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("worker".into());
+            terminal.state = crate::detect::AgentState::Idle;
+        }
+
+        for (request_id, text) in [("fragment", "/com"), ("submit", "pact\r")] {
+            let response = app.handle_pane_send_text(
+                request_id.into(),
+                PaneSendTextParams {
+                    pane_id: public_pane_id.clone(),
+                    text: text.into(),
+                },
+            );
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(success.result, ResponseResult::Ok {});
+        }
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"/com"));
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"pact\r"));
+        assert_eq!(
+            app.state.terminals[&terminal_id].state,
+            crate::detect::AgentState::Idle
+        );
+        assert_eq!(
+            app.state.terminals[&terminal_id].display_state(),
+            crate::detect::AgentState::Working
+        );
+        assert_eq!(
+            app.pane_info(0, pane_id).unwrap().agent_status,
+            crate::api::schema::AgentStatus::Working
+        );
+        assert_eq!(
+            app.tab_info(0, 0).unwrap().agent_status,
+            crate::api::schema::AgentStatus::Working
+        );
+        assert_eq!(
+            app.workspace_info(0).agent_status,
+            crate::api::schema::AgentStatus::Working
+        );
+        let status_events = app
+            .event_hub
+            .events_after(0)
+            .into_iter()
+            .filter(|(_, event)| matches!(&event.data, EventData::PaneAgentStatusChanged { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(status_events.len(), 1);
+        assert!(matches!(
+            &status_events[0].1.data,
+            EventData::PaneAgentStatusChanged {
+                agent_status: crate::api::schema::AgentStatus::Working,
+                ..
+            }
+        ));
+        assert!(app.state.toast.is_none());
+
+        let (mut failed, failed_public_pane_id, mut failed_rx) = app_with_send_key_runtime(1);
+        let failed_pane_id = failed.state.workspaces[0].tabs[0].root_pane;
+        let failed_terminal_id = failed
+            .state
+            .terminal_id_for_pane(0, failed_pane_id)
+            .unwrap();
+        {
+            let terminal = failed.state.terminals.get_mut(&failed_terminal_id).unwrap();
+            terminal.set_agent_name("worker".into());
+            terminal.state = crate::detect::AgentState::Idle;
+        }
+        failed
+            .lookup_runtime_sender(0, failed_pane_id)
+            .unwrap()
+            .try_send_bytes(bytes::Bytes::from_static(b"occupied"))
+            .unwrap();
+        let rejected = failed.handle_pane_send_text(
+            "rejected-fragment".into(),
+            PaneSendTextParams {
+                pane_id: failed_public_pane_id.clone(),
+                text: "/com".into(),
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "pane_send_failed");
+        assert_eq!(
+            failed_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"occupied")
+        );
+
+        let response = failed.handle_pane_send_text(
+            "unrelated-submit".into(),
+            PaneSendTextParams {
+                pane_id: failed_public_pane_id,
+                text: "pact\r".into(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            failed_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"pact\r")
+        );
+        assert_eq!(
+            failed.state.terminals[&failed_terminal_id].display_state(),
+            crate::detect::AgentState::Idle,
+            "a rejected command fragment must not contaminate the detector"
+        );
+        assert!(failed.event_hub.events_after(0).is_empty());
+        assert!(failed.state.toast.is_none());
     }
 
     #[tokio::test]

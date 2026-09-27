@@ -993,6 +993,42 @@ impl AppState {
             .min()
     }
 
+    pub(crate) fn next_optimistic_working_deadline(&self) -> Option<std::time::Instant> {
+        self.terminals
+            .values()
+            .filter_map(crate::terminal::TerminalState::optimistic_working_deadline)
+            .min()
+    }
+
+    pub(crate) fn expire_optimistic_working_at(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Vec<(usize, crate::layout::PaneId)> {
+        let expired_terminal_ids = self
+            .terminals
+            .iter_mut()
+            .filter_map(|(terminal_id, terminal)| {
+                terminal
+                    .expire_optimistic_working_at(now)
+                    .then_some(terminal_id.clone())
+            })
+            .collect::<std::collections::HashSet<_>>();
+        if expired_terminal_ids.is_empty() {
+            return Vec::new();
+        }
+        let mut targets = Vec::new();
+        for (ws_idx, workspace) in self.workspaces.iter().enumerate() {
+            for tab in &workspace.tabs {
+                for (pane_id, pane) in &tab.panes {
+                    if expired_terminal_ids.contains(&pane.attached_terminal_id) {
+                        targets.push((ws_idx, *pane_id));
+                    }
+                }
+            }
+        }
+        targets
+    }
+
     /// Called once per loop tick. Returns true exactly on the tick where the overlay stops being
     /// visible, which is when a full repaint is owed to erase it -- the retained fast path only
     /// repaints rows the terminal itself dirtied, so an expired overlay would otherwise linger on
