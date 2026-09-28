@@ -615,17 +615,23 @@ mod tests {
     #[tokio::test]
     async fn status_command_drains_large_output_and_keeps_the_last_line() {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        // The 30s budget is a hang guard, not the property under test (the drain
+        // keeps the LAST line). 2s flaked once under system load at gate time:
+        // spawn + 5KB of pipe output can exceed it, and the event then arrives
+        // as Err("timed out after 2s") - the same class as the reload test's
+        // fixed 500ms poll budget. The timeout BEHAVIOR itself is asserted by
+        // the deadline test above with its own 1s budget.
         spawn_status_command(
             event_tx,
             7,
             3,
             OVER_CAP_COMMAND.into(),
-            Duration::from_secs(2),
+            Duration::from_secs(30),
             Vec::new(),
             None,
         );
 
-        let event = tokio::time::timeout(Duration::from_secs(3), event_rx.recv())
+        let event = tokio::time::timeout(Duration::from_secs(30), event_rx.recv())
             .await
             .expect("status command timed out")
             .expect("status command event channel closed");
