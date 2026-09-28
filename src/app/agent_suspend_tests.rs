@@ -283,3 +283,85 @@ fn same_kind_replacement_drops_the_previous_pi_session_and_authority() {
     assert_eq!(session_value(&app, &terminal_id), None);
     app.assert_invariants_for_test();
 }
+
+fn second_pi_session() -> AgentSessionRef {
+    AgentSessionRef::path(
+        std::env::current_dir()
+            .expect("cwd")
+            .join("takeover-pi-2.jsonl")
+            .display()
+            .to_string(),
+    )
+    .expect("second pi session path")
+}
+
+/// A new pi replaces a stopped pi of the same kind in front of the pane, and its first report
+/// reaches herdr before the detector's two replacement ticks. Upstream's background tracker
+/// (#4964) drops the old session's authority at the ticks, and the report that came before them is
+/// gone with it: the pane shows `unknown` until the new agent reports again. Measured identical on
+/// stock v0.9.5 (`2ecf19a9`) and on the fork; this pins that the fork's fast-relaunch recovery does
+/// not hold such a report back or change where the new agent ends up.
+#[test]
+fn a_report_before_a_replacement_in_front_is_dropped_and_the_next_report_binds_the_new_session() {
+    let start = Instant::now();
+    let (mut app, pane_id, terminal_id) = pi_with_live_authority(start);
+
+    app.handle_app_event(AppEvent::HookStateReported {
+        pane_id,
+        source: "herdr:pi".into(),
+        agent_label: "pi".into(),
+        state: AgentState::Working,
+        message: None,
+        seq: Some(131),
+        session_ref: Some(second_pi_session()),
+    });
+    assert_eq!(
+        session_value(&app, &terminal_id),
+        Some(pi_session().value),
+        "the first session still holds the pane before the replacement is detected"
+    );
+
+    same_kind_replacement(&mut app, pane_id, Agent::Pi, start + Duration::from_secs(1));
+    let terminal = &app.terminals[&terminal_id];
+    assert!(!terminal.full_lifecycle_hook_authority_active());
+    assert_eq!(terminal.state, AgentState::Unknown);
+    assert_eq!(session_value(&app, &terminal_id), None);
+
+    app.handle_app_event(AppEvent::AgentSessionReported {
+        pane_id,
+        source: "herdr:pi".into(),
+        agent_label: "pi".into(),
+        seq: Some(130),
+        session_ref: Some(second_pi_session()),
+        session_start_source: Some("startup".into()),
+    });
+    let terminal = &app.terminals[&terminal_id];
+    assert_eq!(
+        session_value(&app, &terminal_id),
+        Some(second_pi_session().value)
+    );
+    assert_eq!(
+        terminal.state,
+        AgentState::Unknown,
+        "the report that came before the replacement is not replayed"
+    );
+    assert!(!terminal.full_lifecycle_hook_authority_active());
+
+    app.handle_app_event(AppEvent::HookStateReported {
+        pane_id,
+        source: "herdr:pi".into(),
+        agent_label: "pi".into(),
+        state: AgentState::Idle,
+        message: None,
+        seq: Some(132),
+        session_ref: Some(second_pi_session()),
+    });
+    let terminal = &app.terminals[&terminal_id];
+    assert!(terminal.full_lifecycle_hook_authority_active());
+    assert_eq!(terminal.state, AgentState::Idle);
+    assert_eq!(
+        session_value(&app, &terminal_id),
+        Some(second_pi_session().value)
+    );
+    app.assert_invariants_for_test();
+}

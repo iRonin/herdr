@@ -12,6 +12,9 @@ use crate::terminal::TerminalId;
 
 #[path = "metadata.rs"]
 mod metadata;
+#[cfg(test)]
+#[path = "state_successor_tests.rs"]
+mod successor_tests;
 pub use metadata::{AgentMetadata, AgentMetadataReport, EffectivePresentation};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
