@@ -865,7 +865,11 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
         );
 
         // Exercise both auto-start and a subsequent attach to the healthy Local server.
-        for args in [&[][..], &["client"][..]] {
+        // Each phase gets its own marker. The attach phase (args ["client"]) renders the
+        // same pane as the auto-start phase, including its scrollback, so a shared marker
+        // let the attach phase pass without a single write of its own; with per-phase tags
+        // a phase can only pass by executing its own command.
+        for (phase, args) in [&[][..], &["client"][..]].iter().enumerate() {
             let client = spawn_client_process_with_args_and_env(
                 &config_home,
                 &runtime_dir,
@@ -882,6 +886,8 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
                 || { read_output(&output).contains("Local") }
             ));
             let mut input = client._master.as_ref().unwrap().take_writer().unwrap();
+            let remote_tag = if select_remote { "R1" } else { "R0" };
+            let marker = format!("LOCAL_DIRECT_READY_{remote_tag}_P{phase}");
             // Input is gated until Local's active surface is ready, and that readiness can lag
             // the first rendered frame (the unavailable remote must not extend the wait). Retry
             // the write instead of assuming a single write lands, matching the recovered-Local
@@ -897,11 +903,14 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
             // space-separated — so this wait can only be satisfied by the shell EXECUTING the
             // command, never by the input echo alone.
             assert!(wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
-                if read_output(&output).contains("LOCAL_DIRECT_READY") {
+                if read_output(&output).contains(marker.as_str()) {
                     return true;
                 }
                 input
-                    .write_all(b"\x03printf %s%s%s LOCAL_ DIRECT_ READY\r")
+                    .write_all(
+                        format!("\u{3}printf %s%s%s%s LOCAL_ DIRECT_ READY_ {remote_tag}_P{phase}\r")
+                            .as_bytes(),
+                    )
                     .unwrap();
                 false
             }), "Local must accept input without waiting for SSH (remote selected: {select_remote}): {}", read_output(&output));
