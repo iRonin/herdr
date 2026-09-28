@@ -975,6 +975,32 @@ mod tests {
     }
 
     #[test]
+    fn derive_label_ignores_settings_above_the_repo_root() {
+        let base = temp_test_dir("settings-above-repo");
+        // A project file ABOVE the repository must not leak into it: the walk
+        // stops at the repository root (inclusive), so this file is never read.
+        std::fs::create_dir_all(base.join(".herdr")).unwrap();
+        std::fs::write(
+            base.join(".herdr/settings.toml"),
+            "[workspace]\nname = \"outer-pin\"\n",
+        )
+        .unwrap();
+        let repo = base.join("repo");
+        write_git_repo_marker(&repo);
+        let nested = repo.join("sub");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let expected = repo.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            derive_label_from_cwd(&nested),
+            expected,
+            "a settings file above the repository root must be ignored"
+        );
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn derive_label_ignores_malformed_settings() {
         let root = temp_test_dir("settings-malformed");
         write_git_repo_marker(&root);
