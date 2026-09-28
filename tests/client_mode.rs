@@ -248,6 +248,23 @@ fn first_pane_id_in_workspace(socket_path: &PathBuf, workspace_id: &str) -> Stri
     panic!("pane.list did not return a pane for workspace {workspace_id} before timeout");
 }
 
+/// True when the server has written bytes that this client has not read yet.
+fn client_has_unread_bytes(stream: &UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+
+    let mut byte = 0_u8;
+    // A one-byte peek into a local buffer; MSG_DONTWAIT keeps it from blocking.
+    let peeked = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    peeked > 0
+}
+
 fn app_dir_name() -> &'static str {
     if cfg!(debug_assertions) {
         "herdr-dev"
@@ -2017,6 +2034,35 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
     wait_for_client_shell_bootstrap(&mut stream, Duration::from_secs(5))
         .expect("client shell bootstrap");
 
+    // Pane output the server sent after the bootstrap surface can still be unread when the
+    // signal arrives: the shell draws its first prompt after that surface, for one. Make that
+    // case certain instead of a race: type into the pane, then wait until the server has queued
+    // the resulting update on this client's socket, ahead of the signal.
+    let panes = send_json_request(
+        &api_socket,
+        r#"{"id":"panes","method":"pane.list","params":{}}"#,
+    );
+    let pane_id = panes["result"]["panes"][0]["pane_id"]
+        .as_str()
+        .expect("bootstrap pane id")
+        .to_owned();
+    let typed = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id": "type",
+            "method": "pane.send_text",
+            "params": {"pane_id": pane_id, "text": "x"}
+        })
+        .to_string(),
+    );
+    assert!(typed.get("error").is_none(), "{typed}");
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+            client_has_unread_bytes(&stream)
+        }),
+        "typing into the pane should queue an update for the client"
+    );
+
     // Send SIGINT to the server process to trigger graceful shutdown.
     if let Some(pid) = spawned.child.process_id() {
         unsafe {
@@ -2026,21 +2072,32 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
 
     // The client should receive a ServerShutdown message
     // before the connection is closed, not just an abrupt EOF.
+    // Updates the server queued before it handled the signal arrive first.
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let result = read_server_message(&mut stream);
-    match result {
-        Ok((variant, _payload)) => {
-            assert_eq!(
-                variant, SERVER_MESSAGE_SERVER_SHUTDOWN,
-                "expected ServerShutdown, got variant {variant}"
-            );
-        }
-        Err(e) => {
-            panic!("expected ServerShutdown message before connection close, got error: {e}");
+    let mut read_before_shutdown = Vec::new();
+    loop {
+        match read_server_message(&mut stream) {
+            Ok((SERVER_MESSAGE_SERVER_SHUTDOWN, _payload)) => break,
+            Ok((variant, _payload)) => {
+                read_before_shutdown.push(variant);
+                assert!(
+                    read_before_shutdown.len() < 1_000,
+                    "no ServerShutdown after {} other messages",
+                    read_before_shutdown.len()
+                );
+            }
+            Err(e) => panic!(
+                "expected ServerShutdown message before connection close, got error: {e} \
+                 (messages before it: {read_before_shutdown:?})"
+            ),
         }
     }
+    assert!(
+        !read_before_shutdown.is_empty(),
+        "the queued pane update should arrive before the shutdown notice"
+    );
 
     // Wait for the server to exit.
     spawned.close_master();
