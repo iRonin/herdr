@@ -396,6 +396,22 @@ fn wait_for_output(socket_path: &Path, pane_id: &str, needle: &str) {
     );
 }
 
+/// Waits until a new pane's shell has run a command. The pane starts a login shell, which reads
+/// the user's profile before it reads typed input; on a busy machine that alone can take longer
+/// than the 5 s the tests give their own commands. The shell itself creates `marker`, so the
+/// terminal's echo of the typed command cannot satisfy the wait.
+fn wait_for_pane_shell(socket_path: &Path, pane_id: &str, marker: &Path) {
+    assert_ok(request(
+        socket_path,
+        serde_json::json!({
+            "id": "test:pane:shell-ready",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": format!(": > {}", marker.display()), "keys": ["Enter"]}
+        }),
+    ));
+    support::wait_for_file(marker, Duration::from_secs(60));
+}
+
 fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     let mut last_text = String::new();
@@ -1046,6 +1062,12 @@ fn live_handoff_preserves_pane_process_io() {
         second_hup_marker.display(),
         second_received_marker.display()
     );
+    wait_for_pane_shell(&api_socket, &pane_id, &base.join("shell-ready"));
+    wait_for_pane_shell(
+        &api_socket,
+        &second_pane_id,
+        &base.join("second-shell-ready"),
+    );
     assert_ok(request(
         &api_socket,
         serde_json::json!({
@@ -1227,6 +1249,7 @@ pathlib.Path({received:?}).write_text(data.hex())
         .as_str()
         .unwrap()
         .to_string();
+    wait_for_pane_shell(&api_socket, &pane_id, &base.join("shell-ready"));
     assert_ok(request(
         &api_socket,
         serde_json::json!({
@@ -1323,6 +1346,7 @@ pathlib.Path({received:?}).write_text(data.hex())
         .as_str()
         .unwrap()
         .to_string();
+    wait_for_pane_shell(&api_socket, &pane_id, &base.join("shell-ready"));
     assert_ok(request(
         &api_socket,
         serde_json::json!({
@@ -1396,6 +1420,7 @@ fn live_handoff_accepts_canonical_pane_id_from_child_env() {
         .as_str()
         .unwrap()
         .to_string();
+    wait_for_pane_shell(&api_socket, &pane_id, &base.join("shell-ready"));
     assert_ok(request(
         &api_socket,
         serde_json::json!({
@@ -1493,6 +1518,7 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
         .as_str()
         .unwrap()
         .to_string();
+    wait_for_pane_shell(&api_socket, &pane_id, &base.join("shell-ready"));
     assert_ok(request(
         &api_socket,
         serde_json::json!({
@@ -1909,6 +1935,7 @@ fn live_handoff_keeps_shell_pane_after_foreground_process_exits() {
         started_marker.display(),
         exited_marker.display()
     );
+    wait_for_pane_shell(&api_socket, &pane_id, &base.join("shell-ready"));
     assert_ok(request(
         &api_socket,
         serde_json::json!({
@@ -1978,6 +2005,7 @@ fn live_handoff_preserves_python_http_server() {
         .unwrap()
         .to_string();
 
+    wait_for_pane_shell(&api_socket, &pane_id, &base.join("shell-ready"));
     assert_ok(request(
         &api_socket,
         serde_json::json!({
@@ -2059,6 +2087,11 @@ fn live_handoff_preserves_http_servers_across_multiple_sessions() {
             .as_str()
             .unwrap()
             .to_string();
+        wait_for_pane_shell(
+            api_socket,
+            &pane_id,
+            &base.join(format!("shell-ready-{}", session_name.unwrap_or("default"))),
+        );
         assert_ok(request(
             api_socket,
             serde_json::json!({
@@ -2140,6 +2173,7 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
         marker.display(),
         received_marker.display()
     );
+    wait_for_pane_shell(&api_socket, &pane_id, &base.join("shell-ready"));
     assert_ok(request(
         &api_socket,
         serde_json::json!({
@@ -2224,6 +2258,7 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         marker.display(),
         received_marker.display()
     );
+    wait_for_pane_shell(&api_socket, &pane_id, &base.join("shell-ready"));
     assert_ok(request(
         &api_socket,
         serde_json::json!({
