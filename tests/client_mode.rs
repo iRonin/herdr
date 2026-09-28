@@ -1288,6 +1288,33 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
         Duration::from_millis(20),
         || screen_text().contains("REMOTE_STILL_SELECTED")
     ));
+    // The remote frame is drawn before the selection commits, and pane input stays gated until
+    // it does. Losing the remote inside that window rolls the selection back to Local instead,
+    // so prove the remote is selected before losing it: typed input must reach the remote pane.
+    assert!(
+        wait_until(Duration::from_secs(8), Duration::from_millis(100), || {
+            let read = send_json_request(
+                &remote_api,
+                &serde_json::json!({
+                    "id": "remote-read", "method": "pane.read",
+                    "params": {"pane_id": remote_pane, "source": "recent", "lines": 200},
+                })
+                .to_string(),
+            );
+            if read["result"]["read"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("REMOTE_INPUT_BEFORE_LOSS"))
+            {
+                return true;
+            }
+            input
+                .write_all(b"printf 'REMOTE_%s\\n' INPUT_BEFORE_LOSS\r")
+                .unwrap();
+            false
+        }),
+        "the selected remote must accept input before it is lost: {}",
+        screen_text()
+    );
 
     let watermark = output_len(&output);
     remote_server.child.kill().unwrap();
