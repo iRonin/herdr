@@ -26,9 +26,11 @@ const CLIENT_MESSAGE_CLIENT_SHELL_PANE_INPUT: u32 = 13;
 const CLIENT_MESSAGE_CLIENT_SHELL_FOCUS: u32 = 18;
 const CLIENT_MESSAGE_ENDPOINT_CONTROL: u32 = 20;
 
+/// Strips EVERY inherited HERDR_* variable, not only HERDR_STARTUP_CWD and HERDR_SESSION: a shell inside a
+/// herdr pane exports more of them, and HERDR_SOCKET_PATH names the developer's LIVE server. Callers set the
+/// few variables they mean to pass AFTER this call, so deliberate HERDR_* assignments survive.
 pub fn isolate_herdr_test_process(command: &mut CommandBuilder) {
-    command.env_remove("HERDR_STARTUP_CWD");
-    command.env_remove("HERDR_SESSION");
+    sanitize_herdr_env(command);
 }
 
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
@@ -86,6 +88,28 @@ pub fn unregister_runtime_dir(path: &Path) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.remove(path);
+    }
+}
+
+/// Remove every inherited HERDR_* variable so a spawned test process never
+/// sees the developer's live pane environment: HERDR_STARTUP_CWD makes every fresh
+/// server seed an extra startup workspace, and HERDR_SOCKET_PATH names the
+/// developer's LIVE server. Callers set the few variables they mean to pass AFTER
+/// this, so deliberate HERDR_* assignments survive.
+pub fn sanitize_herdr_env(command: &mut portable_pty::CommandBuilder) {
+    for (key, _) in std::env::vars() {
+        if key.starts_with("HERDR_") {
+            command.env_remove(&key);
+        }
+    }
+}
+
+/// std::process::Command twin of [sanitize_herdr_env].
+pub fn sanitize_herdr_env_command(command: &mut std::process::Command) {
+    for (key, _) in std::env::vars() {
+        if key.starts_with("HERDR_") {
+            command.env_remove(&key);
+        }
     }
 }
 
@@ -1196,6 +1220,7 @@ mod tests {
                 })
                 .unwrap();
             let mut command = CommandBuilder::new(binary);
+            sanitize_herdr_env(&mut command);
             command.arg("server");
             command.env("XDG_RUNTIME_DIR", runtime_dir.as_os_str());
             command.env(

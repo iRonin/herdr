@@ -1,5 +1,7 @@
 #![cfg(all(unix, not(target_os = "macos")))]
 
+pub mod support;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -89,7 +91,9 @@ exec "$TEST_REMOTE_HERDR" "$@"
         remote.set_nonblocking(true).unwrap();
         let local = UnixListener::bind(root.join("local.sock")).unwrap();
         local.set_nonblocking(true).unwrap();
-        let status = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        let mut herdr_command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+        support::sanitize_herdr_env_command(&mut herdr_command);
+        let status = herdr_command
             .args(["status", "client", "--json"])
             .output()
             .unwrap();
@@ -105,6 +109,7 @@ exec "$TEST_REMOTE_HERDR" "$@"
 
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+        support::sanitize_herdr_env_command(&mut command);
         command
             .args(args)
             .env(

@@ -203,6 +203,7 @@ fn wait_for_log_contains(path: &Path, needle: &str, timeout: Duration) {
 
 fn run_cli(socket_path: &Path, args: &[&str]) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    support::sanitize_herdr_env_command(&mut command);
     command.args(args);
     command.env("HERDR_SOCKET_PATH", socket_path);
     command.output().unwrap()
@@ -711,7 +712,11 @@ fn auto_detect_respects_nested_guard_before_auto_attach() {
         .map(|workspaces| workspaces.len())
         .unwrap_or(0);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+    let mut herdr_command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+
+    support::sanitize_herdr_env_command(&mut herdr_command);
+
+    let output = herdr_command
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env("HERDR_SOCKET_PATH", &api_socket)

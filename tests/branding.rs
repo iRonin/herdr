@@ -1,8 +1,12 @@
+pub mod support;
+
 use std::process::Command;
 
 #[test]
 fn version_identifies_branded_fork() {
-    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+    let mut herdr_command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    support::sanitize_herdr_env_command(&mut herdr_command);
+    let output = herdr_command
         .arg("--version")
         .output()
         .expect("herdr --version should run");

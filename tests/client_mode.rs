@@ -498,7 +498,11 @@ fn server_unreachable_shows_clear_error() {
     )
     .unwrap();
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
+    let mut herdr_command = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"));
+
+    support::sanitize_herdr_env_command(&mut herdr_command);
+
+    let output = herdr_command
         .arg("client")
         .env("HERDR_DISABLE_SOUND", "1")
         .env("XDG_CONFIG_HOME", &config_home)

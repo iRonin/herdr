@@ -1,3 +1,5 @@
+pub mod support;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -46,7 +48,9 @@ impl SessionConfig {
     }
 
     fn delete(&self, name: &str) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_herdr"))
+        let mut herdr_command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+        support::sanitize_herdr_env_command(&mut herdr_command);
+        herdr_command
             .args(["session", "delete", name, "--json"])
             .env("XDG_CONFIG_HOME", &self.root)
             .env_remove("HERDR_SESSION")

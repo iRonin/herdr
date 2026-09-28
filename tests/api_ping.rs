@@ -364,7 +364,11 @@ fn successful_server_stop_prints_dim_fork_branding_to_stderr() {
     let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
+    let mut herdr_command = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"));
+
+    support::sanitize_herdr_env_command(&mut herdr_command);
+
+    let output = herdr_command
         .args(["server", "stop"])
         .env("HERDR_SOCKET_PATH", &socket_path)
         .output()
@@ -390,7 +394,11 @@ fn failed_server_stop_does_not_print_fork_branding() {
     let socket_path = runtime_dir.join("missing.sock");
     register_runtime_dir(&runtime_dir);
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
+    let mut herdr_command = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"));
+
+    support::sanitize_herdr_env_command(&mut herdr_command);
+
+    let output = herdr_command
         .args(["server", "stop"])
         .env("XDG_CONFIG_HOME", &config_home)
         .env("HERDR_SOCKET_PATH", &socket_path)
