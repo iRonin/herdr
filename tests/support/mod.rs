@@ -1167,8 +1167,14 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let base = std::env::temp_dir().join(format!(
-            "herdr-support-scan-{}-{unique}",
+        // Literal /tmp like the other test dirs (not std::env::temp_dir, which
+        // on macOS is ~50 chars of /var/folders path): the runtime dir plus
+        // herdr.sock must stay under the kernel's 104-byte sun_path limit, and
+        // the temp_dir variant overflowed it intermittently - the (pid, nanos)
+        // length wobbled across the boundary, so the server died at startup
+        // with "local socket name length exceeds capacity of sun_path".
+        let base = PathBuf::from(format!(
+            "/tmp/herdr-support-scan-{}-{unique}",
             std::process::id()
         ));
         let real_runtime = base.join("real-runtime");
@@ -1188,6 +1194,7 @@ mod tests {
             u32,
             Box<dyn portable_pty::Child + Send + Sync>,
             Box<dyn portable_pty::MasterPty + Send>,
+            Box<dyn Read + Send>,
         ) {
             let pair = native_pty_system()
                 .openpty(PtySize {
@@ -1197,6 +1204,7 @@ mod tests {
                     pixel_height: 0,
                 })
                 .unwrap();
+            let reader = pair.master.try_clone_reader().unwrap();
             let mut command = CommandBuilder::new(binary);
             sanitize_herdr_env(&mut command);
             command.arg("server");
@@ -1208,13 +1216,28 @@ mod tests {
             let child = pair.slave.spawn_command(command).unwrap();
             let pid = child.process_id().expect("spawned server pid");
             drop(pair.slave);
-            (pid, child, Box::from(pair.master))
+            (pid, child, pair.master, reader)
         };
 
-        let (real_pid, mut real_child, _real_master) =
+        let (real_pid, mut real_child, _real_master, mut real_reader) =
             spawn(Path::new(env!("CARGO_BIN_EXE_herdr")), &real_runtime);
-        let (foreign_pid, mut foreign_child, _foreign_master) =
+        let (foreign_pid, mut foreign_child, _foreign_master, _foreign_reader) =
             spawn(&foreign_bin, &foreign_runtime);
+
+        // Keep the real server's output so a startup failure can say WHY.
+        let real_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let log = real_log.clone();
+            std::thread::spawn(move || {
+                let mut buffer = [0u8; 4096];
+                while let Ok(n) = real_reader.read(&mut buffer) {
+                    if n == 0 {
+                        break;
+                    }
+                    log.lock().unwrap().extend_from_slice(&buffer[..n]);
+                }
+            });
+        }
 
         // Poll: the scan can only see a process once it is exec'd.
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1247,7 +1270,10 @@ mod tests {
 
         assert!(
             found_real,
-            "the scan must find this build's own test server (pid {real_pid})"
+            "the scan must find this build's own test server (pid {real_pid}: \
+             child status {:?}, server output {:?})",
+            real_child.try_wait(),
+            String::from_utf8_lossy(&real_log.lock().unwrap()[..]),
         );
         assert!(
             foreign_alive,
