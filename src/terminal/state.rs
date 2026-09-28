@@ -493,7 +493,11 @@ impl TerminalState {
         let starts_acquisition = !self
             .should_ignore_detected_state_under_full_lifecycle_hook(Some(agent), false)
             && !self.detected_state_observed_before_release_suppression(Some(agent), now);
-        let mutation = self.set_detected_state_with_screen_signals_at(
+        if starts_acquisition {
+            // Opened before the update, so a held working report that it replays can close it.
+            self.agent_process_acquisition_pending = true;
+        }
+        self.set_detected_state_with_screen_signals_at(
             Some(agent),
             AgentState::Unknown,
             false,
@@ -501,11 +505,7 @@ impl TerminalState {
             false,
             false,
             now,
-        );
-        if starts_acquisition {
-            self.agent_process_acquisition_pending = true;
-        }
-        mutation
+        )
     }
 
     #[cfg(unix)]
@@ -712,8 +712,8 @@ impl TerminalState {
             let agent_label = crate::detect::agent_label(agent);
             self.reconcile_agent_name_owner(agent_label, None);
         }
-        if !process_exited {
-            self.clear_full_lifecycle_hook_suppression_for_detected_agent(
+        let replayed_working = !process_exited
+            && self.clear_full_lifecycle_hook_suppression_for_detected_agent(
                 if replacement_process_detected {
                     None
                 } else {
@@ -721,7 +721,6 @@ impl TerminalState {
                 },
                 agent,
             );
-        }
         self.fallback_state = fallback_state;
         self.fallback_visible_blocker = visible_blocker && fallback_state == AgentState::Blocked;
         self.fallback_observed_at = Some(now);
@@ -917,6 +916,9 @@ impl TerminalState {
             now,
         );
         if fallback_state == AgentState::Working && self.state == AgentState::Working {
+            self.agent_process_acquisition_pending = false;
+        }
+        if replayed_working && self.state == AgentState::Working {
             self.agent_process_acquisition_pending = false;
         }
         TerminalStateMutation {
@@ -1416,16 +1418,17 @@ impl TerminalState {
             .cloned()
     }
 
+    /// Returns true when it replays a held working report as the current authority.
     fn clear_full_lifecycle_hook_suppression_for_detected_agent(
         &mut self,
         previous_detected_agent: Option<Agent>,
         detected_agent: Option<Agent>,
-    ) {
+    ) -> bool {
         let Some(detected_agent) = detected_agent else {
-            return;
+            return false;
         };
         if previous_detected_agent == Some(detected_agent) {
-            return;
+            return false;
         }
         let detected_label = crate::detect::agent_label(detected_agent);
         let mut stale_sessions = Vec::new();
@@ -1496,6 +1499,7 @@ impl TerminalState {
                 .any(|(validated_source, _, _, _)| validated_source == source)
                 || !crate::detect::full_lifecycle_hook_authority(source, detected_label)
         });
+        let mut replayed_working = false;
         for (source, agent_label, session_ref, pending) in validated_replacement_sessions {
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
             self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
@@ -1506,9 +1510,11 @@ impl TerminalState {
             });
             if let Some(pending) = pending {
                 self.hook_report_sequences.insert(source, pending.seq);
+                replayed_working = pending.authority.state == AgentState::Working;
                 self.hook_authority = Some(pending.authority);
             }
         }
+        replayed_working
     }
 
     fn remember_stale_full_lifecycle_hook_session(
@@ -1842,16 +1848,22 @@ impl TerminalState {
             self.hook_report_sequences.insert(source.clone(), seq);
 
             if process_present {
-                self.clear_full_lifecycle_hook_suppression_for_detected_agent(None, known_agent);
+                let replayed_working = self
+                    .clear_full_lifecycle_hook_suppression_for_detected_agent(None, known_agent);
                 let current_session = self.current_session_identity_for_persistence();
+                let effective_state_change = self.recompute_effective_state(
+                    previous_agent_label,
+                    previous_known_agent,
+                    previous_state,
+                    previous_presentation,
+                    now,
+                );
+                if replayed_working && self.state == AgentState::Working {
+                    // A replayed report is as fresh as a live one, so it ends acquisition too.
+                    self.agent_process_acquisition_pending = false;
+                }
                 return Some(TerminalStateMutation {
-                    effective_state_change: self.recompute_effective_state(
-                        previous_agent_label,
-                        previous_known_agent,
-                        previous_state,
-                        previous_presentation,
-                        now,
-                    ),
+                    effective_state_change,
                     session_ref_changed: previous_session != current_session,
                     agent_released: false,
                 });
@@ -2845,6 +2857,79 @@ mod tests {
         assert!(
             terminal.finish_agent_process_acquisition(),
             "after a rebind only a fresh working report ends acquisition"
+        );
+    }
+
+    #[test]
+    fn a_working_report_held_for_the_session_start_still_ends_process_acquisition() {
+        // A reporter sends its session start and its first report together. A working report
+        // that arrives first is held, then replayed by the session start; the replay carries a
+        // fresh report, so the first idle after it ends a turn.
+        let session = test_session_path("pi-report-before-session-start.jsonl");
+        let mut terminal = test_terminal();
+        terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+        report_pi(&mut terminal, &session, AgentState::Working, 11);
+        assert_eq!(
+            terminal.state,
+            AgentState::Unknown,
+            "with no session anchored the working report is held"
+        );
+        let start = terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            crate::agent_resume::AgentSessionRef::path(session.clone()),
+            Some(10),
+            Some("startup".into()),
+        );
+        assert!(start.is_some(), "the session start anchors the session");
+        assert_eq!(
+            terminal.state,
+            AgentState::Working,
+            "the session start replays the held working report"
+        );
+        report_pi(&mut terminal, &session, AgentState::Idle, 12);
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert!(
+            !terminal.finish_agent_process_acquisition(),
+            "the first idle after a replayed working report must count as a completion"
+        );
+    }
+
+    #[test]
+    fn a_working_report_held_for_process_detection_still_ends_process_acquisition() {
+        // When the reports arrive before herdr has seen the agent process, detection replays the
+        // held working report. The acquisition that detection opens must not outlive that report.
+        let session = test_session_path("pi-reports-before-detection.jsonl");
+        let mut terminal = test_terminal();
+        let start = terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            crate::agent_resume::AgentSessionRef::path(session.clone()),
+            Some(10),
+            Some("startup".into()),
+        );
+        assert!(
+            start.is_none(),
+            "with no agent process the session start is held"
+        );
+        report_pi(&mut terminal, &session, AgentState::Working, 11);
+        assert_eq!(
+            terminal.state,
+            AgentState::Unknown,
+            "the working report is held too"
+        );
+        terminal
+            .set_detected_agent_process_at(Agent::Pi, Instant::now() + Duration::from_millis(1));
+        assert_eq!(
+            terminal.state,
+            AgentState::Working,
+            "detection replays the held working report"
+        );
+        report_pi(&mut terminal, &session, AgentState::Idle, 12);
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert!(
+            !terminal.finish_agent_process_acquisition(),
+            "the first idle after a replayed working report must count as a completion"
         );
     }
 
