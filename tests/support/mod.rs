@@ -1188,14 +1188,14 @@ mod tests {
         fs::copy(env!("CARGO_BIN_EXE_herdr"), &foreign_bin)
             .expect("copy the test binary for the negative control");
 
-        let spawn = |binary: &Path,
-                     runtime_dir: &Path|
-         -> (
+        type SpawnedScanServer = (
             u32,
             Box<dyn portable_pty::Child + Send + Sync>,
             Box<dyn portable_pty::MasterPty + Send>,
             Box<dyn Read + Send>,
-        ) {
+        );
+
+        let spawn = |binary: &Path, runtime_dir: &Path| -> SpawnedScanServer {
             let pair = native_pty_system()
                 .openpty(PtySize {
                     rows: 24,
