@@ -298,6 +298,8 @@ fn handle_connection_with_stop(
         }
         method_body => {
             let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
+            // The sender is waiting for this reply, so it is alive to be identified.
+            let peer_process = crate::platform::local_peer_process(&stream);
             let response = handle_request(
                 Request {
                     id: request_id.clone(),
@@ -307,6 +309,7 @@ fn handle_connection_with_stop(
                 capabilities,
                 server_stop,
                 Some(response_write_rx),
+                peer_process,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             let _ = response_write_tx.send(());
@@ -364,6 +367,7 @@ fn handle_request(
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+    peer_process: Option<crate::platform::PeerProcess>,
 ) -> String {
     if matches!(&request.method, Method::Ping(_)) {
         return serde_json::to_string(&SuccessResponse {
@@ -405,7 +409,15 @@ fn handle_request(
         );
     }
 
-    dispatch_to_app(request, api_tx, None, response_write_complete, None, None)
+    dispatch_to_app(
+        request,
+        peer_process,
+        api_tx,
+        None,
+        response_write_complete,
+        None,
+        None,
+    )
 }
 
 pub(crate) fn api_method_name(method: &Method) -> &'static str {
@@ -854,7 +866,7 @@ pub(super) fn dispatch_to_app_with_timeout(
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
 ) -> String {
-    dispatch_to_app(request, api_tx, timeout, None, None, None)
+    dispatch_to_app(request, None, api_tx, timeout, None, None, None)
 }
 
 pub(super) fn dispatch_to_app_with_caller_timeout(
@@ -864,6 +876,7 @@ pub(super) fn dispatch_to_app_with_caller_timeout(
 ) -> String {
     dispatch_to_app(
         request,
+        None,
         api_tx,
         timeout,
         None,
@@ -878,7 +891,15 @@ pub(super) fn dispatch_stream_open(
     timeout: Duration,
     active: Arc<AtomicBool>,
 ) -> String {
-    dispatch_to_app(request, api_tx, Some(timeout), None, Some(active), None)
+    dispatch_to_app(
+        request,
+        None,
+        api_tx,
+        Some(timeout),
+        None,
+        Some(active),
+        None,
+    )
 }
 
 pub(super) fn dispatch_stream_frame(
@@ -888,6 +909,7 @@ pub(super) fn dispatch_stream_frame(
 ) -> String {
     dispatch_to_app(
         request,
+        None,
         api_tx,
         Some(crate::app::pane_graphics::DIRECT_OUTER_TIMEOUT),
         None,
@@ -898,6 +920,7 @@ pub(super) fn dispatch_stream_frame(
 
 fn dispatch_to_app(
     request: Request,
+    peer_process: Option<crate::platform::PeerProcess>,
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
@@ -909,6 +932,7 @@ fn dispatch_to_app(
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
+        peer_process,
         respond_to,
         response_write_complete,
         stream_active,
@@ -1256,6 +1280,7 @@ mod tests {
             }),
             None,
             None,
+            None,
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1276,6 +1301,7 @@ mod tests {
             None,
             Some(&stop),
             None,
+            None,
         );
 
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -1292,6 +1318,7 @@ mod tests {
             None,
             Some(&stop),
             None,
+            None,
         );
         let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
         assert_eq!(rejected["error"]["code"], "server_unavailable");
@@ -1307,8 +1334,9 @@ mod tests {
         };
 
         let request_for_thread = request.clone();
-        let thread =
-            std::thread::spawn(move || handle_request(request_for_thread, &tx, None, None, None));
+        let thread = std::thread::spawn(move || {
+            handle_request(request_for_thread, &tx, None, None, None, None)
+        });
 
         let msg = rx.blocking_recv().unwrap();
         assert_eq!(msg.request.id, "req_2");

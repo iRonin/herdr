@@ -92,6 +92,9 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
 
 pub struct ApiRequestMessage {
     pub request: Request,
+    /// The process that sent the request, when the socket can say. Internal: never
+    /// serialized; requests that did not arrive on a local API socket carry `None`.
+    pub peer_process: Option<crate::platform::PeerProcess>,
     pub respond_to: std::sync::mpsc::Sender<String>,
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     pub stream_active: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
