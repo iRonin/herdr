@@ -685,16 +685,20 @@ mod tests {
             " ",
         );
         app.handle_tab_bar_status_tasks(std::time::Instant::now());
-        for _ in 0..50 {
-            if descendant_started.exists() {
-                break;
-            }
+        // The descendant must be observed before the reload, but spawning the status
+        // shell can take arbitrarily long under CPU load. The previous fixed budget
+        // (50 polls x 10ms) flaked at load ~80-120 with "descendant did not start"
+        // while the command was fine. Wait on a wall-clock deadline instead: the test
+        // still fails loudly if the descendant never starts, but no longer races the
+        // scheduler for the first 500ms.
+        let start_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !descendant_started.exists() {
+            assert!(
+                std::time::Instant::now() < start_deadline,
+                "status command descendant did not start"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(
-            descendant_started.exists(),
-            "status command descendant did not start"
-        );
 
         app.configure_tab_bar_status(
             &[TabBarRightEntryConfig::Text {
@@ -705,15 +709,22 @@ mod tests {
 
         // Task cancellation is delivered when Tokio next polls the task. Block
         // this current-thread test runtime long enough for the descendant to
-        // run, proving config reload kills its process group synchronously.
-        std::thread::sleep(Duration::from_millis(400));
+        // finish its sleep had the reload failed to kill it, proving config
+        // reload kills its process group synchronously. The window must exceed
+        // the descendant's 0.3s sleep by a margin that absorbs scheduler delay
+        // under load, or a failed kill could write `survived` after the check
+        // and slip through.
+        std::thread::sleep(Duration::from_secs(2));
         let descendant_survived = survived.exists();
         let _ = std::fs::remove_file(&descendant_started);
         let _ = std::fs::remove_file(&survived);
         assert!(!descendant_survived, "status command descendant survived");
 
+        // If the reload failed to abort the command task, the killed process group
+        // would still surface a TabBarCommandFinished event once the runtime polls
+        // the task; give that a window that survives load too.
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), app.event_rx.recv())
+            tokio::time::timeout(Duration::from_secs(1), app.event_rx.recv())
                 .await
                 .is_err()
         );
