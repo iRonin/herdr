@@ -11,6 +11,7 @@ fn queue_requests(server: &mut HeadlessServer, count: usize) -> std::sync::mpsc:
                     id: index.to_string(),
                     method: api::schema::Method::WorkspaceList(api::schema::EmptyParams::default()),
                 },
+                peer_process: None,
                 respond_to: respond_to.clone(),
                 response_write_complete: None,
             })
@@ -117,6 +118,7 @@ async fn server_loop_drains_api_backlog_and_runs_scheduled_work() {
                     id: index.to_string(),
                     method,
                 },
+                peer_process: None,
                 respond_to: respond_to.clone(),
                 response_write_complete: None,
             })

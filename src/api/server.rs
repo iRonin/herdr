@@ -499,6 +499,8 @@ fn handle_connection_with_stop(
                 })
             });
             let stop_caller = stop_caller.flatten();
+            // The sender is waiting for this reply, so it is alive to be identified.
+            let peer_process = crate::platform::local_peer_process(&stream);
             let response = handle_request(
                 Request {
                     id: request_id.clone(),
@@ -509,6 +511,7 @@ fn handle_connection_with_stop(
                 server_stop,
                 stop_caller,
                 Some(response_write_rx),
+                peer_process,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             let _ = response_write_tx.send(());
@@ -567,6 +570,7 @@ fn handle_request(
     server_stop: Option<&ServerStop>,
     stop_caller: Option<String>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+    peer_process: Option<crate::platform::PeerProcess>,
 ) -> String {
     if matches!(&request.method, Method::Ping(_)) {
         return serde_json::to_string(&SuccessResponse {
@@ -610,7 +614,14 @@ fn handle_request(
         );
     }
 
-    dispatch_to_app(request, api_tx, None, response_write_complete, None)
+    dispatch_to_app(
+        request,
+        peer_process,
+        api_tx,
+        None,
+        response_write_complete,
+        None,
+    )
 }
 
 pub(crate) fn api_method_name(method: &Method) -> &'static str {
@@ -1089,7 +1100,7 @@ pub(super) fn dispatch_to_app_with_timeout(
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
 ) -> String {
-    dispatch_to_app(request, api_tx, timeout, None, None)
+    dispatch_to_app(request, None, api_tx, timeout, None, None)
 }
 
 pub(super) fn dispatch_to_app_with_caller_timeout(
@@ -1099,6 +1110,7 @@ pub(super) fn dispatch_to_app_with_caller_timeout(
 ) -> String {
     dispatch_to_app(
         request,
+        None,
         api_tx,
         timeout,
         None,
@@ -1108,6 +1120,7 @@ pub(super) fn dispatch_to_app_with_caller_timeout(
 
 fn dispatch_to_app(
     request: Request,
+    peer_process: Option<crate::platform::PeerProcess>,
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
@@ -1117,6 +1130,7 @@ fn dispatch_to_app(
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
+        peer_process,
         respond_to,
         response_write_complete,
     }) {
@@ -1615,6 +1629,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1635,6 +1650,7 @@ mod tests {
             None,
             Some(&stop),
             Some("pid 42 (herdr)".into()),
+            None,
             None,
         );
 
@@ -1659,6 +1675,7 @@ mod tests {
             Some(&stop),
             None,
             None,
+            None,
         );
         let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
         assert_eq!(rejected["error"]["code"], "server_unavailable");
@@ -1675,7 +1692,7 @@ mod tests {
 
         let request_for_thread = request.clone();
         let thread = std::thread::spawn(move || {
-            handle_request(request_for_thread, &tx, None, None, None, None)
+            handle_request(request_for_thread, &tx, None, None, None, None, None)
         });
 
         let msg = rx.blocking_recv().unwrap();

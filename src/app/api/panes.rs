@@ -1587,7 +1587,7 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
-        self.handle_internal_event(crate::events::AppEvent::HookStateReported {
+        self.handle_reported_agent_state(crate::events::AppEvent::HookStateReported {
             pane_id,
             session_ref: session_ref.clone(),
             source: params.source.clone(),
@@ -1632,7 +1632,7 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
-        self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
+        self.handle_reported_agent_session(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: session_ref.clone(),
             source: params.source.clone(),

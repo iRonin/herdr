@@ -150,6 +150,14 @@ pub(crate) fn process_command_line(_pid: u32) -> Option<String> {
     None
 }
 
+/// The process that sent an API request, read from the local socket's peer
+/// credentials when the connection was accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerProcess {
+    pub pid: u32,
+    pub process_group: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,
@@ -522,6 +530,24 @@ pub(crate) use process_cwd as pane_process_cwd;
 mod fallback;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub use fallback::*;
+
+// Sender identity is read from unix-socket peer credentials on Linux and macOS only.
+// Elsewhere (Windows named pipes, other unixes) no request has a sender, so nothing
+// that needs one can fire: a reporter's session start keeps today's handling.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn local_peer_process(_stream: &crate::ipc::LocalStream) -> Option<PeerProcess> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn process_parent_id(_pid: u32) -> Option<u32> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn process_group_exists(_process_group: u32) -> bool {
+    true
+}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn available_pane_shell_from_job(child_pid: u32, job: ForegroundJob) -> Option<String> {

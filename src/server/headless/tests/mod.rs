@@ -260,6 +260,7 @@ fn headless_pane_list(server: &mut HeadlessServer) -> Vec<api::schema::PaneInfo>
             id: "list-titles".into(),
             method: api::schema::Method::PaneList(api::schema::PaneListParams::default()),
         },
+        peer_process: None,
         respond_to,
         response_write_complete: None,
     });
@@ -317,6 +318,7 @@ fn headless_api_request_drains_all_pending_internal_events_before_reading_state(
                 id: "headless_stop_after_events".into(),
                 method: api::schema::Method::ServerStop(api::schema::EmptyParams::default()),
             },
+            peer_process: None,
             respond_to,
             response_write_complete: None,
         })
@@ -2251,6 +2253,7 @@ async fn client_local_navigation_does_not_emit_global_focus_transitions() {
                     tab_id: second_tab_id,
                 }),
             },
+            peer_process: None,
             respond_to,
             response_write_complete: None,
         },
@@ -2341,6 +2344,7 @@ async fn client_local_navigation_emits_pane_focused_only_when_that_client_moves(
                     id: "navigate".into(),
                     method,
                 },
+                peer_process: None,
                 respond_to,
                 response_write_complete: None,
             },
@@ -2472,6 +2476,7 @@ async fn repeated_layout_action_reapplies_controller_geometry() {
                     },
                 ),
             },
+            peer_process: None,
             respond_to,
             response_write_complete: None,
         },
@@ -2516,6 +2521,7 @@ async fn public_close_reapplies_controller_geometry() {
                     pane_id: second_pane_id,
                 }),
             },
+            peer_process: None,
             respond_to,
             response_write_complete: None,
         })
@@ -2719,6 +2725,7 @@ async fn public_background_tab_create_preserves_client_locations() {
                 env: std::collections::HashMap::new(),
             }),
         },
+        peer_process: None,
         respond_to,
         response_write_complete: None,
     });
@@ -2766,6 +2773,7 @@ async fn public_workspace_focus_preserves_each_clients_remembered_tabs() {
                 },
             ),
         },
+        peer_process: None,
         respond_to,
         response_write_complete: None,
     });
@@ -2846,6 +2854,7 @@ async fn public_agent_focus_replaces_a_diverged_client_shell_projection() {
                 target: first_pane_id.clone(),
             }),
         },
+        peer_process: None,
         respond_to,
         response_write_complete: None,
     });
@@ -2921,6 +2930,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
                 },
             ),
         },
+        peer_process: None,
         respond_to,
         response_write_complete: None,
     });
@@ -3538,6 +3548,7 @@ async fn worktree_discovery_does_not_block_client_typing() {
                 id: "blocked-read".into(),
                 method,
             },
+            peer_process: None,
             respond_to,
             response_write_complete: None,
         });
@@ -3978,6 +3989,7 @@ fn api_request_reports_ui_change(server: &mut HeadlessServer, method: api::schem
             id: "api-send".into(),
             method,
         },
+        peer_process: None,
         respond_to,
         response_write_complete: None,
     });
@@ -5569,6 +5581,7 @@ fn windows_shutdown_probe_preserves_panes_and_agent_sessions() {
                             },
                         ),
                     },
+                    peer_process: None,
                     respond_to,
                     response_write_complete: None,
                 });
@@ -8469,6 +8482,7 @@ fn notification_show_api_forwards_one_semantic_client_notification() {
                 sound: api::schema::NotificationShowSound::Request,
             }),
         },
+        peer_process: None,
         respond_to,
         response_write_complete: None,
     });
@@ -8531,6 +8545,7 @@ fn notification_show_api_preserves_colon_in_forwarded_title() {
                 sound: api::schema::NotificationShowSound::None,
             }),
         },
+        peer_process: None,
         respond_to,
         response_write_complete: None,
     });
@@ -8576,6 +8591,7 @@ fn notification_show_api_validates_empty_title_before_disabled_delivery() {
                 sound: api::schema::NotificationShowSound::None,
             }),
         },
+        peer_process: None,
         respond_to,
         response_write_complete: None,
     });
@@ -8606,6 +8622,7 @@ fn notification_show_api_reports_no_foreground_client() {
                 sound: api::schema::NotificationShowSound::Request,
             }),
         },
+        peer_process: None,
         respond_to,
         response_write_complete: None,
     });
@@ -8656,6 +8673,7 @@ fn notification_show_api_includes_sound_in_semantic_event() {
                     },
                 ),
             },
+            peer_process: None,
             respond_to,
             response_write_complete: None,
         })
@@ -8717,6 +8735,7 @@ fn completion_guard_api_report(server: &mut HeadlessServer, method: api::schema:
             id: "completion-probe".into(),
             method,
         },
+        peer_process: None,
         respond_to,
         response_write_complete: None,
     });
@@ -8776,6 +8795,7 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
             id: "invalid-resume".into(),
             method: report(vec!["/opt/prime/prime-agent", "--resume", "01a0"]),
         },
+        peer_process: None,
         respond_to,
         response_write_complete: None,
     });
@@ -8808,6 +8828,7 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
                 },
             ),
         },
+        peer_process: None,
         respond_to,
         response_write_complete: None,
     });
@@ -9191,6 +9212,7 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
                 resume_argv: None,
             }),
         },
+        peer_process: None,
         respond_to,
         response_write_complete: None,
     });
@@ -9468,6 +9490,7 @@ fn report_agent_completion_notifications(
                     resume_argv: None,
                 }),
             },
+            peer_process: None,
             respond_to,
             response_write_complete: None,
         });
@@ -9847,6 +9870,7 @@ fn drive_completion_scenario_via_api(
                                     },
                                 ),
                             },
+                            peer_process: None,
                             respond_to,
                             response_write_complete: None,
                         });
@@ -10028,6 +10052,7 @@ fn api_held_working_report_replayed_by_session_start_still_toasts() {
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
             request,
+            peer_process: None,
             respond_to,
             response_write_complete: None,
         });
@@ -10308,6 +10333,7 @@ fn a_repeated_idle_report_keeps_the_recorded_completion_and_stays_silent() {
                             },
                         ),
                     },
+                    peer_process: None,
                     respond_to,
                     response_write_complete: None,
                 });

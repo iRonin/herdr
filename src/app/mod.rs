@@ -114,6 +114,8 @@ pub struct App {
     /// alone cannot say: a pane send that submits a compact or acknowledges a blocked pane.
     /// The headless server takes it after each request.
     pub(crate) api_request_changed_ui: bool,
+    /// The process that sent the API request being handled right now, if known.
+    pub(crate) api_request_sender: Option<crate::platform::PeerProcess>,
     pub(crate) event_hub: crate::api::EventHub,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     /// Each pane's read state as last compared by `sync_read_state_events`.
@@ -682,6 +684,7 @@ impl App {
             last_presentation_at: None,
             api_rx,
             api_request_changed_ui: false,
+            api_request_sender: None,
             event_hub,
             last_focus,
             read_state_observed: HashMap::new(),

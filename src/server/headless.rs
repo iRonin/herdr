@@ -3303,9 +3303,11 @@ impl HeadlessServer {
                 .unwrap_or_else(|_| "{}".to_string())
             })
         } else {
+            self.app.api_request_sender = msg.peer_process;
             let response = self
                 .app
                 .handle_api_request_after_internal_events_drained(msg.request);
+            self.app.api_request_sender = None;
             changed |= std::mem::take(&mut self.app.api_request_changed_ui);
             response
         };

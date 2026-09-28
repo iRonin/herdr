@@ -39,6 +39,7 @@ fn a_read_state_request_announces_a_pending_change_before_answering() {
                 pane_id: public_id.clone(),
             }),
         },
+        peer_process: None,
         respond_to,
         response_write_complete: None,
     });

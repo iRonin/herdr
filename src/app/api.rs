@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+mod agent_successor;
 mod agent_view;
 mod agents;
 mod env;
