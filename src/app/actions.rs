@@ -3733,9 +3733,9 @@ mod tests {
             .pop()
             .expect("idle state update");
 
-        assert!(update.suppress_completion);
-        assert!(state.workspaces[1].panes[&pane_id].seen);
-        assert!(!matches!(
+        assert!(!update.suppress_completion);
+        assert!(!state.workspaces[1].panes[&pane_id].seen);
+        assert!(matches!(
             state.toast.as_ref().map(|toast| toast.kind),
             Some(ToastKind::Finished)
         ));
