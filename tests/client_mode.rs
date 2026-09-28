@@ -1513,6 +1513,20 @@ fn send_pane_shell_command(socket_path: &PathBuf, pane_id: &str, command: &str) 
     assert_eq!(response["result"]["type"], "ok", "{response}");
 }
 
+/// Waits until a new pane's shell has run a command. The pane starts a login shell, which reads the
+/// user's profile before it reads typed input; on a busy machine that alone can take longer than
+/// the few seconds a test gives its own command. The shell itself creates `marker`, so the
+/// terminal's echo of the typed command cannot satisfy the wait.
+fn wait_for_pane_shell(socket_path: &PathBuf, pane_id: &str, marker: &std::path::Path) {
+    send_pane_shell_command(socket_path, pane_id, &format!(": > {}", marker.display()));
+    assert!(
+        wait_until(Duration::from_secs(60), Duration::from_millis(50), || {
+            marker.exists()
+        }),
+        "pane shell did not run a command within 60s"
+    );
+}
+
 #[test]
 fn configured_window_title_tracks_all_tokens_and_focused_osc_only() {
     let _lock = test_lock();
@@ -1580,6 +1594,8 @@ fn configured_window_title_tracks_all_tokens_and_focused_osc_only() {
         "hostname token was empty: {renamed}"
     );
 
+    // The pane is new: let its shell start before timing the title change.
+    wait_for_pane_shell(&api_socket, &pane_id, &base.join("shell-ready"));
     send_pane_shell_command(&api_socket, &pane_id, r"printf '\033]0;building\007'");
     wait_for_window_title(&output, "|W=space-a|T=tab-a|P=pane-a|O=building");
 
@@ -1603,6 +1619,11 @@ fn configured_window_title_tracks_all_tokens_and_focused_osc_only() {
     // Intentionally consume the AppState title through a read-only request
     // before the queued source is handled.
     wait_for_pane_terminal_title(&api_socket, &pane_id, "hidden update");
+    wait_for_pane_shell(
+        &api_socket,
+        &second_pane_id,
+        &base.join("second-shell-ready"),
+    );
     send_pane_shell_command(
         &api_socket,
         &second_pane_id,
