@@ -757,8 +757,10 @@ fn cross_area_two_clients_shared_view_and_single_detach_stability() {
         .expect("root pane id")
         .to_string();
 
-    // Input from client A should update shared state visible to client B.
-    pane_send_text(&api_socket, &pane_id, "echo SHARED_VIEW\n");
+    // Input from client A should update shared state visible to client B. The commands print
+    // markers their typed text does not contain, so the terminal's echo cannot satisfy the checks.
+    wait_for_pane_shell(&api_socket, &pane_id);
+    pane_send_text(&api_socket, &pane_id, "printf 'SHARED_%s\\n' VIEW\n");
     assert!(
         wait_for_frame(&mut client_b, Duration::from_secs(2)),
         "client B should receive update from client A"
@@ -779,7 +781,7 @@ fn cross_area_two_clients_shared_view_and_single_detach_stability() {
     );
     drop(client_a);
 
-    pane_send_text(&api_socket, &pane_id, "echo AFTER_A_DETACH\n");
+    pane_send_text(&api_socket, &pane_id, "printf 'AFTER_%s\\n' A_DETACH\n");
     assert!(pane_read_recent_contains(
         &api_socket,
         &pane_id,
