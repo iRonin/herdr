@@ -828,20 +828,26 @@ fn attach_thin_client_with_config(
     (spawned_server, thin_client, output)
 }
 
-/// Stops the auto-started Local server through its API socket on drop.
+/// Stops the auto-started Local server through its API socket on drop, and
+/// verifies by PROCESS that it is gone.
 ///
-/// The tests/support panic hook, atexit handler and watchdog all hunt leaked servers by
-/// enumerating /proc, which does not exist on macOS, so on this platform none of them can
-/// act. A guard whose drop talks to the server's own API socket works everywhere and on
-/// every exit path, including panics: `server.stop` is the same request the test's happy
-/// path already sends. Every operation is best effort because drop also runs when the
-/// socket does not exist (server never started, or already stopped by the happy path).
+/// The tests/support panic hook, atexit handler and watchdog hunt leaked
+/// servers by enumerating processes; that enumeration used to be /proc-only,
+/// a silent no-op on macOS, which is why servers leaked. The enumeration is
+/// now ported (libproc on macOS), so the hook covers the panic path - but it
+/// cannot cover a stop that merely fails to take on the SUCCESS path:
+/// server.stop only flags shutdown and answers before the process exits, so
+/// a reply proves nothing. This guard sends the same request, then confirms
+/// by process scan that no server holds its runtime dir any more, escalating
+/// to SIGTERM/SIGKILL if one lingers. Every operation is best effort because
+/// drop also runs when the socket does not exist (server never started, or
+/// already stopped by the happy path).
 struct LocalServerGuard {
     api_socket: PathBuf,
 }
 
 impl LocalServerGuard {
-    fn stop(&self) {
+    fn send_stop(&self) {
         let Ok(mut stream) = UnixStream::connect(&self.api_socket) else {
             return;
         };
@@ -850,11 +856,36 @@ impl LocalServerGuard {
         let mut response = String::new();
         let _ = BufReader::new(stream).read_line(&mut response);
     }
+
+    /// server.stop answers before the process exits, so verify the state, not
+    /// the reply: wait until no server process holds this runtime dir, then
+    /// escalate if one still lingers.
+    fn stop_and_verify(&self) {
+        self.send_stop();
+        let Some(runtime_dir) = self.api_socket.parent() else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let leftover =
+                support::herdr_server_pids_for_runtime_dir(runtime_dir).unwrap_or_default();
+            if leftover.is_empty() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                for pid in leftover {
+                    support::terminate_pid(pid);
+                }
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
 }
 
 impl Drop for LocalServerGuard {
     fn drop(&mut self) {
-        self.stop();
+        self.stop_and_verify();
     }
 }
 
