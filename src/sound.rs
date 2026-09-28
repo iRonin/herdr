@@ -26,6 +26,8 @@ const SOUND_LOCK_FILE_NAME: &str = "sound.lock";
 
 /// Set while this process plays a sound; see `start_playback`.
 static SOUND_PLAYING: AtomicBool = AtomicBool::new(false);
+/// Set once this process has warned that the sound lock file is unusable.
+static SOUND_LOCK_WARNED: AtomicBool = AtomicBool::new(false);
 static SOUND_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SOUND_DONE: &[u8] = include_bytes!("../assets/sounds/done.mp3");
 static SOUND_REQUEST: &[u8] = include_bytes!("../assets/sounds/request.mp3");
@@ -66,7 +68,8 @@ pub fn play(sound: Sound, config: &crate::config::SoundConfig) {
 /// exclusive lock on `lock_path` limits every herdr process to one player.
 /// The lock is released when playback ends, fails or times out, and by the
 /// operating system when the process exits. If the lock file cannot be used,
-/// the sound still plays under the in-process limit alone.
+/// the sound still plays, as it did before this limit existed, but only one at
+/// a time in this process.
 fn start_playback<P>(
     sound: Sound,
     custom_path: Option<PathBuf>,
@@ -92,7 +95,7 @@ where
                 return;
             }
             Err(err) => {
-                warn!(path = %lock_path.display(), err = %err, "sound lock unavailable, playing without the cross-process limit");
+                report_unusable_sound_lock(&SOUND_LOCK_WARNED, &lock_path, &err);
                 None
             }
         };
@@ -170,6 +173,17 @@ fn lock_sound_file(path: &Path) -> std::io::Result<Option<SoundLock>> {
         Ok(()) => Ok(Some(SoundLock(file))),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(err)) => Err(err),
+    }
+}
+
+/// Warns the first time this process cannot use the sound lock file, naming
+/// the file and the error. Later failures are logged at debug level, so a burst
+/// of sounds cannot flood the log.
+fn report_unusable_sound_lock(warned: &AtomicBool, path: &Path, err: &std::io::Error) {
+    if warned.swap(true, Ordering::Relaxed) {
+        debug!(path = %path.display(), err = %err, "sound lock still unavailable");
+    } else {
+        warn!(path = %path.display(), err = %err, "sound lock unavailable, playing without the cross-process limit");
     }
 }
 
@@ -498,27 +512,81 @@ mod tests {
         assert!(!programs.contains(&"aplay"));
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(windows))]
     #[test]
     fn linux_audio_player_does_not_wait_forever() {
-        let pid_path = temp_sound_path().with_extension("pid");
-        let player = AudioPlayer {
-            program: "sh",
-            args: &[
-                "-c",
-                "printf '%s' \"$$\" > \"$1\"; exec sleep 2",
-                "herdr-sound-timeout-test",
-            ],
-        };
-        let result = player.output_with_timeout(&pid_path, Duration::from_millis(100));
-        let pid = std::fs::read_to_string(&pid_path)
-            .expect("hanging test player should record its process ID");
-        let _ = std::fs::remove_file(pid_path);
+        let player = time_out_hung_player(&temp_sound_path().with_extension("pid"));
 
-        let err = result.expect_err("hanging audio player should time out");
-        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_killed_at_the_bound(&player);
+    }
+
+    /// A player that records its process ID in its sound path, then never exits.
+    #[cfg(not(windows))]
+    const HUNG_PLAYER: AudioPlayer = AudioPlayer {
+        program: "sh",
+        args: &[
+            "-c",
+            "printf '%s' \"$$\" > \"$1\"; exec sleep 30",
+            "herdr-sound-timeout-test",
+        ],
+    };
+
+    /// What the timeout path did to one `HUNG_PLAYER`.
+    #[cfg(not(windows))]
+    struct TimedOutPlayer {
+        error: std::io::Error,
+        pid: u32,
+        bound: Duration,
+        elapsed: Duration,
+    }
+
+    /// Runs `HUNG_PLAYER` through the real timeout path. A loaded machine can
+    /// reach the bound before the player has run at all, and a player killed
+    /// then never records its process ID, so that run shows nothing: it is
+    /// repeated with a doubled bound. A run whose player recorded its ID is
+    /// returned as it is, whatever happened, and never repeated.
+    #[cfg(not(windows))]
+    fn time_out_hung_player(pid_path: &Path) -> TimedOutPlayer {
+        let mut bound = Duration::from_millis(100);
+        loop {
+            let _ = std::fs::remove_file(pid_path);
+            let started = Instant::now();
+            let result = HUNG_PLAYER.output_with_timeout(pid_path, bound);
+            let elapsed = started.elapsed();
+            let recorded = std::fs::read_to_string(pid_path)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok());
+            let _ = std::fs::remove_file(pid_path);
+            if let Some(pid) = recorded {
+                return TimedOutPlayer {
+                    error: result.expect_err("hanging audio player should time out"),
+                    pid,
+                    bound,
+                    elapsed,
+                };
+            }
+            assert!(
+                bound < Duration::from_secs(5),
+                "hanging test player should record its process ID (bound {bound:?}, result {result:?})"
+            );
+            bound *= 2;
+        }
+    }
+
+    /// Fails unless the timeout path stopped the player at its bound: a timeout
+    /// error, long before the player would have exited by itself, and no
+    /// process left behind.
+    #[cfg(not(windows))]
+    fn assert_killed_at_the_bound(player: &TimedOutPlayer) {
+        assert_eq!(player.error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            player.elapsed < player.bound + Duration::from_secs(10),
+            "the player ran {:?}, so it was not stopped at its {:?} bound",
+            player.elapsed,
+            player.bound
+        );
         let status = Command::new("kill")
-            .args(["-0", pid.trim()])
+            .args(["-0", &player.pid.to_string()])
             .stderr(std::process::Stdio::null())
             .status()
             .expect("test should inspect the timed-out player PID");
@@ -883,6 +951,60 @@ mod tests {
         drop(shared);
     }
 
+    /// Collects one test's formatted log output.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn unusable_sound_lock_is_reported_once_per_process() {
+        let log = CapturedLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        let warned = AtomicBool::new(false);
+        let path = Path::new("/state/herdr/sound.lock");
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "lock refused");
+
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..3 {
+                report_unusable_sound_lock(&warned, path, &err);
+            }
+        });
+
+        let text = String::from_utf8(log.0.lock().expect("log buffer").clone()).expect("utf-8 log");
+        let warnings: Vec<&str> = text.lines().filter(|line| line.contains("WARN")).collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "three failures must warn once, not once per sound:\n{text}"
+        );
+        assert!(
+            warnings[0].contains("/state/herdr/sound.lock") && warnings[0].contains("lock refused"),
+            "the warning must name the lock file and the error: {}",
+            warnings[0]
+        );
+        assert_eq!(
+            text.lines().filter(|line| line.contains("DEBUG")).count(),
+            2,
+            "later failures stay visible at debug level:\n{text}"
+        );
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum Ending {
         Finished,
@@ -891,15 +1013,13 @@ mod tests {
         TimedOut,
     }
 
-    /// Runs upstream's real timeout path: the player is killed and reaped.
+    /// A player that hangs until upstream's real timeout path stops it; fails
+    /// the test unless that happened at the bound.
     #[cfg(not(windows))]
     fn timed_out_player(path: &Path) -> Result<Output, String> {
-        AudioPlayer {
-            program: "sh",
-            args: &["-c", "exec sleep 5", "herdr-sound-timeout-test"],
-        }
-        .output_with_timeout(path, Duration::from_millis(100))
-        .map_err(|err| err.to_string())
+        let player = time_out_hung_player(&path.with_extension("pid"));
+        assert_killed_at_the_bound(&player);
+        Err(player.error.to_string())
     }
 
     /// The Windows player enforces its limit in PowerShell and reports an error.

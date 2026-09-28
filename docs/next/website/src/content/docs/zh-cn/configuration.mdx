@@ -517,7 +517,7 @@ request_path = "sounds/request.mp3"
 
 `path` 为所有声音通知设置同一种声音。`done_path` 和 `request_path` 只覆盖完成和需要输入时的声音。
 
-Herdr 在本机运行的所有 Herdr 客户端中一次只播放一个声音；另一个声音播放期间到达的声音会被跳过。自定义声音应短于 15 秒：播放超过 15 秒的声音会被停止。
+Herdr 在本机运行的所有 Herdr 客户端中一次只播放一个声音；另一个声音播放期间到达的声音会被跳过。自定义声音应短于 15 秒：在 macOS、Linux 和 Windows 上，播放超过 15 秒的声音都会被停止。
 
 按智能体覆盖声音设置时，可使用 `default`、`on` 或 `off`。键应使用检测到的智能体标签，例如 `claude`、`codex`、`devin` 或 `droid`。Droid 默认静音。
 

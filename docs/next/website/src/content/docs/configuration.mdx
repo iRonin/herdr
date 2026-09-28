@@ -537,7 +537,7 @@ request_path = "sounds/request.mp3"
 
 `path` sets one sound for all sound notifications. `done_path` and `request_path` override only the finished and needs-input sounds.
 
-Herdr plays one sound at a time across all Herdr clients you run on the machine; a sound that arrives while another is playing is skipped. Keep custom sounds shorter than 15 seconds: Herdr stops a sound that is still playing after that.
+Herdr plays one sound at a time across all Herdr clients you run on the machine; a sound that arrives while another is playing is skipped. Keep custom sounds shorter than 15 seconds: on macOS, Linux and Windows, Herdr stops a sound that is still playing after 15 seconds.
 
 Per-agent sound overrides accept `default`, `on`, or `off`. Use detected agent labels such as `claude`, `codex`, `devin`, or `droid` as keys. Droid is muted by default.
 
