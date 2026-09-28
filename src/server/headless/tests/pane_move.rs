@@ -27,6 +27,7 @@ fn public_move(
             id: "move-pane".into(),
             method: crate::api::schema::Method::PaneMove(params),
         },
+        peer_process: None,
         respond_to,
         response_write_complete: None,
         stream_active: None,

@@ -111,6 +111,8 @@ pub struct App {
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
+    /// The process that sent the API request being handled right now, if known.
+    pub(crate) api_request_sender: Option<crate::platform::PeerProcess>,
     pub(crate) event_hub: crate::api::EventHub,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     pub(crate) policy: AppPolicy,
@@ -618,6 +620,7 @@ impl App {
             last_render_at: None,
             last_presentation_at: None,
             api_rx,
+            api_request_sender: None,
             event_hub,
             last_focus,
             policy,

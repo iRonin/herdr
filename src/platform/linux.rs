@@ -774,6 +774,52 @@ pub fn process_exists(pid: u32) -> bool {
     }
 }
 
+/// The process that sent a request over an accepted local API connection
+/// (`SO_PEERCRED`), with its process group. `None` when the socket cannot say or
+/// the sender has already exited.
+pub(crate) fn local_peer_process(stream: &crate::ipc::LocalStream) -> Option<super::PeerProcess> {
+    use std::os::fd::AsRawFd as _;
+
+    let crate::ipc::LocalStream::UdSocket(socket) = stream;
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            socket.inner().as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut credentials as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 || credentials.pid <= 0 {
+        return None;
+    }
+    let process_group = unsafe { libc::getpgid(credentials.pid) };
+    (process_group > 0).then_some(super::PeerProcess {
+        pid: credentials.pid as u32,
+        process_group: process_group as u32,
+    })
+}
+
+pub(crate) fn process_parent_id(pid: u32) -> Option<u32> {
+    // /proc/<pid>/stat: "pid (comm) state ppid ..."; (comm) may hold spaces and parens.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    let ppid: u32 = rest.split_whitespace().nth(1)?.parse().ok()?;
+    (ppid > 0).then_some(ppid)
+}
+
+/// Whether any process is still in `process_group`. Anything but a definite "no such
+/// group" (ESRCH) counts as present, so callers that need the group gone fail safe.
+pub(crate) fn process_group_exists(process_group: u32) -> bool {
+    if process_group <= 1 {
+        return true;
+    }
+    let result = unsafe { libc::kill(-(process_group as i32), 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 pub fn write_clipboard(bytes: &[u8]) -> bool {
     for command in clipboard_commands() {
         if run_clipboard_command(&command, bytes) {

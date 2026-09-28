@@ -121,6 +121,8 @@ impl HeadlessServer {
                 client_id,
                 api::ApiRequestMessage {
                     request: *request,
+                    // Forwarded by an attached client, not sent on the API socket: no sender.
+                    peer_process: None,
                     respond_to,
                     response_write_complete: None,
                     stream_active: None,

@@ -1144,6 +1144,49 @@ pub fn process_exists(pid: u32) -> bool {
     }
 }
 
+/// The process that sent a request over an accepted local API connection
+/// (`LOCAL_PEERPID`), with its process group. `None` when the socket cannot say or
+/// the sender has already exited.
+pub(crate) fn local_peer_process(stream: &crate::ipc::LocalStream) -> Option<super::PeerProcess> {
+    use std::os::fd::AsRawFd as _;
+
+    let crate::ipc::LocalStream::UdSocket(socket) = stream;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            socket.inner().as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            &mut pid as *mut libc::pid_t as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 || pid <= 0 {
+        return None;
+    }
+    let process_group = unsafe { libc::getpgid(pid) };
+    (process_group > 0).then_some(super::PeerProcess {
+        pid: pid as u32,
+        process_group: process_group as u32,
+    })
+}
+
+pub(crate) fn process_parent_id(pid: u32) -> Option<u32> {
+    let info = process_bsdinfo(pid)?;
+    (info.pbi_ppid > 0).then_some(info.pbi_ppid)
+}
+
+/// Whether any process is still in `process_group`. Anything but a definite "no such
+/// group" (ESRCH) counts as present, so callers that need the group gone fail safe.
+pub(crate) fn process_group_exists(process_group: u32) -> bool {
+    if process_group <= 1 {
+        return true;
+    }
+    let result = unsafe { libc::kill(-(process_group as libc::c_int), 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -23,6 +23,19 @@ pub struct HookAuthority {
     #[serde(skip, default = "Instant::now")]
     pub reported_at: Instant,
     pub session_ref: Option<crate::agent_resume::AgentSessionRef>,
+    /// The process that sent the report, when the API socket could say. Never serialized:
+    /// after a live handoff it is unknown until the agent reports again.
+    #[serde(skip)]
+    pub sender: Option<crate::platform::PeerProcess>,
+}
+
+/// A session start refused because the same agent's hook authority is live on the pane with
+/// another session. The caller may still prove that the authority's holder exited unobserved
+/// and that the start comes from its successor; `holder` is the sender of the live authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveSessionStartRefusal {
+    pub(crate) agent: Agent,
+    pub(crate) holder: Option<crate::platform::PeerProcess>,
 }
 
 #[cfg(unix)]
@@ -346,6 +359,9 @@ pub struct TerminalState {
     /// Display-only state for commands that do work without lifecycle reports.
     optimistic_working_until: Option<Instant>,
     compact_command_detector: CompactCommandDetector,
+    /// The sender of the report being applied, set by the caller around that one call.
+    report_sender: Option<crate::platform::PeerProcess>,
+    live_session_start_refusal: Option<LiveSessionStartRefusal>,
 }
 
 impl TerminalState {
@@ -384,6 +400,8 @@ impl TerminalState {
             pending_agent_resume_plan: None,
             optimistic_working_until: None,
             compact_command_detector: CompactCommandDetector::default(),
+            report_sender: None,
+            live_session_start_refusal: None,
         }
     }
 
@@ -1084,6 +1102,7 @@ impl TerminalState {
             message,
             reported_at: now,
             session_ref,
+            sender: self.report_sender,
         });
         let current_session = self.current_session_identity_for_persistence();
         let effective_state_change = self.recompute_effective_state(
@@ -1314,6 +1333,7 @@ impl TerminalState {
             .as_ref()
             .filter(|session| session.source == source && session.agent == agent_label)
             .map(|session| session.session_ref.clone());
+        let sender = self.report_sender;
         let suppressed = self
             .suppressed_full_lifecycle_hook_reports
             .entry(source.to_string())
@@ -1338,6 +1358,7 @@ impl TerminalState {
                     message: message.map(str::to_string),
                     reported_at,
                     session_ref: Some(session_ref),
+                    sender,
                 },
                 seq,
             });
@@ -1705,6 +1726,46 @@ impl TerminalState {
         )
     }
 
+    pub(crate) fn set_report_sender(&mut self, sender: Option<crate::platform::PeerProcess>) {
+        self.report_sender = sender;
+    }
+
+    pub(crate) fn take_live_session_start_refusal(&mut self) -> Option<LiveSessionStartRefusal> {
+        self.live_session_start_refusal.take()
+    }
+
+    /// Notes a refused session start that the path of a relaunch at normal speed would accept
+    /// (a recognized, sequenced start) had the detector seen the live authority's process exit.
+    fn note_live_session_start_refusal(
+        &mut self,
+        source: &str,
+        agent_label: &str,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+        seq: Option<u64>,
+        session_start_source: Option<&str>,
+    ) {
+        if seq.is_none()
+            || !Self::session_start_source_is_recognized(session_start_source)
+            || self
+                .same_owner_full_lifecycle_hook_authority_session_ref(
+                    source,
+                    agent_label,
+                    session_ref,
+                )
+                .is_none()
+        {
+            return;
+        }
+        let Some(agent) = crate::detect::parse_agent_label(agent_label) else {
+            return;
+        };
+        let holder = self
+            .hook_authority
+            .as_ref()
+            .and_then(|authority| authority.sender);
+        self.live_session_start_refusal = Some(LiveSessionStartRefusal { agent, holder });
+    }
+
     fn session_start_source_is_recognized(session_start_source: Option<&str>) -> bool {
         matches!(
             session_start_source,
@@ -1929,6 +1990,13 @@ impl TerminalState {
             )
             .is_some()
         {
+            self.note_live_session_start_refusal(
+                &source,
+                &agent_label,
+                &session_ref,
+                seq,
+                session_start_source.as_deref(),
+            );
             return None;
         }
         let replaced_hook_session = self.same_owner_full_lifecycle_hook_authority_session_ref(
@@ -1937,6 +2005,13 @@ impl TerminalState {
             &session_ref,
         );
         if replaced_hook_session.is_some() && !session_replacement_allowed {
+            self.note_live_session_start_refusal(
+                &source,
+                &agent_label,
+                &session_ref,
+                seq,
+                session_start_source.as_deref(),
+            );
             return None;
         }
 
