@@ -218,7 +218,7 @@ pub struct AgentInfo {
     pub interactive_ready: bool,
     #[serde(default)]
     pub state_change_seq: u64,
-    /// The current idle transition completed work, independently of who has viewed it.
+    /// The current idle transition completed work, independently of who has viewed it. Unset for startup, session changes, and completions on a pane that carries the `auto_read` metadata token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

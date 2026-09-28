@@ -6622,7 +6622,7 @@
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
             },
             "completion_seq": {
-              "description": "The current idle transition completed work, independently of who has viewed it.",
+              "description": "The current idle transition completed work, independently of who has viewed it. Unset for startup, session changes, and completions on a pane that carries the `auto_read` metadata token.",
               "format": "uint64",
               "minimum": 0,
               "type": [
