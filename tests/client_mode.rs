@@ -1070,6 +1070,8 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
         .to_string(),
     );
     let remote_pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    // The typed-input checks below need the pane's shell running, not just its echo on screen.
+    wait_for_pane_shell(&remote_api, remote_pane, &base.join("remote-shell-ready"));
     send_pane_shell_command(&remote_api, remote_pane, "printf 'REMOTE_INITIAL_FRAME\\n'");
 
     fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
@@ -1235,6 +1237,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
         screen_text()
     );
     let local_pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    wait_for_pane_shell(&api_socket, local_pane, &base.join("local-shell-ready"));
     send_pane_shell_command(
         &api_socket,
         local_pane,
