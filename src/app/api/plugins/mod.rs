@@ -910,25 +910,63 @@ mod tests {
             .to_string()
     }
 
-    /// Wait for non-empty contents at `path`. Shell `>` creates the file empty
-    /// before the command writes, so waiting on existence alone can read EOF.
+    /// Wait for complete capture contents at `path`. Shell `>` creates the file
+    /// empty before the command writes, so waiting on existence alone can read
+    /// EOF - and returning on the first NON-EMPTY read can return a partial
+    /// capture: a multi-line writer lands its output incrementally, and reading
+    /// between writes used to panic callers on a missing trailing line. Waiting
+    /// for `expected_lines` newline-terminated lines makes completion observable:
+    /// every capture writer in these tests terminates its output with newlines,
+    /// so callers see the whole capture or a deadline failure, never a prefix.
     /// `pump` advances any event loop the command depends on.
-    fn read_capture_when_ready(path: &std::path::Path, mut pump: impl FnMut()) -> String {
+    fn read_capture_when_ready(
+        path: &std::path::Path,
+        expected_lines: usize,
+        mut pump: impl FnMut(),
+    ) -> String {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             pump();
             if let Ok(contents) = std::fs::read_to_string(path) {
-                if !contents.is_empty() {
+                let complete_lines = contents.bytes().filter(|byte| *byte == b'\n').count();
+                if complete_lines >= expected_lines {
                     return contents;
                 }
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "plugin command did not write {} within deadline",
+                "plugin command did not write {expected_lines} complete lines to {} within deadline",
                 path.display()
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn read_capture_when_ready_waits_for_a_slow_writer_to_finish() {
+        use std::io::Write;
+
+        let root = unique_temp_path("capture-slow-writer");
+        std::fs::create_dir_all(&root).unwrap();
+        let capture = root.join("capture.txt");
+        let writer_target = capture.clone();
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&writer_target)
+                .unwrap();
+            // Line by line with pauses: a reader that returns on the first non-empty
+            // poll sees only a prefix, which used to panic callers on a missing line.
+            for line in ["first\n", "second\n", "third\n"] {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                file.write_all(line.as_bytes()).unwrap();
+            }
+        });
+        let text = read_capture_when_ready(&capture, 3, || {});
+        writer.join().unwrap();
+        assert_eq!(text, "first\nsecond\nthird\n");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn write_manifest(root: &std::path::Path) -> std::path::PathBuf {
@@ -1710,6 +1748,7 @@ command = ["cmd.exe", "/d", "/c", "slot.cmd", "default"]
             }
             let capture = read_capture_when_ready(
                 &expected_cwd.join(format!("capture-{entrypoint}.txt")),
+                2,
                 || {},
             );
             let mut lines = capture.lines();
@@ -1780,9 +1819,10 @@ command = ["sh", "-c", '"$HERDR_BIN_PATH" --list >/dev/null; printf "%s\n" "$?" 
             link_manifest(&mut app, &plugin_root);
             app.invoke_plugin_action_from_keybind("example.update.probe".into(), None)
                 .unwrap();
-            let action_status = read_capture_when_ready(&plugin_root.join("action-status"), || {
-                app.drain_all_internal_events();
-            });
+            let action_status =
+                read_capture_when_ready(&plugin_root.join("action-status"), 1, || {
+                    app.drain_all_internal_events();
+                });
             let open = app.handle_api_request(Request {
                 id: "update-pane".into(),
                 method: Method::PluginPaneOpen(PluginPaneOpenParams {
@@ -1803,7 +1843,7 @@ command = ["sh", "-c", '"$HERDR_BIN_PATH" --list >/dev/null; printf "%s\n" "$?" 
                 response_result(&open),
                 ResponseResult::PluginPaneOpened { .. }
             ));
-            let pane_status = read_capture_when_ready(&plugin_root.join("pane-status"), || {});
+            let pane_status = read_capture_when_ready(&plugin_root.join("pane-status"), 1, || {});
             for (_, runtime) in app.terminal_runtimes.drain() {
                 runtime.shutdown();
             }
@@ -1928,7 +1968,7 @@ command = ["sh", "-c", "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PWD\" \
         };
         assert!(app.state.plugin_panes.contains_key(&opened_pane_id));
 
-        let text = read_capture_when_ready(&capture, || {});
+        let text = read_capture_when_ready(&capture, 9, || {});
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some(canonical_path_string(&root).as_str()));
         assert_eq!(lines.next(), Some("example.pane"));
@@ -2027,7 +2067,7 @@ command = ["sh", "-c", "printf '%s\n%s\n%s\n' \"$HERDR_PLUGIN_ROOT\" \"$HERDR_PL
             panic!("expected plugin pane opened response: {open}");
         };
 
-        let text = read_capture_when_ready(&capture, || {});
+        let text = read_capture_when_ready(&capture, 3, || {});
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some(canonical_path_string(&root).as_str()));
         assert_eq!(
@@ -2337,7 +2377,7 @@ title = "Plugin Popup"
 placement = "popup"
 width = "80%"
 height = "40%"
-command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
+command = ["sh", "-c", "printf '%s\n' ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
 "#,
             env_capture.display()
         );
@@ -2368,9 +2408,10 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
             serde_json::from_str(&duplicate).unwrap();
         assert_eq!(duplicate.error.code, "ui_busy");
         assert_eq!(
-            read_capture_when_ready(&env_capture, || {
+            read_capture_when_ready(&env_capture, 1, || {
                 app.drain_internal_events();
-            }),
+            })
+            .trim(),
             "unset"
         );
 
@@ -2848,7 +2889,7 @@ min_herdr_version = "0.6.10"
 platforms = ["linux", "macos"]
 
 [[startup]]
-command = ["sh", "-c", "printf '%s:%s' \"$HERDR_PLUGIN_ID\" \"$HERDR_PLUGIN_EVENT\" > {}"]
+command = ["sh", "-c", "printf '%s:%s\n' \"$HERDR_PLUGIN_ID\" \"$HERDR_PLUGIN_EVENT\" > {}"]
 "#,
                 capture.display()
             ),
@@ -2858,9 +2899,10 @@ command = ["sh", "-c", "printf '%s:%s' \"$HERDR_PLUGIN_ID\" \"$HERDR_PLUGIN_EVEN
         app.run_plugin_startup_hooks();
 
         assert_eq!(
-            read_capture_when_ready(&capture, || {
+            read_capture_when_ready(&capture, 1, || {
                 app.drain_all_internal_events();
-            }),
+            })
+            .trim(),
             "example.startup:startup"
         );
         let plugin = app.state.installed_plugins.get("example.startup").unwrap();
@@ -2896,7 +2938,7 @@ platforms = ["linux", "macos"]
 
 [[events]]
 on = "worktree.created"
-command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_CONTEXT_JSON\" > {}"]
+command = ["sh", "-c", "printf '%s\n' \"$HERDR_PLUGIN_CONTEXT_JSON\" > {}"]
 "#,
                 capture.display()
             ),
@@ -2921,7 +2963,7 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_CONTEXT_JSON\" > {}"]
         });
 
         let context: PluginInvocationContext =
-            serde_json::from_str(&read_capture_when_ready(&capture, || {
+            serde_json::from_str(&read_capture_when_ready(&capture, 1, || {
                 app.drain_all_internal_events();
             }))
             .unwrap();
