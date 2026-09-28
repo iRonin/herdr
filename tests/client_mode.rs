@@ -846,8 +846,7 @@ impl LocalServerGuard {
             return;
         };
         let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-        let _ = stream
-            .write_all(b"{\"id\":\"stop\",\"method\":\"server.stop\",\"params\":{}}\n");
+        let _ = stream.write_all(b"{\"id\":\"stop\",\"method\":\"server.stop\",\"params\":{}}\n");
         let mut response = String::new();
         let _ = BufReader::new(stream).read_line(&mut response);
     }
