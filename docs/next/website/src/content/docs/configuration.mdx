@@ -120,7 +120,7 @@ Besides `config.toml`, Herdr reads a project-local settings file from the projec
 name = "payments"
 ```
 
-Herdr looks for the nearest `.herdr/settings.toml` walking up from the workspace's working directory. Inside a Git repository the search stops at the repository root, so a file never leaks in from a directory above the project. A linked Git worktree is its own project: the search stops at that checkout's root, so each checkout can carry its own name and a file at the main repository's root does not apply. Outside a repository the search continues up the directory tree.
+Herdr looks for the nearest `.herdr/settings.toml` walking up from the workspace's working directory. Inside a Git repository the search stops at the repository root, so a file never leaks in from a directory above the project. A linked Git worktree is its own project: the search stops at that checkout's root, so each checkout can carry its own name and a file at the main repository's root does not apply. Outside a repository the search continues up through parent folders, but never reads a file in your home directory or at the filesystem root unless the workspace's working directory is that directory itself — so a `~/.herdr/settings.toml` names only a workspace rooted at `$HOME`, never the non-Git projects beneath it.
 
 When no file is found — or the file is unreadable, malformed, or has no `name` — the label is derived as usual: the repository root's directory name, the checkout's name in a linked worktree, or the working directory's name outside Git. With `name` set, every workspace whose panes live under that project uses the pinned name, and it keeps showing while panes move deeper into the project. Delete the file or the `name` line to return to the automatic label.
 
