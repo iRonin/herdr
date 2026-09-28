@@ -69,6 +69,28 @@ pub fn unregister_runtime_dir(path: &Path) {
     }
 }
 
+/// Remove every inherited HERDR_* variable so a spawned test process never
+/// sees the developer's live pane environment: HERDR_STARTUP_CWD makes every fresh
+/// server seed an extra startup workspace, and HERDR_SOCKET_PATH names the
+/// developer's LIVE server. Callers set the few variables they mean to pass AFTER
+/// this, so deliberate HERDR_* assignments survive.
+pub fn sanitize_herdr_env(command: &mut portable_pty::CommandBuilder) {
+    for (key, _) in std::env::vars() {
+        if key.starts_with("HERDR_") {
+            command.env_remove(&key);
+        }
+    }
+}
+
+/// std::process::Command twin of [sanitize_herdr_env].
+pub fn sanitize_herdr_env_command(command: &mut std::process::Command) {
+    for (key, _) in std::env::vars() {
+        if key.starts_with("HERDR_") {
+            command.env_remove(&key);
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn herdr_server_pids_for_runtime_dir(runtime_dir: &Path) -> std::io::Result<Vec<u32>> {
     let mut pids = Vec::new();
@@ -1176,6 +1198,7 @@ mod tests {
                 })
                 .unwrap();
             let mut command = CommandBuilder::new(binary);
+            sanitize_herdr_env(&mut command);
             command.arg("server");
             command.env("XDG_RUNTIME_DIR", runtime_dir.as_os_str());
             command.env(

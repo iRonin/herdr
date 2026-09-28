@@ -121,6 +121,8 @@ fn spawn_server_with_config(
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+
+    support::sanitize_herdr_env(&mut cmd);
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
