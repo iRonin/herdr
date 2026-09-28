@@ -886,12 +886,22 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
             // the first rendered frame (the unavailable remote must not extend the wait). Retry
             // the write instead of assuming a single write lands, matching the recovered-Local
             // path below.
+            //
+            // The marker command carries no quotes, backslashes, braces or operators, so a
+            // write torn by the startup input gates can garble a line but can never leave the
+            // shell waiting at a continuation prompt. The old quoted marker unrecoverably
+            // poisoned the shell: one torn write kept a quote open, and every retry added two
+            // more quotes, so the count stayed odd forever. Each retry also starts with an
+            // interrupt so it recovers from any half-typed line left by earlier damage. The
+            // echoed command never contains the contiguous marker — its pieces are
+            // space-separated — so this wait can only be satisfied by the shell EXECUTING the
+            // command, never by the input echo alone.
             assert!(wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
                 if read_output(&output).contains("LOCAL_DIRECT_READY") {
                     return true;
                 }
                 input
-                    .write_all(b"printf 'LOCAL_%s\\n' DIRECT_READY\r")
+                    .write_all(b"\x03printf %s%s%s LOCAL_ DIRECT_ READY\r")
                     .unwrap();
                 false
             }), "Local must accept input without waiting for SSH (remote selected: {select_remote}): {}", read_output(&output));
