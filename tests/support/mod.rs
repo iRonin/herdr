@@ -69,7 +69,7 @@ pub fn unregister_runtime_dir(path: &Path) {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn herdr_server_pids_for_runtime_dir(runtime_dir: &Path) -> std::io::Result<Vec<u32>> {
     let mut pids = Vec::new();
     for pid in iter_worktree_server_pids()? {
@@ -659,8 +659,18 @@ fn terminate_servers_for_runtime_dirs(runtime_dirs: &HashSet<PathBuf>) {
     }
 }
 
-fn iter_worktree_server_pids() -> std::io::Result<Vec<u32>> {
+pub fn iter_worktree_server_pids() -> std::io::Result<Vec<u32>> {
     let own_pid = std::process::id();
+    Ok(list_system_pids()?
+        .into_iter()
+        .filter(|pid| *pid != own_pid && is_test_herdr_server_process(*pid))
+        .collect())
+}
+
+/// Enumerate every PID on the system. Linux walks /proc; macOS uses libproc.
+/// On Linux a missing /proc simply means there is nothing to scan.
+#[cfg(target_os = "linux")]
+fn list_system_pids() -> std::io::Result<Vec<u32>> {
     let mut pids = Vec::new();
 
     let proc_entries = match fs::read_dir("/proc") {
@@ -672,20 +682,46 @@ fn iter_worktree_server_pids() -> std::io::Result<Vec<u32>> {
     for entry in proc_entries {
         let entry = entry?;
         let file_name = entry.file_name();
-        let Some(pid) = file_name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+        let Some(pid) = file_name
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .filter(|pid| *pid > 0)
+        else {
             continue;
         };
-
-        if pid == own_pid {
-            continue;
-        }
-
-        if is_test_herdr_server_process(pid) {
-            pids.push(pid);
-        }
+        pids.push(pid);
     }
 
     Ok(pids)
+}
+
+/// libproc's proc_listallpids; grows its buffer until every PID fits. macOS has
+/// no /proc, and the previous /proc-only enumeration silently returned no PIDs
+/// here, which is why leaked servers were never reaped on this platform.
+#[cfg(target_os = "macos")]
+fn list_system_pids() -> std::io::Result<Vec<u32>> {
+    let mut capacity = 2048usize;
+    loop {
+        let mut buffer = vec![0i32; capacity];
+        let count = unsafe {
+            libc::proc_listallpids(
+                buffer.as_mut_ptr().cast(),
+                (capacity * std::mem::size_of::<i32>()) as libc::c_int,
+            )
+        };
+        if count < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if count as usize <= capacity {
+            buffer.truncate(count as usize);
+            return Ok(buffer
+                .into_iter()
+                .filter(|pid| *pid > 0)
+                .map(|pid| pid as u32)
+                .collect());
+        }
+        capacity = count as usize + 64;
+    }
 }
 
 fn is_test_herdr_server_process(pid: u32) -> bool {
@@ -704,10 +740,33 @@ fn is_test_herdr_server_process(pid: u32) -> bool {
     cmdline.iter().any(|arg| arg == "server")
 }
 
+/// Resolve a process's executable. Linux reads /proc/<pid>/exe; macOS uses
+/// proc_pidpath, canonicalized so aliasing build paths compare equal to the
+/// canonicalize()d CARGO_BIN_EXE_herdr the binary matcher holds.
+#[cfg(target_os = "linux")]
 fn proc_link_target(pid: u32, link: &str) -> Option<PathBuf> {
     fs::read_link(format!("/proc/{pid}/{link}")).ok()
 }
 
+#[cfg(target_os = "macos")]
+fn proc_link_target(pid: u32, _link: &str) -> Option<PathBuf> {
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let length = unsafe {
+        libc::proc_pidpath(
+            pid as libc::pid_t,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    if length <= 0 {
+        return None;
+    }
+    buffer.truncate(length as usize);
+    let path = PathBuf::from(String::from_utf8_lossy(&buffer).into_owned());
+    fs::canonicalize(&path).ok().or(Some(path))
+}
+
+#[cfg(target_os = "linux")]
 fn read_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
     let cmdline = fs::read(format!("/proc/{pid}/cmdline"))?;
     Ok(cmdline
@@ -717,6 +776,114 @@ fn read_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
         .collect())
 }
 
+/// KERN_PROCARGS2 layout: argc (i32), the executable-path record, padding
+/// NULs, then argc NUL-terminated argv strings, then the environment strings.
+/// Only the argv portion is returned here; the remainder feeds
+/// process_runtime_dir.
+#[cfg(target_os = "macos")]
+fn read_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
+    let blob = proc_args_blob(pid)?;
+    let mut offset = proc_args_argv_offset(&blob).unwrap_or(blob.len());
+    let argc = proc_args_argv_bounds(&blob).map_or(0, |(argc, _)| argc);
+    let mut args = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        let Some(end) = blob[offset..].iter().position(|byte| *byte == 0) else {
+            break;
+        };
+        if end > 0 {
+            args.push(String::from_utf8_lossy(&blob[offset..offset + end]).into_owned());
+        }
+        offset += end + 1;
+    }
+    Ok(args)
+}
+
+#[cfg(target_os = "macos")]
+fn proc_args_blob(pid: u32) -> std::io::Result<Vec<u8>> {
+    let mut mib = [
+        libc::CTL_KERN as libc::c_int,
+        libc::KERN_PROCARGS2 as libc::c_int,
+        pid as libc::c_int,
+    ];
+    let mut length = 0usize;
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3 as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if length == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no procargs for pid",
+        ));
+    }
+    let mut buffer = vec![0u8; length];
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3 as libc::c_uint,
+            buffer.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    buffer.truncate(length);
+    Ok(buffer)
+}
+
+/// (argc, byte offset just past the argc field) when the blob is shaped like a
+/// KERN_PROCARGS2 result; bounds-checked because unrelated sysctl data or a
+/// mid-exec snapshot must never be trusted as an argv.
+#[cfg(target_os = "macos")]
+fn proc_args_argv_bounds(blob: &[u8]) -> Option<(usize, usize)> {
+    if blob.len() < 4 {
+        return None;
+    }
+    let argc = i32::from_ne_bytes([blob[0], blob[1], blob[2], blob[3]]);
+    if !(0..=4096).contains(&argc) {
+        return None;
+    }
+    Some((argc as usize, 4))
+}
+
+/// Offset of the first argv string: past the argc field, past the
+/// executable-path record that follows it, and past any padding NULs.
+#[cfg(target_os = "macos")]
+fn proc_args_argv_offset(blob: &[u8]) -> Option<usize> {
+    let (_, mut offset) = proc_args_argv_bounds(blob)?;
+    let mut skipped_path = false;
+    while offset < blob.len() {
+        let end = blob[offset..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(blob.len() - offset);
+        if end == 0 {
+            offset += 1;
+            continue;
+        }
+        if !skipped_path {
+            skipped_path = true;
+            offset += end + 1;
+            continue;
+        }
+        return Some(offset);
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
 fn process_runtime_dir(pid: u32) -> std::io::Result<Option<PathBuf>> {
     let environ = fs::read(format!("/proc/{pid}/environ"))?;
 
@@ -732,6 +899,40 @@ fn process_runtime_dir(pid: u32) -> std::io::Result<Option<PathBuf>> {
             return Ok(Some(PathBuf::from(value)));
         }
 
+        if let Some(value) = kv.strip_prefix("HERDR_SOCKET_PATH=") {
+            socket_path = Some(PathBuf::from(value));
+        }
+    }
+
+    Ok(socket_path.and_then(|path| path.parent().map(Path::to_path_buf)))
+}
+
+/// The environment strings sit after the argv block in the KERN_PROCARGS2
+/// blob; same precedence as Linux (XDG_RUNTIME_DIR wins, else the socket's
+/// parent).
+#[cfg(target_os = "macos")]
+fn process_runtime_dir(pid: u32) -> std::io::Result<Option<PathBuf>> {
+    let blob = proc_args_blob(pid)?;
+    let argc = proc_args_argv_bounds(&blob).map_or(0, |(argc, _)| argc);
+    let Some(mut offset) = proc_args_argv_offset(&blob) else {
+        return Ok(None);
+    };
+    for _ in 0..argc {
+        let Some(end) = blob[offset..].iter().position(|byte| *byte == 0) else {
+            return Ok(None);
+        };
+        offset += end + 1;
+    }
+
+    let mut socket_path: Option<PathBuf> = None;
+    for entry in blob[offset..].split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let kv = String::from_utf8_lossy(entry);
+        if let Some(value) = kv.strip_prefix("XDG_RUNTIME_DIR=") {
+            return Ok(Some(PathBuf::from(value)));
+        }
         if let Some(value) = kv.strip_prefix("HERDR_SOCKET_PATH=") {
             socket_path = Some(PathBuf::from(value));
         }
@@ -775,7 +976,7 @@ impl Drop for CleanupGuard {
     }
 }
 
-fn terminate_pid(pid: u32) {
+pub fn terminate_pid(pid: u32) {
     let pid_t = pid as libc::pid_t;
 
     if process_exists(pid_t) {
@@ -926,5 +1127,113 @@ mod tests {
                 binary.display()
             );
         }
+    }
+
+    /// Positive and negative control for the PID scan itself. On macOS the scan
+    /// used to enumerate /proc (which does not exist there), so every caller -
+    /// the panic hook, atexit handler and watchdog - silently found nothing and
+    /// leaked servers. The scan must FIND this build's own server, and must NOT
+    /// select a byte copy of the same binary executed from a foreign path even
+    /// though it runs the same argv against a registered runtime dir: only the
+    /// executable-path gate can be excluding it.
+    #[cfg(unix)]
+    #[test]
+    fn server_scan_finds_this_builds_server_and_rejects_foreign_copies() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "herdr-support-scan-{}-{unique}",
+            std::process::id()
+        ));
+        let real_runtime = base.join("real-runtime");
+        let foreign_runtime = base.join("foreign-runtime");
+        fs::create_dir_all(&real_runtime).unwrap();
+        fs::create_dir_all(&foreign_runtime).unwrap();
+        register_runtime_dir(&real_runtime);
+        register_runtime_dir(&foreign_runtime);
+
+        let foreign_bin = base.join("herdr-copy");
+        fs::copy(env!("CARGO_BIN_EXE_herdr"), &foreign_bin)
+            .expect("copy the test binary for the negative control");
+
+        let spawn = |binary: &Path,
+                     runtime_dir: &Path|
+         -> (
+            u32,
+            Box<dyn portable_pty::Child + Send + Sync>,
+            Box<dyn portable_pty::MasterPty + Send>,
+        ) {
+            let pair = native_pty_system()
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            let mut command = CommandBuilder::new(binary);
+            command.arg("server");
+            command.env("XDG_RUNTIME_DIR", runtime_dir.as_os_str());
+            command.env(
+                "HERDR_SOCKET_PATH",
+                runtime_dir.join("herdr.sock").as_os_str(),
+            );
+            let child = pair.slave.spawn_command(command).unwrap();
+            let pid = child.process_id().expect("spawned server pid");
+            drop(pair.slave);
+            (pid, child, Box::from(pair.master))
+        };
+
+        let (real_pid, mut real_child, _real_master) =
+            spawn(Path::new(env!("CARGO_BIN_EXE_herdr")), &real_runtime);
+        let (foreign_pid, mut foreign_child, _foreign_master) =
+            spawn(&foreign_bin, &foreign_runtime);
+
+        // Poll: the scan can only see a process once it is exec'd.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut found_real = false;
+        while Instant::now() < deadline {
+            found_real = iter_worktree_server_pids()
+                .unwrap_or_default()
+                .contains(&real_pid);
+            if found_real {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        // The negative control must be judged while provably alive, so its
+        // absence from the scan cannot be explained by early exit.
+        let foreign_alive = foreign_child.try_wait().unwrap().is_none();
+        let foreign_selected = iter_worktree_server_pids()
+            .unwrap_or_default()
+            .contains(&foreign_pid)
+            || is_test_herdr_server_process(foreign_pid);
+
+        let _ = real_child.kill();
+        let _ = foreign_child.kill();
+        let _ = real_child.wait();
+        let _ = foreign_child.wait();
+        unregister_runtime_dir(&real_runtime);
+        unregister_runtime_dir(&foreign_runtime);
+        let _ = fs::remove_dir_all(&base);
+
+        assert!(
+            found_real,
+            "the scan must find this build's own test server (pid {real_pid})"
+        );
+        assert!(
+            foreign_alive,
+            "negative control server must still be running"
+        );
+        assert!(
+            !foreign_selected,
+            "a byte copy of the binary at {} must never be selected",
+            foreign_bin.display()
+        );
     }
 }
