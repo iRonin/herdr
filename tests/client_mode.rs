@@ -828,6 +828,37 @@ fn attach_thin_client_with_config(
     (spawned_server, thin_client, output)
 }
 
+/// Stops the auto-started Local server through its API socket on drop.
+///
+/// The tests/support panic hook, atexit handler and watchdog all hunt leaked servers by
+/// enumerating /proc, which does not exist on macOS, so on this platform none of them can
+/// act. A guard whose drop talks to the server's own API socket works everywhere and on
+/// every exit path, including panics: `server.stop` is the same request the test's happy
+/// path already sends. Every operation is best effort because drop also runs when the
+/// socket does not exist (server never started, or already stopped by the happy path).
+struct LocalServerGuard {
+    api_socket: PathBuf,
+}
+
+impl LocalServerGuard {
+    fn stop(&self) {
+        let Ok(mut stream) = UnixStream::connect(&self.api_socket) else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let _ = stream
+            .write_all(b"{\"id\":\"stop\",\"method\":\"server.stop\",\"params\":{}}\n");
+        let mut response = String::new();
+        let _ = BufReader::new(stream).read_line(&mut response);
+    }
+}
+
+impl Drop for LocalServerGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 #[test]
 fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
     use std::os::unix::fs::PermissionsExt;
@@ -863,6 +894,14 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
             bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
+
+        // Stop the auto-started Local server on EVERY exit path. A panic mid-phase used
+        // to leak it: the server is not the test process's child, so nothing reaps it — it
+        // survives the test binary, reparented to launchd with a live shell inside. The
+        // happy path below still stops it synchronously; the guard only backstops failures.
+        let _server_guard = LocalServerGuard {
+            api_socket: api_socket.clone(),
+        };
 
         // Exercise both auto-start and a subsequent attach to the healthy Local server.
         // Each phase gets its own marker. The attach phase (args ["client"]) renders the
