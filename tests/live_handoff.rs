@@ -396,6 +396,13 @@ fn wait_for_output(socket_path: &Path, pane_id: &str, needle: &str) {
     );
 }
 
+/// Waits for the line a pane command writes with `echo ... > path` and returns the file's text.
+/// The shell creates the file before it writes the line, so the file can exist while it is still
+/// empty: reading it as soon as it exists races that write.
+fn wait_for_marker_line(path: &Path) -> String {
+    wait_for_file_contains(path, "\n", Duration::from_secs(5))
+}
+
 fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     let mut last_text = String::new();
@@ -1018,11 +1025,9 @@ fn live_handoff_preserves_pane_process_io() {
             "params": {"pane_id": second_pane_id, "text": second_command, "keys": ["Enter"]}
         }),
     ));
-    support::wait_for_file(&marker, Duration::from_secs(5));
-    support::wait_for_file(&second_marker, Duration::from_secs(5));
-    let pid_text = fs::read_to_string(&marker).unwrap();
+    let pid_text = wait_for_marker_line(&marker);
     let child_pid: u32 = pid_text.split_whitespace().last().unwrap().parse().unwrap();
-    let second_pid_text = fs::read_to_string(&second_marker).unwrap();
+    let second_pid_text = wait_for_marker_line(&second_marker);
     let second_child_pid: u32 = second_pid_text
         .split_whitespace()
         .last()
@@ -1959,8 +1964,7 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
             "params": {"pane_id": pane_id, "text": command, "keys": ["Enter"]}
         }),
     ));
-    support::wait_for_file(&marker, Duration::from_secs(5));
-    let pid_text = fs::read_to_string(&marker).unwrap();
+    let pid_text = wait_for_marker_line(&marker);
     let child_pid: u32 = pid_text.split_whitespace().last().unwrap().parse().unwrap();
 
     let failed = request(
@@ -2045,8 +2049,7 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
             "params": {"pane_id": pane_id, "text": command, "keys": ["Enter"]}
         }),
     ));
-    support::wait_for_file(&marker, Duration::from_secs(5));
-    let pid_text = fs::read_to_string(&marker).unwrap();
+    let pid_text = wait_for_marker_line(&marker);
     let child_pid: u32 = pid_text.split_whitespace().last().unwrap().parse().unwrap();
 
     let failed = request(
