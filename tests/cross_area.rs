@@ -310,6 +310,20 @@ fn pane_read_recent_contains(
     false
 }
 
+/// Waits until a new pane's shell has run a command. The pane starts a login shell, which reads
+/// the user's profile before it reads typed input; on a busy machine that alone can outlast the
+/// 5 s budgets below (tens of seconds were measured under CPU load with a heavy login
+/// profile). The typed command does not contain the text it prints, so the
+/// terminal's echo of the typing cannot satisfy the wait.
+fn wait_for_pane_shell(socket_path: &Path, pane_id: &str) {
+    pane_send_input(socket_path, pane_id, "printf 'SHELL_%s\\n' READY");
+    assert!(
+        pane_read_recent_contains(socket_path, pane_id, "SHELL_READY", Duration::from_secs(60)),
+        "pane shell did not run a command within 60s: {:?}",
+        pane_read_recent(socket_path, pane_id)
+    );
+}
+
 fn pane_report_agent(socket_path: &Path, pane_id: &str, agent: &str, state: &str, source: &str) {
     let response = send_json_request(
         socket_path,
@@ -506,7 +520,10 @@ fn cross_area_detach_and_reattach_preserves_state() {
         .expect("root pane id")
         .to_string();
 
-    pane_send_input(&api_socket, &pane_id, "echo LOCAL_BEFORE_DETACH");
+    // Each command prints a marker that its typed text does not contain. The terminal echoes
+    // typing, so a command containing its own marker would pass even if the shell ran nothing.
+    wait_for_pane_shell(&api_socket, &pane_id);
+    pane_send_input(&api_socket, &pane_id, "printf 'LOCAL_%s\\n' BEFORE_DETACH");
     assert!(pane_read_recent_contains(
         &api_socket,
         &pane_id,
@@ -519,7 +536,7 @@ fn cross_area_detach_and_reattach_preserves_state() {
     drop(client_a);
 
     // Simulate activity while detached.
-    pane_send_text(&api_socket, &pane_id, "echo DETACHED_UPDATE\n");
+    pane_send_text(&api_socket, &pane_id, "printf 'DETACHED_%s\\n' UPDATE\n");
     assert!(pane_read_recent_contains(
         &api_socket,
         &pane_id,
@@ -594,25 +611,9 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
         .expect("root pane id")
         .to_string();
 
-    // Ensure detected agent surface is populated by running fake `pi`.
-    //
-    // The pane runs a login shell, which reads the user's profile before it reads typed input.
-    // On a busy machine that alone can outlast the detection budget below (tens of seconds were
-    // measured under CPU load with a heavy login profile). So first wait
-    // until the shell has run a command: the budget then times agent detection, not shell
-    // startup. The typed command does not contain the text it prints, so the terminal's echo of
-    // the typing cannot satisfy the wait.
-    pane_send_input(&api_socket, &pane_id, "printf 'SHELL_%s\\n' READY");
-    assert!(
-        pane_read_recent_contains(
-            &api_socket,
-            &pane_id,
-            "SHELL_READY",
-            Duration::from_secs(60)
-        ),
-        "pane shell did not run a command within 60s: {:?}",
-        pane_read_recent(&api_socket, &pane_id)
-    );
+    // Ensure detected agent surface is populated by running fake `pi`. Wait for the shell first,
+    // so the detection budget below times agent detection, not shell startup.
+    wait_for_pane_shell(&api_socket, &pane_id);
     pane_send_text(&api_socket, &pane_id, "pi");
     pane_send_input(&api_socket, &pane_id, "");
     let detected_before_hook = {
