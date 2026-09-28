@@ -81,18 +81,26 @@ fn project_workspace_name(cwd: &Path, repo_root: Option<&Path>) -> Option<String
 
 /// Path of the nearest `.herdr/settings.toml` found by walking up from `cwd`.
 /// The search stops at `repo_root` when given (so a project file cannot leak in
-/// from above the repository); otherwise it walks to the filesystem root.
+/// from above the repository). Outside a repository, no settings file is ever
+/// read from `$HOME` or `/` unless the walk started there: a file in either
+/// place would pin every non-Git workspace beneath it, and a rename from any
+/// of those workspaces would have created or updated it as the "nearest"
+/// file. A workspace whose own directory is `$HOME` (or `/`) keeps its file.
 fn existing_settings_path(cwd: &Path, repo_root: Option<&Path>) -> Option<PathBuf> {
     let mut current = if cwd.is_dir() {
         cwd.to_path_buf()
     } else {
         cwd.parent()?.to_path_buf()
     };
+    let start = current.clone();
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
 
     loop {
-        let candidate = current.join(".herdr/settings.toml");
-        if candidate.is_file() {
-            return Some(candidate);
+        if !settings_dir_is_excluded(&current, &start, repo_root, home.as_deref()) {
+            let candidate = current.join(".herdr/settings.toml");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
         if Some(current.as_path()) == repo_root {
             break;
@@ -103,6 +111,22 @@ fn existing_settings_path(cwd: &Path, repo_root: Option<&Path>) -> Option<PathBu
     }
 
     None
+}
+
+/// Whether the walk refuses to read a settings file from `current`. Inside a
+/// repository the repository cap is the only rule. Outside one, `$HOME` and
+/// `/` are excluded unless the walk started there -- the starting directory is
+/// always in range, so the home workspace itself keeps its own file.
+fn settings_dir_is_excluded(
+    current: &Path,
+    start: &Path,
+    repo_root: Option<&Path>,
+    home: Option<&Path>,
+) -> bool {
+    if repo_root.is_some() || current == start {
+        return false;
+    }
+    current == Path::new("/") || home == Some(current)
 }
 
 /// Where a new `.herdr/settings.toml` is created when none exists in the walk
@@ -528,6 +552,39 @@ mod tests {
         let path = std::env::temp_dir().join(unique);
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    /// Points HOME at a temp directory for the duration of a test and restores
+    /// the real value on drop, so no test ever reads or writes the real home
+    /// directory. Tests using this MUST hold `env_lock()` first (the suite runs
+    /// single-threaded, but the lock also encodes the intent).
+    struct HomeDirGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    /// The shared env-test lock, recovered from poisoning so one failing env
+    /// test does not mask the verdicts of the others with PoisonError.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    impl HomeDirGuard {
+        fn point_at(home: &Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            std::env::set_var("HOME", home);
+            Self { previous }
+        }
+    }
+
+    impl Drop for HomeDirGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     #[test]
@@ -1074,6 +1131,109 @@ mod tests {
         assert_eq!(derive_label_from_cwd(&root), "plain");
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // THE HOME TRAP. Outside a repository the walk used to climb to the
+    // filesystem root, so a ~/.herdr/settings.toml (written by renaming any
+    // workspace whose cwd was the home directory) silently pinned EVERY later
+    // non-git workspace under home, and a rename from below home updated the
+    // home file in place. The walk must never read a settings file from HOME
+    // or / unless it started there.
+    #[test]
+    fn derive_label_ignores_home_settings_below_home() {
+        let _env = env_lock();
+        let home = temp_test_dir("settings-home-below");
+        let _guard = HomeDirGuard::point_at(&home);
+        std::fs::create_dir_all(home.join(".herdr")).unwrap();
+        std::fs::write(
+            home.join(".herdr/settings.toml"),
+            "[workspace]\nname = \"home-pin\"\n",
+        )
+        .unwrap();
+        let cwd = home.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let expected = cwd.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            derive_label_from_cwd(&cwd),
+            expected,
+            "a home-directory settings file must not pin a workspace below home"
+        );
+
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    // OVERSHOOT CONTROL: parent folders BETWEEN the cwd and home still apply,
+    // so a non-git project folder with subfolders keeps working.
+    #[test]
+    fn derive_label_uses_parent_settings_below_home() {
+        let _env = env_lock();
+        let home = temp_test_dir("settings-home-parent");
+        let _guard = HomeDirGuard::point_at(&home);
+        let proj = home.join("proj");
+        std::fs::create_dir_all(proj.join(".herdr")).unwrap();
+        std::fs::write(
+            proj.join(".herdr/settings.toml"),
+            "[workspace]\nname = \"proj-pin\"\n",
+        )
+        .unwrap();
+        let cwd = proj.join("sub");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        assert_eq!(derive_label_from_cwd(&cwd), "proj-pin");
+
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    // The home workspace itself keeps its own file: the walk's starting
+    // directory is always in range.
+    #[test]
+    fn derive_label_uses_home_settings_for_the_home_workspace() {
+        let _env = env_lock();
+        let home = temp_test_dir("settings-home-root");
+        let _guard = HomeDirGuard::point_at(&home);
+        std::fs::create_dir_all(home.join(".herdr")).unwrap();
+        std::fs::write(
+            home.join(".herdr/settings.toml"),
+            "[workspace]\nname = \"home-pin\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(derive_label_from_cwd(&home), "home-pin");
+
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    // WRITE SIDE of the same trap: a rename below home must not update the
+    // home file as the "nearest existing" one; it creates the project file at
+    // the workspace's own directory instead.
+    #[test]
+    fn persist_workspace_name_below_home_does_not_touch_home_settings() {
+        let _env = env_lock();
+        let home = temp_test_dir("settings-home-persist");
+        let _guard = HomeDirGuard::point_at(&home);
+        std::fs::create_dir_all(home.join(".herdr")).unwrap();
+        std::fs::write(
+            home.join(".herdr/settings.toml"),
+            "[workspace]\nname = \"home-pin\"\n",
+        )
+        .unwrap();
+        let cwd = home.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        persist_workspace_name(&cwd, "renamed").unwrap();
+
+        let home_file = std::fs::read_to_string(home.join(".herdr/settings.toml")).unwrap();
+        assert!(
+            home_file.contains("home-pin") && !home_file.contains("renamed"),
+            "the home file must be left alone: {home_file}"
+        );
+        let work_file = std::fs::read_to_string(cwd.join(".herdr/settings.toml"))
+            .expect("the rename should create the project file at the workspace cwd");
+        assert!(work_file.contains("name = \"renamed\""), "{work_file}");
+        assert_eq!(derive_label_from_cwd(&cwd), "renamed");
+
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
