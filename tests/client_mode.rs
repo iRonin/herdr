@@ -939,7 +939,7 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
         // let the attach phase pass without a single write of its own; with per-phase tags
         // a phase can only pass by executing its own command.
         for (phase, args) in [&[][..], &["client"][..]].iter().enumerate() {
-            let client = spawn_client_process_with_args_and_env(
+            let mut client = spawn_client_process_with_args_and_env(
                 &config_home,
                 &runtime_dir,
                 &api_socket,
@@ -971,7 +971,16 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
             // echoed command never contains the contiguous marker — its pieces are
             // space-separated — so this wait can only be satisfied by the shell EXECUTING the
             // command, never by the input echo alone.
-            assert!(wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+            // Retry SPACED, not flooded. macOS XNU re-feeds unread typeahead when a
+            // shell toggles the tty back to canonical mode, and if the pending text
+            // wraps the 1024-byte ring, earlier bytes replay as garbage (the p-runs);
+            // a full line every 20ms piled up kilobytes of typeahead while the pane
+            // shell started late and tripped that kernel bug
+            // (VS Code hit it too: microsoft/vscode#296955). At 600ms the 10s deadline
+            // allows ~17 writes of ~45 bytes: under 1KB total even if the shell
+            // never starts. Detecting that garbling is now a dedicated
+            // regression test's job, not this test's accident.
+            assert!(wait_until(Duration::from_secs(10), Duration::from_millis(600), || {
                 if read_output(&output).contains(marker.as_str()) {
                     return true;
                 }
@@ -983,6 +992,16 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
                     .unwrap();
                 false
             }), "Local must accept input without waiting for SSH (remote selected: {select_remote}): {}", read_output(&output));
+            // The retry's interrupt prefix must never take the client's own exit
+            // paths. Raw mode is enabled before any frame renders, so a write gated
+            // on a rendered "Local" cannot reach a cooked tty (where ^C would
+            // SIGINT the client); the client installs no SIGINT handler, and its
+            // only local ^C handling clears the rename overlay. Assert the client
+            // survived every retry in every startup state.
+            assert!(
+                client.child.try_wait().unwrap().is_none(),
+                "client must survive the marker retry in every startup state"
+            );
             let text = read_output(&output);
             assert!(!text.contains("Local: connecting"), "{text}");
             assert!(!text.contains("Local: reconnecting"), "{text}");
