@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+pub mod support;
+
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Output, Stdio};
@@ -16,7 +18,9 @@ fn closed_pipe_writer() -> Stdio {
 }
 
 fn run_with_closed_stdout(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_herdr"))
+    let mut herdr_command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    support::sanitize_herdr_env_command(&mut herdr_command);
+    herdr_command
         .args(args)
         .stdout(closed_pipe_writer())
         .stderr(Stdio::piped())

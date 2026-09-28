@@ -175,6 +175,8 @@ pub(super) fn spawn_named_server(
     .unwrap();
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+
+    crate::support::sanitize_herdr_env_command(&mut command);
     command
         .args(["--session", session, "server"])
         .env("XDG_CONFIG_HOME", config_home)
@@ -225,6 +227,7 @@ pub(super) fn run_named_cli_with_env_and_socket_override(
     socket_override: Option<&Path>,
 ) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    crate::support::sanitize_herdr_env_command(&mut command);
     command
         .args(args)
         .env("XDG_CONFIG_HOME", config_home)
@@ -300,6 +303,8 @@ pub(super) fn spawn_herdr_with_config(
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+
+    crate::support::sanitize_herdr_env(&mut cmd);
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -321,6 +326,7 @@ pub(super) fn spawn_herdr_with_config(
 
 pub(super) fn run_cli(socket_path: &Path, args: &[&str]) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    crate::support::sanitize_herdr_env_command(&mut command);
     command.args(args);
     command.env("HERDR_SOCKET_PATH", socket_path);
     command.output().unwrap()
@@ -332,6 +338,7 @@ pub(super) fn run_cli_in_dir(
     current_dir: &Path,
 ) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    crate::support::sanitize_herdr_env_command(&mut command);
     command.args(args);
     command.current_dir(current_dir);
     command.env("HERDR_SOCKET_PATH", socket_path);

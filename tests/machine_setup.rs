@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+pub mod support;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -98,7 +100,9 @@ fn setup_with_strict_host_key_failure(
         "onboarding = false\n[remote]\nmanage_ssh_config = false\n",
     )
     .unwrap();
-    let status = Command::new(env!("CARGO_BIN_EXE_herdr"))
+    let mut herdr_command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    support::sanitize_herdr_env_command(&mut herdr_command);
+    let status = herdr_command
         .args(["status", "client", "--json"])
         .output()
         .unwrap();
@@ -106,6 +110,7 @@ fn setup_with_strict_host_key_failure(
 
     let pair = native_pty_system().openpty(PtySize::default()).unwrap();
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    support::sanitize_herdr_env(&mut command);
     if handoff {
         command.args(["--remote", "fake-host", "--handoff"]);
     } else {
@@ -228,6 +233,7 @@ fn machine_add_accepts_help_argument_order() {
     )
     .unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    support::sanitize_herdr_env_command(&mut command);
     command.args(["machine", "add", "--label", "coder", "workstation.coder"]);
     // Reach remote preparation, but never execute SSH or start a server.
     command.env("PATH", root.join("no-executables"));
