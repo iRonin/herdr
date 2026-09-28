@@ -909,14 +909,18 @@ impl TerminalState {
         if agent.is_none() && self.recent_agent_process_exit.is_some() {
             self.clear_agent_name();
         }
+        let effective_state_change = self.recompute_effective_state(
+            previous_agent_label,
+            previous_known_agent,
+            previous_state,
+            previous_presentation,
+            now,
+        );
+        if fallback_state == AgentState::Working && self.state == AgentState::Working {
+            self.agent_process_acquisition_pending = false;
+        }
         TerminalStateMutation {
-            effective_state_change: self.recompute_effective_state(
-                previous_agent_label,
-                previous_known_agent,
-                previous_state,
-                previous_presentation,
-                now,
-            ),
+            effective_state_change,
             session_ref_changed: previous_session
                 != self.current_session_identity_for_persistence(),
             agent_released,
@@ -1067,14 +1071,18 @@ impl TerminalState {
             session_ref,
         });
         let current_session = self.current_session_identity_for_persistence();
+        let effective_state_change = self.recompute_effective_state(
+            previous_agent_label,
+            previous_known_agent,
+            previous_state,
+            previous_presentation,
+            now,
+        );
+        if state == AgentState::Working && self.state == AgentState::Working {
+            self.agent_process_acquisition_pending = false;
+        }
         Some(TerminalStateMutation {
-            effective_state_change: self.recompute_effective_state(
-                previous_agent_label,
-                previous_known_agent,
-                previous_state,
-                previous_presentation,
-                now,
-            ),
+            effective_state_change,
             session_ref_changed: previous_session != current_session,
             agent_released: false,
         })
@@ -1940,6 +1948,10 @@ impl TerminalState {
         }
         self.persisted_agent_session = Some(persisted_session);
         let current_session = self.current_session_identity_for_persistence();
+        if previous_session.is_some() && previous_session != current_session {
+            // Rebinding can expose a cached Working screen; only a fresh report ends acquisition.
+            self.agent_process_acquisition_pending = true;
+        }
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -2253,6 +2265,7 @@ impl TerminalState {
         timeout: Duration,
     ) {
         self.set_agent_name(name);
+        self.agent_process_acquisition_pending = true;
         self.agent_name_owner = Some(AgentNameOwner {
             agent_label: crate::detect::agent_label(kind).to_string(),
             session_ref: None,
