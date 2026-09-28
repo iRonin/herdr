@@ -2775,6 +2775,96 @@ mod tests {
         });
     }
 
+    fn detected_anchored_pi(session: &str) -> TerminalState {
+        let mut terminal = test_terminal();
+        terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+        anchor_full_lifecycle_session(
+            &mut terminal,
+            Agent::Pi,
+            "herdr:pi",
+            "pi",
+            crate::agent_resume::AgentSessionRef::path(session.to_string()).unwrap(),
+        );
+        terminal
+    }
+
+    fn report_pi(terminal: &mut TerminalState, session: &str, state: AgentState, seq: u64) {
+        terminal.set_hook_authority_with_session_ref(
+            "herdr:pi".into(),
+            "pi".into(),
+            state,
+            None,
+            crate::agent_resume::AgentSessionRef::path(session.to_string()),
+            Some(seq),
+        );
+    }
+
+    #[test]
+    fn working_report_ends_process_acquisition_so_the_first_idle_is_a_completion() {
+        // An agent spawned with a prompt reports working before its first idle. That idle ends a
+        // turn, so it must count as a completion, not as startup (#4457).
+        let session = test_session_path("pi-working-first.jsonl");
+        let mut terminal = detected_anchored_pi(&session);
+        report_pi(&mut terminal, &session, AgentState::Working, 10);
+        report_pi(&mut terminal, &session, AgentState::Idle, 11);
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert!(
+            !terminal.finish_agent_process_acquisition(),
+            "the first idle after a working report must count as a completion"
+        );
+    }
+
+    #[test]
+    fn a_first_idle_with_no_turn_before_it_is_still_startup() {
+        let session = test_session_path("pi-idle-first.jsonl");
+        let mut terminal = detected_anchored_pi(&session);
+        report_pi(&mut terminal, &session, AgentState::Idle, 10);
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert!(
+            terminal.finish_agent_process_acquisition(),
+            "an idle that follows no working turn is startup, not a completion"
+        );
+    }
+
+    #[test]
+    fn a_session_rebind_reopens_process_acquisition() {
+        let first = test_session_path("pi-before-rebind.jsonl");
+        let second = test_session_path("pi-after-rebind.jsonl");
+        let mut terminal = detected_anchored_pi(&first);
+        report_pi(&mut terminal, &first, AgentState::Working, 10);
+        let rebind = terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            crate::agent_resume::AgentSessionRef::path(second.clone()),
+            Some(11),
+            Some("new".into()),
+        );
+        assert!(rebind.is_some(), "a new session replaces the current one");
+        report_pi(&mut terminal, &second, AgentState::Idle, 12);
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert!(
+            terminal.finish_agent_process_acquisition(),
+            "after a rebind only a fresh working report ends acquisition"
+        );
+    }
+
+    #[test]
+    fn beginning_a_managed_agent_opens_process_acquisition() {
+        let mut terminal = test_terminal();
+        terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::Pi,
+            Instant::now(),
+            Duration::ZERO,
+            Duration::from_secs(5),
+        );
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        assert!(
+            terminal.finish_agent_process_acquisition(),
+            "a managed agent's first idle is startup"
+        );
+    }
+
     #[test]
     fn managed_agent_readiness_tracks_detection_state() {
         let mut terminal = test_terminal();
