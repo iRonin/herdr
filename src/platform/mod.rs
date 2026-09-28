@@ -352,6 +352,9 @@ pub(crate) fn process_group_exists(_process_group: u32) -> bool {
     true
 }
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod peer_process_tests;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn available_pane_shell_from_job(child_pid: u32, job: ForegroundJob) -> Option<String> {
     if job.process_group_id != child_pid
