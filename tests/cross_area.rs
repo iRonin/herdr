@@ -595,6 +595,24 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
         .to_string();
 
     // Ensure detected agent surface is populated by running fake `pi`.
+    //
+    // The pane runs a login shell, which reads the user's profile before it reads typed input.
+    // On a busy machine that alone can outlast the detection budget below (tens of seconds were
+    // measured under CPU load with a heavy login profile). So first wait
+    // until the shell has run a command: the budget then times agent detection, not shell
+    // startup. The typed command does not contain the text it prints, so the terminal's echo of
+    // the typing cannot satisfy the wait.
+    pane_send_input(&api_socket, &pane_id, "printf 'SHELL_%s\\n' READY");
+    assert!(
+        pane_read_recent_contains(
+            &api_socket,
+            &pane_id,
+            "SHELL_READY",
+            Duration::from_secs(60)
+        ),
+        "pane shell did not run a command within 60s: {:?}",
+        pane_read_recent(&api_socket, &pane_id)
+    );
     pane_send_text(&api_socket, &pane_id, "pi");
     pane_send_input(&api_socket, &pane_id, "");
     let detected_before_hook = {
