@@ -325,6 +325,18 @@ pub struct TerminalState {
     metadata_token_sequence_sources: std::collections::HashSet<String>,
     pub state: AgentState,
     pub last_agent_state_change_seq: Option<u64>,
+    /// The client-facing completion-notification decision the update fold
+    /// (`AppState::update_terminal_state_with_completion_policy`) made for
+    /// the transition that produced the current effective state: true when
+    /// that transition's completion notification is suppressed
+    /// (process-acquisition startup noise, managed-launch noise, a forced
+    /// shutdown, or the `auto_read` metadata token). Only an update that
+    /// CHANGES the effective state records its decision — updates that leave
+    /// the state unchanged (session-ref or label bookkeeping) never
+    /// overwrite it. The headless API-request loop consults this record
+    /// instead of re-deriving a completion from the raw transition, so every
+    /// surface honours the one policy.
+    pub last_state_change_suppressed_completion: bool,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
@@ -363,6 +375,7 @@ impl TerminalState {
             metadata_token_sequence_sources: std::collections::HashSet::new(),
             state: AgentState::Unknown,
             last_agent_state_change_seq: None,
+            last_state_change_suppressed_completion: false,
             revision: 0,
             launch_argv: None,
             respawn_shell_on_exit: false,
