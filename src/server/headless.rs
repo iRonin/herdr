@@ -3423,24 +3423,21 @@ impl HeadlessServer {
             let agent = terminal_after.effective_known_agent();
             let agent_label = terminal_after.effective_agent_label().map(str::to_string);
 
-            // `auto_read` completions skip the client-facing completion
-            // notification on EVERY surface. This loop re-derives
-            // notifications from the raw effective transition instead of the
-            // update's `suppress_completion`, so consult the same policy the
-            // fold in `update_terminal_state_with_completion_policy` applies
-            // (the normal completion route for reporter-driven agents —
-            // exactly the panes the token targets).
-            if crate::app::actions::auto_read_suppresses_completion(
-                self.app.state.pane_has_auto_read_token(*ws_idx, *pane_id),
-                *prev_state,
-                new_state,
-                prev_agent_label.as_deref(),
-                agent_label.as_deref(),
-            ) {
+            // The update fold already decided whether this pane's completion
+            // notification is suppressed — process-acquisition startup noise,
+            // managed-launch noise, a forced shutdown, or the `auto_read`
+            // metadata token — and recorded that decision on the terminal
+            // with every effective state change. This loop re-derives the
+            // transition from raw before/after states and never sees
+            // PaneStateUpdate.suppress_completion, so honour the record
+            // instead of re-deriving the suppression: one policy on every
+            // surface. (Upstream master gates this same loop on
+            // `last_agent_completion_seq` for the same reason.)
+            if terminal_after.last_state_change_suppressed_completion {
                 debug!(
                     ws_idx,
                     pane_id = pane_id.raw(),
-                    "auto_read completion suppressed for API-request notifications"
+                    "completion notification suppressed by the update fold during API request"
                 );
                 continue;
             }

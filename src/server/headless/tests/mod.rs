@@ -8047,6 +8047,418 @@ fn auto_read_blocked_transition_still_notifies_clients() {
     );
 }
 
+impl ClientNotification {
+    fn needs_attention_semantic(&self) -> bool {
+        matches!(
+            self,
+            Self::Semantic {
+                kind: protocol::SemanticNotificationKind::NeedsAttention,
+                ..
+            }
+        )
+    }
+
+    fn attention_sound(&self) -> bool {
+        matches!(
+            self,
+            Self::Notify {
+                kind: protocol::NotifyKind::Sound,
+                message,
+            } if message == "agent attention"
+        )
+    }
+}
+
+/// One step of a completion scenario, shared by the app-level and API-level
+/// drivers so the parity test drives the same story through both surfaces.
+enum CompletionStep {
+    Detect,
+    ReportWorking,
+    ReportIdle,
+    ReportBlocked,
+    /// Bind a persisted agent session through the session-report routing
+    /// (`AgentSessionReported` — where #4457's rebind hunk lives: binding a
+    /// SECOND, different session re-opens the acquisition window, so the
+    /// next idle is startup noise again). Driven through the event at both
+    /// levels; the measured transition (the idle report) still goes through
+    /// the API loop on one side and the update path on the other.
+    BindSession(&'static str),
+}
+
+fn completion_step_agent_state(step: &CompletionStep) -> Option<api::schema::PaneAgentState> {
+    match step {
+        CompletionStep::Detect | CompletionStep::BindSession(_) => None,
+        CompletionStep::ReportWorking => Some(api::schema::PaneAgentState::Working),
+        CompletionStep::ReportIdle => Some(api::schema::PaneAgentState::Idle),
+        CompletionStep::ReportBlocked => Some(api::schema::PaneAgentState::Blocked),
+    }
+}
+
+/// Drives a scenario through `pane.report_agent` API requests (plus the
+/// event route for detection), i.e. through the headless API-request loop
+/// whose notifications this fix governs. Returns everything the client saw.
+fn drive_completion_scenario_via_api(
+    tag: &str,
+    auto_read: bool,
+    steps: &[CompletionStep],
+) -> Vec<ClientNotification> {
+    let mut fixture = auto_read_forwarding_fixture(tag, auto_read);
+    for step in steps {
+        match step {
+            CompletionStep::Detect => {
+                assert!(fixture.server.handle_internal_event_with_forwarding(
+                    AppEvent::AgentProcessDetected {
+                        pane_id: fixture.pane_id,
+                        agent: crate::detect::Agent::Pi,
+                        observed_at: Instant::now(),
+                    }
+                ));
+            }
+            CompletionStep::BindSession(name) => {
+                assert!(fixture.server.handle_internal_event_with_forwarding(
+                    AppEvent::AgentSessionReported {
+                        pane_id: fixture.pane_id,
+                        source: "custom:test".into(),
+                        agent_label: "pi".into(),
+                        seq: None,
+                        session_ref: Some(
+                            crate::agent_resume::AgentSessionRef::path(
+                                std::env::temp_dir()
+                                    .join(format!("parity-{tag}-{name}.jsonl"))
+                                    .display()
+                                    .to_string(),
+                            )
+                            .unwrap(),
+                        ),
+                        session_start_source: None,
+                    }
+                ));
+            }
+            report_step => {
+                let state = completion_step_agent_state(report_step)
+                    .expect("report step carries an agent state");
+                let public_pane_id = format!("{}:p1", fixture.server.app.state.workspaces[0].id);
+                let (respond_to, response_rx) = std::sync::mpsc::channel();
+                let changed =
+                    fixture
+                        .server
+                        .handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                            request: api::schema::Request {
+                                id: format!("scenario-{tag}"),
+                                method: api::schema::Method::PaneReportAgent(
+                                    api::schema::PaneReportAgentParams {
+                                        pane_id: public_pane_id,
+                                        source: "custom:test".into(),
+                                        agent: "pi".into(),
+                                        state,
+                                        message: None,
+                                        seq: None,
+                                        agent_session_id: None,
+                                        agent_session_path: None,
+                                    },
+                                ),
+                            },
+                            respond_to,
+                            response_write_complete: None,
+                            stream_active: None,
+                        });
+                assert!(changed);
+                assert!(response_rx.recv_timeout(Duration::from_millis(100)).is_ok());
+            }
+        }
+    }
+    drain_client_notifications(&fixture.client_control_rx)
+}
+
+/// Drives the SAME scenario through the update path only (AppState events,
+/// no client forwarding) and returns the last state-changing update's
+/// `suppress_completion` — the decision every update-consuming forwarder
+/// honours and the API loop must match.
+fn drive_completion_scenario_at_app_level(
+    tag: &str,
+    auto_read: bool,
+    steps: &[CompletionStep],
+) -> bool {
+    let mut fixture = auto_read_forwarding_fixture(&format!("{tag}-app"), auto_read);
+    let mut last_suppressed = false;
+    for step in steps {
+        match step {
+            CompletionStep::Detect => {
+                let updates =
+                    fixture
+                        .server
+                        .app
+                        .state
+                        .handle_app_event(AppEvent::AgentProcessDetected {
+                            pane_id: fixture.pane_id,
+                            agent: crate::detect::Agent::Pi,
+                            observed_at: Instant::now(),
+                        });
+                if let Some(update) = updates.last() {
+                    last_suppressed = update.suppress_completion;
+                }
+            }
+            CompletionStep::BindSession(name) => {
+                let updates =
+                    fixture
+                        .server
+                        .app
+                        .state
+                        .handle_app_event(AppEvent::AgentSessionReported {
+                            pane_id: fixture.pane_id,
+                            source: "custom:test".into(),
+                            agent_label: "pi".into(),
+                            seq: None,
+                            session_ref: Some(
+                                crate::agent_resume::AgentSessionRef::path(
+                                    std::env::temp_dir()
+                                        .join(format!("parity-{tag}-app-{name}.jsonl"))
+                                        .display()
+                                        .to_string(),
+                                )
+                                .unwrap(),
+                            ),
+                            session_start_source: None,
+                        });
+                if let Some(update) = updates.last() {
+                    last_suppressed = update.suppress_completion;
+                }
+            }
+            report_step => {
+                let state = match completion_step_agent_state(report_step) {
+                    Some(api::schema::PaneAgentState::Working) => {
+                        crate::detect::AgentState::Working
+                    }
+                    Some(api::schema::PaneAgentState::Idle) => crate::detect::AgentState::Idle,
+                    Some(api::schema::PaneAgentState::Blocked) => {
+                        crate::detect::AgentState::Blocked
+                    }
+                    _ => panic!("report step carries an agent state"),
+                };
+                let updates =
+                    fixture
+                        .server
+                        .app
+                        .state
+                        .handle_app_event(AppEvent::HookStateReported {
+                            pane_id: fixture.pane_id,
+                            source: "custom:test".into(),
+                            agent_label: "pi".into(),
+                            state,
+                            message: None,
+                            seq: None,
+                            session_ref: None,
+                        });
+                if let Some(update) = updates.last() {
+                    last_suppressed = update.suppress_completion;
+                }
+            }
+        }
+    }
+    last_suppressed
+}
+
+#[test]
+fn api_reported_startup_idle_sends_no_client_notifications() {
+    // THE DEFECT: a pure startup — detect, then
+    // a first idle report — is suppressed by the update path (#2537's
+    // acquisition window: the pane reads idle, not done), but the headless
+    // API-request loop re-derived a completion from the raw transition and
+    // toasted "finished" on every agent start.
+    let notes = drive_completion_scenario_via_api(
+        "startup-toast",
+        false,
+        &[CompletionStep::Detect, CompletionStep::ReportIdle],
+    );
+    assert!(
+        notes.is_empty(),
+        "a pure startup must raise no semantic/sound/toast notification: {notes:?}"
+    );
+}
+
+#[test]
+fn api_loop_completion_decisions_match_the_update_path() {
+    // PARITY (the intent): whatever the update path decides for a completion
+    // (PaneStateUpdate.suppress_completion — acquisition noise, managed
+    // launch, force, or the auto_read token), the API loop must decide the
+    // same. The defect WAS a disagreement between the two, so this fails if
+    // either side drifts.
+    let scenarios: [(&str, bool, &[CompletionStep], bool); 6] = [
+        (
+            "pure-startup",
+            false,
+            &[CompletionStep::Detect, CompletionStep::ReportIdle],
+            true,
+        ),
+        (
+            "working-first-completion",
+            false,
+            &[
+                CompletionStep::Detect,
+                CompletionStep::ReportWorking,
+                CompletionStep::ReportIdle,
+            ],
+            false,
+        ),
+        (
+            "idle-first-control",
+            false,
+            &[
+                CompletionStep::Detect,
+                CompletionStep::ReportIdle,
+                CompletionStep::ReportWorking,
+                CompletionStep::ReportIdle,
+            ],
+            false,
+        ),
+        (
+            "auto-read-token",
+            true,
+            &[
+                CompletionStep::Detect,
+                CompletionStep::ReportWorking,
+                CompletionStep::ReportIdle,
+            ],
+            true,
+        ),
+        (
+            "blocked-after-detection",
+            false,
+            &[CompletionStep::Detect, CompletionStep::ReportBlocked],
+            false,
+        ),
+        (
+            "rebind-reopens-the-window",
+            false,
+            &[
+                CompletionStep::Detect,
+                CompletionStep::ReportWorking,
+                CompletionStep::BindSession("s1"),
+                CompletionStep::BindSession("s2"),
+                CompletionStep::ReportIdle,
+            ],
+            true,
+        ),
+    ];
+    for (name, auto_read, steps, expect_suppressed) in scenarios {
+        let app_suppressed = drive_completion_scenario_at_app_level(name, auto_read, steps);
+        assert_eq!(
+            app_suppressed, expect_suppressed,
+            "{name}: the update path's suppression decision changed"
+        );
+        let notes = drive_completion_scenario_via_api(name, auto_read, steps);
+        assert_eq!(
+            notes.is_empty(),
+            app_suppressed,
+            "{name}: the API loop must match the update path's decision, got {notes:?}"
+        );
+    }
+}
+
+#[test]
+fn api_reported_blocked_after_detection_still_notifies_clients() {
+    // The record governs COMPLETION notifications only: a blocked first
+    // report after detection is an attention transition — the update path
+    // does not suppress it, and neither may the API loop.
+    let notes = drive_completion_scenario_via_api(
+        "blocked-after-detect",
+        false,
+        &[CompletionStep::Detect, CompletionStep::ReportBlocked],
+    );
+    assert!(
+        notes.iter().any(|note| note.needs_attention_semantic()),
+        "a blocked first report after detection must still notify: {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note.attention_sound()),
+        "a blocked first report after detection must still raise the request sound: {notes:?}"
+    );
+}
+
+#[test]
+fn api_reported_blocked_on_auto_read_pane_still_notifies_clients() {
+    // Same boundary through the API route with the token present: auto_read
+    // suppresses completion noise only, never attention.
+    let notes = drive_completion_scenario_via_api(
+        "autoread-blocked-api",
+        true,
+        &[
+            CompletionStep::Detect,
+            CompletionStep::ReportWorking,
+            CompletionStep::ReportBlocked,
+        ],
+    );
+    assert!(
+        notes.iter().any(|note| note.needs_attention_semantic()),
+        "a blocked report on an auto_read pane must still notify: {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note.attention_sound()),
+        "a blocked report on an auto_read pane must still raise the request sound: {notes:?}"
+    );
+}
+
+#[test]
+fn startup_idle_repeat_report_keeps_the_pane_silent_and_the_record_intact() {
+    // RECORD MEANING: "the decision made for the transition that produced
+    // the current state". A follow-up report that does NOT change the
+    // effective state must not overwrite the recorded decision — the pane
+    // stays silent and the record stays true.
+    let mut fixture = auto_read_forwarding_fixture("startup-repeat", false);
+    assert!(fixture
+        .server
+        .handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
+            pane_id: fixture.pane_id,
+            agent: crate::detect::Agent::Pi,
+            observed_at: Instant::now(),
+        }));
+    let public_pane_id = format!("{}:p1", fixture.server.app.state.workspaces[0].id);
+    for expected_round in ["startup idle", "repeat idle (no state change)"] {
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        let changed =
+            fixture
+                .server
+                .handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                    request: api::schema::Request {
+                        id: format!("repeat-{expected_round}"),
+                        method: api::schema::Method::PaneReportAgent(
+                            api::schema::PaneReportAgentParams {
+                                pane_id: public_pane_id.clone(),
+                                source: "custom:test".into(),
+                                agent: "pi".into(),
+                                state: api::schema::PaneAgentState::Idle,
+                                message: None,
+                                seq: None,
+                                agent_session_id: None,
+                                agent_session_path: None,
+                            },
+                        ),
+                    },
+                    respond_to,
+                    response_write_complete: None,
+                    stream_active: None,
+                });
+        assert!(changed);
+        assert!(response_rx.recv_timeout(Duration::from_millis(100)).is_ok());
+        let record = fixture
+            .server
+            .app
+            .state
+            .terminals
+            .get(&fixture.terminal_id)
+            .unwrap()
+            .last_state_change_suppressed_completion;
+        assert!(
+            record,
+            "after the {expected_round}, the recorded decision must stay 'suppressed'"
+        );
+    }
+    assert!(
+        drain_client_notifications(&fixture.client_control_rx).is_empty(),
+        "neither the startup idle nor the state-unchanged repeat may notify"
+    );
+}
+
 /// Verify that calls to the app's internal-event methods only occur inside
 /// `handle_internal_event_with_forwarding`. This ensures the forwarding
 /// bypass cannot be reintroduced.

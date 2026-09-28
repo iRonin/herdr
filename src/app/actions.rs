@@ -1959,6 +1959,14 @@ impl AppState {
             self.next_agent_state_change_seq += 1;
             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                 terminal.last_agent_state_change_seq = Some(self.next_agent_state_change_seq);
+                // Record the fold's client-facing decision for THIS
+                // transition so surfaces that never see the update (the
+                // headless API-request loop re-derives from raw before/after
+                // states) honour the same policy instead of re-deriving it.
+                // Gated on a real state change: bookkeeping-only updates
+                // (session ref, label) must not overwrite the decision that
+                // produced the current state.
+                terminal.last_state_change_suppressed_completion = suppress_completion_for_clients;
             }
         }
         let seen = self.apply_pane_state_change(ws_idx, pane_id, &change, suppress_completion)?;
@@ -3595,6 +3603,85 @@ mod tests {
         );
         assert!(!seen, "untokenized background completion stays unread");
         assert_eq!(toast_kind, Some(ToastKind::Finished));
+    }
+
+    #[test]
+    fn state_changes_record_their_completion_decision_and_unchanged_updates_keep_it() {
+        // The terminal's last_state_change_suppressed_completion is the
+        // decision the update fold made for the transition that produced the
+        // current state — what the headless API-request loop honours instead
+        // of re-deriving. Only an update that CHANGES the effective state may
+        // set it; a state-unchanged report must never overwrite it.
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.active = Some(0);
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+        let bg_terminal_id = state.workspaces[1]
+            .panes
+            .get(&bg_pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+
+        // Pure startup: detection opens the acquisition window, the first
+        // idle report lands inside it — suppressed, and recorded as such.
+        state.handle_app_event(AppEvent::AgentProcessDetected {
+            pane_id: bg_pane_id,
+            agent: Agent::Pi,
+            observed_at: std::time::Instant::now(),
+        });
+        let startup = state
+            .handle_app_event(AppEvent::HookStateReported {
+                pane_id: bg_pane_id,
+                source: "custom:test".into(),
+                agent_label: "pi".into(),
+                state: AgentState::Idle,
+                message: None,
+                seq: None,
+                session_ref: None,
+            })
+            .pop()
+            .expect("startup idle update");
+        assert!(
+            startup.suppress_completion,
+            "the startup idle is acquisition noise"
+        );
+        assert!(
+            state.terminals[&bg_terminal_id].last_state_change_suppressed_completion,
+            "the suppressed decision must be recorded on the terminal"
+        );
+
+        // A repeat idle report changes nothing: no new decision, the record
+        // for the transition that produced the current state stays intact.
+        state.handle_app_event(AppEvent::HookStateReported {
+            pane_id: bg_pane_id,
+            source: "custom:test".into(),
+            agent_label: "pi".into(),
+            state: AgentState::Idle,
+            message: None,
+            seq: None,
+            session_ref: None,
+        });
+        assert!(
+            state.terminals[&bg_terminal_id].last_state_change_suppressed_completion,
+            "a state-unchanged report must not overwrite the recorded decision"
+        );
+
+        // A working report IS a new state: its decision (not suppressed)
+        // replaces the record.
+        state.handle_app_event(AppEvent::HookStateReported {
+            pane_id: bg_pane_id,
+            source: "custom:test".into(),
+            agent_label: "pi".into(),
+            state: AgentState::Working,
+            message: None,
+            seq: None,
+            session_ref: None,
+        });
+        assert!(
+            !state.terminals[&bg_terminal_id].last_state_change_suppressed_completion,
+            "a real state change records its own decision"
+        );
     }
 
     #[test]
