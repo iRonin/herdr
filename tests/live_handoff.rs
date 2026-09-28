@@ -1579,6 +1579,160 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
     cleanup_test_base(&base);
 }
 
+// A live handoff keeps the agent process running, so it must also keep what that agent
+// reported. Reporters speak only on lifecycle events: an agent that is working when the
+// server is replaced does not report again until its turn ends, which can take many
+// minutes. A replacement server that forgot the report showed the agent as unknown, and
+// then as whatever the screen fallback guessed, for that whole time.
+#[test]
+fn live_handoff_preserves_reported_agent_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let session = base.join("session.jsonl");
+    let started_marker = base.join("agent-started");
+    let fake_pi = base.join("pi");
+    fs::create_dir_all(&base).unwrap();
+    fs::write(&session, "{}\n").unwrap();
+    fs::write(
+        &fake_pi,
+        format!(
+            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\n/bin/sleep 30\n:\n",
+            started_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:start-agent",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": fake_pi, "keys": ["Enter"]}
+        }),
+    ));
+    support::wait_for_file(&started_marker, Duration::from_secs(5));
+
+    let report = |id: &str, state: &str, seq: u64| {
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({
+                "id": id,
+                "method": "pane.report_agent",
+                "params": {
+                    "pane_id": pane_id,
+                    "source": "herdr:pi",
+                    "agent": "pi",
+                    "state": state,
+                    "seq": seq,
+                    "agent_session_path": session
+                }
+            }),
+        ));
+    };
+    let agent = || {
+        request(
+            &api_socket,
+            serde_json::json!({
+                "id": "test:agent:get",
+                "method": "agent.get",
+                "params": {"target": pane_id}
+            }),
+        )["result"]["agent"]
+            .clone()
+    };
+    let reported = |agent: &serde_json::Value, status: &str| {
+        agent["agent_status"].as_str() == Some(status)
+            && agent["screen_detection_skipped"].as_bool() == Some(true)
+            && agent["agent_session"]["value"].as_str() == session.to_str()
+    };
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:agent:session",
+            "method": "pane.report_agent_session",
+            "params": {
+                "pane_id": pane_id,
+                "source": "herdr:pi",
+                "agent": "pi",
+                "seq": 1,
+                "agent_session_path": session,
+                "session_start_source": "startup"
+            }
+        }),
+    ));
+    report("test:agent:working", "working", 2);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let current = agent();
+        if reported(&current, "working") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the working report never took hold before the handoff: {current}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    // No report since the handoff: the replacement server must already show it.
+    let after = agent();
+    // The per-source sequence survives too: a report the old server had already
+    // superseded stays rejected, and the next one is taken.
+    report("test:agent:stale", "idle", 2);
+    let stale = agent();
+    report("test:agent:blocked", "blocked", 3);
+    let blocked = agent();
+
+    // Stop the replacement server before asserting: it is not this test's child, so a
+    // failed assertion would otherwise leave it running.
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+    assert!(
+        reported(&after, "working"),
+        "the replacement server forgot the agent's report: {after}"
+    );
+    assert!(
+        reported(&stale, "working"),
+        "a superseded report replaced the carried state: {stale}"
+    );
+    assert!(
+        reported(&blocked, "blocked"),
+        "the replacement server refused the agent's next report: {blocked}"
+    );
+}
+
 #[test]
 fn live_handoff_keeps_agent_started_pane_after_agent_exits() {
     use std::os::unix::fs::PermissionsExt;
