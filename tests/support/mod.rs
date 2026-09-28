@@ -69,17 +69,47 @@ pub fn unregister_runtime_dir(path: &Path) {
     }
 }
 
+/// Per-test-process isolated HOME for spawned test processes. Pane login
+/// shells source their init files from HOME (~/.zprofile, ~/.profile, ...);
+/// inheriting the developer's real HOME made every pane run the developer's
+/// shell profile - measured at 13.7-32.5s to first prompt under
+/// load, versus 2.9-4.7s with an empty HOME - which is the common root of the
+/// cross_area, graceful_shutdown and federated timing failures. Tests that
+/// need particular HOME contents can plant them here.
+static ISOLATED_HOME: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn isolated_home() -> &'static Path {
+    ISOLATED_HOME.get_or_init(|| {
+        // Literal /tmp, like the other test dirs: short paths keep every
+        // derived socket name under the kernel's sun_path limit.
+        let home = PathBuf::from(format!("/tmp/herdr-test-home-{}", std::process::id()));
+        let _ = fs::create_dir_all(&home);
+        home
+    })
+}
+
+fn remove_isolated_home() {
+    if let Some(home) = ISOLATED_HOME.get() {
+        let _ = fs::remove_dir_all(home);
+    }
+}
+
 /// Remove every inherited HERDR_* variable so a spawned test process never
 /// sees the developer's live pane environment: HERDR_STARTUP_CWD makes every fresh
 /// server seed an extra startup workspace, and HERDR_SOCKET_PATH names the
-/// developer's LIVE server. Callers set the few variables they mean to pass AFTER
-/// this, so deliberate HERDR_* assignments survive.
+/// developer's LIVE server. Also redirect HOME (and ZDOTDIR) to the isolated
+/// per-process home so login shells cannot source the developer's profile.
+/// Callers set the few variables they mean to pass AFTER this, so deliberate
+/// assignments - including their own HOME - survive.
 pub fn sanitize_herdr_env(command: &mut portable_pty::CommandBuilder) {
     for (key, _) in std::env::vars() {
         if key.starts_with("HERDR_") {
             command.env_remove(&key);
         }
     }
+    let home = isolated_home();
+    command.env("HOME", home);
+    command.env("ZDOTDIR", home);
 }
 
 /// std::process::Command twin of [sanitize_herdr_env].
@@ -89,6 +119,9 @@ pub fn sanitize_herdr_env_command(command: &mut std::process::Command) {
             command.env_remove(&key);
         }
     }
+    let home = isolated_home();
+    command.env("HOME", home);
+    command.env("ZDOTDIR", home);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -988,6 +1021,7 @@ fn is_test_herdr_binary(path: &Path) -> bool {
 
 extern "C" fn run_atexit_cleanup() {
     cleanup_registered_herdr_pids();
+    remove_isolated_home();
 }
 
 struct CleanupGuard;
@@ -995,6 +1029,7 @@ struct CleanupGuard;
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
         cleanup_registered_herdr_pids();
+        remove_isolated_home();
     }
 }
 
