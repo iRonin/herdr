@@ -8277,6 +8277,137 @@ fn api_reported_startup_idle_sends_no_client_notifications() {
 }
 
 #[test]
+fn api_held_working_report_replayed_by_session_start_still_toasts() {
+    // The held-report replay path (a report sent before its session start, where
+    // upstream master goes SILENT): a working report that arrives before its
+    // session start is held, the session start anchors and REPLAYS it — and
+    // a replayed working report ends acquisition (fixed in this fork), so the
+    // first idle after it is a real completion. The API loop must toast it;
+    // the record gate must never swallow a replayed turn's completion.
+    let mut fixture = auto_read_forwarding_fixture("held-replay", false);
+    let session_path = std::env::temp_dir()
+        .join("held-replay-pi-session.jsonl")
+        .display()
+        .to_string();
+    let public_pane_id = format!("{}:p1", fixture.server.app.state.workspaces[0].id);
+    assert!(fixture
+        .server
+        .handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
+            pane_id: fixture.pane_id,
+            agent: crate::detect::Agent::Pi,
+            observed_at: Instant::now(),
+        }));
+
+    let respond = |server: &mut HeadlessServer, request: api::schema::Request| {
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request,
+            respond_to,
+            response_write_complete: None,
+            stream_active: None,
+        });
+        assert!(changed);
+        assert!(response_rx.recv_timeout(Duration::from_millis(100)).is_ok());
+    };
+
+    // The working report arrives before its session start: with nothing
+    // anchored it is held (no state change, no notification).
+    respond(
+        &mut fixture.server,
+        api::schema::Request {
+            id: "held-working".into(),
+            method: api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
+                pane_id: public_pane_id.clone(),
+                source: "herdr:pi".into(),
+                agent: "pi".into(),
+                state: api::schema::PaneAgentState::Working,
+                message: None,
+                seq: Some(11),
+                agent_session_id: None,
+                agent_session_path: Some(session_path.clone()),
+            }),
+        },
+    );
+    assert_eq!(
+        fixture
+            .server
+            .app
+            .state
+            .terminals
+            .get(&fixture.terminal_id)
+            .unwrap()
+            .state,
+        crate::detect::AgentState::Unknown,
+        "the working report is held until its session start anchors it"
+    );
+
+    // The session start anchors the session and replays the held working
+    // report — a real state change whose completion decision is recorded.
+    respond(
+        &mut fixture.server,
+        api::schema::Request {
+            id: "session-start".into(),
+            method: api::schema::Method::PaneReportAgentSession(
+                api::schema::PaneReportAgentSessionParams {
+                    pane_id: public_pane_id.clone(),
+                    source: "herdr:pi".into(),
+                    agent: "pi".into(),
+                    seq: Some(10),
+                    agent_session_id: None,
+                    agent_session_path: Some(session_path.clone()),
+                    session_start_source: Some("startup".into()),
+                },
+            ),
+        },
+    );
+    assert_eq!(
+        fixture
+            .server
+            .app
+            .state
+            .terminals
+            .get(&fixture.terminal_id)
+            .unwrap()
+            .state,
+        crate::detect::AgentState::Working,
+        "the session start replays the held working report"
+    );
+
+    // The first idle after the replayed working report completes the turn:
+    // the completion notification must reach every client lane.
+    respond(
+        &mut fixture.server,
+        api::schema::Request {
+            id: "idle".into(),
+            method: api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
+                pane_id: public_pane_id.clone(),
+                source: "herdr:pi".into(),
+                agent: "pi".into(),
+                state: api::schema::PaneAgentState::Idle,
+                message: None,
+                seq: Some(12),
+                agent_session_id: None,
+                agent_session_path: Some(session_path.clone()),
+            }),
+        },
+    );
+
+    let notes = drain_client_notifications(&fixture.client_control_rx);
+    assert!(
+        notes.iter().any(|note| note.finished_semantic()),
+        "a completion after a replayed working report must reach the Finished semantic lane: {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note.done_sound()),
+        "a completion after a replayed working report must reach the Done sound lane: {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note.finished_toast()),
+        "a completion after a replayed working report must reach the finished toast lane: {notes:?}"
+    );
+}
+
+#[test]
 fn api_loop_completion_decisions_match_the_update_path() {
     // PARITY (the intent): whatever the update path decides for a completion
     // (PaneStateUpdate.suppress_completion — acquisition noise, managed
