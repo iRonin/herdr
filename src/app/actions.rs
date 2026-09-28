@@ -60,6 +60,27 @@ pub fn is_completion_transition_parts(
             && previous_agent_label == agent_label)
 }
 
+/// Whether the `auto_read` metadata token suppresses the client-facing
+/// COMPLETION notification for this pane transition.
+///
+/// This is the ONE policy every completion-notification surface consults.
+/// The token (reported via `pane.report_metadata`) declares "my completions
+/// need no attention" — unattended supervised sub-agents whose parent
+/// aggregates the results — so a completion transition raises no `Finished`
+/// semantic notification, no `Done` sound and no finished toast on any
+/// server→client surface. Blocked / needs-attention transitions and panes
+/// without the token are never suppressed.
+pub fn auto_read_suppresses_completion(
+    auto_read: bool,
+    previous_state: AgentState,
+    state: AgentState,
+    previous_agent_label: Option<&str>,
+    agent_label: Option<&str>,
+) -> bool {
+    auto_read
+        && is_completion_transition_parts(previous_state, state, previous_agent_label, agent_label)
+}
+
 pub fn active_tab_suppresses_notifications(
     is_active_tab: bool,
     outer_terminal_focus: Option<bool>,
@@ -257,6 +278,11 @@ pub struct PaneStateUpdate {
     pub agent_released: bool,
     pub agent_release_status: Option<crate::api::schema::AgentStatus>,
     pub display_projection_cleared: bool,
+    /// Whether the client-facing COMPLETION notification for this update is
+    /// suppressed: process-acquisition noise OR an `auto_read` completion
+    /// (see [`auto_read_suppresses_completion`]). Every server→client
+    /// forwarder — Finished semantic, Done sound, finished toast — gates on
+    /// this; blocked/attention notifications never set it.
     pub suppress_completion: bool,
 }
 
@@ -1913,6 +1939,22 @@ impl AppState {
         let suppress_completion = force_suppress_completion
             || (change.state == AgentState::Idle
                 && (managed_launch_pending || suppress_acquisition_completion));
+        // The update's `suppress_completion` is the gate every server→client
+        // forwarder consults (Finished semantic, Done sound, finished toast),
+        // so an `auto_read` completion folds in here — ONE seam covers the
+        // AppEvent forwarders and the niche paths (pane death, worktree
+        // shutdowns). The AppState-local machinery below (seen marking,
+        // pending-notification bookkeeping) keeps the acquisition-noise
+        // notion, which already honors the token inside
+        // `apply_pane_state_change` / `record_or_deliver_agent_notification`.
+        let suppress_completion_for_clients = suppress_completion
+            || auto_read_suppresses_completion(
+                self.pane_has_auto_read_token(ws_idx, pane_id),
+                change.previous_state,
+                change.state,
+                change.previous_agent_label.as_deref(),
+                change.agent_label.as_deref(),
+            );
         if change.previous_state != change.state {
             self.next_agent_state_change_seq += 1;
             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
@@ -1945,7 +1987,7 @@ impl AppState {
             agent_released,
             agent_release_status: agent_released.then(|| pane_agent_status(change.state, seen)),
             display_projection_cleared,
-            suppress_completion,
+            suppress_completion: suppress_completion_for_clients,
         };
         Some(update)
     }
@@ -2039,7 +2081,7 @@ impl AppState {
     /// `apply_pane_state_change`). Presence-only contract: the token's value is
     /// a placeholder; reporters set it via `pane.report_metadata` and clear it
     /// with a null patch.
-    fn pane_has_auto_read_token(&self, ws_idx: usize, pane_id: PaneId) -> bool {
+    pub(crate) fn pane_has_auto_read_token(&self, ws_idx: usize, pane_id: PaneId) -> bool {
         self.workspaces
             .get(ws_idx)
             .and_then(|workspace| workspace.pane_state(pane_id))
@@ -2058,7 +2100,15 @@ impl AppState {
 
         // `auto_read` panes skip the COMPLETION notification (toast + done
         // sound) only — a blocked/needs-attention transition still notifies.
-        if auto_read && is_completion_transition(change) {
+        // Same policy as the fold in `update_terminal_state_with_completion_policy`
+        // and the headless API-request loop: one helper, three call sites.
+        if auto_read_suppresses_completion(
+            auto_read,
+            change.previous_state,
+            change.state,
+            change.previous_agent_label.as_deref(),
+            change.agent_label.as_deref(),
+        ) {
             return None;
         }
 
@@ -3464,6 +3514,87 @@ mod tests {
 
         let toast = state.toast.as_ref().unwrap();
         assert_eq!(toast.kind, ToastKind::NeedsAttention);
+    }
+
+    /// Shared scenario for the suppress_completion fold tests: a background
+    /// pane whose agent is Working completes while the `auto_read` metadata
+    /// token is present (or not, for the control).
+    fn auto_read_completion_update(auto_read: bool) -> (PaneStateUpdate, bool, Option<ToastKind>) {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.active = Some(0);
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+
+        let bg_terminal_id = state.workspaces[1]
+            .panes
+            .get(&bg_pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        {
+            let terminal = state.terminals.get_mut(&bg_terminal_id).unwrap();
+            terminal.state = AgentState::Working;
+            if auto_read {
+                terminal.metadata_tokens.patch(
+                    std::collections::HashMap::from([(
+                        "auto_read".to_string(),
+                        Some("1".to_string()),
+                    )]),
+                    None,
+                    std::time::Instant::now(),
+                );
+            }
+        }
+
+        let update = state
+            .handle_app_event(AppEvent::StateChanged {
+                pane_id: bg_pane_id,
+                agent: Some(Agent::Pi),
+                state: AgentState::Idle,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+            })
+            .pop()
+            .expect("completion state update");
+        let seen = state.workspaces[1].panes.get(&bg_pane_id).unwrap().seen;
+        let toast_kind = state.toast.as_ref().map(|toast| toast.kind);
+        (update, seen, toast_kind)
+    }
+
+    #[test]
+    fn auto_read_completion_update_suppresses_client_forwarding() {
+        // PaneStateUpdate.suppress_completion is the gate every server→client
+        // forwarder consults (semantic notification, done sound, finished
+        // toast). An auto_read completion must set it so those surfaces stay
+        // silent — while the seen mark (✓, not ●) the feature promises is kept.
+        let (update, seen, toast_kind) = auto_read_completion_update(true);
+        assert_eq!(update.state, AgentState::Idle);
+        assert!(
+            update.suppress_completion,
+            "auto_read completion must carry suppress_completion for client forwarders"
+        );
+        assert!(seen, "auto_read completion must still mark the pane seen");
+        assert_eq!(
+            toast_kind, None,
+            "auto_read completion must not raise the AppState toast either"
+        );
+    }
+
+    #[test]
+    fn completion_update_without_token_keeps_client_forwarding() {
+        // Same-shape control without the token: the completion is NOT
+        // suppressed — the update stays forwardable, the pane is unread and
+        // the finished toast fires. Proves the fold is opt-in per pane.
+        let (update, seen, toast_kind) = auto_read_completion_update(false);
+        assert_eq!(update.state, AgentState::Idle);
+        assert!(
+            !update.suppress_completion,
+            "untokenized completion must stay forwardable to clients"
+        );
+        assert!(!seen, "untokenized background completion stays unread");
+        assert_eq!(toast_kind, Some(ToastKind::Finished));
     }
 
     #[test]
