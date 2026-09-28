@@ -110,6 +110,24 @@ Grouped worktrees still behave like normal Herdr workspaces: they can be focused
 
 To delete a worktree checkout, use `Delete worktree checkout...` on a grouped child workspace. Herdr runs `git worktree remove`, first asking Git to remove safely. If Git refuses because the checkout has modified or untracked files, Herdr asks again before running the forced remove. Branches are not deleted.
 
+## Project workspace name
+
+Besides `config.toml`, Herdr reads a project-local settings file from the projects you open: `.herdr/settings.toml` in the project directory. It currently carries one setting, the workspace name:
+
+```toml
+# <project>/.herdr/settings.toml
+[workspace]
+name = "payments"
+```
+
+Herdr looks for the nearest `.herdr/settings.toml` walking up from the workspace's working directory. Inside a Git repository the search stops at the repository root, so a file never leaks in from a directory above the project. A linked Git worktree is its own project: the search stops at that checkout's root, so each checkout can carry its own name and a file at the main repository's root does not apply. Outside a repository the search continues up the directory tree.
+
+When no file is found — or the file is unreadable, malformed, or has no `name` — the label is derived as usual: the repository root's directory name, the checkout's name in a linked worktree, or the working directory's name outside Git. With `name` set, every workspace whose panes live under that project uses the pinned name, and it keeps showing while panes move deeper into the project. Delete the file or the `name` line to return to the automatic label.
+
+Renaming a workspace also writes this file. `herdr workspace rename <workspace_id> <label>` and the socket API's `workspace.rename` update the nearest existing `.herdr/settings.toml` in the search range, or create one at the repository root — or at the workspace's working directory outside a repository. Other tables and keys in the file are preserved. The write is best-effort: on a read-only checkout the rename still applies to the running session, it just is not persisted to the project file.
+
+The pinned name belongs to the project, not to one workspace. The in-session rename keeps precedence while that workspace exists, and the pinned name is what future workspaces in the same project start with.
+
 ## Remote attach
 
 Remote attach manages its SSH connection with temporary keepalives and, where supported, connection reuse by default.
