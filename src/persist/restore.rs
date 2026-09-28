@@ -1835,9 +1835,28 @@ mod tests {
                 AgentState::Idle,
                 "the next hook report must take effect immediately"
             );
+            // Whether this first idle counts as a completion is decided by the completion rule,
+            // which upstream changed in #4457 (not carried here). The handoff must not change the
+            // answer, so compare with the same terminal given the same reports without a handoff.
+            let restored_suppresses = terminal.finish_agent_process_acquisition();
+            let control = terminals.values_mut().next().unwrap();
+            control.set_detected_state(Some(crate::detect::Agent::Pi), AgentState::Idle);
+            control.set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Idle,
+                None,
+                Some(
+                    crate::agent_resume::AgentSessionRef::path("/var/tmp/handoff-test.jsonl")
+                        .unwrap(),
+                ),
+                Some(2),
+            );
+            assert_eq!(control.state, AgentState::Idle);
             assert_eq!(
-                terminal.finish_agent_process_acquisition(),
-                state_before_handoff == AgentState::Blocked
+                restored_suppresses,
+                control.finish_agent_process_acquisition(),
+                "the handoff must carry the pending agent acquisition"
             );
         }
     }
