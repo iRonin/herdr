@@ -253,7 +253,15 @@ impl Drop for IntegrationEnvLock {
 #[cfg(test)]
 pub(crate) fn integration_env_lock() -> IntegrationEnvLock {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    // A test that panics while holding this lock must not fail every later test:
+    // recover the poisoned guard instead of unwrapping. The lock still serializes
+    // (poisoning only marks a panic, the mutex keeps working), so one failure
+    // stays one failure - the int gate at load ~53 lost 32 tests to one timeout
+    // cascading through PoisonError unwraps here.
+    let guard = LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     IntegrationEnvLock {
         _guard: guard,
         #[cfg(windows)]
