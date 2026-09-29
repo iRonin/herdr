@@ -365,6 +365,9 @@ pub struct TerminalState {
     /// The sender of the report being applied, set by the caller around that one call.
     report_sender: Option<crate::platform::PeerProcess>,
     live_session_start_refusal: Option<LiveSessionStartRefusal>,
+    /// Set by the caller around one report it judged to come from another process while the
+    /// live session's holder still runs: such a report is refused with nothing recorded.
+    refuse_other_session_report: bool,
 }
 
 /// The shared gates of a full-lifecycle session start, computed once so the
@@ -418,6 +421,7 @@ impl TerminalState {
             compact_command_detector: CompactCommandDetector::default(),
             report_sender: None,
             live_session_start_refusal: None,
+            refuse_other_session_report: false,
         }
     }
 
@@ -1330,6 +1334,18 @@ impl TerminalState {
             };
         }
 
+        // Judged by the caller: a report for another session from a process outside the live
+        // holder's group while the holder still runs. Holding it would record a suppression that
+        // freezes the holder and lets the other session's start take the pane, so it is refused
+        // with nothing recorded.
+        if self.refuse_other_session_report
+            && process_present
+            && self
+                .live_other_session_holder(source, agent_label, session_ref.as_ref())
+                .is_some()
+        {
+            return FullLifecycleHookReportRoute::Ignore;
+        }
         let Some(session_ref) = session_ref.clone() else {
             return FullLifecycleHookReportRoute::Ignore;
         };
@@ -1748,6 +1764,30 @@ impl TerminalState {
 
     pub(crate) fn take_live_session_start_refusal(&mut self) -> Option<LiveSessionStartRefusal> {
         self.live_session_start_refusal.take()
+    }
+
+    pub(crate) fn set_refuse_other_session_report(&mut self, refuse: bool) {
+        self.refuse_other_session_report = refuse;
+    }
+
+    /// The sender of the live full-lifecycle session (`None` when unknown) when a report from the
+    /// same source and agent names another session; `None` when there is no such live session.
+    pub(crate) fn live_other_session_holder(
+        &self,
+        source: &str,
+        agent_label: &str,
+        session_ref: Option<&crate::agent_resume::AgentSessionRef>,
+    ) -> Option<Option<crate::platform::PeerProcess>> {
+        let authority = self.hook_authority.as_ref()?;
+        let incoming = session_ref?;
+        (crate::detect::full_lifecycle_hook_authority(&authority.source, &authority.agent_label)
+            && authority.source == source
+            && authority.agent_label == agent_label
+            && authority
+                .session_ref
+                .as_ref()
+                .is_some_and(|current| current != incoming))
+        .then_some(authority.sender)
     }
 
     /// Notes a refused session start that the path of a relaunch at normal speed would accept
