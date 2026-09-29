@@ -1629,18 +1629,47 @@ impl App {
         let session_ref = crate::agent_resume::session_ref_from_report(
             &params.source,
             &agent_label,
-            params.agent_session_id,
-            params.agent_session_path,
+            params.agent_session_id.clone(),
+            params.agent_session_path.clone(),
         );
+        let session_start_source = crate::agent_resume::normalize_session_start_source(
+            params.session_start_source.clone(),
+        );
+        // Fix for the recorded silent ok: a full-lifecycle session
+        // start whose ONLY missing piece is `session_start_source` used to
+        // answer ok while binding nothing — the anchor never existed and
+        // every later report from the session was silently ignored. Answer
+        // an error naming the field for exactly that case; every other
+        // refusal keeps today's reply.
+        let refused_only_for_missing_source = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.pane_state(pane_id))
+            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+            .is_some_and(|terminal| {
+                terminal.session_start_refused_only_for_missing_source(
+                    &params.source,
+                    &agent_label,
+                    session_ref.as_ref(),
+                    params.seq,
+                    session_start_source.as_deref(),
+                )
+            });
+        if refused_only_for_missing_source {
+            return encode_error(
+                id,
+                "invalid_params",
+                "session_start_source is required for this session start to bind (one of: startup, clear, resume, compact, new, fork, select); the report was not applied",
+            );
+        }
         self.handle_reported_agent_session(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: session_ref.clone(),
             source: params.source.clone(),
             agent_label: agent_label.clone(),
             seq: params.seq,
-            session_start_source: crate::agent_resume::normalize_session_start_source(
-                params.session_start_source,
-            ),
+            session_start_source,
         });
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
