@@ -109,6 +109,10 @@ pub struct App {
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
+    /// Set while handling an API request that changed what is shown in a way its method
+    /// alone cannot say: a pane send that submits a compact or acknowledges a blocked pane.
+    /// The headless server takes it after each request.
+    pub(crate) api_request_changed_ui: bool,
     pub(crate) event_hub: crate::api::EventHub,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     pub(crate) policy: AppPolicy,
@@ -671,6 +675,7 @@ impl App {
             last_render_at: None,
             last_presentation_at: None,
             api_rx,
+            api_request_changed_ui: false,
             event_hub,
             last_focus,
             policy,
@@ -2393,9 +2398,12 @@ mod tests {
         assert!(crate::api::request_changes_ui(&command_invoke));
         assert!(crate::api::request_changes_ui(&announcement_dismiss));
         assert!(crate::api::request_changes_ui(&release_notes_dismiss));
-        assert!(crate::api::request_changes_ui(&pane_send_text));
-        assert!(crate::api::request_changes_ui(&pane_send_input));
-        assert!(crate::api::request_changes_ui(&pane_send_keys));
+        // A pane send changes what is shown only when it submits a compact or acknowledges a
+        // blocked pane, and its handler reports that per request. Its method alone must not
+        // push the echo of every send onto the complete renderer.
+        assert!(!crate::api::request_changes_ui(&pane_send_text));
+        assert!(!crate::api::request_changes_ui(&pane_send_input));
+        assert!(!crate::api::request_changes_ui(&pane_send_keys));
     }
 
     #[test]
