@@ -389,6 +389,15 @@ mod tests {
         pid: 9_200_001,
         process_group: LEADER,
     };
+    const OUTSIDER: PeerProcess = PeerProcess {
+        pid: 9_300_001,
+        process_group: 9_300_000,
+    };
+    /// Another process in the holder's group, such as a hook script the agent runs.
+    const GROUP_HELPER: PeerProcess = PeerProcess {
+        pid: 9_100_002,
+        process_group: HOLDER.process_group,
+    };
     const GRANDCHILD: PeerProcess = PeerProcess {
         pid: 9_200_002,
         process_group: LEADER,
@@ -926,6 +935,165 @@ mod tests {
                 pane_view(&unobserved, unobserved_pane),
                 pane_view(&observed, observed_pane),
                 "after {name} reports {state:?}"
+            );
+        }
+    }
+
+    fn holder_alive() -> Table {
+        let mut table = successor_in_front("pi");
+        table.alive.insert(HOLDER.pid);
+        table.groups.insert(HOLDER.process_group);
+        table
+    }
+
+    fn send_state_with(
+        app: &mut App,
+        sender: Option<PeerProcess>,
+        event: AppEvent,
+        facts: &impl ProcessFacts,
+    ) {
+        app.api_request_sender = sender;
+        app.handle_reported_agent_state_with(event, facts);
+        app.api_request_sender = None;
+    }
+
+    #[test]
+    fn report_guard_refuses_only_another_process_while_the_holder_lives() {
+        let alive = holder_alive();
+        let check = |holder, sender, facts: &Table| {
+            report_would_displace_live_holder(holder, sender, facts)
+        };
+        assert!(check(Some(HOLDER), Some(OUTSIDER), &alive));
+        assert!(!check(None, Some(OUTSIDER), &alive), "holder unknown");
+        assert!(!check(Some(HOLDER), None, &alive), "sender unknown");
+        assert!(
+            !check(Some(HOLDER), Some(HOLDER), &alive),
+            "the holder itself"
+        );
+        assert!(
+            !check(Some(HOLDER), Some(GROUP_HELPER), &alive),
+            "its group"
+        );
+        assert!(
+            !check(Some(HOLDER), Some(OUTSIDER), &Table::default()),
+            "holder gone"
+        );
+        let mut group_only = Table::default();
+        group_only.groups.insert(HOLDER.process_group);
+        assert!(
+            check(Some(HOLDER), Some(OUTSIDER), &group_only),
+            "a live group"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_guard_counts_a_reused_holder_pid_or_group_as_alive() {
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let dead = gone.id();
+        gone.wait().unwrap();
+        let facts = RealLiveness(Table::default());
+        let pid_reused = PeerProcess {
+            pid: std::process::id(),
+            process_group: dead,
+        };
+        let group_reused = PeerProcess {
+            pid: dead,
+            process_group: unsafe { libc::getpgid(0) } as u32,
+        };
+        assert!(report_would_displace_live_holder(
+            Some(pid_reused),
+            Some(OUTSIDER),
+            &facts
+        ));
+        assert!(report_would_displace_live_holder(
+            Some(group_reused),
+            Some(OUTSIDER),
+            &facts
+        ));
+    }
+
+    #[tokio::test]
+    async fn stray_report_from_another_process_leaves_a_live_holder_untouched() {
+        let (mut app, pane_id) = app_with_pane();
+        holder_established(&mut app, pane_id, Some(HOLDER));
+        let before = pane_view(&app, pane_id);
+        let stray = report(pane_id, "stray", 30, AgentState::Working);
+        send_state_with(&mut app, Some(OUTSIDER), stray, &holder_alive());
+        assert_eq!(
+            pane_view(&app, pane_id),
+            before,
+            "the stray report is refused"
+        );
+
+        let next = report(pane_id, "holder", 31, AgentState::Working);
+        send_state_with(&mut app, Some(HOLDER), next, &holder_alive());
+        assert!(
+            holds_session(&pane_view(&app, pane_id), "holder", AgentState::Working),
+            "the holder's next report still applies: nothing was recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_holder_is_not_taken_over_by_a_second_agent_reporting_first() {
+        let (mut app, pane_id) = app_with_pane();
+        holder_established(&mut app, pane_id, Some(HOLDER));
+        let facts = holder_alive();
+        let first = report(pane_id, "second", 31, AgentState::Working);
+        send_state_with(&mut app, Some(LEADER_CHILD), first, &facts);
+        let start = session_start(pane_id, "second", 30, Some("startup"));
+        let updates = send_session_start(&mut app, Some(LEADER_CHILD), start, &facts);
+
+        assert!(updates.is_empty());
+        assert!(
+            holds_session(&pane_view(&app, pane_id), "holder", AgentState::Idle),
+            "the live holder keeps its session"
+        );
+        let next = report(pane_id, "holder", 32, AgentState::Blocked);
+        send_state_with(&mut app, Some(HOLDER), next, &facts);
+        assert!(holds_session(
+            &pane_view(&app, pane_id),
+            "holder",
+            AgentState::Blocked
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_holder_switching_its_own_session_report_first_binds_the_new_session() {
+        for (sender, who) in [
+            (HOLDER, "the holder itself"),
+            (GROUP_HELPER, "a helper in its group"),
+        ] {
+            let (mut app, pane_id) = app_with_pane();
+            holder_established(&mut app, pane_id, Some(HOLDER));
+            let facts = holder_alive();
+            let first = report(pane_id, "next", 31, AgentState::Working);
+            send_state_with(&mut app, Some(sender), first, &facts);
+            let start = session_start(pane_id, "next", 30, Some("new"));
+            send_session_start(&mut app, Some(sender), start, &facts);
+            assert!(
+                holds_session(&pane_view(&app, pane_id), "next", AgentState::Working),
+                "{who}: the new session is bound with its first report"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reports_the_guard_cannot_judge_take_todays_path() {
+        let cases = [
+            (Some(LEADER_CHILD), successor_in_front("pi"), "holder gone"),
+            (None, holder_alive(), "sender unknown"),
+        ];
+        for (sender, facts, who) in cases {
+            let (mut app, pane_id) = app_with_pane();
+            holder_established(&mut app, pane_id, Some(HOLDER));
+            let first = report(pane_id, "second", 31, AgentState::Working);
+            send_state_with(&mut app, sender, first, &facts);
+            let start = session_start(pane_id, "second", 30, Some("startup"));
+            send_session_start(&mut app, sender, start, &facts);
+            assert!(
+                holds_session(&pane_view(&app, pane_id), "second", AgentState::Working),
+                "{who}: the report-first successor still binds, as today"
             );
         }
     }

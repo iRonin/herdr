@@ -229,3 +229,64 @@ fn a_start_that_the_normal_relaunch_path_would_also_refuse_is_not_noted() {
         );
     }
 }
+
+#[test]
+fn a_refused_report_for_another_session_records_nothing() {
+    let mut terminal = live_session(Some(HOLDER), path);
+    terminal.set_refuse_other_session_report(true);
+    assert!(report(
+        &mut terminal,
+        Some(SUCCESSOR),
+        path("other"),
+        20,
+        AgentState::Working
+    )
+    .is_none());
+    assert!(
+        report(
+            &mut terminal,
+            Some(HOLDER),
+            path("holder"),
+            21,
+            AgentState::Working
+        )
+        .is_some(),
+        "the flag leaves the live session's own reports alone"
+    );
+    terminal.set_refuse_other_session_report(false);
+    assert!(
+        report(
+            &mut terminal,
+            Some(HOLDER),
+            path("holder"),
+            22,
+            AgentState::Blocked
+        )
+        .is_some(),
+        "nothing was recorded that would hold the holder's reports"
+    );
+    assert_eq!(live_session_ref(&terminal), path("holder"));
+}
+
+#[test]
+fn live_other_session_holder_names_the_live_sessions_sender() {
+    let terminal = live_session(Some(HOLDER), path);
+    let other = path("other");
+    assert_eq!(
+        terminal.live_other_session_holder("herdr:pi", "pi", other.as_ref()),
+        Some(Some(HOLDER))
+    );
+    let own = path("holder");
+    assert_eq!(
+        terminal.live_other_session_holder("herdr:pi", "pi", own.as_ref()),
+        None
+    );
+    assert_eq!(
+        terminal.live_other_session_holder("herdr:omp", "omp", other.as_ref()),
+        None
+    );
+    assert_eq!(
+        terminal.live_other_session_holder("herdr:pi", "pi", None),
+        None
+    );
+}
