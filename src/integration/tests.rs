@@ -3588,31 +3588,45 @@ fn letta_session_hook_is_silent_and_encodes_default_conversation() {
     permissions.set_mode(0o755);
     fs::set_permissions(&fake_herdr, permissions).unwrap();
 
-    let mut child = Command::new("sh")
-        .arg(&installed.hook_path)
-        .arg("session")
-        .env("HERDR_ENV", "1")
-        .env("HERDR_PANE_ID", "w1:p2")
-        .env("HERDR_SOCKET_PATH", "/tmp/herdr.sock")
-        .env("HERDR_BIN_PATH", &fake_herdr)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(
-            br#"{"event_type":"SessionStart","conversation_id":"default","agent_id":"agent-123","is_new_session":false}"#,
-        )
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(output.stderr.is_empty());
-    let args = fs::read_to_string(capture).unwrap();
+    // The hook asset's python caps the herdr call at 1s. Under system load the
+    // spawned reporter can start later than that and be killed before it writes
+    // (the int gate at load ~53 saw exactly this: ENOENT on the capture), so a
+    // single attempt cannot prove the encoding. Retry the hook - every attempt
+    // gets a fresh 1s window, and every attempt must stay silent, which is the
+    // test's claim - until the capture lands, on a generous wall-clock deadline.
+    let payload =
+        br#"{"event_type":"SessionStart","conversation_id":"default","agent_id":"agent-123","is_new_session":false}"#;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let args = loop {
+        let mut child = Command::new("sh")
+            .arg(&installed.hook_path)
+            .arg("session")
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_ID", "w1:p2")
+            .env("HERDR_SOCKET_PATH", "/tmp/herdr.sock")
+            .env("HERDR_BIN_PATH", &fake_herdr)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(payload).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        if let Ok(args) = fs::read_to_string(&capture) {
+            if !args.is_empty() {
+                break args;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "letta hook never reported through {} within deadline",
+            capture.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
     assert!(args.contains("report-agent-session w1:p2"));
     assert!(args.contains("--source herdr:letta --agent letta"));
     assert!(args.contains("--agent-session-id default:agent-123"));
