@@ -3457,6 +3457,228 @@ async fn client_shell_compact_submission_projects_working_without_changing_raw_s
     shutdown_test_runtimes(&mut server);
 }
 
+/// A headless server with one idle named-agent pane whose runtime records the input forwarded
+/// to it.
+fn api_send_test_server() -> (
+    HeadlessServer,
+    crate::terminal::TerminalId,
+    String,
+    tokio::sync::mpsc::Receiver<Bytes>,
+) {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("api-send");
+    let pane_id = workspace.tabs[0].root_pane;
+    let (runtime, input_rx) =
+        crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 20);
+    workspace.insert_test_runtime(pane_id, runtime);
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.ensure_test_terminals();
+    let terminal_id = server.app.state.terminal_id_for_pane(0, pane_id).unwrap();
+    {
+        let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("worker".into());
+        terminal.state = crate::detect::AgentState::Idle;
+    }
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    (server, terminal_id, public_pane_id, input_rx)
+}
+
+/// Handles one API request the way the headless loop does and returns whether it reported a UI
+/// change. A reported change makes the loop take the complete renderer for the pane's next
+/// output instead of the retained row patch.
+fn api_request_reports_ui_change(server: &mut HeadlessServer, method: api::schema::Method) -> bool {
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        request: api::schema::Request {
+            id: "api-send".into(),
+            method,
+        },
+        peer_process: None,
+        respond_to,
+        response_write_complete: None,
+        stream_active: None,
+    });
+    let response = response_rx
+        .recv_timeout(Duration::from_millis(100))
+        .unwrap();
+    let parsed: api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+    assert_eq!(parsed.result, api::schema::ResponseResult::Ok {});
+    changed
+}
+
+#[tokio::test]
+async fn api_send_that_changes_nothing_shown_keeps_the_retained_render_path() {
+    let (mut server, terminal_id, public_pane_id, mut input_rx) = api_send_test_server();
+    let sends = [
+        (
+            "pane.send_text",
+            api::schema::Method::PaneSendText(api::schema::PaneSendTextParams {
+                pane_id: public_pane_id.clone(),
+                text: "a".into(),
+            }),
+        ),
+        (
+            "pane.send_input",
+            api::schema::Method::PaneSendInput(api::schema::PaneSendInputParams {
+                pane_id: public_pane_id.clone(),
+                text: "b".into(),
+                keys: Vec::new(),
+            }),
+        ),
+        (
+            "pane.send_keys",
+            api::schema::Method::PaneSendKeys(api::schema::PaneSendKeysParams {
+                pane_id: public_pane_id.clone(),
+                keys: vec!["left".into()],
+            }),
+        ),
+    ];
+    let mut forced_full_render = Vec::new();
+    for (label, method) in sends {
+        if api_request_reports_ui_change(&mut server, method) {
+            forced_full_render.push(label);
+        }
+        assert!(
+            input_rx.try_recv().is_ok(),
+            "{label} must have forwarded its input"
+        );
+    }
+    assert!(
+        forced_full_render.is_empty(),
+        "these sends changed nothing shown, so the pane's echo must take the retained row \
+         patch, but they reported a UI change: {forced_full_render:?}"
+    );
+    assert_eq!(
+        server.app.state.terminals[&terminal_id].display_state(),
+        crate::detect::AgentState::Idle
+    );
+    assert!(
+        !server.app.render_dirty.take().generic,
+        "a send that changed nothing shown must not request a complete render another way"
+    );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn api_compact_submission_still_reports_a_ui_change() {
+    type SendToPane = fn(String) -> api::schema::Method;
+    let sends: [(&str, SendToPane); 2] = [
+        ("pane.send_text", |pane_id| {
+            api::schema::Method::PaneSendText(api::schema::PaneSendTextParams {
+                pane_id,
+                text: "/compact\r".into(),
+            })
+        }),
+        ("pane.send_input", |pane_id| {
+            api::schema::Method::PaneSendInput(api::schema::PaneSendInputParams {
+                pane_id,
+                text: "/compact".into(),
+                keys: vec!["enter".into()],
+            })
+        }),
+    ];
+    let mut not_reported = Vec::new();
+    for (label, method) in sends {
+        let (mut server, terminal_id, public_pane_id, mut input_rx) = api_send_test_server();
+        if !api_request_reports_ui_change(&mut server, method(public_pane_id)) {
+            not_reported.push(label);
+        }
+        assert!(
+            input_rx.try_recv().is_ok(),
+            "{label} must have forwarded its input"
+        );
+        assert_eq!(
+            server.app.state.terminals[&terminal_id].state,
+            crate::detect::AgentState::Idle,
+            "{label}: compact projection must not enter lifecycle arbitration"
+        );
+        assert_eq!(
+            server.app.state.terminals[&terminal_id].display_state(),
+            crate::detect::AgentState::Working,
+            "{label}: the compact submission must be shown as working"
+        );
+        shutdown_test_runtimes(&mut server);
+    }
+    assert!(
+        not_reported.is_empty(),
+        "a compact submission shows the agent working, so it must redraw at once, but these \
+         sends did not report a UI change: {not_reported:?}"
+    );
+}
+
+#[tokio::test]
+async fn api_send_into_a_blocked_pane_still_reports_a_ui_change() {
+    let (mut server, terminal_id, public_pane_id, mut input_rx) = api_send_test_server();
+    let (_, pane_id) = server
+        .app
+        .parse_pane_id(&public_pane_id)
+        .expect("public pane id");
+    let sends = [
+        (
+            "pane.send_text",
+            api::schema::Method::PaneSendText(api::schema::PaneSendTextParams {
+                pane_id: public_pane_id.clone(),
+                text: "y".into(),
+            }),
+        ),
+        (
+            "pane.send_input",
+            api::schema::Method::PaneSendInput(api::schema::PaneSendInputParams {
+                pane_id: public_pane_id.clone(),
+                text: "y".into(),
+                keys: Vec::new(),
+            }),
+        ),
+        (
+            "pane.send_keys",
+            api::schema::Method::PaneSendKeys(api::schema::PaneSendKeysParams {
+                pane_id: public_pane_id.clone(),
+                keys: vec!["left".into()],
+            }),
+        ),
+    ];
+    let mut not_reported = Vec::new();
+    for (label, method) in sends {
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .state = crate::detect::AgentState::Blocked;
+        server.app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .seen = false;
+        if !api_request_reports_ui_change(&mut server, method) {
+            not_reported.push(label);
+        }
+        assert!(
+            input_rx.try_recv().is_ok(),
+            "{label} must have forwarded its input"
+        );
+        assert!(
+            server.app.state.workspaces[0]
+                .pane_state(pane_id)
+                .unwrap()
+                .seen,
+            "{label} must acknowledge the blocked pane"
+        );
+        assert_eq!(
+            server.app.state.terminals[&terminal_id].state,
+            crate::detect::AgentState::Blocked
+        );
+    }
+    assert!(
+        not_reported.is_empty(),
+        "acknowledging a blocked pane changes its mark, so it must redraw at once, but these \
+         sends did not report a UI change: {not_reported:?}"
+    );
+    shutdown_test_runtimes(&mut server);
+}
+
 #[tokio::test]
 async fn client_shell_mouse_motion_delivers_without_render_when_foreground() {
     let mut server = test_headless_server();

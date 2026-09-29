@@ -3326,6 +3326,7 @@ impl HeadlessServer {
                 .app
                 .handle_api_request_after_internal_events_drained(msg.request);
             self.app.api_request_sender = None;
+            changed |= std::mem::take(&mut self.app.api_request_changed_ui);
             response
         };
         if let Some(snapshot) = frozen_alt_screen_read {
