@@ -8178,6 +8178,7 @@ fn drive_completion_scenario_via_api(
                             respond_to,
                             response_write_complete: None,
                             stream_active: None,
+                            peer_process: None,
                         });
                 assert!(changed);
                 assert!(response_rx.recv_timeout(Duration::from_millis(100)).is_ok());
@@ -8322,6 +8323,7 @@ fn api_held_working_report_replayed_by_session_start_still_toasts() {
             respond_to,
             response_write_complete: None,
             stream_active: None,
+            peer_process: None,
         });
         assert!(changed);
         assert!(response_rx.recv_timeout(Duration::from_millis(100)).is_ok());
@@ -8585,6 +8587,7 @@ fn startup_idle_repeat_report_keeps_the_pane_silent_and_the_record_intact() {
                     respond_to,
                     response_write_complete: None,
                     stream_active: None,
+                    peer_process: None,
                 });
         assert!(changed);
         assert!(response_rx.recv_timeout(Duration::from_millis(100)).is_ok());
