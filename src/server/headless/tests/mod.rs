@@ -8294,6 +8294,181 @@ fn api_reported_startup_idle_sends_no_client_notifications() {
     );
 }
 
+/// Sends a `pane.report_agent_session` request and returns (decoded reply,
+/// whether the pane's terminal carries any session anchor afterwards).
+fn send_session_report(
+    server: &mut HeadlessServer,
+    public_pane_id: &str,
+    terminal_id: &crate::terminal::TerminalId,
+    id: &str,
+    source: &str,
+    session_start_source: Option<&str>,
+    seq: Option<u64>,
+) -> (serde_json::Value, bool) {
+    let session_path = std::env::temp_dir()
+        .join(format!("{id}-pi-session.jsonl"))
+        .display()
+        .to_string();
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        request: api::schema::Request {
+            id: id.into(),
+            method: api::schema::Method::PaneReportAgentSession(
+                api::schema::PaneReportAgentSessionParams {
+                    pane_id: public_pane_id.into(),
+                    source: source.into(),
+                    agent: "pi".into(),
+                    seq,
+                    agent_session_id: None,
+                    agent_session_path: Some(session_path),
+                    session_start_source: session_start_source.map(str::to_string),
+                },
+            ),
+        },
+        respond_to,
+        response_write_complete: None,
+        stream_active: None,
+        peer_process: None,
+    });
+    assert!(changed);
+    let response = response_rx
+        .recv_timeout(Duration::from_millis(100))
+        .expect("session report reply");
+    let reply: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let anchored = server
+        .app
+        .state
+        .terminals
+        .get(terminal_id)
+        .unwrap()
+        .hook_authority
+        .as_ref()
+        .is_some_and(|authority| authority.session_ref.is_some())
+        || server
+            .app
+            .state
+            .terminals
+            .get(terminal_id)
+            .unwrap()
+            .persisted_agent_session
+            .is_some();
+    (reply, anchored)
+}
+
+#[test]
+fn session_report_without_start_source_answers_error_and_binds_nothing() {
+    // A full-lifecycle `pane.report_agent_session` WITHOUT
+    // `session_start_source` used to reply {"type":"ok"} while binding
+    // NOTHING — the anchor never existed and every later report from the
+    // session was silently ignored. When the missing field is the ONLY
+    // reason the start is not applied, the reply must name it.
+    let mut fixture = auto_read_forwarding_fixture("session-source-missing", false);
+    let public_pane_id = format!("{}:p1", fixture.server.app.state.workspaces[0].id);
+    assert!(fixture
+        .server
+        .handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
+            pane_id: fixture.pane_id,
+            agent: crate::detect::Agent::Pi,
+            observed_at: Instant::now(),
+        }));
+
+    let (reply, anchored) = send_session_report(
+        &mut fixture.server,
+        &public_pane_id,
+        &fixture.terminal_id,
+        "missing-source",
+        "herdr:pi",
+        None,
+        Some(10),
+    );
+    let error = reply.get("error").unwrap_or_else(|| {
+        panic!("missing session_start_source must answer an error, got {reply}")
+    });
+    assert_eq!(
+        error.get("code").and_then(|v| v.as_str()),
+        Some("invalid_params"),
+        "the error must use the existing invalid_params code: {reply}"
+    );
+    let message = error.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        message.contains("session_start_source"),
+        "the error message must name the field: {reply}"
+    );
+    assert!(
+        !anchored,
+        "the refused session start must still bind nothing"
+    );
+}
+
+#[test]
+fn session_report_with_start_source_still_binds_and_answers_ok() {
+    // Control: the same request WITH the field keeps today's behaviour — ok
+    // reply and a bound session.
+    let mut fixture = auto_read_forwarding_fixture("session-source-present", false);
+    let public_pane_id = format!("{}:p1", fixture.server.app.state.workspaces[0].id);
+    assert!(fixture
+        .server
+        .handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
+            pane_id: fixture.pane_id,
+            agent: crate::detect::Agent::Pi,
+            observed_at: Instant::now(),
+        }));
+
+    let (reply, anchored) = send_session_report(
+        &mut fixture.server,
+        &public_pane_id,
+        &fixture.terminal_id,
+        "with-source",
+        "herdr:pi",
+        Some("startup"),
+        Some(10),
+    );
+    assert_eq!(
+        reply
+            .get("result")
+            .and_then(|r| r.get("type"))
+            .and_then(|v| v.as_str()),
+        Some("ok"),
+        "a session start carrying session_start_source must still answer ok: {reply}"
+    );
+    assert!(anchored, "the session start must still bind");
+}
+
+#[test]
+fn session_report_refused_for_another_reason_keeps_its_silent_ok() {
+    // Scope control: a request refused for a DIFFERENT reason — here an
+    // unofficial source, whose session_ref cannot even be built — keeps
+    // today's reply exactly: a silent ok that binds nothing.
+    let mut fixture = auto_read_forwarding_fixture("session-source-scope", false);
+    let public_pane_id = format!("{}:p1", fixture.server.app.state.workspaces[0].id);
+    assert!(fixture
+        .server
+        .handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
+            pane_id: fixture.pane_id,
+            agent: crate::detect::Agent::Pi,
+            observed_at: Instant::now(),
+        }));
+
+    let (reply, anchored) = send_session_report(
+        &mut fixture.server,
+        &public_pane_id,
+        &fixture.terminal_id,
+        "other-refusal",
+        "custom:test",
+        None,
+        Some(10),
+    );
+    assert_eq!(
+        reply
+            .get("result")
+            .and_then(|r| r.get("type"))
+            .and_then(|v| v.as_str()),
+        Some("ok"),
+        "an unofficial source's refusal must keep its silent ok: {reply}"
+    );
+    assert!(!anchored);
+}
+
 #[test]
 fn api_held_working_report_replayed_by_session_start_still_toasts() {
     // The held-report replay path (a report sent before its session start, where

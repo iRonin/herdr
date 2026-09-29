@@ -367,6 +367,19 @@ pub struct TerminalState {
     live_session_start_refusal: Option<LiveSessionStartRefusal>,
 }
 
+/// The shared gates of a full-lifecycle session start, computed once so the
+/// applying path in `set_agent_session_ref_for_session_start` and the
+/// missing-`session_start_source` refusal predicate
+/// (`session_start_refused_only_for_missing_source`) cannot drift apart.
+struct FullLifecycleSessionStartGate {
+    known_agent: Option<Agent>,
+    process_present: bool,
+    full_lifecycle_source: bool,
+    unsequenced_selection: bool,
+    selection_can_reconcile: bool,
+    anchor_required: bool,
+}
+
 impl TerminalState {
     pub fn new(id: TerminalId, cwd: PathBuf) -> Self {
         Self {
@@ -1769,6 +1782,81 @@ impl TerminalState {
         self.live_session_start_refusal = Some(LiveSessionStartRefusal { agent, holder });
     }
 
+    fn full_lifecycle_session_start_gate(
+        &self,
+        source: &str,
+        agent_label: &str,
+        session_start_source: Option<&str>,
+        seq: Option<u64>,
+    ) -> FullLifecycleSessionStartGate {
+        let known_agent = crate::detect::parse_agent_label(agent_label);
+        let process_present = known_agent.is_some()
+            && self.detected_agent == known_agent
+            && self.recent_agent_process_exit.is_none();
+        let full_lifecycle_source =
+            crate::detect::full_lifecycle_hook_authority(source, agent_label);
+        let generation_gated = self
+            .suppressed_full_lifecycle_hook_reports
+            .get(source)
+            .is_some_and(|suppressed| {
+                suppressed.agent_label == agent_label
+                    && suppressed.reason != FullLifecycleHookSuppressionReason::HookClear
+            });
+        let session_anchored = self.hook_authority.as_ref().is_some_and(|authority| {
+            authority.source == source
+                && authority.agent_label == agent_label
+                && authority.session_ref.is_some()
+        }) || self.persisted_agent_session_matches(source, agent_label);
+        let unsequenced_selection =
+            Self::is_unsequenced_opencode_selection(source, agent_label, session_start_source, seq);
+        FullLifecycleSessionStartGate {
+            known_agent,
+            process_present,
+            full_lifecycle_source,
+            unsequenced_selection,
+            selection_can_reconcile: unsequenced_selection && process_present,
+            anchor_required: !process_present || generation_gated || !session_anchored,
+        }
+    }
+
+    /// Whether a full-lifecycle `pane.report_agent_session` would be refused
+    /// ONLY because its `session_start_source` is missing or unrecognized:
+    /// the anchor-required branch is entered with the agent process present
+    /// (so a recognized source would bind), the source value would not be
+    /// recognized, and the sequence is present and fresh. The API layer
+    /// answers exactly this case with an `invalid_params` error naming the
+    /// field instead of a silent ok; every other refusal keeps its reply.
+    pub(crate) fn session_start_refused_only_for_missing_source(
+        &self,
+        source: &str,
+        agent_label: &str,
+        session_ref: Option<&crate::agent_resume::AgentSessionRef>,
+        seq: Option<u64>,
+        session_start_source: Option<&str>,
+    ) -> bool {
+        if session_ref.is_none() {
+            return false;
+        }
+        let gate =
+            self.full_lifecycle_session_start_gate(source, agent_label, session_start_source, seq);
+        if !gate.full_lifecycle_source
+            || gate.selection_can_reconcile
+            || !gate.anchor_required
+            || !gate.process_present
+        {
+            return false;
+        }
+        if Self::session_start_source_is_recognized(session_start_source) {
+            return false;
+        }
+        let Some(seq) = seq else {
+            return false;
+        };
+        self.hook_report_sequences
+            .get(source)
+            .is_none_or(|previous| seq > *previous)
+    }
+
     fn session_start_source_is_recognized(session_start_source: Option<&str>) -> bool {
         matches!(
             session_start_source,
@@ -1820,31 +1908,19 @@ impl TerminalState {
         session_start_source: Option<String>,
     ) -> Option<TerminalStateMutation> {
         let session_ref = session_ref?;
-        let known_agent = crate::detect::parse_agent_label(&agent_label);
-        let process_present = known_agent.is_some()
-            && self.detected_agent == known_agent
-            && self.recent_agent_process_exit.is_none();
-        let full_lifecycle_source =
-            crate::detect::full_lifecycle_hook_authority(&source, &agent_label);
-        let generation_gated = self
-            .suppressed_full_lifecycle_hook_reports
-            .get(&source)
-            .is_some_and(|suppressed| {
-                suppressed.agent_label == agent_label
-                    && suppressed.reason != FullLifecycleHookSuppressionReason::HookClear
-            });
-        let session_anchored = self.hook_authority.as_ref().is_some_and(|authority| {
-            authority.source == source
-                && authority.agent_label == agent_label
-                && authority.session_ref.is_some()
-        }) || self.persisted_agent_session_matches(&source, &agent_label);
-        let unsequenced_selection = Self::is_unsequenced_opencode_selection(
+        let FullLifecycleSessionStartGate {
+            known_agent,
+            process_present,
+            full_lifecycle_source,
+            unsequenced_selection,
+            selection_can_reconcile,
+            anchor_required,
+        } = self.full_lifecycle_session_start_gate(
             &source,
             &agent_label,
             session_start_source.as_deref(),
             seq,
         );
-        let selection_can_reconcile = unsequenced_selection && process_present;
         if selection_can_reconcile {
             self.suppressed_full_lifecycle_hook_reports.remove(&source);
         } else if full_lifecycle_source && unsequenced_selection {
@@ -1876,10 +1952,7 @@ impl TerminalState {
             suppressed.pending_replacement_report = None;
             return None;
         }
-        if full_lifecycle_source
-            && !selection_can_reconcile
-            && (!process_present || generation_gated || !session_anchored)
-        {
+        if full_lifecycle_source && !selection_can_reconcile && anchor_required {
             if !Self::session_start_source_is_recognized(session_start_source.as_deref()) {
                 return None;
             }
