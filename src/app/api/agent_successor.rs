@@ -15,6 +15,10 @@
 //! there). herdr then records what the detector would have recorded between the two processes,
 //! the holder's exit and then the successor's detection, and routes the session start again,
 //! down the path a relaunch at normal speed takes. Anything not proven keeps the refusal.
+//!
+//! It also refuses a report for another session that comes from a process outside the live
+//! holder's group while the holder still runs. Holding such a report would freeze the holder's
+//! pane and let the other session's start take it over.
 
 use tracing::{debug, info};
 
@@ -108,6 +112,25 @@ pub(crate) fn judge_successor(
     Ok(())
 }
 
+/// Whether a report for another session would displace a live agent: it comes from a process
+/// outside the holder's process group while the holder's process or group still exists. The same
+/// process or its group moving to another session (`/new`, `/resume`, `/fork`, or a helper
+/// script, which shares the agent's group), an unknown sender, and an unknown or gone holder all
+/// keep today's handling. A reused PID or group number makes a gone holder look alive, which
+/// fails safe for the holder.
+pub(crate) fn report_would_displace_live_holder(
+    holder: Option<PeerProcess>,
+    sender: Option<PeerProcess>,
+    facts: &impl ProcessFacts,
+) -> bool {
+    let (Some(holder), Some(sender)) = (holder, sender) else {
+        return false;
+    };
+    sender.pid != holder.pid
+        && sender.process_group != holder.process_group
+        && (facts.process_exists(holder.pid) || facts.process_group_exists(holder.process_group))
+}
+
 /// The detector's own first question about a foreground job: is its leader the agent?
 fn leader_is_agent(job: &ForegroundJob, agent: Agent) -> bool {
     let Some(leader) = job
@@ -142,17 +165,51 @@ impl App {
     /// Applies a reporter's state report with its sender recorded on the pane's terminal, so an
     /// accepted report names the process that holds the session.
     pub(super) fn handle_reported_agent_state(&mut self, event: AppEvent) {
-        let pane_id = match &event {
-            AppEvent::HookStateReported { pane_id, .. } => *pane_id,
-            _ => {
-                self.handle_internal_event(event);
-                return;
-            }
+        let _ = self.handle_reported_agent_state_with(event, &SystemProcesses);
+    }
+
+    /// Also refuses a report for another session that would displace a live holder: see
+    /// `report_would_displace_live_holder`.
+    pub(crate) fn handle_reported_agent_state_with(
+        &mut self,
+        event: AppEvent,
+        facts: &impl ProcessFacts,
+    ) -> Vec<PaneStateUpdate> {
+        let (pane_id, live_holder) = match &event {
+            AppEvent::HookStateReported {
+                pane_id,
+                source,
+                agent_label,
+                session_ref,
+                ..
+            } => (
+                *pane_id,
+                self.pane_live_other_session_holder(
+                    *pane_id,
+                    source,
+                    agent_label,
+                    session_ref.as_ref(),
+                ),
+            ),
+            _ => return self.handle_internal_event_with_pane_updates(event),
         };
         let sender = self.api_request_sender;
+        let refuse = live_holder
+            .is_some_and(|holder| report_would_displace_live_holder(holder, sender, facts));
+        if refuse {
+            debug!(
+                pane = pane_id.raw(),
+                holder = ?live_holder.flatten(),
+                sender = ?sender,
+                "report for another session refused while the live session's holder runs"
+            );
+        }
         self.set_pane_report_sender(pane_id, sender);
-        self.handle_internal_event(event);
+        self.set_pane_refuse_other_session_report(pane_id, refuse);
+        let updates = self.handle_internal_event_with_pane_updates(event);
+        self.set_pane_refuse_other_session_report(pane_id, false);
         self.set_pane_report_sender(pane_id, None);
+        updates
     }
 
     pub(super) fn handle_reported_agent_session(&mut self, event: AppEvent) {
@@ -268,6 +325,32 @@ impl App {
         };
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.set_report_sender(sender);
+        }
+    }
+
+    fn pane_live_other_session_holder(
+        &self,
+        pane_id: PaneId,
+        source: &str,
+        agent_label: &str,
+        session_ref: Option<&crate::agent_resume::AgentSessionRef>,
+    ) -> Option<Option<PeerProcess>> {
+        let (_, pane) = self.find_pane(pane_id)?;
+        self.state
+            .terminals
+            .get(&pane.attached_terminal_id)?
+            .live_other_session_holder(source, agent_label, session_ref)
+    }
+
+    fn set_pane_refuse_other_session_report(&mut self, pane_id: PaneId, refuse: bool) {
+        let Some(terminal_id) = self
+            .find_pane(pane_id)
+            .map(|(_, pane)| pane.attached_terminal_id.clone())
+        else {
+            return;
+        };
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.set_refuse_other_session_report(refuse);
         }
     }
 
