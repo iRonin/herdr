@@ -554,17 +554,23 @@ mod tests {
     #[tokio::test]
     async fn status_command_reports_its_sanitized_last_line() {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        // 30s is a hang guard, not the property under test (the command's last
+        // line survives sanitizing). The former 2s budget flaked once at gate
+        // time under load ~53: spawn plus output exceeded it and the event
+        // arrived as Err("timed out after 2s") - same class as the drains and
+        // reload tests in this file. Timeout BEHAVIOR stays asserted by
+        // status_command_timeout_starts_before_task_is_polled (1s budget).
         spawn_status_command(
             event_tx,
             7,
             3,
             MULTILINE_COMMAND.into(),
-            Duration::from_secs(2),
+            Duration::from_secs(30),
             Vec::new(),
             None,
         );
 
-        let event = tokio::time::timeout(Duration::from_secs(3), event_rx.recv())
+        let event = tokio::time::timeout(Duration::from_secs(30), event_rx.recv())
             .await
             .expect("status command timed out")
             .expect("status command event channel closed");
