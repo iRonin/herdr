@@ -1463,10 +1463,13 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
     let started_marker = base.join("agent-started");
     let fake_pi = base.join("pi");
     fs::create_dir_all(&base).unwrap();
+    // The fake agent prints once it runs, as real agents do. herdr checks a new foreground job
+    // once, and checks the same job again only after new pane output, so a silent agent that
+    // its job had not exec'd yet at that first check would never be detected.
     fs::write(
         &fake_pi,
         format!(
-            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\n/bin/sleep 30\n:\n",
+            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\nprintf 'fake pi ready\\n'\n/bin/sleep 30\n:\n",
             started_marker.display()
         ),
     )
@@ -1624,10 +1627,13 @@ fn live_handoff_preserves_reported_agent_state() {
     let fake_pi = base.join("pi");
     fs::create_dir_all(&base).unwrap();
     fs::write(&session, "{}\n").unwrap();
+    // The fake agent prints once it runs, as real agents do. herdr checks a new foreground job
+    // once, and checks the same job again only after new pane output, so a silent agent that
+    // its job had not exec'd yet at that first check would never be detected.
     fs::write(
         &fake_pi,
         format!(
-            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\n/bin/sleep 30\n:\n",
+            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\nprintf 'fake pi ready\\n'\n/bin/sleep 30\n:\n",
             started_marker.display()
         ),
     )
