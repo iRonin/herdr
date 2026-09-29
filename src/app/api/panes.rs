@@ -1846,14 +1846,17 @@ impl App {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
         if input_nonempty {
-            self.state
+            let acknowledged = self
+                .state
                 .mark_pane_acknowledged_if_blocked(ws_idx, pane_id);
-            self.track_pane_forwarded_input(ws_idx, pane_id, input.as_ref());
+            let display_changed = self.track_pane_forwarded_input(ws_idx, pane_id, input.as_ref());
+            self.api_request_changed_ui |= acknowledged | display_changed;
         }
 
         encode_success(id, ResponseResult::Ok {})
     }
 
+    /// Returns whether the forwarded input changed the pane's displayed agent status.
     fn track_forwarded_api_input(
         &mut self,
         ws_idx: usize,
@@ -1861,15 +1864,22 @@ impl App {
         text: &[u8],
         text_bracketed: bool,
         keys: &[super::super::api_helpers::EncodedTerminalKey],
-    ) {
+    ) -> bool {
+        let mut display_changed = false;
         if text_bracketed {
             self.track_pane_forwarded_bracketed_paste(ws_idx, pane_id, text);
         } else {
-            self.track_pane_forwarded_input(ws_idx, pane_id, text);
+            display_changed |= self.track_pane_forwarded_input(ws_idx, pane_id, text);
         }
         for encoded_key in keys {
-            self.track_pane_forwarded_key(ws_idx, pane_id, &encoded_key.bytes, &encoded_key.key);
+            display_changed |= self.track_pane_forwarded_key(
+                ws_idx,
+                pane_id,
+                &encoded_key.bytes,
+                &encoded_key.key,
+            );
         }
+        display_changed
     }
 
     pub(super) fn handle_pane_send_input(
@@ -1898,15 +1908,17 @@ impl App {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
         if input_nonempty {
-            self.state
+            let acknowledged = self
+                .state
                 .mark_pane_acknowledged_if_blocked(ws_idx, pane_id);
-            self.track_forwarded_api_input(
+            let display_changed = self.track_forwarded_api_input(
                 ws_idx,
                 pane_id,
                 &detector_text,
                 encoded_input.text_bracketed,
                 &encoded_input.keys,
             );
+            self.api_request_changed_ui |= acknowledged | display_changed;
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -2014,15 +2026,19 @@ impl App {
                 }
             }
         }
+        let mut display_changed = false;
         for (key, encoded) in &forwarded_keys {
-            self.track_pane_forwarded_key(ws_idx, pane_id, encoded, key);
+            display_changed |= self.track_pane_forwarded_key(ws_idx, pane_id, encoded, key);
         }
+        self.api_request_changed_ui |= display_changed;
         if let Some(err) = send_error {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
         if !forwarded_keys.is_empty() {
-            self.state
+            let acknowledged = self
+                .state
                 .mark_pane_acknowledged_if_blocked(ws_idx, pane_id);
+            self.api_request_changed_ui |= acknowledged;
         }
 
         encode_success(id, ResponseResult::Ok {})
