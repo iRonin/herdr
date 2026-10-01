@@ -297,7 +297,10 @@ pub(crate) fn render_sidebar(
         let selected = state.selected_workspace_id.is_some_and(|target| {
             target.matches(state.active_endpoint_id, &workspace.workspace_id)
         });
-        let dragged = state.dragged_workspace_id == Some(workspace.workspace_id.as_str());
+        let dragged = state.dragged_workspace_id == Some(workspace.workspace_id.as_str())
+            || state
+                .tab_drag_move_target
+                .is_some_and(|(_, workspace_id)| workspace_id == workspace.workspace_id.as_str());
         if selected {
             buffer.set_style(rect, Style::default().bg(palette.selection_bg));
         } else if dragged {

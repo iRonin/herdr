@@ -443,6 +443,13 @@ pub(super) fn render_expanded(
                     rect.height,
                 );
                 let endpoint_active = &endpoint.endpoint_id == state.active_endpoint_id;
+                let tab_move_target =
+                    state
+                        .tab_drag_move_target
+                        .is_some_and(|(endpoint_id, workspace_id)| {
+                            endpoint_id == &endpoint.endpoint_id
+                                && workspace_id == workspace.workspace_id.as_str()
+                        });
                 let selected = state.selected_workspace_id.is_some_and(|target| {
                     target.matches(&endpoint.endpoint_id, &workspace.workspace_id)
                 });
@@ -456,11 +463,14 @@ pub(super) fn render_expanded(
                     tokens,
                     endpoint_active,
                     selected,
-                    false,
+                    tab_move_target,
                     palette,
                 );
                 if selected && palette.selection_bg == ratatui::style::Color::Reset {
                     buffer.set_style(nested, Style::default().bg(palette.active_row_bg));
+                }
+                if tab_move_target {
+                    buffer.set_style(nested, Style::default().bg(palette.surface1));
                 }
                 if endpoint.status != ClientEndpointStatus::Online {
                     buffer.set_style(

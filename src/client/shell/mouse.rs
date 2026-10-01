@@ -450,6 +450,32 @@ impl ClientShellState {
         ((pointer + grab_offset - origin) as f32 / f32::from(length.max(1))).clamp(0.1, 0.9)
     }
 
+    /// Sidebar workspace entry under `point` that a dragged tab could move to:
+    /// only entries of the ACTIVE endpoint (tab hits are active-endpoint-only,
+    /// so another machine's server could never receive the moved tab) and never
+    /// the dragged tab's own workspace. Requires `ui.tab_drag_move_workspace`;
+    /// `None` everywhere when it is off, which is the stock behaviour.
+    fn tab_move_target_at(&self, point: (u16, u16), dragged_workspace_id: &str) -> Option<String> {
+        if !self.config.tab_drag_move_workspace {
+            return None;
+        }
+        let snapshot = self.snapshot.as_deref()?;
+        self.hits
+            .workspaces
+            .iter()
+            .find(|hit| {
+                hit.endpoint_id == self.active_endpoint_id && super::contains(hit.rect, point)
+            })
+            .map(|hit| hit.workspace_id.clone())
+            .filter(|workspace_id| workspace_id != dragged_workspace_id)
+            .filter(|workspace_id| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .any(|workspace| &workspace.workspace_id == workspace_id)
+            })
+    }
+
     fn tab_drop_index_at(&self, point: (u16, u16)) -> Option<usize> {
         let snapshot = self.snapshot.as_deref()?;
         let workspace_id = snapshot.focused_workspace_id.as_deref()?;
@@ -1148,12 +1174,30 @@ impl ClientShellState {
                 }
                 Some(ClientChromeDrag::Tab { .. }) => {
                     let insert_index = self.tab_drop_index_at(point);
+                    let move_target = self.chrome_drag.as_ref().and_then(|drag| match drag {
+                        ClientChromeDrag::Tab { workspace_id, .. } => {
+                            self.tab_move_target_at(point, workspace_id)
+                        }
+                        _ => None,
+                    });
                     if let Some(ClientChromeDrag::Tab {
                         insert_index: current,
+                        move_target: current_move,
                         ..
                     }) = self.chrome_drag.as_mut()
                     {
-                        *current = insert_index;
+                        // One coherent update, so the two outcomes are never
+                        // both armed by construction: a hovered sidebar
+                        // workspace entry (same endpoint, not the tab's own)
+                        // takes priority and suppresses the in-bar reorder
+                        // indicator; otherwise the in-bar indicator returns.
+                        if let Some(move_target) = move_target {
+                            *current_move = Some(move_target);
+                            *current = None;
+                        } else {
+                            *current_move = None;
+                            *current = insert_index;
+                        }
                     }
                     outcome.repaint = true;
                     return;
@@ -1197,11 +1241,26 @@ impl ClientShellState {
                     .abs_diff(press.start_column)
                     .max(mouse.row.abs_diff(press.start_row));
                 if delta >= 1 {
-                    if let Some(insert_index) = self.tab_drop_index_at(point) {
+                    // With ui.tab_drag_move_workspace the pointer has to be able
+                    // to leave the tab row on its way to a sidebar entry, so the
+                    // drag starts wherever the threshold is crossed — and arms
+                    // a move immediately if that is already over an entry, so a
+                    // single fast jump onto an entry is still a move. With the
+                    // gate off the drag may only start inside the tab row —
+                    // exactly the previous behaviour.
+                    let insert_index = self.tab_drop_index_at(point);
+                    if insert_index.is_some() || self.config.tab_drag_move_workspace {
+                        let move_target = self.tab_move_target_at(point, &press.workspace_id);
+                        let insert_index = if move_target.is_some() {
+                            None
+                        } else {
+                            insert_index
+                        };
                         self.chrome_drag = Some(ClientChromeDrag::Tab {
                             tab_id: press.tab_id.clone(),
                             workspace_id: press.workspace_id.clone(),
-                            insert_index: Some(insert_index),
+                            insert_index,
+                            move_target,
                         });
                         outcome.repaint = true;
                     }
@@ -1217,35 +1276,71 @@ impl ClientShellState {
                     ClientChromeDrag::Tab {
                         tab_id,
                         workspace_id,
+                        move_target,
                         ..
                     } => {
-                        let insert_index = self.tab_drop_index_at(point);
-                        let valid_drop = self.snapshot.as_deref().is_some_and(|snapshot| {
-                            snapshot.focused_workspace_id.as_deref() == Some(workspace_id.as_str())
-                                && snapshot.tabs.iter().any(|tab| {
+                        // ORDER MATTERS: `move_target` is dispatched before the
+                        // in-bar reorder. The drag-update path never arms both
+                        // at once, but that invariant lives in a different
+                        // function; dispatching the move first keeps this
+                        // correct even if a refactor ever breaks it — a drag
+                        // carrying both outcomes must never downgrade to a
+                        // reorder of a live layout.
+                        if let Some(move_target) = move_target {
+                            let valid_move = self.snapshot.as_deref().is_some_and(|snapshot| {
+                                snapshot.tabs.iter().any(|tab| {
                                     tab.tab_id == tab_id && tab.workspace_id == workspace_id
+                                }) && snapshot.workspaces.iter().any(|workspace| {
+                                    workspace.workspace_id == move_target
+                                        && move_target != workspace_id
                                 })
-                                && insert_index.is_some_and(|index| {
-                                    index
-                                        <= snapshot
-                                            .tabs
-                                            .iter()
-                                            .filter(|tab| tab.workspace_id == workspace_id)
-                                            .count()
-                                })
-                        });
-                        if valid_drop {
-                            self.push_endpoint_method(
-                                crate::api::schema::Method::TabMove(
-                                    crate::api::schema::TabMoveParams {
-                                        tab_id,
-                                        insert_index: insert_index.unwrap_or_default(),
-                                    },
-                                ),
-                                outcome,
-                            );
+                            });
+                            if valid_move {
+                                // Dropping on a workspace entry appends to its
+                                // tab bar without yanking the user to it.
+                                self.push_endpoint_method(
+                                    crate::api::schema::Method::TabMoveToWorkspace(
+                                        crate::api::schema::TabMoveToWorkspaceParams {
+                                            tab_id,
+                                            workspace_id: move_target,
+                                            insert_index: None,
+                                            focus: false,
+                                        },
+                                    ),
+                                    outcome,
+                                );
+                            }
+                            outcome.repaint = true;
+                        } else {
+                            let insert_index = self.tab_drop_index_at(point);
+                            let valid_drop = self.snapshot.as_deref().is_some_and(|snapshot| {
+                                snapshot.focused_workspace_id.as_deref()
+                                    == Some(workspace_id.as_str())
+                                    && snapshot.tabs.iter().any(|tab| {
+                                        tab.tab_id == tab_id && tab.workspace_id == workspace_id
+                                    })
+                                    && insert_index.is_some_and(|index| {
+                                        index
+                                            <= snapshot
+                                                .tabs
+                                                .iter()
+                                                .filter(|tab| tab.workspace_id == workspace_id)
+                                                .count()
+                                    })
+                            });
+                            if valid_drop {
+                                self.push_endpoint_method(
+                                    crate::api::schema::Method::TabMove(
+                                        crate::api::schema::TabMoveParams {
+                                            tab_id,
+                                            insert_index: insert_index.unwrap_or_default(),
+                                        },
+                                    ),
+                                    outcome,
+                                );
+                            }
+                            outcome.repaint = true;
                         }
-                        outcome.repaint = true;
                     }
                     ClientChromeDrag::Workspace {
                         source_workspace_id,

@@ -247,6 +247,9 @@ pub(super) struct ShellRenderState<'a> {
     pub(super) reveal_navigation_workspace: &'a mut bool,
     pub(super) dragged_workspace_id: Option<&'a str>,
     pub(super) workspace_drop_indicator_row: Option<u16>,
+    /// Workspace entry highlighted as a dragged TAB's drop target (endpoint id,
+    /// workspace id) while `ui.tab_drag_move_workspace` is armed.
+    pub(super) tab_drag_move_target: Option<(&'a ClientEndpointId, &'a str)>,
 }
 
 pub(super) fn render_shell(

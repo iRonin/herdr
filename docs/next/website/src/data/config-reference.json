@@ -947,6 +947,12 @@
           "description": "Ask for a tab name before creating a new tab."
         },
         {
+          "key": "ui.tab_drag_move_workspace",
+          "type": "boolean",
+          "default": "false",
+          "description": "Allow dragging a tab from the tab row onto a sidebar workspace entry to move that tab (with all its panes) to the workspace."
+        },
+        {
           "key": "ui.prompt_new_workspace_name",
           "type": "boolean",
           "default": "false",

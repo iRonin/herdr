@@ -102,7 +102,7 @@ Raw socket method names use dot notation:
 | Session | `session.snapshot` |
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
-| Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
+| Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.move_to_workspace`, `tab.close` |
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
@@ -332,6 +332,30 @@ optional and defaults to the target tab's focused pane. Same-tab layout changes
 remain `pane.swap`; moving to the source tab returns `changed: false` with
 `reason: "same_tab"`. Moves involving a zoomed source or target tab return
 `changed: false` with `reason: "zoomed_tab"`.
+
+`tab.move_to_workspace` moves a whole tab — panes, split layout, label, zoom,
+and running terminals — to another workspace as a unit, where `tab.move` only
+reorders within one workspace:
+
+```json
+{"id":"req_tab_move","method":"tab.move_to_workspace","params":{"tab_id":"w1:t2","workspace_id":"w2","insert_index":1,"focus":true}}
+```
+
+It is a separate method rather than a `workspace_id` field on `tab.move`
+because the request envelope ignores unknown fields: an older server would
+silently reorder instead of moving, while an unknown method fails cleanly at
+parse time. Omitting `insert_index` appends to the target workspace's tab bar;
+naming the tab's own workspace reorders within it and still reports through the
+`tab_move_to_workspace` response. The response contains `changed`, the
+`previous_tab_id`/`previous_workspace_id`, the moved `tab`, the final
+`insert_index`, an optional `closed_workspace_id` when the move emptied the
+source workspace, `pane_id_map` (the destination reassigns public pane ids;
+old ids keep resolving as aliases), and `target_layout`. A move that would
+close a worktree group's member workspace returns `confirmation_required`, the
+same contract as `tab.close`. The `tab.moved` event gains optional
+`previous_tab_id`/`previous_workspace_id` on cross-workspace moves so
+subscribers can correlate the new identity with the one that disappeared;
+Herdr does not emit fake tab close/create events for the moved entity.
 
 The response is `type: "pane_move"` with `changed`, optional `reason`,
 `previous_pane_id`, `previous_workspace_id`, `previous_tab_id`, the moved
@@ -821,7 +845,9 @@ Workspace event subscriptions include `workspace.created`, `workspace.updated`, 
 Tab event subscriptions include `tab.created`, `tab.closed`, `tab.focused`,
 `tab.renamed`, and `tab.moved`. `tab.moved` includes the moved `tab_id`,
 `workspace_id`, requested `insert_index`, and updated ordered `tabs` list for
-that workspace.
+that workspace; on a cross-workspace `tab.move_to_workspace` move it also
+carries `previous_tab_id` and `previous_workspace_id`, linking the new identity
+to the one that disappeared from the source workspace.
 Pane event subscriptions include `pane.created`, `pane.updated`, `pane.closed`, `pane.focused`,
 `pane.moved`, `pane.exited`, `pane.agent_detected`,
 `pane.output_matched`, `pane.agent_status_changed`, and `pane.scroll_changed`.

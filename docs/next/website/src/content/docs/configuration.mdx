@@ -304,6 +304,8 @@ The sidebar is the main Herdr dashboard. Search `ui.` in the [Config reference](
 
 Set `tab_bar_position = "bottom"` under `[ui]` to place the desktop tab row below the terminal panes. Prefix, Navigate, Copy, and Resize mode bars temporarily replace the bottom tab row while active. The default is `"top"`.
 
+Set `tab_drag_move_workspace = true` under `[ui]` to let a tab drag leave the tab row: press a tab, drag it onto a workspace entry in the sidebar, and release to move that tab — every pane, the split layout, the label, zoom, and the running terminals — to that workspace in one piece. The hovered entry highlights as the drop target, the move appends to the destination's tab bar without switching your view there, and a source workspace left without tabs closes as if its last tab had been closed, worktree-group confirmation included. The gesture composes with wrapped tab rows (a tab on any row can be dragged) and with `tab_close_button` (the close marker is modifier-armed on mouse-down, the move is an unmodified drag, so the two never overlap). It never moves a tab to another machine: with several machines connected, dropping onto another machine's workspace entry is ignored, because the tab lives on the server you dragged it from. A server that does not know the `tab.move_to_workspace` method reports the action as unsupported instead of mis-executing it. The default is `false`, which keeps drags inside the tab row exactly as they behave without it.
+
 Configure an ordered tmux-style status area at the right edge of the tab row:
 
 ```toml

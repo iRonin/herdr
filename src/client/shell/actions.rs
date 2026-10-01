@@ -496,10 +496,19 @@ impl ClientShellState {
         }
         if let Err(error) = &result {
             let code = error.code.as_deref().unwrap_or("invalid_response");
-            if !matches!(
-                code,
-                "confirmation_required" | "stale_content" | "stale_target"
-            ) {
+            // `confirmation_required` is normally silent here because TabClose
+            // and PaneClose surface it as a confirm-close overlay instead. A
+            // refused tab.move_to_workspace has no overlay — its confirm button
+            // would close the group, which is not the action being confirmed —
+            // so for that method the refusal is shown as a notice, visibly.
+            let confirmation_surfaces_as_notice =
+                code == "confirmation_required" && pending.method_name == "tab.move_to_workspace";
+            if confirmation_surfaces_as_notice
+                || !matches!(
+                    code,
+                    "confirmation_required" | "stale_content" | "stale_target"
+                )
+            {
                 let (kind, notice_code, title, body) = match code {
                     "endpoint_timeout" => (
                         ClientEndpointNoticeKind::Timeout,
