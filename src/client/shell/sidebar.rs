@@ -231,6 +231,11 @@ pub(crate) fn render_sidebar(
                         workspace,
                         displayed_workspace_status(snapshot, workspace, state.collapsed_groups),
                         entry.indented,
+                        displayed_workspace_agent_count(
+                            snapshot,
+                            workspace,
+                            state.collapsed_groups,
+                        ),
                         &config.spaces,
                     )
                     .len()
@@ -288,7 +293,15 @@ pub(crate) fn render_sidebar(
             continue;
         };
         let status = displayed_workspace_status(snapshot, workspace, state.collapsed_groups);
-        let rows = workspace_rows(workspace, status, entry.indented, &config.spaces);
+        let agent_count =
+            displayed_workspace_agent_count(snapshot, workspace, state.collapsed_groups);
+        let rows = workspace_rows(
+            workspace,
+            status,
+            entry.indented,
+            agent_count,
+            &config.spaces,
+        );
         let row_height = (rows.len().max(1).min(u16::MAX as usize) as u16).min(body.height);
         if y.saturating_add(row_height) > body.bottom() {
             break;
@@ -607,10 +620,42 @@ pub(in crate::client::shell) fn displayed_workspace_status(
         .unwrap_or(workspace.agent_status)
 }
 
+/// Agent count a space row should show. A collapsed worktree-group parent stands in for its whole
+/// group, so it sums their counts; this mirrors `displayed_workspace_status`, which aggregates the
+/// same set for the status glyph.
+pub(in crate::client::shell) fn displayed_workspace_agent_count(
+    snapshot: &ClientShellSnapshot,
+    workspace: &ClientShellWorkspace,
+    collapsed_groups: &HashSet<String>,
+) -> usize {
+    let Some(worktree) = workspace
+        .worktree
+        .as_ref()
+        .filter(|worktree| !worktree.is_linked_worktree)
+    else {
+        return workspace.agent_count;
+    };
+    if !collapsed_groups.contains(&worktree.key) {
+        return workspace.agent_count;
+    }
+    snapshot
+        .workspaces
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .worktree
+                .as_ref()
+                .is_some_and(|candidate| candidate.key == worktree.key)
+        })
+        .map(|candidate| candidate.agent_count)
+        .sum()
+}
+
 pub(in crate::client::shell) fn workspace_rows(
     workspace: &ClientShellWorkspace,
     status: crate::api::schema::AgentStatus,
     indented: bool,
+    agent_count: usize,
     config: &SpacesSidebarConfig,
 ) -> Vec<Vec<crate::ui::ResolvedToken>> {
     let label = if indented && !workspace.custom_label {
@@ -632,6 +677,7 @@ pub(in crate::client::shell) fn workspace_rows(
             ahead_behind: workspace.git_ahead_behind,
             tokens: &token_values,
             suppress_git_details: indented,
+            agent_count,
         },
     )
 }

@@ -1076,7 +1076,7 @@
           "key": "ui.sidebar.spaces.rows",
           "type": "list of token rows",
           "default": "[[\"state_icon\", \"workspace\"], [\"branch\", \"git_status\"]]",
-          "description": "Expanded Space sidebar layout. Entries may be token strings or inline { token, fg, bold, dim, rules } style tables. Text-valued built-ins and $name metadata tokens accept up to 16 ordered rules using equals, contains, starts_with, gt, or lt; the first match overrides specified styles. Text conditions optionally accept ignore_case for ASCII matching; numeric conditions require full finite numbers. state_icon and git_status accept fixed styles only. At most 16 rows and 16 tokens per row."
+          "description": "Expanded Space sidebar layout. Entries may be token strings or inline { token, fg, bold, dim, rules } style tables. Text-valued built-ins and $name metadata tokens accept up to 16 ordered rules using equals, contains, starts_with, gt, or lt; the first match overrides specified styles. Text conditions optionally accept ignore_case for ASCII matching; numeric conditions require full finite numbers. state_icon, git_status, and agent_count accept fixed styles only. At most 16 rows and 16 tokens per row. agent_count (live agent panes in the space, including zero; a collapsed worktree group's parent row sums its members) is not in the default rows; set rows = [[\"state_icon\", \"workspace\"], [\"agent_count\", \"branch\", \"git_status\"]] to show it."
         },
         {
           "key": "ui.accent",

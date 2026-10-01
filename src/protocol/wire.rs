@@ -1036,6 +1036,10 @@ pub struct ClientShellWorkspace {
     pub tokens: Vec<(String, String)>,
     pub worktree: Option<ClientShellWorktree>,
     pub focused: bool,
+    /// Live agent panes in this space. `#[serde(default)]` so a newer client attached to an older
+    /// server degrades to "no counts shown" rather than failing to decode the whole snapshot.
+    #[serde(default)]
+    pub agent_count: usize,
     #[serde(deserialize_with = "deserialize_client_shell_agent_status")]
     pub agent_status: crate::api::schema::AgentStatus,
 }
@@ -2717,6 +2721,7 @@ mod tests {
                 tokens: Vec::new(),
                 worktree: None,
                 focused: true,
+                agent_count: 0,
                 agent_status: crate::api::schema::AgentStatus::Idle,
             }],
             tabs: vec![ClientShellTab {

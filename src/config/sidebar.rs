@@ -130,6 +130,7 @@ pub enum SpaceSidebarToken {
     Workspace,
     Branch,
     GitStatus,
+    AgentCount,
     Custom(String),
     Styled {
         token: Box<SpaceSidebarToken>,
@@ -200,7 +201,10 @@ impl RawSidebarToken {
                     return Err("sidebar tokens may contain at most 16 rules".into());
                 }
                 if !token.rules.is_empty()
-                    && matches!(token.token.as_str(), "state_icon" | "git_status")
+                    && matches!(
+                        token.token.as_str(),
+                        "state_icon" | "git_status" | "agent_count"
+                    )
                 {
                     return Err("sidebar rules require a text-valued token".into());
                 }
@@ -291,6 +295,7 @@ fn space_token_name(token: &SpaceSidebarToken) -> String {
         SpaceSidebarToken::Workspace => "workspace".into(),
         SpaceSidebarToken::Branch => "branch".into(),
         SpaceSidebarToken::GitStatus => "git_status".into(),
+        SpaceSidebarToken::AgentCount => "agent_count".into(),
         SpaceSidebarToken::Custom(name) => format!("${name}"),
         SpaceSidebarToken::Styled { token, .. } => space_token_name(token),
     }
@@ -387,6 +392,7 @@ impl<'de> Deserialize<'de> for SpaceSidebarToken {
                 ("workspace", Self::Workspace),
                 ("branch", Self::Branch),
                 ("git_status", Self::GitStatus),
+                ("agent_count", Self::AgentCount),
             ],
         )
         .map_err(serde::de::Error::custom)?;
@@ -646,6 +652,9 @@ rows = [[{ token = "$status", rules = [{ contains = "error", bold = true }] }]]
             ("agents", "state_icon"),
             ("spaces", "state_icon"),
             ("spaces", "git_status"),
+            // Not text-valued either, so a rule on it could never match. Rejecting keeps that
+            // loud instead of silently doing nothing.
+            ("spaces", "agent_count"),
         ] {
             let input = format!(
                 "[{section}]\nrows = [[{{ token = '{token}', rules = [{{ equals = 'x' }}] }}]]"
@@ -659,6 +668,29 @@ rows = [[{ token = "$status", rules = [{ contains = "error", bold = true }] }]]
             let input = format!("[agents]\nrows = [[{{ token = 'machine', rules = [{rules}] }}]]");
             assert_eq!(toml::from_str::<SidebarConfig>(&input).is_ok(), count == 16);
         }
+    }
+
+    #[test]
+    fn parses_and_serializes_the_agent_count_token() {
+        let parsed: crate::config::Config = toml::from_str(
+            r#"[ui.sidebar.spaces]
+rows = [["state_icon", "workspace"], ["agent_count", "branch", "git_status"]]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.ui.sidebar.spaces.rows[1],
+            vec![
+                SpaceSidebarToken::AgentCount,
+                SpaceSidebarToken::Branch,
+                SpaceSidebarToken::GitStatus,
+            ]
+        );
+
+        // Round-trips, so a config Herdr writes back keeps the token rather than dropping it.
+        let emitted = toml::to_string(&parsed.ui.sidebar.spaces).unwrap();
+        let reparsed: SpacesSidebarConfig = toml::from_str(&emitted).unwrap();
+        assert_eq!(reparsed, parsed.ui.sidebar.spaces);
     }
 
     #[test]

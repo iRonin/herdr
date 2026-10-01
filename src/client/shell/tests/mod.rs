@@ -39,6 +39,7 @@ pub(super) fn snapshot() -> ClientShellSnapshot {
             tokens: Vec::new(),
             worktree: None,
             focused: true,
+            agent_count: 0,
             agent_status: AgentStatus::Idle,
         }],
         tabs: vec![ClientShellTab {
@@ -257,4 +258,5 @@ mod link_hover;
 mod mobile;
 mod mouse_selection;
 mod popup_focus_projection;
+mod space_agent_counts;
 mod startup_overlays;

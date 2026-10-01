@@ -115,6 +115,7 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
             is_linked_worktree: true,
         }),
         focused: false,
+        agent_count: 0,
         agent_status: AgentStatus::Idle,
     });
     state.set_snapshot(Box::new(snapshot));
