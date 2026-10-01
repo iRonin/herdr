@@ -1725,6 +1725,7 @@ impl App {
                 );
             }
         }
+        let tokens_reported = tokens.is_some();
         let token_changed = tokens.is_some_and(|tokens| {
             let changed = terminal
                 .metadata_tokens
@@ -1751,8 +1752,17 @@ impl App {
                 ttl,
             });
         }
+        // `auto_read` is level-triggered: every accepted token report that
+        // leaves the token set also covers a completion that already happened
+        // (the token arrived after the pane went idle: a spawn race, or the
+        // re-report after a server restart), so a finished pane becomes read.
+        let auto_read_marked = tokens_reported
+            && self.state.pane_has_auto_read_token(ws_idx, pane_id)
+            && self.state.mark_auto_read_pane_seen_if_done(ws_idx, pane_id);
         if token_changed {
             self.sync_agent_metadata_deadline();
+        }
+        if token_changed || auto_read_marked {
             self.emit_pane_updated(ws_idx, pane_id);
         }
 
@@ -2279,6 +2289,179 @@ mod tests {
         );
         app.state.insert_test_runtime(pane_id, runtime);
         (app, public_pane_id, pane_id)
+    }
+
+    /// A pane in a background tab whose agent finished before any `auto_read`
+    /// token arrived: idle and unread ("done").
+    fn background_finished_pane(toast_delay_seconds: u64) -> (App, PaneId, String) {
+        let (mut app, _) = app_with_test_workspace();
+        let background = app.state.workspaces[0].test_add_tab(Some("background"));
+        let pane_id = app.state.workspaces[0].tabs[background].root_pane;
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.workspaces[0].switch_tab(0);
+        app.state.outer_terminal_focus = Some(true);
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        app.state.toast_config.delay_seconds = toast_delay_seconds;
+        let public_id = app.public_pane_id(0, pane_id).unwrap();
+        auto_read_transition(&mut app, pane_id, AgentState::Working);
+        auto_read_transition(&mut app, pane_id, AgentState::Idle);
+        assert_auto_read_pane(
+            &mut app,
+            &public_id,
+            false,
+            crate::api::schema::AgentStatus::Done,
+        );
+        (app, pane_id, public_id)
+    }
+
+    fn auto_read_transition(app: &mut App, pane_id: PaneId, state: AgentState) {
+        app.handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+    }
+
+    fn assert_auto_read_pane(
+        app: &mut App,
+        pane_id: &str,
+        seen: bool,
+        status: crate::api::schema::AgentStatus,
+    ) {
+        let (ws_idx, internal_id) = app.parse_pane_id(pane_id).unwrap();
+        assert_eq!(
+            app.state.workspaces[ws_idx]
+                .pane_state(internal_id)
+                .unwrap()
+                .seen,
+            seen
+        );
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "get".into(),
+            method: crate::api::schema::Method::PaneGet(PaneTarget {
+                pane_id: pane_id.into(),
+            }),
+        });
+        let response: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneInfo { pane } = response.result else {
+            panic!("expected pane.get response");
+        };
+        assert_eq!(pane.agent_status, status);
+    }
+
+    fn report_token(app: &mut App, pane_id: &str, name: &str, value: Option<&str>) {
+        let mut params = metadata_params(pane_id.to_string());
+        params.title = None;
+        params.source = "user:label-test".into();
+        params.tokens =
+            std::collections::HashMap::from([(name.to_string(), value.map(str::to_string))]);
+        let response = app.handle_pane_report_metadata("token".into(), params);
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+    }
+
+    #[test]
+    fn auto_read_token_arriving_after_completion_marks_the_pane_read() {
+        // The spawn race: the child finished before its reporter sent the token.
+        let (mut app, _, public_id) = background_finished_pane(0);
+        let sequence = app.event_hub.current_sequence();
+        report_token(&mut app, &public_id, "auto_read", Some("1"));
+        assert_auto_read_pane(
+            &mut app,
+            &public_id,
+            true,
+            crate::api::schema::AgentStatus::Idle,
+        );
+        assert!(
+            app.event_hub.current_sequence() > sequence,
+            "clients must hear that the pane became read"
+        );
+    }
+
+    #[test]
+    fn auto_read_token_resent_re_applies_to_a_finished_unread_pane() {
+        // Level-triggered: a token that is already set still applies when the
+        // reporter sends it again, so an unchanged re-send repairs the pane.
+        let (mut app, pane_id, public_id) = background_finished_pane(0);
+        report_token(&mut app, &public_id, "auto_read", Some("1"));
+        app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .seen = false;
+        report_token(&mut app, &public_id, "auto_read", Some("1"));
+        assert_auto_read_pane(
+            &mut app,
+            &public_id,
+            true,
+            crate::api::schema::AgentStatus::Idle,
+        );
+    }
+
+    #[test]
+    fn auto_read_token_leaves_a_blocked_pane_unread() {
+        let (mut app, pane_id, public_id) = background_finished_pane(0);
+        auto_read_transition(&mut app, pane_id, AgentState::Working);
+        auto_read_transition(&mut app, pane_id, AgentState::Blocked);
+        // Upstream marks a pane seen on entering blocked; make it unread so the
+        // token has something it must not touch.
+        app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .seen = false;
+        assert_auto_read_pane(
+            &mut app,
+            &public_id,
+            false,
+            crate::api::schema::AgentStatus::Blocked,
+        );
+        report_token(&mut app, &public_id, "auto_read", Some("1"));
+        assert_auto_read_pane(
+            &mut app,
+            &public_id,
+            false,
+            crate::api::schema::AgentStatus::Blocked,
+        );
+    }
+
+    #[test]
+    fn only_a_set_auto_read_token_marks_a_finished_pane_read() {
+        let (mut app, _, public_id) = background_finished_pane(0);
+        report_token(&mut app, &public_id, "summary", Some("reviewing"));
+        assert_auto_read_pane(
+            &mut app,
+            &public_id,
+            false,
+            crate::api::schema::AgentStatus::Done,
+        );
+        report_token(&mut app, &public_id, "auto_read", None);
+        assert_auto_read_pane(
+            &mut app,
+            &public_id,
+            false,
+            crate::api::schema::AgentStatus::Done,
+        );
+    }
+
+    #[test]
+    fn late_auto_read_token_drops_the_delayed_completion_notification() {
+        let (mut app, pane_id, public_id) = background_finished_pane(30);
+        assert!(
+            app.state.pending_agent_notifications.contains_key(&pane_id),
+            "the completion must be waiting out the toast delay"
+        );
+        report_token(&mut app, &public_id, "auto_read", Some("1"));
+        assert!(!app.state.pending_agent_notifications.contains_key(&pane_id));
+        assert_auto_read_pane(
+            &mut app,
+            &public_id,
+            true,
+            crate::api::schema::AgentStatus::Idle,
+        );
     }
 
     fn metadata_params(pane_id: String) -> PaneReportMetadataParams {

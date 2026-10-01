@@ -6858,6 +6858,532 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
     );
 }
 
+/// A client-visible notification captured from a test client's control
+/// channel: semantic notifications (client shells) and notify messages
+/// (foreground client: sounds and toasts).
+#[derive(Debug, Clone, PartialEq)]
+enum ClientNotification {
+    Semantic {
+        kind: protocol::SemanticNotificationKind,
+        title: String,
+        sound: Option<protocol::SemanticNotificationSound>,
+    },
+    Notify {
+        kind: protocol::NotifyKind,
+        message: String,
+    },
+}
+
+impl ClientNotification {
+    fn finished_semantic(&self) -> bool {
+        matches!(
+            self,
+            Self::Semantic {
+                kind: protocol::SemanticNotificationKind::Finished,
+                ..
+            }
+        )
+    }
+
+    fn done_sound(&self) -> bool {
+        matches!(
+            self,
+            Self::Notify {
+                kind: protocol::NotifyKind::Sound,
+                message,
+            } if message == "agent done"
+        )
+    }
+
+    fn finished_toast(&self) -> bool {
+        matches!(
+            self,
+            Self::Notify {
+                kind: protocol::NotifyKind::SystemToast | protocol::NotifyKind::Toast,
+                message,
+            } if message.contains("finished")
+        )
+    }
+}
+
+/// Drains every pending client message, keeping only notification lanes.
+/// Sends are synchronous inside the driving call, so a 50 ms quiet gap
+/// means the channel is genuinely empty.
+fn drain_client_notifications(
+    control_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+) -> Vec<ClientNotification> {
+    let mut seen = Vec::new();
+    while let Ok(bytes) = control_rx.recv_timeout(Duration::from_millis(50)) {
+        match read_server_message(bytes) {
+            ServerMessage::SemanticNotification(notification) => {
+                seen.push(ClientNotification::Semantic {
+                    kind: notification.kind,
+                    title: notification.title,
+                    sound: notification.sound,
+                });
+            }
+            ServerMessage::Notify { kind, message, .. } => {
+                seen.push(ClientNotification::Notify { kind, message });
+            }
+            _ => {}
+        }
+    }
+    seen
+}
+
+/// Shared scaffolding for the auto_read forwarding tests: a background
+/// workspace whose pane's agent is Working, a foreground workspace, and one
+/// connected shell client that is also the foreground client (so it receives
+/// both the semantic and the sound/toast lanes).
+struct AutoReadForwardingFixture {
+    server: HeadlessServer,
+    pane_id: crate::layout::PaneId,
+    terminal_id: crate::terminal::TerminalId,
+    client_control_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+fn auto_read_forwarding_fixture(tag: &str, auto_read: bool) -> AutoReadForwardingFixture {
+    let mut server = test_headless_server();
+    let background = crate::workspace::Workspace::test_new(tag);
+    let pane_id = background.tabs[0].root_pane;
+    let foreground = crate::workspace::Workspace::test_new("foreground");
+    server.app.state.workspaces = vec![background, foreground];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(1);
+    server.app.state.selected = 1;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    server.app.state.toast_config.delivery = crate::config::ToastDelivery::System;
+    server.app.state.toast_config.delay_seconds = 0;
+    server.app.state.sound.enabled = true;
+
+    let terminal_id = server.app.state.workspaces[0]
+        .pane_state(pane_id)
+        .unwrap()
+        .attached_terminal_id
+        .clone();
+    if auto_read {
+        let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([("auto_read".to_string(), Some("1".to_string()))]),
+            None,
+            Instant::now(),
+        );
+    }
+
+    let (client_tx, client_control_rx, _render_rx) = test_client_writer();
+    server.clients.insert(
+        1,
+        ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(client_tx),
+        ),
+    );
+    server.foreground_client_id = Some(1);
+    server.sync_foreground_client_state();
+    // Discard the attach/snapshot traffic so the assertions below see only
+    // what the driven transition forwards.
+    while client_control_rx
+        .recv_timeout(Duration::from_millis(20))
+        .is_ok()
+    {}
+
+    AutoReadForwardingFixture {
+        server,
+        pane_id,
+        terminal_id,
+        client_control_rx,
+    }
+}
+
+/// AppEvent::StateChanged route (detector-driven state changes).
+fn state_changed_completion_notifications(
+    auto_read: bool,
+) -> (crate::detect::AgentState, Vec<ClientNotification>) {
+    let mut fixture = auto_read_forwarding_fixture("auto-read-state-changed", auto_read);
+    fixture
+        .server
+        .app
+        .state
+        .terminals
+        .get_mut(&fixture.terminal_id)
+        .unwrap()
+        .state = crate::detect::AgentState::Working;
+
+    assert!(fixture
+        .server
+        .handle_internal_event_with_forwarding(AppEvent::StateChanged {
+            pane_id: fixture.pane_id,
+            agent: Some(crate::detect::Agent::Pi),
+            state: crate::detect::AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        }));
+
+    let state_after = fixture
+        .server
+        .app
+        .state
+        .terminals
+        .get(&fixture.terminal_id)
+        .unwrap()
+        .state;
+    (
+        state_after,
+        drain_client_notifications(&fixture.client_control_rx),
+    )
+}
+
+/// AppEvent::HookStateReported route (hook-reported state changes).
+fn hook_report_completion_notifications(
+    auto_read: bool,
+) -> (crate::detect::AgentState, Vec<ClientNotification>) {
+    let mut fixture = auto_read_forwarding_fixture("auto-read-hook-report", auto_read);
+    fixture
+        .server
+        .app
+        .state
+        .terminals
+        .get_mut(&fixture.terminal_id)
+        .unwrap()
+        .state = crate::detect::AgentState::Working;
+
+    assert!(fixture
+        .server
+        .handle_internal_event_with_forwarding(AppEvent::HookStateReported {
+            pane_id: fixture.pane_id,
+            source: "custom:test".into(),
+            agent_label: "pi".into(),
+            state: crate::detect::AgentState::Idle,
+            message: None,
+            seq: None,
+            session_ref: None,
+        }));
+
+    let state_after = fixture
+        .server
+        .app
+        .state
+        .terminals
+        .get(&fixture.terminal_id)
+        .unwrap()
+        .state;
+    (
+        state_after,
+        drain_client_notifications(&fixture.client_control_rx),
+    )
+}
+
+/// `pane.report_agent` route (the normal completion route for reporter-driven
+/// agents — exactly the panes auto_read targets). The report lands as an
+/// internal `HookStateReported` handled INSIDE the API request, so its
+/// notifications ride the request loop's re-derivation — the loop that
+/// ignores `PaneStateUpdate.suppress_completion` entirely. A non-lifecycle
+/// source (`custom:test`) keeps acceptance free of the full-lifecycle
+/// anchoring gates a synthetic pane cannot satisfy.
+fn report_agent_completion_notifications(
+    auto_read: bool,
+) -> (crate::detect::AgentState, Vec<ClientNotification>) {
+    let mut fixture = auto_read_forwarding_fixture("auto-read-report-agent", auto_read);
+    let public_pane_id = format!("{}:p1", fixture.server.app.state.workspaces[0].id);
+    fixture
+        .server
+        .app
+        .state
+        .terminals
+        .get_mut(&fixture.terminal_id)
+        .unwrap()
+        .state = crate::detect::AgentState::Working;
+
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    let changed = fixture
+        .server
+        .handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: "auto-read-idle".into(),
+                method: api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
+                    pane_id: public_pane_id,
+                    source: "custom:test".into(),
+                    agent: "pi".into(),
+                    state: api::schema::PaneAgentState::Idle,
+                    message: None,
+                    seq: None,
+                    agent_session_id: None,
+                    agent_session_path: None,
+                }),
+            },
+            respond_to,
+            response_write_complete: None,
+            stream_active: None,
+        });
+    assert!(changed);
+    assert!(response_rx.recv_timeout(Duration::from_millis(100)).is_ok());
+
+    let state_after = fixture
+        .server
+        .app
+        .state
+        .terminals
+        .get(&fixture.terminal_id)
+        .unwrap()
+        .state;
+    (
+        state_after,
+        drain_client_notifications(&fixture.client_control_rx),
+    )
+}
+
+/// AppEvent::PaneDied route (hard-killed agent → final Idle transition via
+/// `publish_pane_process_exit_if_agent`). Hook authority keeps the agent
+/// claimable by the exit publisher. A second pane keeps the workspace alive:
+/// killing a workspace's only pane tears the workspace down. Async because
+/// pane-death handling touches the tokio runtime (pane.rs runtime teardown);
+/// the pane's terminal is torn down with it, so the helper returns only the
+/// client-visible notifications — the without-token control of this pair
+/// proves the same scenario forwards the completion when the token is absent.
+async fn pane_death_completion_notifications(auto_read: bool) -> Vec<ClientNotification> {
+    let mut server = test_headless_server();
+    let mut background = crate::workspace::Workspace::test_new("auto-read-pane-death");
+    let pane_id = background.tabs[0].root_pane;
+    let survivor_pane = background.test_split(ratatui::layout::Direction::Vertical);
+    background.insert_test_runtime(
+        pane_id,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+    );
+    background.insert_test_runtime(
+        survivor_pane,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+    );
+    let foreground = crate::workspace::Workspace::test_new("foreground");
+    server.app.state.workspaces = vec![background, foreground];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(1);
+    server.app.state.selected = 1;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    server.app.state.toast_config.delivery = crate::config::ToastDelivery::System;
+    server.app.state.toast_config.delay_seconds = 0;
+    server.app.state.sound.enabled = true;
+
+    let terminal_id = server.app.state.workspaces[0]
+        .pane_state(pane_id)
+        .unwrap()
+        .attached_terminal_id
+        .clone();
+    {
+        let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_hook_authority(
+            "custom:test".into(),
+            "pi".into(),
+            crate::detect::AgentState::Working,
+            None,
+            Some(20),
+        );
+        if auto_read {
+            terminal.metadata_tokens.patch(
+                std::collections::HashMap::from([("auto_read".to_string(), Some("1".to_string()))]),
+                None,
+                Instant::now(),
+            );
+        }
+    }
+
+    let (client_tx, client_control_rx, _render_rx) = test_client_writer();
+    server.clients.insert(
+        1,
+        ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(client_tx),
+        ),
+    );
+    server.foreground_client_id = Some(1);
+    server.sync_foreground_client_state();
+    while client_control_rx
+        .recv_timeout(Duration::from_millis(20))
+        .is_ok()
+    {}
+
+    assert!(
+        server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+            pane_id,
+            exit_reason: crate::platform::ChildExitReason::Exited,
+        })
+    );
+
+    drain_client_notifications(&client_control_rx)
+}
+
+#[test]
+fn auto_read_state_changed_completion_sends_no_client_notifications() {
+    let (state_after, notes) = state_changed_completion_notifications(true);
+    assert_eq!(
+        state_after,
+        crate::detect::AgentState::Idle,
+        "the completion must still happen — only its notification is suppressed"
+    );
+    assert!(
+        notes.is_empty(),
+        "auto_read completion must raise no semantic/sound/toast notification: {notes:?}"
+    );
+}
+
+#[test]
+fn state_changed_completion_notifies_clients_without_token() {
+    let (state_after, notes) = state_changed_completion_notifications(false);
+    assert_eq!(state_after, crate::detect::AgentState::Idle);
+    assert!(
+        notes.iter().any(|note| note.finished_semantic()),
+        "control: a token-less completion must reach the Finished semantic lane, got {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note.done_sound()),
+        "control: a token-less completion must reach the Done sound lane"
+    );
+    assert!(
+        notes.iter().any(|note| note.finished_toast()),
+        "control: a token-less completion must reach the finished toast lane"
+    );
+}
+
+#[test]
+fn auto_read_hook_report_completion_sends_no_client_notifications() {
+    let (state_after, notes) = hook_report_completion_notifications(true);
+    assert_eq!(
+        state_after,
+        crate::detect::AgentState::Idle,
+        "the completion must still happen — only its notification is suppressed"
+    );
+    assert!(
+        notes.is_empty(),
+        "auto_read hook-reported completion must raise no notification: {notes:?}"
+    );
+}
+
+#[test]
+fn hook_report_completion_notifies_clients_without_token() {
+    let (state_after, notes) = hook_report_completion_notifications(false);
+    assert_eq!(state_after, crate::detect::AgentState::Idle);
+    assert!(
+        notes.iter().any(|note| note.finished_semantic()),
+        "control: a token-less hook completion must reach the Finished semantic lane, got {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note.done_sound()),
+        "control: a token-less hook completion must reach the Done sound lane"
+    );
+}
+
+#[test]
+fn auto_read_report_agent_completion_sends_no_client_notifications() {
+    // `pane.report_agent` idle is the NORMAL completion route for reporter-
+    // driven agents — exactly the panes auto_read targets. The API request
+    // loop re-derives notifications from the raw effective transition and
+    // must honor the token like every other surface.
+    let (state_after, notes) = report_agent_completion_notifications(true);
+    assert_eq!(
+        state_after,
+        crate::detect::AgentState::Idle,
+        "the report must be accepted (fresh seq) so the completion really fired"
+    );
+    assert!(
+        notes.is_empty(),
+        "auto_read reported completion must raise no semantic/sound/toast notification: {notes:?}"
+    );
+}
+
+#[test]
+fn report_agent_completion_notifies_clients_without_token() {
+    let (state_after, notes) = report_agent_completion_notifications(false);
+    assert_eq!(state_after, crate::detect::AgentState::Idle);
+    assert!(
+        notes.iter().any(|note| note.finished_semantic()),
+        "control: a token-less reported completion must reach the Finished semantic lane, got {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note.done_sound()),
+        "control: a token-less reported completion must reach the Done sound lane"
+    );
+    assert!(
+        notes.iter().any(|note| note.finished_toast()),
+        "control: a token-less reported completion must reach the finished toast lane"
+    );
+}
+
+#[tokio::test]
+async fn auto_read_pane_death_sends_no_client_notifications() {
+    // A hard-killed auto_read sub-agent's final transition must not notify.
+    // The without-token control of this pair proves the same scenario
+    // forwards the completion when the token is absent.
+    let notes = pane_death_completion_notifications(true).await;
+    assert!(
+        notes.is_empty(),
+        "auto_read pane death must raise no semantic/sound/toast notification: {notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn pane_death_completion_notifies_clients_without_token() {
+    let notes = pane_death_completion_notifications(false).await;
+    assert!(
+        notes.iter().any(|note| note.finished_semantic()),
+        "control: a token-less pane death must reach the Finished semantic lane, got {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note.done_sound()),
+        "control: a token-less pane death must reach the Done sound lane"
+    );
+}
+
+#[test]
+fn auto_read_blocked_transition_still_notifies_clients() {
+    // auto_read suppresses COMPLETION noise only: a blocked transition on a
+    // token-carrying pane must still raise the needs-attention semantic and
+    // the request sound on the server→client surfaces.
+    let mut fixture = auto_read_forwarding_fixture("auto-read-blocked", true);
+    fixture
+        .server
+        .app
+        .state
+        .terminals
+        .get_mut(&fixture.terminal_id)
+        .unwrap()
+        .state = crate::detect::AgentState::Working;
+
+    assert!(fixture
+        .server
+        .handle_internal_event_with_forwarding(AppEvent::StateChanged {
+            pane_id: fixture.pane_id,
+            agent: Some(crate::detect::Agent::Pi),
+            state: crate::detect::AgentState::Blocked,
+            visible_blocker: true,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        }));
+
+    let notes = drain_client_notifications(&fixture.client_control_rx);
+    assert!(
+        notes.iter().any(|note| matches!(
+            note,
+            ClientNotification::Semantic {
+                kind: protocol::SemanticNotificationKind::NeedsAttention,
+                ..
+            }
+        )),
+        "a blocked transition on an auto_read pane must still notify: {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| matches!(note, ClientNotification::Notify { kind: protocol::NotifyKind::Sound, message } if message == "agent attention")),
+        "a blocked transition on an auto_read pane must still raise the request sound: {notes:?}"
+    );
+}
+
 /// Verify that calls to the app's internal-event methods only occur inside
 /// `handle_internal_event_with_forwarding`. This ensures the forwarding
 /// bypass cannot be reintroduced.
