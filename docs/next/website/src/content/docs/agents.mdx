@@ -138,6 +138,20 @@ herdr pane report-metadata w1:p1 \
 
 Agent sidebar rows can also opt into `terminal_title` or `terminal_title_stripped`; neither appears in the default rows. The first shows the latest safety-normalized OSC 0/2 terminal title. The second removes one recognized leading activity or spinner glyph and following whitespace. Herdr owns these values on the server; they are ephemeral across a cold restart and remain independent of metadata titles and semantic agent state. Spinner animation can therefore update the raw title without producing a pane update when the stripped text stays the same.
 
+## Auto-read agents
+
+Some agents read their own output — an unattended supervised sub-agent whose parent aggregates the results, for example. Such an agent can declare that its completions need no attention, per pane, by reporting the `auto_read` metadata token:
+
+```bash
+herdr pane report-metadata w1:p1 \
+  --source my-agent-hook \
+  --token auto_read=1
+```
+
+The token is presence-only — the value is a placeholder. An integration reports it with `herdr pane report-metadata ... --token auto_read=1` or the socket API's `pane.report_metadata`, and clears it with `--clear-token auto_read`. It is opt-in per pane: a pane without the token behaves exactly as before, and there is no config key — the agent side decides, pane by pane, which completions are unattended.
+
+While the token is present, a completion of that pane's agent marks the pane as already read instead of unread — every surface that distinguishes read from unread, such as the sidebar and tab marks, shows the read variant — and raises no finished toast and no done sound, on any attached client. Blocked transitions are never suppressed: a blocked agent still demands attention even on a pane carrying the token. Clearing the token restores normal completion behavior from the next transition.
+
 ## Attach directly to an agent
 
 Attach your current terminal to one agent terminal instead of the full Herdr UI:
