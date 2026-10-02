@@ -477,6 +477,15 @@ enum SubmissionBoundary {
     Enter,
 }
 
+/// How a held signal byte is delivered when writing it fails: the matching signal through
+/// ioctl(TIOCSIG), or the output flow toggle through ioctl(TIOCSTART/TIOCSTOP).
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+enum HeldSignalAction {
+    Signal(libc::c_int),
+    Flow(libc::c_ulong),
+}
+
 enum SubmissionPhase {
     WritingText,
     WaitingUntil(Instant),
@@ -949,7 +958,11 @@ impl PtyIoActorRunner {
                         }
                     }
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    #[cfg(target_os = "macos")]
+                    self.bypass_held_signal_chars();
+                    return Ok(None);
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return Ok(None),
                 Err(err) => {
                     warn!(pane = self.pane_id, err = %err, "PTY actor write failed");
@@ -961,6 +974,136 @@ impl PtyIoActorRunner {
         }
         self.file.flush()?;
         Ok(None)
+    }
+
+    /// macOS: a pty refuses every byte once about 1 KiB of input is unread, so a signal
+    /// character queued behind held input would never reach the kernel and the program
+    /// could not be interrupted. Apply the kernel's own rules to the held bytes: a signal
+    /// character (VINTR/VQUIT/VSUSP with ISIG set and EXTPROC clear) is delivered at once,
+    /// out of band, and the held bytes before it are dropped unless NOFLSH, mirroring the
+    /// kernel's flush. The byte is written directly; if the pty still refuses it,
+    /// ioctl(TIOCSIG) signals the foreground process group (and flushes the same way).
+    /// VSTART/VSTOP with IXON never enter the kernel's input queue, so they are moved
+    /// ahead of the backlog, with TIOCSTART/TIOCSTOP as the fallback. Everything else
+    /// keeps its order.
+    #[cfg(target_os = "macos")]
+    fn bypass_held_signal_chars(&mut self) {
+        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+        if unsafe { libc::tcgetattr(self.file.as_raw_fd(), &mut termios) } != 0 {
+            return;
+        }
+        const VDISABLE: libc::cc_t = 0xff;
+        let noflush = termios.c_lflag & libc::NOFLSH != 0;
+        let isig = termios.c_lflag & libc::ISIG != 0 && termios.c_lflag & libc::EXTPROC == 0;
+        let signals: [(libc::cc_t, libc::c_int); 3] = if isig {
+            [
+                (termios.c_cc[libc::VINTR], libc::SIGINT),
+                (termios.c_cc[libc::VQUIT], libc::SIGQUIT),
+                (termios.c_cc[libc::VSUSP], libc::SIGTSTP),
+            ]
+        } else {
+            [(VDISABLE, 0); 3]
+        };
+        // IXON is an input flag (c_iflag); the same bit in c_lflag is ALTWERASE.
+        let flows: [(libc::cc_t, libc::c_ulong); 2] = if termios.c_iflag & libc::IXON != 0 {
+            [
+                (termios.c_cc[libc::VSTART], libc::TIOCSTART as libc::c_ulong),
+                (termios.c_cc[libc::VSTOP], libc::TIOCSTOP as libc::c_ulong),
+            ]
+        } else {
+            [(VDISABLE, 0); 2]
+        };
+
+        let mut found: Option<(usize, usize, HeldSignalAction)> = None;
+        'held: for (write_idx, write) in self.pending_writes.iter().enumerate() {
+            let start = if write_idx == 0 {
+                self.current_write_offset
+            } else {
+                0
+            };
+            for (byte_idx, byte) in write.bytes[start..].iter().enumerate() {
+                if let Some((_, sig)) = signals.iter().find(|(ch, _)| *ch != VDISABLE && ch == byte)
+                {
+                    found = Some((write_idx, start + byte_idx, HeldSignalAction::Signal(*sig)));
+                    break 'held;
+                }
+                if let Some((_, request)) =
+                    flows.iter().find(|(ch, _)| *ch != VDISABLE && ch == byte)
+                {
+                    found = Some((
+                        write_idx,
+                        start + byte_idx,
+                        HeldSignalAction::Flow(*request),
+                    ));
+                    break 'held;
+                }
+            }
+        }
+        let Some((write_idx, byte_idx, action)) = found else {
+            return;
+        };
+        let byte = self.pending_writes[write_idx].bytes[byte_idx];
+
+        // Remove the byte from the held input, plus everything held before it when the
+        // kernel would flush on the signal character.
+        let drop_preceding = matches!(action, HeldSignalAction::Signal(_)) && !noflush;
+        let mut dropped_boundaries = Vec::new();
+        let target_idx = if drop_preceding {
+            for _ in 0..write_idx {
+                if let Some(boundary) = self.pending_writes.pop_front().unwrap().boundary {
+                    dropped_boundaries.push(boundary);
+                }
+            }
+            self.current_write_offset = 0;
+            0
+        } else {
+            write_idx
+        };
+        {
+            let write = &mut self.pending_writes[target_idx];
+            write.bytes = if drop_preceding {
+                Bytes::copy_from_slice(&write.bytes[byte_idx + 1..])
+            } else {
+                let mut bytes = write.bytes[..byte_idx].to_vec();
+                bytes.extend_from_slice(&write.bytes[byte_idx + 1..]);
+                Bytes::from(bytes)
+            };
+        }
+        // A write that held only the byte is done; never leave an empty write, whose
+        // zero-byte write attempt would read as a write error.
+        if self.pending_writes[target_idx].bytes.is_empty() {
+            if let Some(boundary) = self.pending_writes.remove(target_idx).unwrap().boundary {
+                dropped_boundaries.push(boundary);
+            }
+            if target_idx == 0 {
+                self.current_write_offset = 0;
+            }
+        }
+
+        // Deliver the byte now; if the pty still refuses it (or writes nothing), use the
+        // ioctl fallback.
+        let direct = self.file.write(&[byte]);
+        if !matches!(direct, Ok(1)) {
+            let rc = unsafe {
+                match action {
+                    HeldSignalAction::Signal(sig) => {
+                        libc::ioctl(self.file.as_raw_fd(), libc::TIOCSIG as libc::c_ulong, sig)
+                    }
+                    HeldSignalAction::Flow(request) => libc::ioctl(self.file.as_raw_fd(), request),
+                }
+            };
+            if rc != 0 {
+                warn!(pane = self.pane_id, err = %std::io::Error::last_os_error(),
+                    direct = ?direct, "PTY signal-character bypass failed");
+            }
+        }
+        debug!(
+            pane = self.pane_id,
+            byte, "held signal character delivered out of band"
+        );
+        for boundary in dropped_boundaries {
+            self.complete_submission_boundary(boundary);
+        }
     }
 
     fn resize(&self, resize: PtyResize) {
