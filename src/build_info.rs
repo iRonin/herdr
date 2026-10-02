@@ -24,6 +24,12 @@ pub fn is_preview() -> bool {
     channel() == "preview"
 }
 
+/// Whether this binary is a fork build. The upstream update feed publishes
+/// stock Herdr releases, so a fork build must never replace itself through
+/// it: `herdr update` would silently drop every fork feature. Fork releases
+/// are built from source instead.
+pub const FORK_BUILD: bool = true;
+
 fn non_empty(value: Option<&'static str>) -> Option<&'static str> {
     value.and_then(|value| {
         let trimmed = value.trim();
