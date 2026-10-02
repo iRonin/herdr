@@ -614,6 +614,13 @@ fn main() -> io::Result<()> {
     }
 
     if args.get(1).map(|s| s.as_str()) == Some("update") {
+        // The fork build has no `herdr update`: the upstream feed would
+        // replace this binary with stock Herdr. Refuse before parsing
+        // arguments, checking the channel, or touching anything on disk.
+        if let Some(message) = update::fork_update_refusal() {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
         let options = match update::parse_self_update_args(&args[2..]) {
             Ok(options) => options,
             Err(err) if err.starts_with("usage:") => {

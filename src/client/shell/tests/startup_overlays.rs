@@ -741,7 +741,21 @@ fn update_ready_menu_opens_client_owned_release_notes_and_dismisses_by_version()
         .join("\n");
     assert!(text.contains("v0.8.3"));
     assert!(text.contains("update ready"));
-    assert!(text.contains("detach, run herdr update"));
+    // The fork's notice names upstream's release and the fork's follow-up
+    // instead of telling the user to run `herdr update`. The modal wraps the
+    // notice between "own" and "release", so assert the two row fragments
+    // the wrapped render actually shows (the failure message dumps the text).
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        normalized
+            .contains("upstream Herdr released this version; the iRonin fork follows in its own"),
+        "release notes text: {normalized}"
+    );
+    assert!(
+        normalized.contains("release (built from source)"),
+        "release notes text: {normalized}"
+    );
+    assert!(!normalized.contains("detach, run herdr update"));
     assert!(!state.hits.release_notes_scrollbar.is_empty());
     let outer = crate::ui::centered_popup_rect(
         Rect::new(0, 0, 106, 30),

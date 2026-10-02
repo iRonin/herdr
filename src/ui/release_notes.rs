@@ -307,13 +307,18 @@ mod tests {
         assert_eq!(line_text(&lines[0]), " ● update ready");
         assert_eq!(
             line_text(&lines[1]),
-            " detach, run herdr update, then run Herdr again to reconnect"
+            " upstream Herdr released this version; the iRonin fork follows in its own release (built from source)"
         );
         assert_eq!(lines[0].spans[1].style.fg, Some(palette.accent));
         assert_eq!(lines[0].spans[2].style.fg, Some(palette.text));
-        assert_eq!(lines[1].spans[2].content.as_ref(), "herdr update");
-        assert_eq!(lines[1].spans[2].style.fg, Some(palette.accent));
-        assert_eq!(lines[1].spans[2].style.bg, Some(palette.surface0));
+        // The fork notice carries no inline code, so it renders as one plain
+        // text span after the leading space.
+        assert_eq!(lines[1].spans.len(), 2);
+        assert_eq!(
+            lines[1].spans[1].content.as_ref(),
+            "upstream Herdr released this version; the iRonin fork follows in its own release (built from source)"
+        );
+        assert_eq!(lines[1].spans[1].style.fg, Some(palette.text));
     }
 
     #[test]
@@ -331,7 +336,7 @@ mod tests {
         assert_eq!(line_text(&lines[0].1), " ● update ready");
         assert_eq!(
             line_text(&lines[1].1),
-            " detach, run herdr update, then run Herdr again to reconnect"
+            " upstream Herdr released this version; the iRonin fork follows in its own release (built from source)"
         );
         assert_eq!(line_text(&lines[2].1), "");
         assert_eq!(line_text(&lines[3].1), " ADDED");

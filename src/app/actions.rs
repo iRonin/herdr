@@ -4511,10 +4511,14 @@ mod tests {
         let toast = state.toast.as_ref().expect("update toast");
         assert_eq!(toast.kind, ToastKind::UpdateInstalled);
         assert_eq!(toast.title, "v0.5.0 available");
+        // On the iRonin fork the notice names upstream's release and the
+        // fork's own follow-up instead of telling the user to run
+        // `herdr update`, which would replace the fork with upstream Herdr.
         assert_eq!(
             toast.context,
-            "detach, run `herdr update`, then run Herdr again to reconnect"
+            "upstream Herdr released this version; the iRonin fork follows in its own release (built from source)"
         );
+        assert!(!toast.context.contains("run `herdr update`"));
     }
 
     #[test]

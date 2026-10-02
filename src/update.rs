@@ -682,6 +682,13 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
 
 #[cfg(not(windows))]
 fn install_downloaded_update(mut update: DownloadedUpdate) -> Result<(), String> {
+    // Defense in depth behind the `self_update` guard: nothing may rename a
+    // downloaded release over this binary on a fork build. Returning early
+    // drops `update`, whose `Drop` removes the staged temp file.
+    if let Some(message) = fork_update_refusal() {
+        return Err(message.to_string());
+    }
+
     let tmp_path = update
         .tmp_path
         .take()
@@ -749,6 +756,12 @@ fn install_windows_update_with_installer(
     release: &ReleaseInfo,
     update: &DownloadedWindowsUpdate,
 ) -> Result<(), String> {
+    // Defense in depth behind the `self_update` guard: the Windows installer
+    // replaces the installed binary, so it must never run on a fork build.
+    if let Some(message) = fork_update_refusal() {
+        return Err(message.to_string());
+    }
+
     let expected_sha256 = release
         .sha256
         .as_deref()
@@ -1899,6 +1912,11 @@ pub(crate) fn update_install_command() -> &'static str {
 pub(crate) fn update_install_instruction(install_command: &str) -> String {
     match install_command {
         HERDR_UPDATE_COMMAND => {
+            // On the fork, `herdr update` refuses, so the notice must not
+            // tell the user to run it.
+            if let Some(notice) = fork_update_notice() {
+                return notice.to_string();
+            }
             "detach, run `herdr update`, then run Herdr again to reconnect".to_string()
         }
         HOMEBREW_UPDATE_COMMAND => {
@@ -2108,8 +2126,45 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Why `herdr update` refuses on fork builds. The update feed publishes
+/// stock Herdr releases, so a self-update would replace this binary with
+/// upstream Herdr and silently drop every fork feature. Fork releases are
+/// built from source instead.
+pub(crate) const FORK_UPDATE_REFUSAL: &str = "this herdr is the iRonin fork: `herdr update` would replace it with the upstream Herdr release and drop the fork's features; get the fork's next release instead (built from source)";
+
+/// The update notice fork builds show wherever upstream's guidance would say
+/// to run `herdr update` (the update toast, the release-notes preview, and
+/// forwarded client notifications).
+pub(crate) const FORK_UPDATE_NOTICE: &str = "upstream Herdr released this version; the iRonin fork follows in its own release (built from source)";
+
+/// The refusal `herdr update` prints on fork builds, or `None` on a stock
+/// build. Returned through a function so call sites branch on a value the
+/// compiler cannot fold away.
+pub(crate) fn fork_update_refusal() -> Option<&'static str> {
+    if crate::build_info::FORK_BUILD {
+        Some(FORK_UPDATE_REFUSAL)
+    } else {
+        None
+    }
+}
+
+fn fork_update_notice() -> Option<&'static str> {
+    if crate::build_info::FORK_BUILD {
+        Some(FORK_UPDATE_NOTICE)
+    } else {
+        None
+    }
+}
+
 /// Manual self-update command (`herdr update`).
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+    // The fork never self-updates: the feed's release would replace this
+    // binary with stock Herdr. Refuse before every environment-dependent
+    // step so the outcome is identical wherever the command runs.
+    if let Some(message) = fork_update_refusal() {
+        return Err(message.to_string());
+    }
+
     let channel = UpdateChannel::configured();
 
     if is_homebrew_managed_install() {
@@ -2399,6 +2454,7 @@ fn platform_target() -> (&'static str, &'static str) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -2410,6 +2466,95 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Points THIS process's environment into a throwaway sandbox (HOME,
+    /// XDG_*, TMPDIR inside a temp dir, a fake `curl` first on PATH that
+    /// logs every invocation and fails, and no HERDR_* variables) so a test
+    /// may call the real updater in-process: if its guard is ever lost, the
+    /// call dies at the sandboxed manifest fetch instead of reaching the
+    /// network, a running server, or a real binary. Every touched variable
+    /// is restored on drop, including after a panic; the sandbox dir is kept
+    /// when dropping during a panic so the failure evidence survives.
+    struct ProcessEnvSandbox {
+        dir: std::path::PathBuf,
+        saved: Vec<(String, Option<std::ffi::OsString>)>,
+    }
+
+    impl ProcessEnvSandbox {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("herdr-update-test-{tag}-{}", std::process::id()));
+            for sub in ["home", "config", "state", "run", "tmp", "bin"] {
+                std::fs::create_dir_all(dir.join(sub)).expect("create sandbox dir");
+            }
+            let curl = dir.join("bin/curl");
+            std::fs::write(
+                &curl,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 22\n",
+                    dir.join("curl.log").display()
+                ),
+            )
+            .expect("write fake curl");
+            std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755))
+                .expect("make fake curl executable");
+
+            let mut saved = Vec::new();
+            for key in [
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_STATE_HOME",
+                "XDG_RUNTIME_DIR",
+                "TMPDIR",
+                "PATH",
+            ] {
+                saved.push((key.to_string(), std::env::var_os(key)));
+            }
+            let herdr_keys: Vec<String> = std::env::vars_os()
+                .map(|(key, _)| key.to_string_lossy().into_owned())
+                .filter(|key| key.starts_with("HERDR_"))
+                .collect();
+            for key in herdr_keys {
+                saved.push((key.clone(), std::env::var_os(&key)));
+                std::env::remove_var(&key);
+            }
+            std::env::set_var("HOME", dir.join("home"));
+            std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
+            std::env::set_var("XDG_STATE_HOME", dir.join("state"));
+            std::env::set_var("XDG_RUNTIME_DIR", dir.join("run"));
+            std::env::set_var("TMPDIR", dir.join("tmp"));
+            std::env::set_var(
+                "PATH",
+                format!("{}:/usr/bin:/bin", dir.join("bin").display()),
+            );
+
+            Self { dir, saved }
+        }
+
+        fn curl_was_called(&self) -> bool {
+            self.dir.join("curl.log").exists()
+        }
+
+        fn curl_log(&self) -> String {
+            std::fs::read_to_string(self.dir.join("curl.log")).unwrap_or_default()
+        }
+    }
+
+    impl Drop for ProcessEnvSandbox {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            if std::thread::panicking() {
+                eprintln!("sandbox kept for inspection: {}", self.dir.display());
+            } else {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
     }
 
     fn unique_test_socket_path(name: &str) -> std::path::PathBuf {
@@ -2755,7 +2900,7 @@ mod tests {
     fn update_install_instruction_distinguishes_install_from_restart() {
         assert_eq!(
             update_install_instruction(HERDR_UPDATE_COMMAND),
-            "detach, run `herdr update`, then run Herdr again to reconnect"
+            "upstream Herdr released this version; the iRonin fork follows in its own release (built from source)"
         );
         assert_eq!(
             update_install_instruction(HOMEBREW_UPDATE_COMMAND),
@@ -2764,6 +2909,78 @@ mod tests {
         assert_eq!(
             update_install_instruction(MISE_UPDATE_COMMAND),
             "detach, run `mise upgrade herdr`, then run Herdr again to reconnect"
+        );
+    }
+
+    #[test]
+    fn self_update_refuses_on_fork_build_before_any_download() {
+        let _env = env_lock().lock().unwrap();
+        // The real `self_update` runs in this process, so the call must be
+        // safe even if the guard is ever lost (for example by a rebase
+        // conflict resolution dropping one line): the process environment is
+        // sandboxed, and an unguarded run would die at the fake manifest
+        // fetch instead of reaching the network, a running server, or a real
+        // binary.
+        let sandbox = ProcessEnvSandbox::new("self-update");
+
+        let error = self_update(SelfUpdateOptions::default())
+            .expect_err("self-update must refuse on the fork build");
+
+        assert!(
+            !sandbox.curl_was_called(),
+            "the refusal must fire before the update feed is contacted; curl saw: {}",
+            sandbox.curl_log()
+        );
+        // The refusal must also fire before every environment-dependent step
+        // (package-manager detection, the inside-herdr check, the channel
+        // lookup), so the outcome is the same whatever surrounding the test
+        // binary runs in.
+        assert_eq!(
+            error,
+            "this herdr is the iRonin fork: `herdr update` would replace it with the upstream Herdr release and drop the fork's features; get the fork's next release instead (built from source)",
+            "the refusal must precede the package-manager and inside-herdr checks"
+        );
+    }
+
+    #[test]
+    fn install_downloaded_update_refuses_on_fork_build_and_keeps_the_binary() {
+        let dir = std::env::temp_dir().join(format!("herdr-fork-refusal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("herdr-under-test");
+        let staged = dir.join(".herdr-update-test.tmp");
+        std::fs::write(&target, b"fork binary").unwrap();
+        std::fs::write(&staged, b"upstream binary").unwrap();
+
+        let error = install_downloaded_update(DownloadedUpdate {
+            current_exe: target.clone(),
+            tmp_path: Some(staged.clone()),
+        })
+        .expect_err("installing a downloaded update must refuse on the fork build");
+
+        assert_eq!(
+            error,
+            "this herdr is the iRonin fork: `herdr update` would replace it with the upstream Herdr release and drop the fork's features; get the fork's next release instead (built from source)"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"fork binary",
+            "the binary on disk must stay byte-identical (no rename over it)"
+        );
+        assert!(!staged.exists(), "the staged download must be cleaned up");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_install_instruction_never_tells_fork_users_to_run_update() {
+        let instruction = update_install_instruction(HERDR_UPDATE_COMMAND);
+
+        assert_eq!(
+            instruction,
+            "upstream Herdr released this version; the iRonin fork follows in its own release (built from source)"
+        );
+        assert!(
+            !instruction.contains("herdr update"),
+            "the update notice must not point fork users at `herdr update`: {instruction}"
         );
     }
 
