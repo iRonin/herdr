@@ -1040,6 +1040,9 @@ fn input_submission_closed_error() -> std::io::Error {
     )
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod macos_typeahead_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
