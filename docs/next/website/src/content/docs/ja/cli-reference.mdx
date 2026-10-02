@@ -118,13 +118,14 @@ compinit
 ```bash
 herdr server
 herdr server stop
+herdr server restart
 herdr server reload-config
 herdr server agent-manifests [--json]
 herdr server update-agent-manifests [--json]
 herdr server reload-agent-manifests
 ```
 
-`herdr server` はヘッドレスサーバーを明示的に起動します。監視下やサービス的な構成で使ってください。`reload-config` はペインを再起動せずにリロード可能な設定を適用します。`agent-manifests` は、アクティブなエージェント検出マニフェストのソース、キャッシュされたリモートバージョン、直近のリモート更新結果を表示します。`update-agent-manifests` はリモートマニフェストの更新を即座に取得し、実行中のサーバーにリロードして、更新後のマニフェスト状態を表示します。生のステータスレスポンスが欲しいときは `--json` を渡してください。`reload-agent-manifests` は、ローカルオーバーライドの編集後にエージェント検出マニフェストを実行中のサーバーにリロードします。
+`herdr server` はヘッドレスサーバーを明示的に起動します。監視下やサービス的な構成で使ってください。`reload-config` はペインを再起動せずにリロード可能な設定を適用します。`restart` は実行中のサーバー（そのセッションのもの、`--session <name>` で選択）を、`session.stop_timeout_ms` まで待って停止し、新しいサーバーを起動してこのターミナルをアタッチします。サーバーが時間内に停止しなかった場合、再起動は行われません。そのセッションの外側のターミナルから実行してください。そのサーバーのペイン内で実行した場合、サーバーを停止すると新しいサーバーが起動する前にコマンドが終了してしまうため、拒否されます。`agent-manifests` は、アクティブなエージェント検出マニフェストのソース、キャッシュされたリモートバージョン、直近のリモート更新結果を表示します。`update-agent-manifests` はリモートマニフェストの更新を即座に取得し、実行中のサーバーにリロードして、更新後のマニフェスト状態を表示します。生のステータスレスポンスが欲しいときは `--json` を渡してください。`reload-agent-manifests` は、ローカルオーバーライドの編集後にエージェント検出マニフェストを実行中のサーバーにリロードします。
 
 ## 通知
 
