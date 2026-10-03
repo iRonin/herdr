@@ -1018,6 +1018,33 @@ mod tests {
         }
     }
 
+    fn agent_info(agent_status: crate::api::schema::AgentStatus) -> crate::api::schema::AgentInfo {
+        crate::api::schema::AgentInfo {
+            terminal_id: "term_1".into(),
+            name: Some("worker".into()),
+            agent: Some("pi".into()),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            display_agent: None,
+            agent_status,
+            screen_detection_skipped: false,
+            state_labels: HashMap::new(),
+            tokens: HashMap::new(),
+            agent_session: None,
+            workspace_id: "ws_1".into(),
+            tab_id: "tab_1".into(),
+            pane_id: "pane_1".into(),
+            focused: true,
+            launch_pending: false,
+            interactive_ready: true,
+            state_change_seq: 1,
+            cwd: None,
+            foreground_cwd: None,
+            revision: 0,
+        }
+    }
+
     fn spawn_pane_get_responder(
         agent_status: crate::api::schema::AgentStatus,
     ) -> (ApiRequestSender, std::thread::JoinHandle<()>) {
@@ -1261,6 +1288,89 @@ mod tests {
         let response: SuccessResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(response.id, "req_write");
         server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn agent_wait_observes_transient_projected_status_edges() {
+        use crate::api::schema::{AgentStatus, EventData, EventEnvelope, EventKind};
+
+        for (case, initial_status, event_status, until) in [
+            ("start", AgentStatus::Idle, AgentStatus::Working, "working"),
+            ("expiry", AgentStatus::Working, AgentStatus::Idle, "idle"),
+        ] {
+            let event_hub = EventHub::default();
+            let (first_get_tx, first_get_rx) = std::sync::mpsc::channel();
+            let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+            let responder = std::thread::spawn(move || {
+                let mut first = true;
+                while let Some(msg) = api_rx.blocking_recv() {
+                    assert!(matches!(msg.request.method, Method::AgentGet(_)));
+                    msg.respond_to
+                        .send(
+                            serde_json::to_string(&SuccessResponse {
+                                id: msg.request.id,
+                                result: ResponseResult::AgentInfo {
+                                    agent: agent_info(initial_status),
+                                },
+                            })
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    if first {
+                        first_get_tx.send(()).unwrap();
+                        first = false;
+                    }
+                }
+            });
+
+            let (mut client, server, _path) = local_stream_pair(&format!("agent-wait-{case}"));
+            client
+                .write_all(
+                    format!(
+                        r#"{{"id":"wait_{case}","method":"agent.wait","params":{{"target":"worker","until":["{until}"],"timeout_ms":1000}}}}"#
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            client.write_all(b"\n").unwrap();
+            client.flush().unwrap();
+
+            let running = Arc::new(AtomicBool::new(true));
+            let server_running = Arc::clone(&running);
+            let server_event_hub = event_hub.clone();
+            let server_api_tx = api_tx.clone();
+            let server_thread = std::thread::spawn(move || {
+                handle_connection(
+                    server,
+                    &server_api_tx,
+                    &server_event_hub,
+                    &server_running,
+                    None,
+                )
+            });
+
+            first_get_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            event_hub.push(EventEnvelope {
+                event: EventKind::PaneAgentStatusChanged,
+                data: EventData::PaneAgentStatusChanged {
+                    pane_id: "pane_1".into(),
+                    workspace_id: "ws_1".into(),
+                    agent_status: event_status,
+                    agent: Some("pi".into()),
+                    title: None,
+                    display_agent: None,
+                    state_labels: HashMap::new(),
+                },
+            });
+
+            let response: serde_json::Value =
+                serde_json::from_str(&read_line(&mut client)).unwrap();
+            assert_eq!(response["id"], format!("wait_{case}"));
+            assert_eq!(response["result"]["agent"]["agent_status"], until);
+            server_thread.join().unwrap().unwrap();
+            drop(api_tx);
+            responder.join().unwrap();
+        }
     }
 
     #[test]

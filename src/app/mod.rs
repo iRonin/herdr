@@ -2205,6 +2205,34 @@ mod tests {
                 },
             ),
         };
+        let pane_send_text = crate::api::schema::Request {
+            id: "req_13".into(),
+            method: crate::api::schema::Method::PaneSendText(
+                crate::api::schema::PaneSendTextParams {
+                    pane_id: "w1:p1".into(),
+                    text: "/compact".into(),
+                },
+            ),
+        };
+        let pane_send_input = crate::api::schema::Request {
+            id: "req_14".into(),
+            method: crate::api::schema::Method::PaneSendInput(
+                crate::api::schema::PaneSendInputParams {
+                    pane_id: "w1:p1".into(),
+                    text: "/compact".into(),
+                    keys: vec!["enter".into()],
+                },
+            ),
+        };
+        let pane_send_keys = crate::api::schema::Request {
+            id: "req_15".into(),
+            method: crate::api::schema::Method::PaneSendKeys(
+                crate::api::schema::PaneSendKeysParams {
+                    pane_id: "w1:p1".into(),
+                    keys: vec!["enter".into()],
+                },
+            ),
+        };
 
         assert!(!crate::api::request_changes_ui(&read_only));
         assert!(!crate::api::request_changes_ui(&worktree_list));
@@ -2218,6 +2246,9 @@ mod tests {
         assert!(crate::api::request_changes_ui(&command_invoke));
         assert!(crate::api::request_changes_ui(&announcement_dismiss));
         assert!(crate::api::request_changes_ui(&release_notes_dismiss));
+        assert!(crate::api::request_changes_ui(&pane_send_text));
+        assert!(crate::api::request_changes_ui(&pane_send_input));
+        assert!(crate::api::request_changes_ui(&pane_send_keys));
     }
 
     #[test]

@@ -131,9 +131,26 @@ pub(super) fn snapshot(
         .map(|agent| {
             let pane_id = agent.pane_id;
             let focused = focused_pane_id.as_deref() == Some(pane_id.as_str());
+            let blocked_read = agent.agent_status == crate::api::schema::AgentStatus::Blocked
+                && app
+                    .parse_pane_id(&pane_id)
+                    .and_then(|(workspace_index, pane_id)| {
+                        app.state
+                            .workspaces
+                            .get(workspace_index)?
+                            .pane_state(pane_id)
+                    })
+                    .is_some_and(|pane| pane.seen);
             let mut state_labels = agent.state_labels.into_iter().collect::<Vec<_>>();
             state_labels.sort_by(|left, right| left.0.cmp(&right.0));
             let mut tokens = agent.tokens.into_iter().collect::<Vec<_>>();
+            tokens.retain(|(key, _)| key != protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN);
+            if blocked_read {
+                tokens.push((
+                    protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.to_owned(),
+                    "1".to_owned(),
+                ));
+            }
             tokens.sort_by(|left, right| left.0.cmp(&right.0));
             protocol::ClientShellAgent {
                 pane_id,
@@ -542,6 +559,107 @@ fn split_hit_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_read_marker_is_client_shell_only_and_roundtrips_both_codecs() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("one");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.state = crate::detect::AgentState::Blocked;
+        app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .seen = true;
+
+        let public = app.session_snapshot();
+        let public_agent = public.agents.first().expect("public agent projection");
+        assert_eq!(
+            public_agent.agent_status,
+            crate::api::schema::AgentStatus::Blocked
+        );
+        assert!(
+            !public_agent.tokens.contains_key("herdr.blocked_read"),
+            "the reserved marker must not leak into the public session snapshot"
+        );
+        let public_pane_id = public_agent.pane_id.clone();
+        let pane_get_json = app.handle_api_request(crate::api::schema::Request {
+            id: "pane-get".into(),
+            method: crate::api::schema::Method::PaneGet(crate::api::schema::PaneTarget {
+                pane_id: public_pane_id,
+            }),
+        });
+        let agent_list_json = app.handle_api_request(crate::api::schema::Request {
+            id: "agent-list".into(),
+            method: crate::api::schema::Method::AgentList(crate::api::schema::EmptyParams {}),
+        });
+        assert!(
+            !pane_get_json.contains("herdr.blocked_read"),
+            "pane.get JSON must not expose the client-shell-only marker: {pane_get_json}"
+        );
+        assert!(
+            !agent_list_json.contains("herdr.blocked_read"),
+            "agent.list JSON must not expose the client-shell-only marker: {agent_list_json}"
+        );
+
+        let projected = snapshot(&app, "boot", 3, None, None);
+        let projected_agent = projected.agents.first().expect("client-shell agent");
+        assert_eq!(
+            projected_agent.agent_status,
+            crate::api::schema::AgentStatus::Blocked,
+            "compatibility fallback stays Blocked"
+        );
+        assert!(projected_agent
+            .tokens
+            .iter()
+            .any(|(key, value)| { key == "herdr.blocked_read" && value == "1" }));
+
+        let binary_message =
+            crate::protocol::ServerMessage::ClientShellSnapshot(Box::new(projected.clone()));
+        let encoded =
+            bincode::serde::encode_to_vec(&binary_message, bincode::config::standard()).unwrap();
+        let (decoded, _): (crate::protocol::ServerMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        let crate::protocol::ServerMessage::ClientShellSnapshot(binary) = decoded else {
+            panic!("expected binary client-shell snapshot");
+        };
+        assert_eq!(
+            binary.agents[0].agent_status,
+            crate::api::schema::AgentStatus::Blocked
+        );
+        assert!(binary.agents[0]
+            .tokens
+            .iter()
+            .any(|(key, value)| key == "herdr.blocked_read" && value == "1"));
+
+        let endpoint = crate::protocol::endpoint::snapshot_message(&projected).unwrap();
+        let crate::protocol::ServerMessage::EndpointControl { kind, data } = endpoint else {
+            panic!("expected JSON endpoint snapshot control");
+        };
+        assert_eq!(kind, crate::protocol::endpoint::ENDPOINT_SNAPSHOT_KIND);
+        let json: crate::protocol::ClientShellSnapshot = serde_json::from_str(&data).unwrap();
+        assert_eq!(
+            json.agents[0].agent_status,
+            crate::api::schema::AgentStatus::Blocked
+        );
+        assert!(json.agents[0]
+            .tokens
+            .iter()
+            .any(|(key, value)| key == "herdr.blocked_read" && value == "1"));
+    }
 
     #[test]
     fn snapshot_projects_cached_release_and_update_facts() {

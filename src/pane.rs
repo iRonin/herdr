@@ -1245,6 +1245,11 @@ async fn run_terminal_compression_task(
     }
 }
 
+pub(crate) struct PreparedPaste {
+    pub(crate) bytes: Bytes,
+    pub(crate) bracketed: bool,
+}
+
 /// PTY runtime for a pane. Owns the terminal, I/O channels, and background tasks.
 /// Dropping this aborts async tasks and closes the PTY. An already-running bounded
 /// compression step may finish before releasing its terminal reference.
@@ -3232,11 +3237,7 @@ impl PaneRuntime {
             .queue_user_input_submission(text, enter, delay, deadline)
     }
 
-    pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.try_send_bytes(self.paste_payload(text))
-    }
-
-    fn paste_payload(&self, text: String) -> Bytes {
+    pub(crate) fn prepare_paste(&self, text: String) -> PreparedPaste {
         let text = crate::platform::prepare_paste_text_for_pty(text);
         let bracketed = self.bracketed_paste_enabled();
         let payload = if bracketed {
@@ -3244,7 +3245,10 @@ impl PaneRuntime {
         } else {
             text
         };
-        Bytes::from(payload)
+        PreparedPaste {
+            bytes: Bytes::from(payload),
+            bracketed,
+        }
     }
 
     pub fn try_send_focus_event(&self, event: crate::ghostty::FocusEvent) -> bool {

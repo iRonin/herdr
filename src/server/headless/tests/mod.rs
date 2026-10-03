@@ -3091,7 +3091,7 @@ async fn client_shell_release_under_popup_renders_when_it_resets_scrollback() {
 }
 
 #[tokio::test]
-async fn client_shell_text_input_renders_only_when_resetting_scrollback() {
+async fn client_shell_text_input_renders_when_resetting_scrollback_or_acknowledging_blocked() {
     let mut server = test_headless_server();
     let mut workspace = crate::workspace::Workspace::test_new("scrolled-input");
     let pane_id = workspace.tabs[0].root_pane;
@@ -3111,6 +3111,19 @@ async fn client_shell_text_input_renders_only_when_resetting_scrollback() {
     server.app.state.workspaces = vec![workspace];
     server.app.state.active = Some(0);
     server.app.state.selected = 0;
+    server.app.state.ensure_test_terminals();
+    let terminal_id = server.app.state.terminal_id_for_pane(0, pane_id).unwrap();
+    server
+        .app
+        .state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .state = crate::detect::AgentState::Blocked;
+    server.app.state.workspaces[0]
+        .pane_state_mut(pane_id)
+        .unwrap()
+        .seen = false;
     let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
     server.clients.insert(
         11,
@@ -3148,20 +3161,161 @@ async fn client_shell_text_input_renders_only_when_resetting_scrollback() {
             .map(|metrics| metrics.offset_from_bottom),
         Some(0)
     );
+    assert!(
+        server.app.state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .seen,
+        "forwarded client-shell text acknowledges the targeted blocked pane"
+    );
+    assert_eq!(
+        server.app.state.terminals[&terminal_id].state,
+        crate::detect::AgentState::Blocked
+    );
+
+    server.app.state.workspaces[0]
+        .pane_state_mut(pane_id)
+        .unwrap()
+        .seen = false;
+    let render_impact =
+        server.handle_server_event_with_render_impact(ServerEvent::ClientShellPaneInput {
+            client_id: 11,
+            pane_id: public_pane_id.clone(),
+            events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+                "y".to_owned(),
+            )],
+        });
+    assert_eq!(
+        render_impact,
+        RenderImpact::Full,
+        "acknowledging blocked must repaint even when scrollback stays at the bottom"
+    );
+    assert_eq!(
+        input_rx.try_recv().expect("second text must reach the PTY"),
+        Bytes::from_static(b"y")
+    );
+    assert!(
+        server.app.state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .seen
+    );
 
     let render_impact =
         server.handle_server_event_with_render_impact(ServerEvent::ClientShellPaneInput {
             client_id: 11,
             pane_id: public_pane_id,
             events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
-                "y".to_owned(),
+                "z".to_owned(),
             )],
         });
     assert_eq!(render_impact, RenderImpact::None);
     assert_eq!(
-        input_rx.try_recv().expect("second text must reach the PTY"),
-        Bytes::from_static(b"y")
+        input_rx.try_recv().expect("third text must reach the PTY"),
+        Bytes::from_static(b"z")
     );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn client_shell_compact_submission_projects_working_without_changing_raw_state() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("compact-input");
+    let pane_id = workspace.tabs[0].root_pane;
+    let (runtime, mut input_rx) =
+        crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 20);
+    runtime.test_process_pty_bytes(b"\x1b[>7u");
+    workspace.insert_test_runtime(pane_id, runtime);
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.ensure_test_terminals();
+    let terminal_id = server.app.state.terminal_id_for_pane(0, pane_id).unwrap();
+    {
+        let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("worker".into());
+        terminal.state = crate::detect::AgentState::Idle;
+    }
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    server.clients.insert(
+        11,
+        ClientConnection::new_with_mode(
+            ClientConnectionMode::ClientShell,
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            1,
+            RenderEncoding::SemanticFrame,
+            None,
+        ),
+    );
+    server.foreground_client_id = Some(11);
+    assert!(server.claim_unowned_shell_tab_geometry(11, false));
+
+    let mut events = Vec::new();
+    for ch in "/compact".chars() {
+        for kind in [
+            crate::protocol::ClientKeyKind::Press,
+            crate::protocol::ClientKeyKind::Release,
+        ] {
+            events.push(crate::protocol::ClientPaneInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char(ch),
+                modifiers: 0,
+                kind,
+                repeat_count: 1,
+                shifted_codepoint: None,
+                generated_text: None,
+                tracks_release: true,
+                physical_key_id: None,
+                windows_record: None,
+            });
+        }
+    }
+    events.push(crate::protocol::ClientPaneInputEvent::Key {
+        code: crate::protocol::ClientKeyCode::Enter,
+        modifiers: 0,
+        kind: crate::protocol::ClientKeyKind::Press,
+        repeat_count: 1,
+        shifted_codepoint: None,
+        generated_text: None,
+        tracks_release: true,
+        physical_key_id: None,
+        windows_record: None,
+    });
+    let render_impact =
+        server.handle_server_event_with_render_impact(ServerEvent::ClientShellPaneInput {
+            client_id: 11,
+            pane_id: public_pane_id,
+            events,
+        });
+
+    assert_eq!(render_impact, RenderImpact::Full);
+    let mut forwarded = Vec::new();
+    while let Ok(bytes) = input_rx.try_recv() {
+        forwarded.push(bytes);
+    }
+    assert_eq!(forwarded.len(), 17);
+    assert_eq!(forwarded[0], Bytes::from_static(b"/"));
+    assert_eq!(forwarded[1], Bytes::from_static(b"\x1b[47;1:3u"));
+    assert_eq!(forwarded.last().unwrap(), &Bytes::from_static(b"\r"));
+    assert_eq!(
+        server.app.state.terminals[&terminal_id].state,
+        crate::detect::AgentState::Idle,
+        "compact projection must not enter lifecycle arbitration"
+    );
+    assert_eq!(
+        server.app.state.terminals[&terminal_id].display_state(),
+        crate::detect::AgentState::Working
+    );
+    let status_events = server.app.event_hub.events_after(0);
+    assert_eq!(status_events.len(), 1);
+    assert!(matches!(
+        &status_events[0].1.data,
+        crate::api::schema::EventData::PaneAgentStatusChanged {
+            agent_status: crate::api::schema::AgentStatus::Working,
+            ..
+        }
+    ));
+    assert!(server.app.state.toast.is_none());
     shutdown_test_runtimes(&mut server);
 }
 
@@ -4786,7 +4940,7 @@ fn terminal_attach_input_resets_scrolled_viewport() {
         4
     );
 
-    apply_terminal_attach_input(&runtime, b"x".to_vec()).expect("attach input");
+    apply_terminal_attach_input(&runtime, b"x").expect("attach input");
     assert_eq!(
         runtime
             .scroll_metrics()
@@ -5001,9 +5155,11 @@ fn client_popup_plain_page_key_remains_popup_input() {
 #[test]
 fn terminal_attach_paste_uses_plain_text_when_runtime_did_not_enable_brackets() {
     with_terminal_attach_runtime(b"", 0, |runtime, input_rx| {
-        apply_terminal_attach_input(runtime, b"\x1b[200~line one\nline two\x1b[201~".to_vec())
-            .expect("attach paste");
+        let bracketed =
+            apply_terminal_attach_input(runtime, b"\x1b[200~line one\nline two\x1b[201~")
+                .expect("attach paste");
 
+        assert!(!bracketed);
         assert_eq!(
             input_rx.try_recv().expect("forwarded paste"),
             Bytes::from_static(if cfg!(windows) {
@@ -5018,9 +5174,13 @@ fn terminal_attach_paste_uses_plain_text_when_runtime_did_not_enable_brackets() 
 #[test]
 fn terminal_attach_paste_preserves_brackets_when_runtime_enabled_them() {
     with_terminal_attach_runtime(b"\x1b[?2004h", 0, |runtime, input_rx| {
-        apply_terminal_attach_input(runtime, b"\x1b[200~line one\nline two\x1b[201~".to_vec())
-            .expect("attach paste");
+        let bracketed =
+            apply_terminal_attach_input(runtime, b"\x1b[200~line one\nline two\x1b[201~")
+                .expect("attach paste");
+        runtime.test_process_pty_bytes(b"\x1b[?2004l");
 
+        assert!(bracketed, "receipt must retain the payload's mode decision");
+        assert!(!runtime.bracketed_paste_enabled());
         assert_eq!(
             input_rx.try_recv().expect("forwarded paste"),
             Bytes::from_static(if cfg!(windows) {
@@ -5264,6 +5424,379 @@ async fn headless_scheduled_tasks_start_pending_agent_resume_without_foreground_
         .pending_agent_resume_plan
         .is_none());
     shutdown_test_runtimes(&mut server);
+}
+
+#[test]
+fn direct_terminal_input_acknowledges_its_blocked_pane_after_forwarding() {
+    with_terminal_session_test_server(|server, terminal_id, terminal_id_string, public_pane_id| {
+        let (_, pane_id) = server
+            .app
+            .parse_pane_id(&public_pane_id)
+            .expect("public pane id");
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .state = crate::detect::AgentState::Blocked;
+        server.app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .seen = false;
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        server.clients.insert(
+            1,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::TerminalAttach {
+                    terminal_id: terminal_id_string,
+                },
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                1,
+                RenderEncoding::TerminalAnsi,
+                None,
+            ),
+        );
+
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: b"answer".to_vec(),
+        }));
+        assert_eq!(input_rx.try_recv().unwrap(), Bytes::from_static(b"answer"));
+        assert!(
+            server.app.state.workspaces[0]
+                .pane_state(pane_id)
+                .unwrap()
+                .seen
+        );
+        assert_eq!(
+            server.app.state.terminals[&terminal_id].state,
+            crate::detect::AgentState::Blocked
+        );
+
+        server.app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .seen = false;
+        assert!(server.paste_client_clipboard_image_path(
+            1,
+            crate::protocol::ClientClipboardImageTarget::DirectTerminal,
+            "/tmp/client-image.png".into(),
+        ));
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            Bytes::from_static(b"/tmp/client-image.png")
+        );
+        assert!(
+            server.app.state.workspaces[0]
+                .pane_state(pane_id)
+                .unwrap()
+                .seen,
+            "a forwarded terminal-attach image path must acknowledge Blocked"
+        );
+        assert_eq!(
+            server.app.state.terminals[&terminal_id].state,
+            crate::detect::AgentState::Blocked
+        );
+    });
+}
+
+#[tokio::test]
+async fn client_shell_clipboard_image_breaks_compact_detector_continuity() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("compact-image-pane");
+    let pane_id = workspace.tabs[0].root_pane;
+    let (runtime, mut input_rx) =
+        crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 3);
+    workspace.insert_test_runtime(pane_id, runtime);
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.ensure_test_terminals();
+    let terminal_id = server.app.state.terminal_id_for_pane(0, pane_id).unwrap();
+    {
+        let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("worker".into());
+        terminal.state = crate::detect::AgentState::Idle;
+    }
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    server.clients.insert(
+        11,
+        ClientConnection::new_with_mode(
+            ClientConnectionMode::ClientShell,
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            1,
+            RenderEncoding::SemanticFrame,
+            None,
+        ),
+    );
+    server.foreground_client_id = Some(11);
+    assert!(server.claim_unowned_shell_tab_geometry(11, false));
+
+    server.handle_server_event(ServerEvent::ClientShellPaneInput {
+        client_id: 11,
+        pane_id: public_pane_id.clone(),
+        events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+            "/com".into(),
+        )],
+    });
+    assert!(server.paste_client_clipboard_image_path(
+        11,
+        crate::protocol::ClientClipboardImageTarget::Pane(public_pane_id.clone()),
+        "/tmp/client-image.png".into(),
+    ));
+    server.handle_server_event(ServerEvent::ClientShellPaneInput {
+        client_id: 11,
+        pane_id: public_pane_id,
+        events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+            "pact\r".into(),
+        )],
+    });
+
+    assert_eq!(input_rx.try_recv().unwrap(), Bytes::from_static(b"/com"));
+    assert_eq!(
+        input_rx.try_recv().unwrap(),
+        Bytes::from_static(b"/tmp/client-image.png")
+    );
+    assert_eq!(input_rx.try_recv().unwrap(), Bytes::from_static(b"pact\r"));
+    assert_eq!(
+        server.app.state.terminals[&terminal_id].state,
+        crate::detect::AgentState::Idle
+    );
+    assert_eq!(
+        server.app.state.terminals[&terminal_id].display_state(),
+        crate::detect::AgentState::Idle,
+        "the pasted image path must separate tracked command fragments"
+    );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn client_shell_compact_tracks_only_bytes_forwarded_by_legacy_keys() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("compact-legacy-input");
+    let pane_id = workspace.tabs[0].root_pane;
+    let (runtime, mut input_rx) =
+        crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 2);
+    workspace.insert_test_runtime(pane_id, runtime);
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.ensure_test_terminals();
+    let terminal_id = server.app.state.terminal_id_for_pane(0, pane_id).unwrap();
+    {
+        let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("worker".into());
+        terminal.state = crate::detect::AgentState::Idle;
+    }
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    server.clients.insert(
+        11,
+        ClientConnection::new_with_mode(
+            ClientConnectionMode::ClientShell,
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            1,
+            RenderEncoding::SemanticFrame,
+            None,
+        ),
+    );
+    server.foreground_client_id = Some(11);
+    assert!(server.claim_unowned_shell_tab_geometry(11, false));
+
+    let key = |code, modifiers| crate::protocol::ClientPaneInputEvent::Key {
+        code,
+        modifiers,
+        kind: crate::protocol::ClientKeyKind::Press,
+        repeat_count: 1,
+        shifted_codepoint: None,
+        generated_text: None,
+        tracks_release: false,
+        physical_key_id: None,
+        windows_record: None,
+    };
+    let render_impact =
+        server.handle_server_event_with_render_impact(ServerEvent::ClientShellPaneInput {
+            client_id: 11,
+            pane_id: public_pane_id,
+            events: vec![
+                crate::protocol::ClientPaneInputEvent::TextCommit("/compact".into()),
+                key(crate::protocol::ClientKeyCode::F(13), 0),
+                key(
+                    crate::protocol::ClientKeyCode::Enter,
+                    crossterm::event::KeyModifiers::SHIFT.bits(),
+                ),
+            ],
+        });
+
+    assert_eq!(render_impact, RenderImpact::Full);
+    assert_eq!(
+        input_rx.try_recv().unwrap(),
+        Bytes::from_static(b"/compact")
+    );
+    assert_eq!(
+        input_rx.try_recv().unwrap(),
+        Bytes::from_static(b"\r"),
+        "legacy F13 forwards nothing and legacy Shift+Enter collapses to CR"
+    );
+    assert!(input_rx.try_recv().is_err());
+    assert_eq!(
+        server.app.state.terminals[&terminal_id].display_state(),
+        crate::detect::AgentState::Working,
+        "client-shell detector must model exactly the bytes the child received"
+    );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[test]
+fn direct_terminal_clipboard_image_breaks_compact_detector_continuity() {
+    with_terminal_session_test_server(
+        |server, terminal_id, terminal_id_string, _public_pane_id| {
+            let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("worker".into());
+            terminal.state = crate::detect::AgentState::Idle;
+            let (runtime, mut input_rx) =
+                crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 3);
+            runtime.test_process_pty_bytes(b"\x1b[?2004h");
+            server
+                .app
+                .terminal_runtimes
+                .insert(terminal_id.clone(), runtime);
+            server.clients.insert(
+                1,
+                ClientConnection::new_with_mode(
+                    ClientConnectionMode::TerminalAttach {
+                        terminal_id: terminal_id_string,
+                    },
+                    (80, 24),
+                    crate::kitty_graphics::HostCellSize::default(),
+                    1,
+                    RenderEncoding::TerminalAnsi,
+                    None,
+                ),
+            );
+
+            assert!(server.handle_server_event(ServerEvent::ClientInput {
+                client_id: 1,
+                data: b"/com".to_vec(),
+            }));
+            assert!(server.paste_client_clipboard_image_path(
+                1,
+                crate::protocol::ClientClipboardImageTarget::DirectTerminal,
+                "/tmp/client-image.png".into(),
+            ));
+            assert!(server.handle_server_event(ServerEvent::ClientInput {
+                client_id: 1,
+                data: b"pact\r".to_vec(),
+            }));
+
+            assert_eq!(input_rx.try_recv().unwrap(), Bytes::from_static(b"/com"));
+            assert_eq!(
+                input_rx.try_recv().unwrap(),
+                Bytes::from_static(b"\x1b[200~/tmp/client-image.png\x1b[201~")
+            );
+            assert_eq!(input_rx.try_recv().unwrap(), Bytes::from_static(b"pact\r"));
+            assert_eq!(
+                server.app.state.terminals[&terminal_id].state,
+                crate::detect::AgentState::Idle
+            );
+            assert_eq!(
+                server.app.state.terminals[&terminal_id].display_state(),
+                crate::detect::AgentState::Idle,
+                "the bracketed image-path receipt must separate tracked command fragments"
+            );
+        },
+    );
+}
+
+#[test]
+fn direct_terminal_compact_submission_projects_working_without_changing_raw_state() {
+    with_terminal_session_test_server(
+        |server, terminal_id, terminal_id_string, _public_pane_id| {
+            let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("worker".into());
+            terminal.state = crate::detect::AgentState::Idle;
+            let (runtime, mut input_rx) =
+                crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 3);
+            runtime.test_process_pty_bytes(b"\x1b[?2004h\x1b[>15u");
+            server
+                .app
+                .terminal_runtimes
+                .insert(terminal_id.clone(), runtime);
+            server.clients.insert(
+                1,
+                ClientConnection::new_with_mode(
+                    ClientConnectionMode::TerminalAttach {
+                        terminal_id: terminal_id_string,
+                    },
+                    (80, 24),
+                    crate::kitty_graphics::HostCellSize::default(),
+                    1,
+                    RenderEncoding::TerminalAnsi,
+                    None,
+                ),
+            );
+
+            assert!(server.handle_server_event(ServerEvent::ClientInput {
+                client_id: 1,
+                data: b"\x1b[200~notes\n/compact\n\x1b[201~".to_vec(),
+            }));
+            assert_eq!(
+                input_rx.try_recv().unwrap(),
+                Bytes::from_static(b"\x1b[200~notes\n/compact\n\x1b[201~")
+            );
+            assert!(server.handle_server_event(ServerEvent::ClientInput {
+                client_id: 1,
+                data: b"\x1b[13u".to_vec(),
+            }));
+            assert_eq!(
+                input_rx.try_recv().unwrap(),
+                Bytes::from_static(b"\x1b[13u")
+            );
+            assert_eq!(
+                server.app.state.terminals[&terminal_id].display_state(),
+                crate::detect::AgentState::Idle,
+                "a line inside bracketed paste was inserted, not submitted"
+            );
+
+            let compact_and_enter = concat!(
+                "\x1b[47;1:1u\x1b[47;1:3u",
+                "\x1b[99;1:1u\x1b[99;1:3u",
+                "\x1b[111;1:1u\x1b[111;1:3u",
+                "\x1b[109;1:1u\x1b[109;1:3u",
+                "\x1b[112;1:1u\x1b[112;1:3u",
+                "\x1b[97;1:1u\x1b[97;1:3u",
+                "\x1b[99;1:1u\x1b[99;1:3u",
+                "\x1b[116;1:1u\x1b[116;1:3u",
+                "\x1b[13u\x1b[13;1:3u",
+            )
+            .as_bytes();
+            assert!(server.handle_server_event(ServerEvent::ClientInput {
+                client_id: 1,
+                data: compact_and_enter.to_vec(),
+            }));
+            assert_eq!(
+                input_rx.try_recv().unwrap(),
+                Bytes::from_static(compact_and_enter)
+            );
+            assert_eq!(
+                server.app.state.terminals[&terminal_id].state,
+                crate::detect::AgentState::Idle
+            );
+            assert_eq!(
+                server.app.state.terminals[&terminal_id].display_state(),
+                crate::detect::AgentState::Working,
+                "a trailing submit in the same input chunk must remain visible to the detector"
+            );
+        },
+    );
 }
 
 #[test]

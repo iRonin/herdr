@@ -1811,13 +1811,24 @@ fn disconnected_active_endpoint_freezes_surface_and_marks_cached_ui_stale() {
     );
     assert!(state.hits.panes.is_empty());
     assert!(frame.cursor.is_none());
-    let buffer = frame.to_ratatui_buffer().expect("frame should reconstruct");
-    let stale_icon = buffer
-        .content()
+    let agent_row = frame
+        .cells
+        .chunks(frame.width as usize)
+        .find(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+                .contains("remote agent")
+        })
+        .expect("stale agent row");
+    let stale_icon = agent_row
         .iter()
-        .find(|cell| cell.symbol() == "×")
-        .expect("stale blocked icon");
-    assert_eq!(stale_icon.fg, state.config.palette.overlay0);
+        .find(|cell| cell.symbol == "○")
+        .expect("stale acknowledged-blocked icon");
+    assert_eq!(
+        stale_icon.fg,
+        crate::protocol::color_to_u32(state.config.palette.overlay0)
+    );
 }
 
 #[cfg(unix)]
@@ -2317,10 +2328,68 @@ fn workspace_drag_rejects_foreign_endpoint_slots() {
 }
 
 #[test]
-fn collapsed_aggregate_workspace_status_uses_its_status_color() {
+fn workspace_aggregate_mark_uses_read_aware_concrete_agent_priority() {
     use crate::api::schema::AgentStatus;
+    use crate::config::StatusIndicatorStyle;
 
     let (mut state, endpoint_id) = state_with_remote();
+    state.config.status_indicators = StatusIndicatorStyle::Symbols;
+    let snapshot = state
+        .endpoints
+        .iter_mut()
+        .find(|endpoint| endpoint.endpoint_id == endpoint_id)
+        .expect("remote endpoint")
+        .snapshot
+        .as_mut()
+        .expect("remote snapshot");
+    snapshot.workspaces[0].agent_status = AgentStatus::Blocked;
+    assert_eq!(
+        status_icon(
+            snapshot.workspaces[0].agent_status,
+            StatusIndicatorStyle::Symbols
+        ),
+        "×",
+        "the raw aggregate path must remain a discriminating negative control"
+    );
+    let mut read_blocked = agent("read-blocked", AgentStatus::Blocked, 2);
+    read_blocked.tokens.push((
+        crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
+        "1".into(),
+    ));
+    snapshot.agents = vec![read_blocked];
+    state.sidebar_collapsed = true;
+
+    let mark = |state: &mut ClientShellState| {
+        let frame = state.compose(100, 28).expect("collapsed aggregate sidebar");
+        let workspace = state
+            .hits
+            .workspaces
+            .iter()
+            .find(|hit| hit.endpoint_id == endpoint_id)
+            .expect("remote workspace")
+            .rect;
+        let buffer = frame.to_ratatui_buffer().expect("frame buffer");
+        let cell = &buffer[(workspace.x.saturating_add(2), workspace.y)];
+        (cell.symbol().to_owned(), cell.fg)
+    };
+
+    let read = mark(&mut state);
+    assert_eq!(read, ("○".into(), state.config.palette.red));
+
+    let snapshot = state
+        .endpoints
+        .iter_mut()
+        .find(|endpoint| endpoint.endpoint_id == endpoint_id)
+        .expect("remote endpoint")
+        .snapshot
+        .as_mut()
+        .expect("remote snapshot");
+    let mut working = agent("working", AgentStatus::Working, 3);
+    working.pane_id = "pane_2".into();
+    snapshot.agents.push(working);
+    let working = mark(&mut state);
+    assert_eq!(working, ("◐".into(), state.config.palette.yellow));
+
     state
         .endpoints
         .iter_mut()
@@ -2329,23 +2398,11 @@ fn collapsed_aggregate_workspace_status_uses_its_status_color() {
         .snapshot
         .as_mut()
         .expect("remote snapshot")
-        .workspaces[0]
-        .agent_status = AgentStatus::Blocked;
-    state.sidebar_collapsed = true;
-
-    let frame = state.compose(100, 28).expect("collapsed aggregate sidebar");
-    let workspace = state
-        .hits
-        .workspaces
-        .iter()
-        .find(|hit| hit.endpoint_id == endpoint_id)
-        .expect("remote workspace")
-        .rect;
-    let buffer = frame.to_ratatui_buffer().expect("frame buffer");
-    assert_eq!(
-        buffer[(workspace.x.saturating_add(2), workspace.y)].fg,
-        state.config.palette.red
-    );
+        .agents[0]
+        .tokens
+        .clear();
+    let unread = mark(&mut state);
+    assert_eq!(unread, ("×".into(), state.config.palette.red));
 }
 
 #[test]

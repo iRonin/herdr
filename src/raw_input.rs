@@ -28,6 +28,41 @@ pub(crate) const GHOSTTY_COLOR_SCHEME_LIGHT_REPORT: &[u8] = b"\x1b[?997;2n";
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextInputSegment<'a> {
+    Bytes(&'a [u8]),
+    BracketedPaste(&'a str),
+}
+
+/// Splits complete UTF-8 bracketed pastes from surrounding input while
+/// preserving bytes that may submit the pasted command in the same write.
+pub(crate) fn split_text_bracketed_pastes(data: &[u8]) -> Vec<TextInputSegment<'_>> {
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative_start) = find_subsequence(&data[cursor..], BRACKETED_PASTE_START) {
+        let start = cursor + relative_start;
+        let payload_start = start + BRACKETED_PASTE_START.len();
+        let Some(relative_end) = find_subsequence(&data[payload_start..], BRACKETED_PASTE_END)
+        else {
+            break;
+        };
+        let end = payload_start + relative_end;
+        let after_end = end + BRACKETED_PASTE_END.len();
+        if start > cursor {
+            segments.push(TextInputSegment::Bytes(&data[cursor..start]));
+        }
+        match std::str::from_utf8(&data[payload_start..end]) {
+            Ok(text) => segments.push(TextInputSegment::BracketedPaste(text)),
+            Err(_) => segments.push(TextInputSegment::Bytes(&data[start..after_end])),
+        }
+        cursor = after_end;
+    }
+    if cursor < data.len() {
+        segments.push(TextInputSegment::Bytes(&data[cursor..]));
+    }
+    segments
+}
+
 /// Returns the UTF-8 payload when `data` is exactly one complete bracketed paste.
 pub(crate) fn complete_text_bracketed_paste(data: &[u8]) -> Option<&str> {
     if !data.starts_with(BRACKETED_PASTE_START) {
@@ -1198,6 +1233,25 @@ mod tests {
             b"\x1b[200~one\x1b[201~\x1b[200~two\x1b[201~"
         ));
         assert!(!is_complete_text_bracketed_paste(b"\x1b[200~\xff\x1b[201~"));
+    }
+
+    #[test]
+    fn bracketed_paste_segments_preserve_trailing_submit_bytes() {
+        assert_eq!(
+            split_text_bracketed_pastes(b"\x1b[200~/compact\x1b[201~\r"),
+            vec![
+                TextInputSegment::BracketedPaste("/compact"),
+                TextInputSegment::Bytes(b"\r"),
+            ]
+        );
+        assert_eq!(
+            split_text_bracketed_pastes(b"before\x1b[200~one\n/compact\x1b[201~after"),
+            vec![
+                TextInputSegment::Bytes(b"before"),
+                TextInputSegment::BracketedPaste("one\n/compact"),
+                TextInputSegment::Bytes(b"after"),
+            ]
+        );
     }
 
     #[test]

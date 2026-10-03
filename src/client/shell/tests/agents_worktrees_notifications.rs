@@ -572,6 +572,48 @@ fn agent_sidebar_honors_priority_symbols_tokens_and_stable_hits() {
 }
 
 #[test]
+fn read_blocked_sidebar_row_is_hollow_and_sorts_below_working() {
+    let mut projected = snapshot();
+    let mut second_pane = projected.panes[0].clone();
+    second_pane.pane_id = "pane_2".into();
+    second_pane.focused = false;
+    projected.panes.push(second_pane);
+    let mut read_blocked = test_agent(
+        AgentStatus::Blocked,
+        vec![(
+            crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
+            "1".into(),
+        )],
+    );
+    read_blocked.name = Some("read-blocked".into());
+    let mut working = test_agent(AgentStatus::Working, Vec::new());
+    working.pane_id = "pane_2".into();
+    working.name = Some("working".into());
+    working.focused = false;
+    projected.agents = vec![read_blocked, working];
+
+    let mut config = Config::default();
+    config.ui.agent_panel_sort = crate::config::AgentPanelSortConfig::Priority;
+    config.ui.status_indicators = crate::config::StatusIndicatorStyle::Symbols;
+    config.ui.sidebar.agents.rows = vec![vec![
+        crate::config::AgentSidebarToken::StateIcon,
+        crate::config::AgentSidebarToken::Agent,
+    ]];
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+
+    let frame = state.compose(106, 30).expect("read-blocked agent sidebar");
+    let text = frame_rows(&frame).join("\n");
+    assert!(text.contains("○ read-blocked"), "frame: {text}");
+    assert_eq!(
+        state.hits.agents.first().map(|(_, id)| id.as_str()),
+        Some("pane_2"),
+        "working must outrank acknowledged blocked"
+    );
+}
+
+#[test]
 fn muted_agent_sidebar_rows_do_not_stack_terminal_faint() {
     let mut projected = snapshot();
     projected.tabs[0].label = "second".into();
@@ -1461,4 +1503,42 @@ fn semantic_notifications_use_client_policy_and_stable_navigation_targets() {
     assert!(repaint);
     assert!(state.visible_notification.is_none());
     assert_eq!(state.pending_notifications.len(), 1);
+}
+
+#[test]
+fn delayed_needs_attention_is_stale_after_blocked_agent_is_acknowledged() {
+    let mut config = ClientShellConfig::from_config(&Config::default());
+    config.toast_delivery = crate::config::ToastDelivery::Herdr;
+    config.toast_delay_seconds = 1;
+    let mut state = ClientShellState::new(config);
+    let mut projected = snapshot();
+    projected.agents = vec![test_agent(
+        AgentStatus::Blocked,
+        vec![(
+            crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
+            "1".into(),
+        )],
+    )];
+    state.set_snapshot(Box::new(projected));
+    let now = std::time::Instant::now();
+    state.receive_notification(
+        &ClientEndpointId::Local,
+        SemanticNotification {
+            kind: SemanticNotificationKind::NeedsAttention,
+            title: "needs attention".into(),
+            body: None,
+            sound: Some(SemanticNotificationSound::Request),
+            agent: None,
+            workspace_id: Some("ws_1".into()),
+            tab_id: Some("tab_1".into()),
+            pane_id: Some("pane_1".into()),
+            position: None,
+        },
+        now,
+    );
+
+    let (effects, _) = state.tick_notifications(now + std::time::Duration::from_secs(2));
+
+    assert!(effects.is_empty());
+    assert!(state.visible_notification.is_none());
 }

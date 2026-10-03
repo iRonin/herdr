@@ -98,62 +98,86 @@ fn rendered_agent_panel_mark(
 }
 
 /// The binding cross-surface test: for the same input the tab mark must equal
-/// BOTH the agent panel's rendered mark AND upstream's own `status_icon` /
-/// `status_color` called directly. The first assertion alone would pass if both
+/// BOTH the agent panel's rendered mark AND the shared read-aware
+/// `agent_status_icon` / `status_color` called directly - and for every unread
+/// agent `agent_status_icon` must be upstream's own `status_icon`, while a block
+/// the user has read draws hollow. The first assertion alone would pass if both
 /// surfaces were routed through a fork-local glyph table; the second alone
 /// would pass if the agent panel were forked and the tab left alone. Colours
 /// are compared too: the symbol alphabet is ambiguous by design (the filled dot
-/// covers blocked, working and done; the hollow dot covers idle), so only
-/// colour separates the states a one-cell mark can carry.
+/// covers blocked, working and done; the hollow dot covers idle and a read
+/// block), so only colour separates the states a one-cell mark can carry.
 #[test]
 fn tab_status_mark_is_the_agent_panels_mark_and_status_icons_own() {
-    for status in [
-        AgentStatus::Blocked,
-        AgentStatus::Done,
-        AgentStatus::Working,
-        AgentStatus::Idle,
-        AgentStatus::Unknown,
+    for (status, read) in [
+        (AgentStatus::Blocked, false),
+        (AgentStatus::Blocked, true),
+        (AgentStatus::Done, false),
+        (AgentStatus::Working, false),
+        (AgentStatus::Idle, false),
+        (AgentStatus::Unknown, false),
     ] {
         let config = tab_status_config(true);
-        let projected = snapshot_with_agent(status);
+        let mut projected = snapshot_with_agent(status);
+        if read {
+            projected.agents[0].tokens.push((
+                crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
+                "1".into(),
+            ));
+        }
         let (tab_symbol, tab_fg) = rendered_tab_mark(&config, &projected);
         let (panel_symbol, panel_fg) = rendered_agent_panel_mark(&config, &projected);
-        let expected_symbol = status_icon(status, config.status_indicators);
+        let expected_symbol = agent_status_icon(&projected.agents[0], config.status_indicators);
         let expected_fg = status_color(status, &config.palette);
+        // The agent-aware mark IS upstream's own for an unread agent, and differs from it for a
+        // read block; without the second check the read case would silently repeat the unread one.
+        if read {
+            assert_ne!(
+                expected_symbol,
+                status_icon(status, config.status_indicators),
+                "a read block must not draw upstream's unread mark"
+            );
+        } else {
+            assert_eq!(
+                expected_symbol,
+                status_icon(status, config.status_indicators),
+                "an unread agent must draw upstream's own mark for {status:?} (read: {read})"
+            );
+        }
 
         // Vacuity guards: a render helper that silently draws nothing returns a
         // blank on either side, and the comparisons below would then pass for
         // no reason at all.
         assert_ne!(
             tab_symbol, " ",
-            "tab fixture produced no mark for {status:?}"
+            "tab fixture produced no mark for {status:?} (read: {read})"
         );
         assert_ne!(
             panel_symbol, " ",
-            "agent panel fixture produced no mark for {status:?}"
+            "agent panel fixture produced no mark for {status:?} (read: {read})"
         );
 
         // (1) the two surfaces agree — glyph and colour.
         assert_eq!(
             tab_symbol, panel_symbol,
-            "tab and agent panel must render the same mark for {status:?}"
+            "tab and agent panel must render the same mark for {status:?} (read: {read})"
         );
         assert_eq!(
             tab_fg, panel_fg,
-            "tab and agent panel must render the same colour for {status:?}"
+            "tab and agent panel must render the same colour for {status:?} (read: {read})"
         );
-        // (2) they agree ON upstream's own function
-        // (2) they agree ON upstream's own function, not on a shared fork-local
-        // wrapper. Without this, routing both surfaces through a fork-local
-        // glyph table would pass (1) — the one thing that must not happen.
+        // (2) they agree ON the shared read-aware function (upstream's own mark for every unread
+        // agent, as asserted above), not on a tab-local wrapper. Without this, routing both
+        // surfaces through a fork-local glyph table would pass (1) — the one thing that must
+        // not happen.
         assert_eq!(
             tab_symbol, expected_symbol,
-            "tab must render status_icon's mark for {status:?}"
+            "tab must render agent_status_icon's mark for {status:?} (read: {read})"
         );
         assert_eq!(
             tab_fg,
             Some(expected_fg),
-            "tab must render status_color's colour for {status:?}"
+            "tab must render status_color's colour for {status:?} (read: {read})"
         );
     }
 }
@@ -322,7 +346,8 @@ fn tabs_without_agents_render_stock_when_the_feature_is_on() {
 }
 
 /// The mark belongs to the tab's highest-attention agent, mirroring the agent
-/// panel's own ordering: a blocked agent outranks a working one in the same tab.
+/// panel's own read-aware ordering: an unread block outranks a working agent in the
+/// same tab, and a block the user has already read ranks below it.
 #[test]
 fn tab_status_mark_shows_the_highest_attention_agent() {
     let config = tab_status_config(true);
@@ -363,11 +388,32 @@ fn tab_status_mark_shows_the_highest_attention_agent() {
     assert_ne!(symbol, " ", "the tab must render a mark at all");
     assert_eq!(
         symbol,
-        status_icon(AgentStatus::Blocked, config.status_indicators)
+        agent_status_icon(&projected.agents[1], config.status_indicators)
     );
     assert_eq!(
         fg,
         Some(status_color(AgentStatus::Blocked, &config.palette))
+    );
+
+    // Once the user has read the block it ranks below the working agent (the agent panel's
+    // read-aware order), so the same tab now carries the working agent's mark.
+    projected.agents[1].tokens.push((
+        crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
+        "1".into(),
+    ));
+    let (read_symbol, read_fg) = rendered_tab_mark(&config, &projected);
+    assert_ne!(
+        (read_symbol.as_str(), read_fg),
+        (symbol.as_str(), fg),
+        "reading the block must change the tab's mark"
+    );
+    assert_eq!(
+        read_symbol,
+        agent_status_icon(&projected.agents[0], config.status_indicators)
+    );
+    assert_eq!(
+        read_fg,
+        Some(status_color(AgentStatus::Working, &config.palette))
     );
 }
 
@@ -466,7 +512,7 @@ fn tab_status_mark_sits_one_painted_space_before_the_name() {
         let mut projected = snapshot_with_agent(AgentStatus::Blocked);
         // Longer than the stock minimum, so the tab renders at its natural width.
         projected.tabs[0].label = "server".into();
-        let mark = status_icon(AgentStatus::Blocked, config.status_indicators);
+        let mark = agent_status_icon(&projected.agents[0], config.status_indicators);
 
         let area = Rect::new(0, 0, 60, 1);
         let mut buffer = Buffer::empty(area);

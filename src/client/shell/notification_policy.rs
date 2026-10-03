@@ -294,7 +294,8 @@ impl ClientShellState {
         };
         match event.kind {
             SemanticNotificationKind::NeedsAttention
-                if agent.agent_status == crate::api::schema::AgentStatus::Blocked =>
+                if agent.agent_status == crate::api::schema::AgentStatus::Blocked
+                    && !super::agent_is_blocked_read(agent) =>
             {
                 NotificationValidation::Current
             }

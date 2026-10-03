@@ -21,6 +21,23 @@ const API_NOTIFICATION_RATE_LIMIT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const WINDOWS_POWERSHELL_AGENT_EXIT_RESPAWN_GRACE: Duration = Duration::from_secs(2);
 
+fn encoded_terminal_key_sequence_len(bytes: &[u8]) -> Option<usize> {
+    if bytes.first() != Some(&0x1b) {
+        return None;
+    }
+    match *bytes.get(1)? {
+        b'[' => bytes[2..]
+            .iter()
+            .position(|byte| (0x40..=0x7e).contains(byte))
+            .map(|index| index + 3),
+        b'O' => (bytes.len() >= 3).then_some(3),
+        _ => {
+            let tail = std::str::from_utf8(&bytes[1..]).ok()?;
+            Some(1 + tail.chars().next()?.len_utf8())
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeExitAction {
     RespawnShell,
@@ -673,6 +690,7 @@ impl App {
 
         if previous_agent_status != agent_status
             || update.previous_presentation != update.presentation
+            || update.display_projection_cleared
         {
             let presentation = update.presentation.clone();
             self.emit_event(crate::api::schema::EventEnvelope {
@@ -757,6 +775,141 @@ impl App {
                 data: crate::api::schema::EventData::PaneUpdated { pane },
             });
         }
+    }
+
+    pub(crate) fn emit_projected_pane_agent_status_changed(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) {
+        let Some(pane) = self.pane_info(ws_idx, pane_id) else {
+            return;
+        };
+        self.emit_event(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneAgentStatusChanged,
+            data: crate::api::schema::EventData::PaneAgentStatusChanged {
+                pane_id: pane.pane_id,
+                workspace_id: pane.workspace_id,
+                agent_status: pane.agent_status,
+                agent: pane.agent,
+                title: pane.title,
+                display_agent: pane.display_agent,
+                state_labels: pane.state_labels,
+            },
+        });
+    }
+
+    pub(crate) fn track_pane_forwarded_input(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        bytes: &[u8],
+    ) -> bool {
+        let display_changed = self.state.note_pane_forwarded_input(ws_idx, pane_id, bytes);
+        if display_changed {
+            self.emit_projected_pane_agent_status_changed(ws_idx, pane_id);
+        }
+        display_changed
+    }
+
+    pub(crate) fn track_pane_forwarded_key(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        encoded: &[u8],
+        key: &crate::input::TerminalKey,
+    ) -> bool {
+        let display_changed = self
+            .state
+            .note_pane_forwarded_key(ws_idx, pane_id, encoded, key);
+        if display_changed {
+            self.emit_projected_pane_agent_status_changed(ws_idx, pane_id);
+        }
+        display_changed
+    }
+
+    pub(crate) fn track_pane_forwarded_bracketed_paste(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        bytes: &[u8],
+    ) {
+        self.state
+            .note_pane_forwarded_bracketed_paste(ws_idx, pane_id, bytes);
+    }
+
+    pub(crate) fn track_terminal_forwarded_input(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        bytes: &[u8],
+    ) -> bool {
+        let display_changed = self.state.note_terminal_forwarded_input(terminal_id, bytes);
+        if display_changed {
+            if let Some((ws_idx, pane_id)) = self.state.pane_target_for_terminal(terminal_id) {
+                self.emit_projected_pane_agent_status_changed(ws_idx, pane_id);
+            }
+        }
+        display_changed
+    }
+
+    pub(crate) fn track_terminal_forwarded_key(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        encoded: &[u8],
+        key: &crate::input::TerminalKey,
+    ) -> bool {
+        let display_changed = self
+            .state
+            .note_terminal_forwarded_key(terminal_id, encoded, key);
+        if display_changed {
+            if let Some((ws_idx, pane_id)) = self.state.pane_target_for_terminal(terminal_id) {
+                self.emit_projected_pane_agent_status_changed(ws_idx, pane_id);
+            }
+        }
+        display_changed
+    }
+
+    pub(crate) fn track_terminal_forwarded_encoded_input(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        mut bytes: &[u8],
+    ) -> bool {
+        let mut display_changed = false;
+        while !bytes.is_empty() {
+            let Some(escape_at) = bytes.iter().position(|byte| *byte == 0x1b) else {
+                display_changed |= self.track_terminal_forwarded_input(terminal_id, bytes);
+                break;
+            };
+            if escape_at > 0 {
+                display_changed |=
+                    self.track_terminal_forwarded_input(terminal_id, &bytes[..escape_at]);
+                bytes = &bytes[escape_at..];
+                continue;
+            }
+            let Some(sequence_len) = encoded_terminal_key_sequence_len(bytes) else {
+                display_changed |= self.track_terminal_forwarded_input(terminal_id, bytes);
+                break;
+            };
+            let sequence = &bytes[..sequence_len];
+            let key = std::str::from_utf8(sequence)
+                .ok()
+                .and_then(crate::input::parse_terminal_key_sequence);
+            display_changed |= match key {
+                Some(key) => self.track_terminal_forwarded_key(terminal_id, sequence, &key),
+                None => self.track_terminal_forwarded_input(terminal_id, sequence),
+            };
+            bytes = &bytes[sequence_len..];
+        }
+        display_changed
+    }
+
+    pub(crate) fn track_terminal_forwarded_bracketed_paste(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        bytes: &[u8],
+    ) {
+        self.state
+            .note_terminal_forwarded_bracketed_paste(terminal_id, bytes);
     }
 
     pub(crate) fn emit_workspace_token_updated(&mut self, ws_idx: usize) {

@@ -244,6 +244,89 @@ fn surface_with_popup() -> PaneSurfaceFrame {
     surface
 }
 
+fn test_agent(status: AgentStatus, tokens: Vec<(String, String)>) -> ClientShellAgent {
+    ClientShellAgent {
+        pane_id: "pane_1".into(),
+        workspace_id: "ws_1".into(),
+        tab_id: "tab_1".into(),
+        name: None,
+        display_agent: None,
+        agent: None,
+        title: None,
+        terminal_title: None,
+        terminal_title_stripped: None,
+        agent_status: status,
+        state_change_seq: 1,
+        state_labels: Vec::new(),
+        tokens,
+        focused: true,
+    }
+}
+
+#[test]
+fn read_aware_agent_status_icon_and_priority_extend_upstream_only_for_read_blocked() {
+    use crate::config::StatusIndicatorStyle::{Dots, Symbols};
+
+    let unread = test_agent(AgentStatus::Blocked, Vec::new());
+    assert!(!agent_is_blocked_read(&unread));
+    assert_eq!(agent_status_icon(&unread, Dots), "●");
+    assert_eq!(agent_status_icon(&unread, Symbols), "×");
+    assert_eq!(
+        agent_status_priority(&unread),
+        status_priority(AgentStatus::Blocked)
+    );
+
+    let read = test_agent(
+        AgentStatus::Blocked,
+        vec![(
+            crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
+            "1".into(),
+        )],
+    );
+    assert!(agent_is_blocked_read(&read));
+    assert_eq!(agent_status_icon(&read, Dots), "○");
+    assert_eq!(agent_status_icon(&read, Symbols), "○");
+    assert_eq!(
+        agent_status_priority(&read),
+        status_priority(AgentStatus::Idle)
+    );
+    let palette = Palette::catppuccin();
+    assert_eq!(status_color(read.agent_status, &palette), palette.red);
+
+    for status in [
+        AgentStatus::Working,
+        AgentStatus::Done,
+        AgentStatus::Idle,
+        AgentStatus::Unknown,
+    ] {
+        let marked = test_agent(
+            status,
+            vec![(
+                crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
+                "1".into(),
+            )],
+        );
+        for style in [Dots, Symbols] {
+            assert_eq!(
+                agent_status_icon(&marked, style),
+                status_icon(status, style),
+                "non-blocked output must stay byte-identical to upstream for {status:?} {style:?}"
+            );
+        }
+        assert_eq!(agent_status_priority(&marked), status_priority(status));
+    }
+
+    let wrong_value = test_agent(
+        AgentStatus::Blocked,
+        vec![(
+            crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
+            "0".into(),
+        )],
+    );
+    assert!(!agent_is_blocked_read(&wrong_value));
+    assert_eq!(agent_status_icon(&wrong_value, Dots), "●");
+}
+
 mod agents_worktrees_notifications;
 mod chrome_context;
 mod copy;

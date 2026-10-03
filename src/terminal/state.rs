@@ -112,6 +112,180 @@ struct RecentAgentProcessExit {
     observed_at: Instant,
 }
 
+/// `/compact` can perform substantial work without emitting a lifecycle event.
+/// Keep its display-only Working projection bounded even if no later report arrives.
+const COMPACT_OPTIMISTIC_WORKING_TTL: Duration = Duration::from_secs(90);
+
+const COMPACT_INPUT_LINE_MAX_BYTES: usize = 4096;
+
+#[derive(Default)]
+struct CompactCommandDetector {
+    line: Vec<u8>,
+    overflowed: bool,
+    escape_pending: bool,
+}
+
+impl CompactCommandDetector {
+    fn clear(&mut self) {
+        self.line.clear();
+        self.overflowed = false;
+        self.escape_pending = false;
+    }
+
+    fn invalidate_until_submit(&mut self) {
+        self.line.clear();
+        self.overflowed = true;
+        self.escape_pending = false;
+    }
+
+    fn push_text_byte(&mut self, byte: u8) {
+        if self.overflowed {
+            return;
+        }
+        if self.line.len() < COMPACT_INPUT_LINE_MAX_BYTES {
+            self.line.push(byte);
+        } else {
+            self.invalidate_until_submit();
+        }
+    }
+
+    fn delete_char(&mut self) {
+        if self.overflowed {
+            return;
+        }
+        let truncate_to = match std::str::from_utf8(&self.line) {
+            Ok(line) => line.char_indices().next_back().map(|(idx, _)| idx),
+            Err(_) => {
+                self.invalidate_until_submit();
+                return;
+            }
+        };
+        if let Some(truncate_to) = truncate_to {
+            self.line.truncate(truncate_to);
+        }
+    }
+
+    fn delete_word(&mut self) {
+        if self.overflowed {
+            return;
+        }
+        let truncate_to = match std::str::from_utf8(&self.line) {
+            Ok(line) => {
+                let mut chars = line.char_indices().rev().peekable();
+                let mut truncate_to = line.len();
+                while chars.peek().is_some_and(|(_, ch)| ch.is_whitespace()) {
+                    truncate_to = chars.next().map_or(truncate_to, |(idx, _)| idx);
+                }
+                while chars.peek().is_some_and(|(_, ch)| !ch.is_whitespace()) {
+                    truncate_to = chars.next().map_or(truncate_to, |(idx, _)| idx);
+                }
+                truncate_to
+            }
+            Err(_) => {
+                self.invalidate_until_submit();
+                return;
+            }
+        };
+        self.line.truncate(truncate_to);
+    }
+
+    fn submitted_line_is_compact(&self) -> bool {
+        !self.overflowed
+            && std::str::from_utf8(&self.line).ok().is_some_and(|line| {
+                let command = line.trim();
+                command == "/compact" || command.starts_with("/compact ")
+            })
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        let mut submitted_compact = false;
+        for &byte in bytes {
+            if self.escape_pending {
+                self.escape_pending = false;
+                if matches!(byte, 0x08 | 0x7f) {
+                    self.delete_word();
+                    continue;
+                }
+                self.invalidate_until_submit();
+            }
+            match byte {
+                b'\r' | b'\n' => {
+                    submitted_compact |= self.submitted_line_is_compact();
+                    self.clear();
+                }
+                0x08 | 0x7f => self.delete_char(),
+                0x1b => self.escape_pending = true,
+                0x17 => self.delete_word(),
+                0x03 | 0x15 => self.clear(),
+                0x20..=0x7e | 0x80..=0xff => self.push_text_byte(byte),
+                _ => self.invalidate_until_submit(),
+            }
+        }
+        submitted_compact
+    }
+
+    fn feed_key(&mut self, key: &crate::input::TerminalKey) -> bool {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+        if key.kind == KeyEventKind::Release {
+            return false;
+        }
+        let mut submitted_compact = false;
+        for _ in 0..key.repeat_count.max(1) {
+            if let Some(text) = key.generated_text.as_deref() {
+                submitted_compact |= self.feed(text.as_bytes());
+                continue;
+            }
+            match key.code {
+                KeyCode::Enter if key.modifiers.is_empty() => {
+                    submitted_compact |= self.feed(b"\r");
+                }
+                KeyCode::Backspace if key.modifiers.is_empty() => self.delete_char(),
+                KeyCode::Backspace if key.modifiers == KeyModifiers::ALT => self.delete_word(),
+                KeyCode::Char(ch)
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key
+                            .modifiers
+                            .difference(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                            .is_empty() =>
+                {
+                    match ch.to_ascii_lowercase() {
+                        'c' => self.clear(),
+                        'u' => self.clear(),
+                        'w' => self.delete_word(),
+                        _ => self.invalidate_until_submit(),
+                    }
+                }
+                KeyCode::Char(_) => {
+                    let Some(ch) = crate::input::text_char_for_key(key) else {
+                        self.invalidate_until_submit();
+                        continue;
+                    };
+                    let mut encoded = [0; 4];
+                    self.feed(ch.encode_utf8(&mut encoded).as_bytes());
+                }
+                _ => self.invalidate_until_submit(),
+            }
+        }
+        submitted_compact
+    }
+
+    /// Bracketed paste inserts text without submitting embedded line breaks.
+    /// Any such break makes the pending command ineligible until a real submit
+    /// resets it; otherwise fragments around the break could form `/compact`.
+    fn feed_bracketed_paste(&mut self, bytes: &[u8]) {
+        if self.escape_pending {
+            self.invalidate_until_submit();
+        }
+        for &byte in bytes {
+            match byte {
+                0x20..=0x7e | 0x80..=0xff => self.push_text_byte(byte),
+                _ => self.invalidate_until_submit(),
+            }
+        }
+    }
+}
+
 /// Pure state for a server-owned terminal.
 ///
 /// During the migration this is still one-to-one with a pane-backed PTY, but
@@ -148,6 +322,9 @@ pub struct TerminalState {
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
+    /// Display-only state for commands that do work without lifecycle reports.
+    optimistic_working_until: Option<Instant>,
+    compact_command_detector: CompactCommandDetector,
 }
 
 impl TerminalState {
@@ -183,7 +360,120 @@ impl TerminalState {
             recent_agent_process_exit: None,
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
+            optimistic_working_until: None,
+            compact_command_detector: CompactCommandDetector::default(),
         }
+    }
+
+    /// State shown to clients. Optimistic work never changes `state`, which remains
+    /// the sole input to lifecycle arbitration and notification decisions.
+    pub fn display_state(&self) -> AgentState {
+        self.display_state_at(Instant::now())
+    }
+
+    pub(crate) fn display_state_at(&self, now: Instant) -> AgentState {
+        if self
+            .optimistic_working_until
+            .is_some_and(|deadline| now < deadline)
+        {
+            AgentState::Working
+        } else {
+            self.state
+        }
+    }
+
+    pub(crate) fn optimistic_working_deadline(&self) -> Option<Instant> {
+        self.optimistic_working_until
+    }
+
+    /// Feeds bytes that were successfully forwarded to this terminal. Returns
+    /// true only when a submitted `/compact` line changes the displayed state.
+    pub(crate) fn note_forwarded_input_at(&mut self, bytes: &[u8], now: Instant) -> bool {
+        if !self.is_agent_terminal() {
+            self.compact_command_detector.clear();
+            return false;
+        }
+        if !self.compact_command_detector.feed(bytes) {
+            return false;
+        }
+        self.start_optimistic_working_at(now)
+    }
+
+    pub(crate) fn note_forwarded_input(&mut self, bytes: &[u8]) -> bool {
+        self.note_forwarded_input_at(bytes, Instant::now())
+    }
+
+    pub(crate) fn note_forwarded_key_at(
+        &mut self,
+        encoded: &[u8],
+        key: &crate::input::TerminalKey,
+        now: Instant,
+    ) -> bool {
+        if !self.is_agent_terminal() {
+            self.compact_command_detector.clear();
+            return false;
+        }
+        if encoded.is_empty() || key.kind == crossterm::event::KeyEventKind::Release {
+            return false;
+        }
+        // Legacy encoding can collapse semantics: Shift+Enter is the same CR as
+        // Enter, while unsupported keys can encode to nothing. Model those
+        // bytes exactly. Escape-prefixed encodings retain key semantics (Kitty
+        // CSI-u, modifyOtherKeys, and legacy Alt/special keys), so normalize
+        // them without letting their protocol bytes poison the line buffer.
+        let submitted_compact = if encoded.len() > 1 && encoded[0] == 0x1b {
+            self.compact_command_detector.feed_key(key)
+        } else {
+            self.compact_command_detector.feed(encoded)
+        };
+        if !submitted_compact {
+            return false;
+        }
+        self.start_optimistic_working_at(now)
+    }
+
+    pub(crate) fn note_forwarded_key(
+        &mut self,
+        encoded: &[u8],
+        key: &crate::input::TerminalKey,
+    ) -> bool {
+        self.note_forwarded_key_at(encoded, key, Instant::now())
+    }
+
+    fn start_optimistic_working_at(&mut self, now: Instant) -> bool {
+        let display_changed = self.display_state_at(now) != AgentState::Working;
+        self.optimistic_working_until = Some(now + COMPACT_OPTIMISTIC_WORKING_TTL);
+        display_changed
+    }
+
+    pub(crate) fn note_forwarded_bracketed_paste(&mut self, bytes: &[u8]) {
+        if !self.is_agent_terminal() {
+            self.compact_command_detector.clear();
+            return;
+        }
+        self.compact_command_detector.feed_bracketed_paste(bytes);
+    }
+
+    pub(crate) fn reset_compact_command_detector(&mut self) {
+        self.compact_command_detector.clear();
+    }
+
+    fn clear_compact_input_state(&mut self) {
+        self.optimistic_working_until = None;
+        self.compact_command_detector.clear();
+    }
+
+    /// Removes an elapsed overlay. A true result means a repaint is owed so a
+    /// previously rendered Working mark cannot linger on an idle server.
+    pub(crate) fn expire_optimistic_working_at(&mut self, now: Instant) -> bool {
+        if self
+            .optimistic_working_until
+            .is_none_or(|deadline| now < deadline)
+        {
+            return false;
+        }
+        self.optimistic_working_until = None;
+        self.state != AgentState::Working
     }
 
     pub fn set_detected_agent_process_at(
@@ -339,6 +629,9 @@ impl TerminalState {
         let agent_released = process_exited
             && !newer_custom_authority
             && (previous_agent_label.is_some() || self.agent_name.is_some());
+        if agent_released {
+            self.clear_compact_input_state();
+        }
         if self.should_ignore_detected_state_under_full_lifecycle_hook(agent, process_exited) {
             if self
                 .hook_authority
@@ -1779,6 +2072,9 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
+        if !process_owns_agent {
+            self.clear_compact_input_state();
+        }
         self.suppress_full_lifecycle_hook_report(
             source,
             agent_label,
@@ -2095,6 +2391,7 @@ impl TerminalState {
         self.recent_agent_process_exit = None;
         self.agent_process_acquisition_pending = false;
         self.pending_agent_resume_plan = None;
+        self.clear_compact_input_state();
         self.clear_agent_name();
     }
 
@@ -2173,6 +2470,11 @@ impl TerminalState {
         let agent_label = self.effective_agent_label().map(str::to_string);
         let known_agent = self.effective_known_agent();
 
+        if previous_state != state {
+            // Real lifecycle state always wins immediately over an optimistic
+            // display projection, even when its TTL has not elapsed.
+            self.optimistic_working_until = None;
+        }
         let presentation = self.effective_presentation_for_state_at(state, now);
         self.clear_expiry_pending_for_hidden_metadata();
 
@@ -2216,6 +2518,199 @@ mod tests {
             .join(name)
             .display()
             .to_string()
+    }
+
+    #[test]
+    fn compact_detector_tracks_line_editing_without_accepting_near_matches() {
+        let mut edited = CompactCommandDetector::default();
+        assert!(!edited.feed(b"/compax"));
+        assert!(
+            edited.feed(b"\x7fct\r"),
+            "backspace edit should submit /compact"
+        );
+
+        let mut cleared = CompactCommandDetector::default();
+        assert!(cleared.feed(b"wrong\x15 /compact with-args\n"));
+
+        let mut interrupted = CompactCommandDetector::default();
+        assert!(!interrupted.feed(b"/comp\x03act\r"));
+
+        let mut deleted_word = CompactCommandDetector::default();
+        assert!(
+            !deleted_word.feed(b"/com\x17pact\r"),
+            "Ctrl-W must delete the preceding word rather than join fragments"
+        );
+        let mut alt_backspace = CompactCommandDetector::default();
+        assert!(
+            !alt_backspace.feed(b"/com\x1b\x7fpact\r"),
+            "Alt-Backspace must not join fragments into /compact"
+        );
+        let mut escaped = CompactCommandDetector::default();
+        assert!(
+            !escaped.feed(b"/compact\x1b\r"),
+            "an escape sequence must invalidate the pending command"
+        );
+
+        let mut pasted_multiline = CompactCommandDetector::default();
+        pasted_multiline.feed_bracketed_paste(b"notes\n/compact\n");
+        assert!(
+            !pasted_multiline.feed(b"\r"),
+            "line breaks inside bracketed paste must not submit /compact"
+        );
+        pasted_multiline.feed_bracketed_paste(b"/compact");
+        assert!(pasted_multiline.feed(b"\r"));
+
+        for input in [
+            b"/compaction\r".as_slice(),
+            b"/compactness\n".as_slice(),
+            b"prefix /compact\r".as_slice(),
+        ] {
+            let mut detector = CompactCommandDetector::default();
+            assert!(!detector.feed(input), "near match accepted: {input:?}");
+        }
+
+        let mut unexpected_bytes = CompactCommandDetector::default();
+        assert!(
+            !unexpected_bytes.feed(b"\x01/compact\r"),
+            "unmodeled controls must fail closed instead of being ignored"
+        );
+        let mut unicode_in_command = CompactCommandDetector::default();
+        assert!(
+            !unicode_in_command.feed("/compéact\r".as_bytes()),
+            "non-ASCII bytes must not disappear inside the command token"
+        );
+        let mut unicode_arguments = CompactCommandDetector::default();
+        assert!(
+            unicode_arguments.feed("/compact résumé\r".as_bytes()),
+            "valid UTF-8 instructions must remain eligible"
+        );
+        let mut pasted_unicode_arguments = CompactCommandDetector::default();
+        pasted_unicode_arguments.feed_bracketed_paste("/compact résumé".as_bytes());
+        assert!(
+            pasted_unicode_arguments.feed(b"\r"),
+            "UTF-8 instructions inserted by bracketed paste must remain eligible"
+        );
+
+        let mut bounded = CompactCommandDetector::default();
+        assert!(!bounded.feed(&vec![b'x'; COMPACT_INPUT_LINE_MAX_BYTES + 1]));
+        assert!(bounded.line.is_empty());
+        assert!(bounded.overflowed);
+        assert!(
+            bounded.feed(b"ignored\x15/compact\r"),
+            "an overflowed line must stay inert until a line-clear control"
+        );
+    }
+
+    #[test]
+    fn compact_detector_normalizes_report_all_keys_and_ignores_releases() {
+        let mut detector = CompactCommandDetector::default();
+        for ch in "/compact".chars() {
+            let press =
+                crate::input::parse_terminal_key_sequence(&format!("\x1b[{};1:1u", ch as u32))
+                    .unwrap();
+            let release =
+                crate::input::parse_terminal_key_sequence(&format!("\x1b[{};1:3u", ch as u32))
+                    .unwrap();
+            assert!(!detector.feed_key(&press));
+            assert!(!detector.feed_key(&release));
+        }
+        let enter = crate::input::parse_terminal_key_sequence("\x1b[13;1u").unwrap();
+        assert!(detector.feed_key(&enter));
+
+        let mut shifted_near_match = CompactCommandDetector::default();
+        assert!(!shifted_near_match.feed(b"/compa"));
+        assert!(
+            !shifted_near_match.feed_key(&crate::input::TerminalKey::new(
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::SHIFT,
+            ))
+        );
+        assert!(!shifted_near_match.feed(b"t\r"));
+    }
+
+    #[test]
+    fn compact_overlay_is_display_only_expires_and_clears_on_real_transition() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.set_agent_name("worker".into());
+        terminal.state = AgentState::Idle;
+
+        assert!(terminal.note_forwarded_input_at(b"/compact\r", now));
+        assert_eq!(
+            terminal.state,
+            AgentState::Idle,
+            "raw arbitration state changed"
+        );
+        assert_eq!(terminal.display_state_at(now), AgentState::Working);
+        let deadline = terminal
+            .optimistic_working_deadline()
+            .expect("compact overlay deadline");
+        assert_eq!(deadline, now + COMPACT_OPTIMISTIC_WORKING_TTL);
+        terminal.reset_compact_command_detector();
+        assert_eq!(
+            terminal.optimistic_working_deadline(),
+            Some(deadline),
+            "breaking input continuity must not clear an existing projection"
+        );
+        assert_eq!(
+            terminal.display_state_at(deadline),
+            AgentState::Idle,
+            "TTL must be exclusive at its deadline"
+        );
+        assert!(terminal.expire_optimistic_working_at(deadline));
+        assert!(terminal.optimistic_working_deadline().is_none());
+
+        assert!(terminal.note_forwarded_input_at(b"/compact\n", now));
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Blocked);
+        assert_eq!(terminal.display_state_at(now), AgentState::Blocked);
+        assert!(terminal.optimistic_working_deadline().is_none());
+
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        assert!(terminal.note_forwarded_input_at(b"/compact\n", now));
+        let process_exit = terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            true,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert_eq!(
+            terminal.display_state_at(now + Duration::from_secs(1)),
+            AgentState::Idle,
+            "same-state process exit must clear the optimistic overlay"
+        );
+        assert!(terminal.optimistic_working_deadline().is_none());
+        assert!(
+            process_exit.effective_state_change.is_some(),
+            "clearing the display overlay must request a repaint"
+        );
+    }
+
+    #[test]
+    fn compact_overlay_requires_an_agent_and_respawn_clears_detector_and_overlay() {
+        let now = Instant::now();
+        let mut shell = test_terminal();
+        shell.state = AgentState::Idle;
+        assert!(!shell.note_forwarded_input_at(b"/compact\r", now));
+        assert_eq!(shell.display_state_at(now), AgentState::Idle);
+
+        let mut terminal = test_terminal();
+        terminal.set_agent_name("worker".into());
+        terminal.state = AgentState::Idle;
+        assert!(!terminal.note_forwarded_input_at(b"/comp", now));
+        terminal.clear_agent_runtime_identity_after_respawn();
+        terminal.set_agent_name("replacement".into());
+        terminal.state = AgentState::Idle;
+        assert!(!terminal.note_forwarded_input_at(b"act\r", now));
+        assert_eq!(terminal.display_state_at(now), AgentState::Idle);
+
+        assert!(terminal.note_forwarded_input_at(b"/compact\r", now));
+        terminal.clear_agent_runtime_identity_after_respawn();
+        assert!(terminal.optimistic_working_deadline().is_none());
+        assert_eq!(terminal.display_state_at(now), AgentState::Unknown);
     }
 
     fn anchor_full_lifecycle_session(
