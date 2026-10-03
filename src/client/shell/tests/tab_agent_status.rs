@@ -36,9 +36,12 @@ fn snapshot_with_agent(status: AgentStatus) -> ClientShellSnapshot {
     projected
 }
 
-/// Renders the real tab bar and returns the status mark cell. The rect comes
-/// from the hit map the renderer itself fills in, so the anchor cannot drift
-/// from the paint.
+/// Renders the real tab bar and returns the status mark cell: the tab's first
+/// non-blank cell, because the mark leads the centred label and has no fixed
+/// column. The rect comes from the hit map the renderer itself fills in, so the
+/// anchor cannot drift from the paint. A tab whose mark went missing returns its
+/// label's first character, which every comparison below rejects; a tab that
+/// drew nothing at all fails here.
 fn rendered_tab_mark(
     config: &ClientShellConfig,
     projected: &ClientShellSnapshot,
@@ -60,7 +63,10 @@ fn rendered_tab_mark(
     );
     let (rect, tab_id) = hits.tabs.first().expect("the snapshot has one tab").clone();
     assert_eq!(tab_id, "tab_1");
-    let cell = &buffer[(rect.x, rect.y)];
+    let cell = (rect.x..rect.right())
+        .map(|x| &buffer[(x, rect.y)])
+        .find(|cell| cell.symbol() != " ")
+        .expect("the tab draws something");
     (cell.symbol().to_string(), cell.style().fg)
 }
 
@@ -196,8 +202,25 @@ fn tab_status_mark_appears_only_when_enabled_and_widens_by_two() {
             .symbol
             .clone()
     };
-    // The mark is the filled dot in the head cell, the name follows the separator.
-    assert_eq!(cell(enabled_rect.x, enabled_rect.y), "●");
+    // The mark is the filled dot leading the label, one separator space before the name.
+    let enabled_row: Vec<String> = (enabled_rect.x..enabled_rect.right())
+        .map(|x| cell(x, enabled_rect.y))
+        .collect();
+    let mark_offset = enabled_row
+        .iter()
+        .position(|symbol| symbol != " ")
+        .expect("the enabled tab draws something");
+    assert_eq!(enabled_row[mark_offset], "●", "row {enabled_row:?}");
+    assert_eq!(
+        enabled_row[mark_offset + 1],
+        " ",
+        "one separator after the mark: {enabled_row:?}"
+    );
+    assert_eq!(
+        enabled_row[mark_offset + 2],
+        "1",
+        "the name follows the separator: {enabled_row:?}"
+    );
 
     let mut disabled = ClientShellState::new(tab_status_config(false));
     disabled.set_snapshot(Box::new(snapshot_with_agent(AgentStatus::Blocked)));
@@ -272,13 +295,23 @@ fn tabs_without_agents_render_stock_when_the_feature_is_on() {
         without_agent.width + 2,
         "only the tab holding an agent widens"
     );
-    let symbol = |rect: Rect| {
-        frame.cells[usize::from(rect.y) * usize::from(frame.width) + usize::from(rect.x)]
-            .symbol
-            .clone()
+    // The first thing each tab draws: the mark on the agent's tab, the bare label on the other.
+    let first_drawn = |rect: Rect| {
+        (rect.x..rect.right())
+            .map(|x| {
+                frame.cells[usize::from(rect.y) * usize::from(frame.width) + usize::from(x)]
+                    .symbol
+                    .clone()
+            })
+            .find(|symbol| symbol != " ")
+            .unwrap_or_else(|| panic!("the tab at {rect:?} draws nothing"))
     };
-    assert_eq!(symbol(with_agent), "●");
-    assert_eq!(symbol(without_agent), " ", "no mark on an agent-less tab");
+    assert_eq!(first_drawn(with_agent), "●");
+    assert_eq!(
+        first_drawn(without_agent),
+        "2",
+        "no mark on an agent-less tab"
+    );
 
     // Stock control: with the feature off both tabs are the same width again.
     let mut stock = ClientShellState::new(tab_status_config(false));
@@ -443,11 +476,87 @@ fn tab_status_mark_survives_on_wrapped_rows() {
         "fixture must wrap: every tab is on the first row"
     );
     for (rect, tab_id) in &lower_row_tabs {
+        let first_drawn = (rect.x..rect.right())
+            .map(|x| {
+                frame.cells[usize::from(rect.y) * usize::from(frame.width) + usize::from(x)]
+                    .symbol
+                    .as_str()
+            })
+            .find(|symbol| *symbol != " ");
         assert_eq!(
-            frame.cells[usize::from(rect.y) * usize::from(frame.width) + usize::from(rect.x)]
-                .symbol,
-            "●",
+            first_drawn,
+            Some("●"),
             "the wrapped row draws {tab_id}'s mark too"
+        );
+    }
+}
+
+/// The mark leads the name as one unit: exactly one space between them, every cell of the tab
+/// in the tab's own colour, and at the tab's natural width the label reads as v0.8.x drew it,
+/// " ● name  x" with the close marker. The first v0.9.1 port drew the mark in the tab's head
+/// cell and the name from its third cell and never painted the second, so the tab bar's panel
+/// colour showed through as a hole between the mark and the name (owner report, 2026-10-03).
+/// Checked through the real renderer, with and without the close marker.
+#[test]
+fn tab_status_mark_sits_one_painted_space_before_the_name() {
+    for close_button in [false, true] {
+        let mut config = tab_status_config(true);
+        config.tab_close_button = close_button;
+        config.mouse_capture = true;
+        let tab_bg = config.palette.accent;
+        // Vacuity guard: if the tab colour equalled the bar colour, an unpainted cell could not
+        // be told from a painted one and the colour check below would prove nothing.
+        assert_ne!(
+            tab_bg, config.palette.panel_bg,
+            "fixture cannot tell an unpainted cell from a painted one"
+        );
+        let mut projected = snapshot_with_agent(AgentStatus::Blocked);
+        // Longer than the stock minimum, so the tab renders at its natural width.
+        projected.tabs[0].label = "server".into();
+        let mark = agent_status_icon(&projected.agents[0], config.status_indicators);
+
+        let area = Rect::new(0, 0, 60, 1);
+        let mut buffer = Buffer::empty(area);
+        let mut hits = ShellHitMap::default();
+        let mut tab_scroll = 0usize;
+        let mut reveal_focused_tab = false;
+        render_tab_bar(
+            &mut buffer,
+            area,
+            &projected,
+            &config,
+            &mut tab_scroll,
+            &mut reveal_focused_tab,
+            None,
+            &mut hits,
+        );
+        let (rect, _) = hits.tabs.first().expect("one tab").clone();
+        let cells: Vec<String> = (rect.x..rect.right())
+            .map(|x| buffer[(x, rect.y)].symbol().to_string())
+            .collect();
+        let row = cells.concat();
+
+        let expected = if close_button {
+            format!(" {mark} server  x")
+        } else {
+            format!("  {mark} server  ")
+        };
+        assert_eq!(row, expected, "tab label (close marker: {close_button})");
+        for (offset, x) in (rect.x..rect.right()).enumerate() {
+            assert_eq!(
+                buffer[(x, rect.y)].style().bg,
+                Some(tab_bg),
+                "cell {offset} of {row:?} must carry the tab's colour (close marker: {close_button})"
+            );
+        }
+        let mark_offset = cells
+            .iter()
+            .position(|symbol| symbol == mark)
+            .expect("the mark is drawn");
+        assert_eq!(
+            buffer[(rect.x + mark_offset as u16, rect.y)].style().fg,
+            Some(status_color(AgentStatus::Blocked, &config.palette)),
+            "the mark keeps its status colour (close marker: {close_button})"
         );
     }
 }

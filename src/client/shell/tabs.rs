@@ -366,35 +366,37 @@ fn put_tab(
     } else {
         Style::default().fg(palette.overlay0).bg(palette.surface0)
     };
-    // The status mark and its separator take the head cells; the close marker takes the label's
-    // last cell. The name centres in what is left, so each decoration claims its own cells and
-    // the geometry and the paint cannot drift apart.
+    // The status mark and its separator lead the name as one unit, centred with it in the label
+    // cells, and the close marker takes the label's last cell. So the mark always sits one
+    // painted space before the name, as v0.8.x drew it (" ● name  x" at the natural width). The
+    // first port drew the mark in the head cell and the name from the third cell and never
+    // painted the second, so the bar's colour showed through between them (2026-10-03).
     let status_prefix = tab_status_prefix(config, snapshot, tab);
-    let status_prefix_width = u16::from(status_prefix.is_some()) * 2;
+    let prefix = status_prefix.map_or_else(String::new, |(mark, _)| format!("{mark} "));
     let close_marker = tab_close_marker_x(rect, config);
     let label_width = match close_marker {
         Some(_) => rect.width.saturating_sub(1),
         None => rect.width,
-    }
-    .saturating_sub(status_prefix_width);
-    let padding = label_width.saturating_sub(display_width(name));
+    };
+    let padding =
+        label_width.saturating_sub(display_width(&prefix).saturating_add(display_width(name)));
     let left = padding / 2;
     let text = format!(
-        "{empty:left$}{name}{empty:right_padding$}",
+        "{empty:left$}{prefix}{name}{empty:right_padding$}",
         empty = "",
         left = left as usize,
         right_padding = padding.saturating_sub(left) as usize,
     );
-    put_text(
-        buffer,
-        rect.x.saturating_add(status_prefix_width),
-        rect.y,
-        label_width,
-        &text,
-        style,
-    );
-    if let Some((mark, color)) = status_prefix {
-        put_text(buffer, rect.x, rect.y, 1, mark, style.fg(color));
+    put_text(buffer, rect.x, rect.y, label_width, &text, style);
+    if let Some((mark, color)) = status_prefix.filter(|_| left < label_width) {
+        put_text(
+            buffer,
+            rect.x.saturating_add(left),
+            rect.y,
+            1,
+            mark,
+            style.fg(color),
+        );
     }
     if let Some(x) = close_marker {
         put_text(buffer, x, rect.y, 1, "x", style);
