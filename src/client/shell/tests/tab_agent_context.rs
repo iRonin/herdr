@@ -131,7 +131,7 @@ fn tab_lifecycle_marker_has_a_separator_before_the_pane_name() {
 }
 
 /// `ui.tab_agent_status` and `ui.tab_agent_context` compose in one label: the
-/// status mark in its own head cells, then the marker, the name, the reading.
+/// status mark and its separator, then the marker, the name, the reading.
 /// Both keys are independent — either alone must work.
 #[test]
 fn status_mark_and_context_compose_on_one_tab() {
@@ -140,7 +140,16 @@ fn status_mark_and_context_compose_on_one_tab() {
     let (state, frame) = composed_state(config, "🥷✅ ~42%·4242 $1.23");
     let (rect, row) = composed_tab_row(&state, &frame);
 
-    assert_eq!(row[0], "●", "the blocked status mark leads the label");
+    let mark = row
+        .iter()
+        .position(|symbol| symbol != " ")
+        .expect("the tab draws something");
+    assert_eq!(
+        row[mark], "●",
+        "the blocked status mark leads the label: {row:?}"
+    );
+    assert_eq!(row[mark + 1], " ", "one separator after the mark: {row:?}");
+    assert_eq!(row[mark + 2], "✅", "then the lifecycle marker: {row:?}");
     let joined = row.join("");
     assert!(joined.contains("✅"), "marker present: {joined:?}");
     assert!(joined.contains("Pane"), "name present: {joined:?}");
