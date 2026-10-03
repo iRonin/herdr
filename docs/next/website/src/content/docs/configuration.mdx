@@ -310,6 +310,8 @@ Set `tab_close_button = true` under `[ui]` to draw an `x` in the last cell of ev
 
 Set `tab_bar_wrap = true` under `[ui]` to wrap tabs onto multiple rows instead of scrolling them along a single row. Every tab stays visible, so the `<` and `>` overflow controls are not drawn, and the terminal panes shrink by however many rows the tabs need. The bar takes at most half the available height; past that the rows scroll to keep the active tab in view. Position is independent: a wrapped bar can sit at the top or the bottom, and at the bottom a mode bar covers only its last row, leaving the rows above it clickable. The default is `false`, which keeps the single scrollable row.
 
+Set `tab_agent_status = true` under `[ui]` to show the status of the highest-attention agent on each top tab that holds an agent. The mark is the same one the agents panel, machine lists and mobile header use — a filled dot for blocked and working, a hollow dot for idle, a middle dot for unknown in the `dots` style, or the `×`/`◐`/`✓` glyph set when `status_indicators = "symbols"` — in that status's colour, so colour carries the state the shape does not. A tab widens by two cells to fit the mark, on both single-row and wrapped bars, and tabs without an agent render exactly as before. It is disabled by default.
+
 Configure an ordered tmux-style status area at the right edge of the tab row:
 
 ```toml

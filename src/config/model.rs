@@ -1003,6 +1003,8 @@ pub struct UiConfig {
     pub tab_bar_position: TabBarPositionConfig,
     /// Wrap tabs onto multiple rows instead of using a single scrollable row. Default: false.
     pub tab_bar_wrap: bool,
+    /// Show the highest-attention agent status on each top tab. Default: false.
+    pub tab_agent_status: bool,
     /// Ordered entries shown at the right edge of the desktop tab row. Empty by default.
     pub tab_bar_right: Vec<TabBarRightEntryConfig>,
     /// Text inserted between visible right-side tab bar entries. Default: one space.
@@ -1238,6 +1240,7 @@ impl Default for UiConfig {
             hide_tab_bar_when_single_tab: false,
             tab_bar_position: TabBarPositionConfig::Top,
             tab_bar_wrap: false,
+            tab_agent_status: false,
             tab_bar_right: Vec::new(),
             tab_bar_right_separator: " ".into(),
             window_title: super::window_title::default_window_title(),
@@ -1607,6 +1610,19 @@ prompt_new_tab_name = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.prompt_new_tab_name);
+    }
+
+    #[test]
+    fn tab_agent_status_defaults_off_and_parses() {
+        let default_config = Config::default();
+        assert!(!default_config.ui.tab_agent_status);
+
+        let toml = r#"
+[ui]
+tab_agent_status = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.ui.tab_agent_status);
     }
 
     #[test]
