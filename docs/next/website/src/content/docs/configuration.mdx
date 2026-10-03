@@ -312,6 +312,8 @@ Set `tab_bar_wrap = true` under `[ui]` to wrap tabs onto multiple rows instead o
 
 Set `tab_agent_status = true` under `[ui]` to show the status of the highest-attention agent on each top tab that holds an agent. The mark is the same one the agents panel, machine lists and mobile header use — a filled dot for blocked and working, a hollow dot for idle, a middle dot for unknown in the `dots` style, or the `×`/`◐`/`✓` glyph set when `status_indicators = "symbols"` — in that status's colour, so colour carries the state the shape does not. A tab widens by two cells to fit the mark, on both single-row and wrapped bars, and tabs without an agent render exactly as before. It is disabled by default.
 
+Set `tab_agent_context = true` under `[ui]` to mirror the highest-attention agent pane's context reading on each top tab. The percentage reported by the agent appears after the pane name — `N%` for a reading, `~N%` for an estimate, `?%` when the agent has just compacted and no figure exists yet — and the agent reporter's lifecycle marker appears before it, separated by one space: awaiting-user (possibly with a pending-ask count), ready-to-close, asked-to-stop, done, or agent-driven. The reading comes from the same agent label the Agents pane shows, so the two cannot disagree; a tab whose agent reports nothing renders exactly as stock, and the setting is off by default.
+
 Configure an ordered tmux-style status area at the right edge of the tab row:
 
 ```toml
