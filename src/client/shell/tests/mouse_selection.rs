@@ -1589,6 +1589,128 @@ fn plain_double_click_copies_unicode_tokens_exactly() {
     }
 }
 
+/// From the delta review. The row reply comes back on the API socket and surface
+/// patches on the client socket, so the client can see a newer patch before the
+/// reply to a read the server answered earlier. While the second press is held
+/// and the reply is pending there is no selection and no deadline, so the patch
+/// takes the fast path, which never runs the held-gesture invalidation.
+/// The copy is still the token that was read; the highlight must not then stand
+/// over the replacement text until its deadline.
+#[test]
+fn reviewer_patch_before_row_reply_does_not_leave_highlight_over_replacement() {
+    let rewritten = ["alpha WRONGTEXT charlie", WORD_ROWS[1], WORD_ROWS[2]];
+    for release_before_response in [false, true] {
+        let mut state = word_state(true, &WORD_ROWS);
+        let mut endpoint = WordEndpoint::new(&WORD_ROWS);
+        let held = press_twice(&mut state, 0, 8);
+        let mut pending = Vec::new();
+        if release_before_response {
+            pending =
+                word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 8).actions;
+        }
+        // The server answered the row read at revision 0; output then rewrote the
+        // row and its patch reaches the client first.
+        let next = word_surface(&rewritten, 2, 1);
+        let patch = patch_to(&state, &next);
+        let outcome = state.apply_pane_surface_patch(patch);
+        assert!(
+            matches!(
+                outcome,
+                super::super::surface_patch::ClientPaneSurfacePatchOutcome::Applied(Some(_))
+            ),
+            "patch took the fast path"
+        );
+        assert!(
+            state.word_selection_gesture.is_some(),
+            "fast path did not cancel the held gesture"
+        );
+        let (after, mut copied) = endpoint.answer(&mut state, held);
+        pending.extend(after);
+        if !release_before_response {
+            pending =
+                word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 8).actions;
+        }
+        copied.extend(endpoint.serve(&mut state, pending));
+        assert_eq!(copied, vec![b"BRAVOCOPY".to_vec()], "copies the token read");
+        // A later identical surface (e.g. unrelated output elsewhere) arrives.
+        state.set_pane_surface(word_surface(
+            &["alpha WRONGTEXT charlie", WORD_ROWS[1], "OUTPUT"],
+            3,
+            2,
+        ));
+        assert!(
+            state.selection.is_none(),
+            "release_before_response={release_before_response}: highlight still marks WRONGTEXT, \
+             which was not copied: {:?}",
+            state.selection.as_ref().map(|s| s.ordered_cells())
+        );
+    }
+}
+
+/// A patch that reaches the client before the row reply can carry newer text, or
+/// a switch to the alternate screen, without cancelling the held gesture (only a
+/// full surface runs that check, and making patches run it would cancel more
+/// double-clicks during output, #4551). The copy is still the token that was
+/// read, but the screen no longer shows it, so no highlight may stand over it.
+#[test]
+fn double_click_shows_no_highlight_when_the_screen_moved_on_before_the_reply() {
+    for alternate in [false, true] {
+        for release_before_response in [false, true] {
+            let case =
+                format!("alternate screen {alternate}, release first {release_before_response}");
+            let mut state = word_state(true, &WORD_ROWS);
+            let mut endpoint = WordEndpoint::new(&WORD_ROWS);
+            let held = press_twice(&mut state, 0, 8);
+            let mut pending = Vec::new();
+            if release_before_response {
+                pending = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 8)
+                    .actions;
+            }
+            let mut next = if alternate {
+                word_surface(&["vim", "", ""], 2, 1)
+            } else {
+                word_surface(
+                    &["alpha WRONGTEXT charlie", WORD_ROWS[1], WORD_ROWS[2]],
+                    2,
+                    1,
+                )
+            };
+            next.panes[0].alternate_screen_active = alternate;
+            let patch = patch_to(&state, &next);
+            assert!(
+                matches!(
+                    state.apply_pane_surface_patch(patch),
+                    super::super::surface_patch::ClientPaneSurfacePatchOutcome::Applied(Some(_))
+                ),
+                "{case}: patch took the fast path"
+            );
+            assert!(
+                state.word_selection_gesture.is_some(),
+                "{case}: gesture still held"
+            );
+            let (after, mut copied) = endpoint.answer(&mut state, held);
+            pending.extend(after);
+            if !release_before_response {
+                pending = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 8)
+                    .actions;
+            }
+            copied.extend(endpoint.serve(&mut state, pending));
+            assert_eq!(
+                copied,
+                vec![b"BRAVOCOPY".to_vec()],
+                "{case}: copies the token read"
+            );
+            assert_eq!(endpoint.reads.len(), 1, "{case}: no second read");
+            assert!(state.copy_feedback.is_some(), "{case}: copy feedback");
+            assert!(
+                state.selection.is_none(),
+                "{case}: no highlight over other text"
+            );
+            assert!(state.selection_highlight_clear_deadline.is_none(), "{case}");
+        }
+    }
+}
+
 #[test]
 fn double_click_copies_at_most_once_across_duplicate_or_obsolete_replies() {
     // A duplicate of the row reply, and a repeated release, copy nothing more.
