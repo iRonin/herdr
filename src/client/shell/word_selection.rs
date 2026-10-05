@@ -24,47 +24,67 @@ pub(super) struct ClientCopiedWord {
     row: u32,
     start_col: u16,
     end_col: u16,
-    text: String,
+    /// The highlighted cells' symbols when the word was copied, one per column.
+    shown: Vec<String>,
 }
 
 impl ClientCopiedWord {
-    /// Whether `surface` shows other text in this token's own cells. Cells the
-    /// surface does not show are left to the highlight's deadline.
-    pub(super) fn replaced_in(&self, surface: &PaneSurfaceFrame) -> bool {
-        let Some(pane) = surface
+    /// Records what `surface` shows in the highlighted cells, if it shows them.
+    fn new(
+        surface: &PaneSurfaceFrame,
+        pane_id: String,
+        row: u32,
+        start_col: u16,
+        end_col: u16,
+    ) -> Option<Self> {
+        let mut word = Self {
+            pane_id,
+            row,
+            start_col,
+            end_col,
+            shown: Vec::new(),
+        };
+        word.shown = word.cells_in(surface)?;
+        Some(word)
+    }
+
+    /// The highlighted cells' symbols in `surface`, indexed by column, so no
+    /// character-width table is involved: a wide character's continuation cell
+    /// is a cell like any other. None if the surface does not show them all.
+    fn cells_in(&self, surface: &PaneSurfaceFrame) -> Option<Vec<String>> {
+        let pane = surface
             .panes
             .iter()
-            .find(|pane| pane.pane_id == self.pane_id)
-        else {
-            return false;
-        };
+            .find(|pane| pane.pane_id == self.pane_id)?;
         let top = pane.scroll.map_or(0, |scroll| {
             scroll
                 .max_offset_from_bottom
                 .saturating_sub(scroll.offset_from_bottom)
         });
-        let Some(viewport_row) = u64::from(self.row)
+        let viewport_row = u64::from(self.row)
             .checked_sub(top)
-            .filter(|row| *row < u64::from(pane.inner_rect.height))
-        else {
-            return false;
-        };
+            .filter(|row| *row < u64::from(pane.inner_rect.height))?;
         let y = usize::from(pane.inner_rect.y) + viewport_row as usize;
-        let mut shown = String::new();
-        let mut col = self.start_col;
-        while col <= self.end_col {
-            let Some(cell) = surface.frame.cells.get(
-                y * usize::from(surface.frame.width)
-                    + usize::from(pane.inner_rect.x)
-                    + usize::from(col),
-            ) else {
-                return false;
-            };
-            shown.push_str(&cell.symbol);
-            // A wide character's symbol covers its continuation cell too.
-            col = col.saturating_add(cell.symbol.width().max(1) as u16);
-        }
-        shown != self.text
+        (self.start_col..=self.end_col)
+            .map(|col| {
+                surface
+                    .frame
+                    .cells
+                    .get(
+                        y * usize::from(surface.frame.width)
+                            + usize::from(pane.inner_rect.x)
+                            + usize::from(col),
+                    )
+                    .map(|cell| cell.symbol.clone())
+            })
+            .collect()
+    }
+
+    /// Whether `surface` shows something else in this token's own cells. Cells
+    /// the surface does not show are left to the highlight's deadline.
+    pub(super) fn replaced_in(&self, surface: &PaneSurfaceFrame) -> bool {
+        self.cells_in(surface)
+            .is_some_and(|cells| cells != self.shown)
     }
 }
 
@@ -201,27 +221,30 @@ impl ClientShellState {
                     (gesture.anchor.0, anchor_start),
                     (gesture.anchor.0, anchor_end),
                 );
-            let copied_word = plain.then(|| ClientCopiedWord {
-                pane_id: gesture.pane_id.clone(),
-                row: start.0,
-                start_col: start.1,
-                end_col: end.1,
-                text: crate::app::actions::text_in_cell_range(text, start.1, end.1),
+            let copied_word = plain.then(|| {
+                (
+                    gesture.pane_id.clone(),
+                    crate::app::actions::text_in_cell_range(text, start.1, end.1),
+                )
             });
             if let Some(selection) = self.selection.as_mut() {
                 selection.finish();
             }
             self.word_selection_gesture = None;
             if self.config.copy_on_select {
-                if let Some(word) = copied_word {
+                if let Some((pane_id, text)) = copied_word {
                     let now = std::time::Instant::now();
-                    outcome.actions.push(ClientShellAction::ClipboardWrite(
-                        word.text.clone().into_bytes(),
-                    ));
+                    outcome
+                        .actions
+                        .push(ClientShellAction::ClipboardWrite(text.into_bytes()));
                     self.show_copy_feedback(now);
                     self.selection_highlight_clear_deadline =
                         Some(now + std::time::Duration::from_millis(500));
-                    self.copied_word_highlight = Some(word);
+                    // The displayed surface is the one the row was read from: any
+                    // newer content revision would have cancelled the gesture.
+                    self.copied_word_highlight = self.pane_surface.as_ref().and_then(|surface| {
+                        ClientCopiedWord::new(surface, pane_id, start.0, start.1, end.1)
+                    });
                 } else {
                     // Extended whole-word selections copy a live range, like a plain drag.
                     self.request_selection_copy(outcome, true);
