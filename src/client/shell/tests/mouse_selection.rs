@@ -1328,6 +1328,58 @@ fn pointer_moved_inside_the_word_still_copies_the_highlighted_token() {
     }
 }
 
+/// The docs promise a double-click copies the word exactly as it read when you
+/// clicked, never text that replaced it. When output beats a row read to the
+/// server, the read is refused and nothing is copied: no snapshot of other text,
+/// and no fallback read. That holds for the first row read and for a re-read of
+/// the clicked row after the pointer left it and came back.
+#[test]
+fn double_click_copies_nothing_when_its_row_read_is_refused() {
+    for (release_first, revisit) in [(false, false), (true, false), (false, true)] {
+        let case = format!("release first {release_first}, revisit {revisit}");
+        let mut state = word_state(true, &WORD_ROWS);
+        let mut endpoint = WordEndpoint::new(&WORD_ROWS);
+        let held = press_twice(&mut state, 0, 8);
+        let mut pending = held;
+        if revisit {
+            assert!(endpoint.serve(&mut state, pending).is_empty(), "{case}");
+            let away = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 1, 8);
+            assert!(
+                endpoint.serve(&mut state, away.actions).is_empty(),
+                "{case}"
+            );
+            pending =
+                word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 0, 8).actions;
+            assert!(
+                !pending.is_empty(),
+                "{case}: back on the clicked row reads it again"
+            );
+        }
+        endpoint.output(0, "alpha WRONGTEXT charlie");
+        if release_first {
+            assert!(
+                word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 8)
+                    .actions
+                    .is_empty(),
+                "{case}"
+            );
+        }
+        let reads_before = endpoint.reads.len();
+        let mut copied = endpoint.serve(&mut state, pending);
+        let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 8);
+        copied.extend(endpoint.serve(&mut state, release.actions));
+        assert!(copied.is_empty(), "{case}: copied {copied:?}");
+        assert_eq!(
+            endpoint.reads.len(),
+            reads_before + 1,
+            "{case}: only the refused read: {:?}",
+            endpoint.reads
+        );
+        assert!(state.selection.is_none(), "{case}");
+        assert!(state.selection_highlight_clear_deadline.is_none(), "{case}");
+    }
+}
+
 /// Ending on another word is a real extension: it copies the live range, like a drag.
 #[test]
 fn word_drag_ending_on_another_word_copies_live_range() {
