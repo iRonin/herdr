@@ -1262,6 +1262,87 @@ fn extended_word_drag_copies_live_range_after_output() {
     }
 }
 
+/// A pointer that moves while the second press is held but ends inside the
+/// clicked word has not extended the selection. It is still a plain
+/// double-click: copy the highlighted token, never the columns' later text, and
+/// keep the highlight under the same row-scoped guard.
+#[test]
+fn pointer_moved_inside_the_word_still_copies_the_highlighted_token() {
+    for path in [&[9][..], &[14, 6, 9], &[18, 9], &[2, 9]] {
+        for (output_row, output_text) in [(0, "alpha WRONGTEXT charlie"), (2, "OUTPUT LINE")] {
+            let case = format!("pointer via {path:?}, output on row {output_row}");
+            let mut state = word_state(true, &WORD_ROWS);
+            let mut endpoint = WordEndpoint::new(&WORD_ROWS);
+            let held = press_twice(&mut state, 0, 8);
+            assert!(endpoint.serve(&mut state, held).is_empty());
+            for col in path {
+                let drag =
+                    word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 0, *col);
+                assert!(drag.actions.is_empty(), "{case}");
+            }
+            assert_eq!(
+                state.selection.as_ref().unwrap().ordered_cells(),
+                ((0, 6), (0, 14)),
+                "{case}: same token highlighted as a plain double-click"
+            );
+            endpoint.output(output_row, output_text);
+            let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 9);
+            assert_eq!(
+                endpoint
+                    .serve(&mut state, release.actions)
+                    .iter()
+                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                    .collect::<Vec<_>>(),
+                vec!["BRAVOCOPY".to_owned()],
+                "{case}: reads {:?}",
+                endpoint.reads
+            );
+            assert_eq!(endpoint.reads.len(), 1, "{case}: no second read");
+            assert!(state.selection_highlight_clear_deadline.is_some(), "{case}");
+            // The row-scoped guard covers this gesture too.
+            let mut shown = WORD_ROWS;
+            shown[output_row] = output_text;
+            state.set_pane_surface(word_surface(&shown, 2, 1));
+            assert_eq!(
+                state.selection.is_some(),
+                output_row != 0,
+                "{case}: highlight kept for output elsewhere, cleared for a rewritten token"
+            );
+        }
+    }
+}
+
+/// Ending on another word is a real extension: it copies the live range, like a drag.
+#[test]
+fn word_drag_ending_on_another_word_copies_live_range() {
+    for (col, range, expected) in [
+        (18, ((0, 6), (0, 22)), "WRONGTEXT charlie"),
+        (2, ((0, 0), (0, 14)), "alpha WRONGTEXT"),
+    ] {
+        let mut state = word_state(true, &WORD_ROWS);
+        let mut endpoint = WordEndpoint::new(&WORD_ROWS);
+        let held = press_twice(&mut state, 0, 8);
+        assert!(endpoint.serve(&mut state, held).is_empty());
+        word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 0, col);
+        assert_eq!(state.selection.as_ref().unwrap().ordered_cells(), range);
+        endpoint.output(0, "alpha WRONGTEXT charlie");
+        let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, col);
+        let copied = endpoint.serve(&mut state, release.actions);
+        let last = endpoint.reads.last().unwrap();
+        assert_eq!(endpoint.reads.len(), 2, "row read, then the copy read");
+        assert_eq!(last.content_revision, None, "live read");
+        assert_eq!(
+            copied
+                .iter()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .collect::<Vec<_>>(),
+            vec![expected.to_owned()]
+        );
+        assert!(state.selection.is_none());
+        assert!(state.selection_highlight_clear_deadline.is_none());
+    }
+}
+
 #[test]
 fn copy_on_select_live_reload_switches_double_click_copy_both_ways() {
     for (configured, reloaded) in [(true, false), (false, true)] {
