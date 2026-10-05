@@ -1030,6 +1030,12 @@ fn copied_word_highlight_clears_only_when_its_own_cells_change() {
             true,
         ),
         (
+            "first token cell rewritten",
+            with_rows(["alpha XRAVOCOPY charlie", WORD_ROWS[1], WORD_ROWS[2]]),
+            false,
+            true,
+        ),
+        (
             "one token cell rewritten",
             with_rows(["alpha BRAVOCOPX charlie", WORD_ROWS[1], WORD_ROWS[2]]),
             false,
@@ -1145,6 +1151,16 @@ fn copied_word_guard_reads_only_its_own_pane_cells() {
             "border cells on the token's screen row change",
             "%",
             [WORD_ROWS[0], "", ""],
+            "below",
+            0,
+            true,
+        ),
+        (
+            // Two cells left of the token inside the pane: inside the token's
+            // window only if the pane's left offset were ignored.
+            "output just before the token",
+            "#",
+            ["alpXX BRAVOCOPY charlie", "", ""],
             "below",
             0,
             true,
