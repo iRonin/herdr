@@ -1397,6 +1397,82 @@ fn copy_on_select_live_reload_switches_double_click_copy_both_ways() {
 }
 
 /// Exact bytes and display columns for tokens whose bytes, chars and columns differ.
+/// A token whose emoji the terminal draws as one wide cluster (VS16, ZWJ family)
+/// sits where per-codepoint widths do not put it. The guard must still compare
+/// the cells the highlight covers with what they showed when the word was copied:
+/// unrelated output keeps the highlight, a change in those cells clears it.
+#[test]
+fn copied_emoji_token_highlight_follows_its_own_cells() {
+    // Real frame layout (see pane::terminal grapheme_cluster_mode_lays_out_emoji_tokens_by_cluster_width):
+    // the cluster is one cell followed by an empty continuation cell.
+    for (emoji, columns) in [
+        ("\u{2764}\u{fe0f}", (6, 8)),
+        ("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}", (6, 13)),
+    ] {
+        let row = format!("alpha x{emoji}y charlie");
+        let shown: Vec<String> = "alpha x"
+            .chars()
+            .map(String::from)
+            .chain([emoji.to_owned(), String::new()])
+            .chain("y charlie".chars().map(String::from))
+            .collect();
+        let frame_for = |rows: [&str; 3], first: &[String]| {
+            let mut next = word_surface(&rows, 2, 1);
+            for (col, symbol) in first.iter().enumerate() {
+                next.frame.cells[col].symbol = symbol.clone();
+            }
+            next
+        };
+        let rows = [row.as_str(), WORD_ROWS[1], WORD_ROWS[2]];
+        let mut state = word_state(true, &rows);
+        let mut copy_time = frame_for(rows, &shown);
+        copy_time.surface_revision = 1;
+        copy_time.panes[0].content_revision = 0;
+        state.set_pane_surface(copy_time);
+        let mut endpoint = WordEndpoint::new(&rows);
+        let held = press_twice(&mut state, 0, 6);
+        assert!(endpoint.serve(&mut state, held).is_empty());
+        let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 6);
+        let token = format!("x{emoji}y");
+        assert_eq!(
+            endpoint.serve(&mut state, release.actions),
+            vec![token.as_bytes().to_vec()],
+            "{token:?}: copies the exact token"
+        );
+        assert_eq!(
+            state.selection.as_ref().unwrap().ordered_cells(),
+            ((0, columns.0), (0, columns.1)),
+            "{token:?}"
+        );
+        let deadline = state.selection_highlight_clear_deadline.unwrap();
+
+        // Unrelated output: the highlighted cells still show what they showed.
+        state.set_pane_surface(frame_for(
+            [row.as_str(), WORD_ROWS[1], "OUTPUT ROW"],
+            &shown,
+        ));
+        assert!(
+            state.selection.is_some(),
+            "{token:?}: unrelated output keeps the highlight"
+        );
+        assert_eq!(state.selection_highlight_clear_deadline, Some(deadline));
+
+        // The token's own cells rewritten: the highlight must go.
+        let mut rewritten = shown.clone();
+        for symbol in &mut rewritten[6..10] {
+            *symbol = "Z".to_owned();
+        }
+        let mut changed = frame_for([row.as_str(), WORD_ROWS[1], "OUTPUT ROW"], &rewritten);
+        changed.surface_revision = 3;
+        changed.panes[0].content_revision = 2;
+        state.set_pane_surface(changed);
+        assert!(
+            state.selection.is_none(),
+            "{token:?}: a rewritten token clears its highlight"
+        );
+    }
+}
+
 #[test]
 fn plain_double_click_copies_unicode_tokens_exactly() {
     for (row, click, token, columns) in [

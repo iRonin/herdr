@@ -5405,6 +5405,45 @@ mod tests {
         );
     }
 
+    /// The cell layout the client's copied-word highlight guard reads: with
+    /// grapheme clustering (the default), a VS16 emoji or a ZWJ family is one
+    /// wide cell plus an empty continuation cell, so the token after it starts
+    /// one column later than per-codepoint widths predict.
+    #[test]
+    fn grapheme_cluster_mode_lays_out_emoji_tokens_by_cluster_width() {
+        for (text, cells) in [
+            ("x\u{2764}\u{fe0f}y", ["x", "\u{2764}\u{fe0f}", "", "y"]),
+            (
+                "x\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}y",
+                ["x", "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}", "", "y"],
+            ),
+        ] {
+            let mut terminal = crate::ghostty::Terminal::new(40, 1, 0).unwrap();
+            terminal.write(text.as_bytes());
+
+            let rendered = render_cells_to_symbols(&mut terminal);
+
+            assert_eq!(
+                rendered[..4]
+                    .iter()
+                    .map(|(_, symbol)| symbol.as_str())
+                    .collect::<Vec<_>>(),
+                cells,
+                "{rendered:?}"
+            );
+            assert_eq!(rendered[1].0, crate::ghostty::CellWide::Wide);
+            assert_eq!(rendered[2].0, crate::ghostty::CellWide::SpacerTail);
+            // Per-codepoint widths, which the client uses to place the token,
+            // put "y" in column 2 for the VS16 emoji and column 7 for the family.
+            let per_codepoint: u16 = text
+                .chars()
+                .take_while(|ch| *ch != 'y')
+                .map(|ch| u16::from(crate::ghostty::unicode_codepoint_width(ch as u32)))
+                .sum();
+            assert_ne!(per_codepoint, 3, "{text:?}: the two width sources disagree");
+        }
+    }
+
     #[test]
     fn grapheme_cluster_mode_renders_zwj_family_in_single_wide_cell() {
         let mut terminal = crate::ghostty::Terminal::new(40, 1, 0).unwrap();
