@@ -194,8 +194,14 @@ impl ClientShellState {
         if gesture.released {
             // A plain double-click copies the token its own validated row read
             // highlighted. A later read can be refused by output anywhere in the
-            // pane, or return whatever those columns hold by then.
-            let copied_word = (!gesture.dragged).then(|| ClientCopiedWord {
+            // pane, or return whatever those columns hold by then. A pointer that
+            // moved but ended inside the clicked word has not extended anything.
+            let plain = (start, end)
+                == (
+                    (gesture.anchor.0, anchor_start),
+                    (gesture.anchor.0, anchor_end),
+                );
+            let copied_word = plain.then(|| ClientCopiedWord {
                 pane_id: gesture.pane_id.clone(),
                 row: start.0,
                 start_col: start.1,

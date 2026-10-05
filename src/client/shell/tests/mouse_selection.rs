@@ -1341,6 +1341,30 @@ fn word_drag_ending_on_another_word_copies_live_range() {
         assert!(state.selection.is_none());
         assert!(state.selection_highlight_clear_deadline.is_none());
     }
+
+    // Ending on another row is an extension even where its columns match the
+    // clicked word's: here the word under the pointer also ends at column 14.
+    let rows = [WORD_ROWS[0], "zz ABCDEFGHIJKL", WORD_ROWS[2]];
+    let mut state = word_state(true, &rows);
+    let mut endpoint = WordEndpoint::new(&rows);
+    let held = press_twice(&mut state, 0, 8);
+    assert!(endpoint.serve(&mut state, held).is_empty());
+    let drag = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 1, 5);
+    assert!(endpoint.serve(&mut state, drag.actions).is_empty());
+    assert_eq!(
+        state.selection.as_ref().unwrap().ordered_cells(),
+        ((0, 6), (1, 14))
+    );
+    let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 1, 5);
+    assert!(
+        matches!(&release.actions[..], [ClientShellAction::Endpoint { request, .. }]
+            if matches!(&request.method, crate::api::schema::Method::PaneSelectionRead(params)
+                if params.anchor == crate::api::schema::PaneTextPoint { row: 0, col: 6 }
+                    && params.cursor == crate::api::schema::PaneTextPoint { row: 1, col: 14 }
+                    && params.content_revision.is_none())),
+        "two-row extension copies the live range: {:?}",
+        release.actions
+    );
 }
 
 #[test]
