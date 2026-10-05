@@ -1589,8 +1589,9 @@ fn plain_double_click_copies_unicode_tokens_exactly() {
     }
 }
 
-/// From the delta review. The row reply comes back on the API socket and surface
-/// patches on the client socket, so the client can see a newer patch before the
+/// From the delta review. The row reply and surface patches share the client
+/// connection, but the server sends the reply from a separate thread
+/// (`spawn_response_waiter`), so the client can see a newer patch before the
 /// reply to a read the server answered earlier. While the second press is held
 /// and the reply is pending there is no selection and no deadline, so the patch
 /// takes the fast path, which never runs the held-gesture invalidation.
