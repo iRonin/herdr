@@ -29,13 +29,15 @@ pub(super) struct ClientCopiedWord {
 }
 
 impl ClientCopiedWord {
-    /// Records what `surface` shows in the highlighted cells, if it shows them.
+    /// Records what `surface` shows in the highlighted cells, if it shows them
+    /// and its pane is still at `revision`, the revision the word was read at.
     fn new(
         surface: &PaneSurfaceFrame,
         pane_id: String,
         row: u32,
         start_col: u16,
         end_col: u16,
+        revision: Option<u64>,
     ) -> Option<Self> {
         let mut word = Self {
             pane_id,
@@ -44,14 +46,19 @@ impl ClientCopiedWord {
             end_col,
             shown: Vec::new(),
         };
-        word.shown = word.cells_in(surface)?;
+        let (shown_revision, shown) = word.cells_in(surface)?;
+        if Some(shown_revision) != revision {
+            return None;
+        }
+        word.shown = shown;
         Some(word)
     }
 
-    /// The highlighted cells' symbols in `surface`, indexed by column, so no
-    /// character-width table is involved: a wide character's continuation cell
-    /// is a cell like any other. None if the surface does not show them all.
-    fn cells_in(&self, surface: &PaneSurfaceFrame) -> Option<Vec<String>> {
+    /// The pane's content revision and the highlighted cells' symbols in
+    /// `surface`, indexed by column, so no character-width table is involved: a
+    /// wide character's continuation cell is a cell like any other. None if the
+    /// surface does not show them all.
+    fn cells_in(&self, surface: &PaneSurfaceFrame) -> Option<(u64, Vec<String>)> {
         let pane = surface
             .panes
             .iter()
@@ -65,7 +72,7 @@ impl ClientCopiedWord {
             .checked_sub(top)
             .filter(|row| *row < u64::from(pane.inner_rect.height))?;
         let y = usize::from(pane.inner_rect.y) + viewport_row as usize;
-        (self.start_col..=self.end_col)
+        let cells = (self.start_col..=self.end_col)
             .map(|col| {
                 surface
                     .frame
@@ -77,14 +84,15 @@ impl ClientCopiedWord {
                     )
                     .map(|cell| cell.symbol.clone())
             })
-            .collect()
+            .collect::<Option<Vec<_>>>()?;
+        Some((pane.content_revision, cells))
     }
 
     /// Whether `surface` shows something else in this token's own cells. Cells
     /// the surface does not show are left to the highlight's deadline.
     pub(super) fn replaced_in(&self, surface: &PaneSurfaceFrame) -> bool {
         self.cells_in(surface)
-            .is_some_and(|cells| cells != self.shown)
+            .is_some_and(|(_, cells)| cells != self.shown)
     }
 }
 
@@ -227,6 +235,7 @@ impl ClientShellState {
                     crate::app::actions::text_in_cell_range(text, start.1, end.1),
                 )
             });
+            let pressed_revision = gesture.content_revision;
             if let Some(selection) = self.selection.as_mut() {
                 selection.finish();
             }
@@ -240,11 +249,25 @@ impl ClientShellState {
                     self.show_copy_feedback(now);
                     self.selection_highlight_clear_deadline =
                         Some(now + std::time::Duration::from_millis(500));
-                    // The displayed surface is the one the row was read from: any
-                    // newer content revision would have cancelled the gesture.
+                    // The row was read at the revision on screen at the press. A patch
+                    // that arrived before the reply can show newer text without
+                    // cancelling the gesture (the patch fast path skips that check), so record the
+                    // cells only while the screen still shows that revision; otherwise
+                    // nothing on screen is the copied word, so drop the highlight now.
                     self.copied_word_highlight = self.pane_surface.as_ref().and_then(|surface| {
-                        ClientCopiedWord::new(surface, pane_id, start.0, start.1, end.1)
+                        ClientCopiedWord::new(
+                            surface,
+                            pane_id,
+                            start.0,
+                            start.1,
+                            end.1,
+                            pressed_revision,
+                        )
                     });
+                    if self.copied_word_highlight.is_none() {
+                        self.selection = None;
+                        self.selection_highlight_clear_deadline = None;
+                    }
                 } else {
                     // Extended whole-word selections copy a live range, like a plain drag.
                     self.request_selection_copy(outcome, true);
