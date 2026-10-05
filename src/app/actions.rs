@@ -1338,6 +1338,16 @@ pub(crate) fn word_bounds_at_column(row: &str, col: u16) -> Option<(u16, u16)> {
     Some(span.columns(&cells))
 }
 
+/// The text a row shows in inclusive display columns, mapped by the same cells
+/// as `word_bounds_at_column`, so wide characters and zero-width marks stay whole.
+pub(crate) fn text_in_cell_range(row: &str, start_col: u16, end_col: u16) -> String {
+    text_cells(row)
+        .into_iter()
+        .filter(|cell| cell.start_col >= start_col && cell.end_col <= end_col)
+        .map(|cell| cell.ch)
+        .collect()
+}
+
 fn url_at_byte(text: &str, clicked_byte: usize) -> Option<&str> {
     let range = url_byte_range(text, clicked_byte)?;
     text.get(range)
@@ -2438,14 +2448,6 @@ mod tests {
 
     fn selected_url<'a>(row: &'a str, click: &str) -> Option<&'a str> {
         url_at_byte(row, row.find(click)?)
-    }
-
-    fn text_in_cell_range(row: &str, start_col: u16, end_col: u16) -> String {
-        text_cells(row)
-            .into_iter()
-            .filter(|cell| cell.start_col >= start_col && cell.end_col <= end_col)
-            .map(|cell| cell.ch)
-            .collect()
     }
 
     fn col_of(row: &str, needle: &str) -> u16 {

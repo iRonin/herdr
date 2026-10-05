@@ -910,6 +910,8 @@ pub(crate) struct ClientShellState {
     pub(super) selection_autoscroll: Option<ClientSelectionAutoscroll>,
     pub(super) selection_autoscroll_deadline: Option<std::time::Instant>,
     pub(super) selection_highlight_clear_deadline: Option<std::time::Instant>,
+    /// What the last plain double-click copied. Read only while its highlight deadline stands.
+    pub(super) copied_word_highlight: Option<word_selection::ClientCopiedWord>,
     pub(super) word_selection_gesture: Option<ClientWordSelection>,
     pub(super) word_selection_generation: u64,
     pub(super) copy_mode: Option<ClientCopyModeState>,
@@ -1077,6 +1079,7 @@ impl ClientShellState {
             selection_autoscroll: None,
             selection_autoscroll_deadline: None,
             selection_highlight_clear_deadline: None,
+            copied_word_highlight: None,
             word_selection_gesture: None,
             word_selection_generation: 0,
             copy_mode: None,
@@ -1724,6 +1727,18 @@ impl ClientShellState {
             self.word_selection_gesture = None;
             self.selection = None;
             self.stop_selection_autoscroll();
+            self.selection_highlight_clear_deadline = None;
+        }
+        // A copied token's highlight must not mark other text. Clear it only when
+        // its own cells change: content_revision is pane-wide, and output elsewhere
+        // would otherwise wipe it at once on a busy pane.
+        if self.selection_highlight_clear_deadline.is_some()
+            && self
+                .copied_word_highlight
+                .as_ref()
+                .is_some_and(|word| word.replaced_in(&surface))
+        {
+            self.selection = None;
             self.selection_highlight_clear_deadline = None;
         }
         for pane in &surface.panes {
