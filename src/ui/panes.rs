@@ -430,11 +430,14 @@ pub(super) fn render_panes(
 }
 
 #[cfg(test)]
+type PaneCellsHook = Box<dyn FnMut(&TerminalRuntime)>;
+
+#[cfg(test)]
 thread_local! {
     /// Test hook run right after a pane's cells are drawn into the frame, so a test
     /// can land pane output exactly between the cells and anything read after them.
-    static AFTER_PANE_CELLS_RENDERED: std::cell::RefCell<Option<Box<dyn FnMut(&TerminalRuntime)>>> =
-        std::cell::RefCell::new(None);
+    static AFTER_PANE_CELLS_RENDERED: std::cell::RefCell<Option<PaneCellsHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Run `hook` after every pane's cells are drawn on this thread, until the returned
