@@ -1452,55 +1452,179 @@ fn extended_double_click_survives_output_and_copies_the_live_range() {
     assert_eq!(endpoint.reads.last().unwrap().content_revision, None);
 }
 
-/// Mode 2027 off: the terminal keeps `❤️` in one narrow cell and puts `y` in the
-/// next, but the client draws the emoji two columns wide over `y`, which is
-/// therefore never drawn. A double-click selects and copies what is drawn, `x❤️`,
-/// never the hidden `y`, wherever it lands, including the column `y` occupies
-/// in the terminal. (0.8.0 copied the terminal's text, `y` included.)
+/// Mode 2027 off copies what the program printed, as 0.8.0 does. The terminal
+/// keeps a VS16 emoji in one narrow cell and the next character in the next
+/// cell; the client draws the emoji two columns wide over it. A VS16 cell
+/// followed by an EMPTY cell was laid out wide by the terminal (the empty cell
+/// is its tail); one followed by anything else was laid out narrow, and the
+/// next cell is real text at its own column. Checked through the real frame
+/// build, delivered as a full surface and as a patch, with mode 2027 on and off.
 #[tokio::test]
-async fn double_click_never_selects_a_character_hidden_under_a_wide_emoji() {
-    let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(
-        40,
-        3,
-        "\x1b[?2027lx\u{2764}\u{fe0f}y next".as_bytes(),
+async fn double_click_copies_what_the_program_printed_around_a_vs16_emoji() {
+    type Case = (
+        bool,
+        String,
+        Vec<&'static str>,
+        Vec<(u16, &'static str, (u16, u16))>,
     );
-    let (buffer, cursor) =
-        crate::server::render_stream::render_terminal_virtual(&runtime, Rect::new(0, 0, 40, 3));
-    let mut drawn = word_surface(&["", "", ""], 1, 0);
-    drawn.frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &[]);
-    let symbols = drawn.frame.cells[..4]
-        .iter()
-        .map(|cell| cell.symbol.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        symbols,
-        ["x", "\u{2764}\u{fe0f}", "y", " "],
-        "the terminal puts y in the cell the client draws the emoji over"
-    );
-    for col in [0, 1, 2] {
-        let mut config = Config::default();
-        config.ui.copy_on_select = true;
-        let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
-        state.set_snapshot(Box::new(snapshot()));
-        state.set_pane_surface(drawn.clone());
-        paint(&mut state);
-        press_twice(&mut state, 0, col);
+    let pad = " ".repeat(34);
+    let cases: Vec<Case> = vec![
+        // (mode 2027 on, row text, the first cells as the client receives them,
+        //  clicks: column, copied token, highlighted columns)
+        (
+            false,
+            "x\u{2764}\u{fe0f}y next".into(),
+            vec!["x", "\u{2764}\u{fe0f}", "y", " ", "n"],
+            vec![
+                (0, "x\u{2764}\u{fe0f}y", (0, 2)),
+                (1, "x\u{2764}\u{fe0f}y", (0, 2)),
+                (2, "x\u{2764}\u{fe0f}y", (0, 2)),
+                (4, "next", (4, 7)),
+            ],
+        ),
+        (
+            true,
+            "x\u{2764}\u{fe0f}y next".into(),
+            vec!["x", "\u{2764}\u{fe0f}", "", "y", " "],
+            vec![
+                (0, "x\u{2764}\u{fe0f}y", (0, 3)),
+                (3, "x\u{2764}\u{fe0f}y", (0, 3)),
+            ],
+        ),
+        (
+            false,
+            "\u{26a0}\u{fe0f} Warning".into(),
+            vec!["\u{26a0}\u{fe0f}", " ", "W", "a"],
+            vec![(2, "Warning", (2, 8)), (8, "Warning", (2, 8))],
+        ),
+        (
+            true,
+            "\u{26a0}\u{fe0f} Warning".into(),
+            vec!["\u{26a0}\u{fe0f}", "", " ", "W"],
+            vec![(3, "Warning", (3, 9)), (9, "Warning", (3, 9))],
+        ),
+        // A wide VS16 emoji at the pane's last two columns: its tail is the
+        // pane's last cell, so the tail signal still works there.
+        (
+            true,
+            format!("{pad}word\u{2764}\u{fe0f}"),
+            vec![],
+            vec![(36, "word\u{2764}\u{fe0f}", (34, 39))],
+        ),
+        // Known loss, mode 2027 off: after two narrow VS16 emoji the character
+        // after the second lies in the shadow of the first as the frame is
+        // built, so it never reaches the client. 0.8.0 copied the y as well.
+        (
+            false,
+            "\u{2764}\u{fe0f}\u{2764}\u{fe0f}y next".into(),
+            vec!["\u{2764}\u{fe0f}", "\u{2764}\u{fe0f}", " ", " ", "n"],
+            vec![(0, "\u{2764}\u{fe0f}\u{2764}\u{fe0f}", (0, 1))],
+        ),
+    ];
+    for (cluster_mode, text, first_cells, clicks) in cases {
+        let mode = if cluster_mode {
+            "\x1b[?2027h"
+        } else {
+            "\x1b[?2027l"
+        };
+        let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(
+            40,
+            3,
+            format!("{mode}{text}").as_bytes(),
+        );
+        let (buffer, cursor) =
+            crate::server::render_stream::render_terminal_virtual(&runtime, Rect::new(0, 0, 40, 3));
+        let mut drawn = word_surface(&["", "", ""], 2, 1);
+        drawn.frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &[]);
+        let received = drawn.frame.cells[..first_cells.len()]
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(
-            state
-                .selection
-                .as_ref()
-                .map(|selection| selection.ordered_cells()),
-            Some(((0, 0), (0, 2))),
-            "column {col}: x and the two columns of the emoji"
+            received, first_cells,
+            "2027 {cluster_mode}, {text:?}: frame layout"
         );
-        let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, col);
-        assert!(
-            matches!(&release.actions[..], [ClientShellAction::ClipboardWrite(bytes)]
-                if bytes == "x\u{2764}\u{fe0f}".as_bytes()),
-            "column {col}: copies what is drawn, without the hidden y: {:?}",
-            release.actions
-        );
+        for via_patch in [false, true] {
+            for (col, token, (start, end)) in &clicks {
+                let case =
+                    format!("2027 {cluster_mode}, {text:?}, column {col}, via patch {via_patch}");
+                let mut config = Config::default();
+                config.ui.copy_on_select = true;
+                let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+                state.set_snapshot(Box::new(snapshot()));
+                if via_patch {
+                    state.set_pane_surface(word_surface(&["", "", ""], 1, 0));
+                    paint(&mut state);
+                    let patch = patch_to(&state, &drawn);
+                    assert!(
+                        matches!(
+                            state.apply_pane_surface_patch(patch),
+                            super::super::surface_patch::ClientPaneSurfacePatchOutcome::Applied(
+                                Some(_)
+                            )
+                        ),
+                        "{case}: fast path"
+                    );
+                    state.commit_presented_patch();
+                } else {
+                    state.set_pane_surface(drawn.clone());
+                    paint(&mut state);
+                }
+                press_twice(&mut state, 0, *col);
+                assert_eq!(
+                    state
+                        .selection
+                        .as_ref()
+                        .map(|selection| selection.ordered_cells()),
+                    Some(((0, *start), (0, *end))),
+                    "{case}: highlighted columns"
+                );
+                let release =
+                    word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, *col);
+                assert!(
+                    matches!(&release.actions[..], [ClientShellAction::ClipboardWrite(bytes)]
+                        if bytes == token.as_bytes()),
+                    "{case}: copies {token:?}: {:?}",
+                    release.actions
+                );
+            }
+        }
     }
+}
+
+/// The tail signal looks only inside the pane's own row. A VS16 cell in the
+/// pane's last column has no next cell there; the frame cell after it belongs
+/// to the next pane (here an empty tail of its wide character), and must not
+/// make the emoji wide.
+#[test]
+fn vs16_emoji_in_the_panes_last_column_is_not_widened_by_the_next_pane() {
+    let mut config = Config::default();
+    config.ui.copy_on_select = true;
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(snapshot()));
+    let row = format!("{}ab", " ".repeat(17));
+    let mut surface = word_surface(&[row.as_str(), "", ""], 1, 0);
+    surface.frame.cells[19].symbol = "\u{2764}\u{fe0f}".into();
+    surface.frame.cells[20].symbol = String::new();
+    surface.panes[0].rect.width = 20;
+    surface.panes[0].inner_rect.width = 20;
+    state.set_pane_surface(surface);
+    paint(&mut state);
+    press_twice(&mut state, 0, 18);
+    assert_eq!(
+        state
+            .selection
+            .as_ref()
+            .map(|selection| selection.ordered_cells()),
+        Some(((0, 17), (0, 19)))
+    );
+    let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 18);
+    assert!(
+        matches!(&release.actions[..], [ClientShellAction::ClipboardWrite(bytes)]
+            if bytes == "ab\u{2764}\u{fe0f}".as_bytes()),
+        "{:?}",
+        release.actions
+    );
 }
 
 /// A reconnect keeps a plain held double-click (upstream's behaviour), but
@@ -2678,13 +2802,13 @@ async fn double_click_columns_follow_the_cells_the_terminal_draws() {
             ],
         ),
         // Mode 2027 off: the terminal keeps the VS16 emoji in one narrow cell and
-        // puts y in the next, but the client draws the emoji two columns wide over
-        // it. What is drawn is x and the emoji, so that is the token; y is hidden.
+        // puts y in the next. The client draws the emoji over y, but copies what
+        // the program printed, as 0.8.0 does: x, the emoji, y.
         (
             false,
             "x\u{2764}\u{fe0f}y next",
             vec![
-                (&[0, 1, 2], Some(("x\u{2764}\u{fe0f}", (0, 2)))),
+                (&[0, 1, 2], Some(("x\u{2764}\u{fe0f}y", (0, 2)))),
                 (&[3], None),
                 (&[4, 7], Some(("next", (4, 7)))),
             ],
@@ -2715,8 +2839,8 @@ async fn double_click_columns_follow_the_cells_the_terminal_draws() {
             false,
             "(x\u{2764}\u{fe0f}y), next",
             vec![
-                (&[1, 2, 3], Some(("x\u{2764}\u{fe0f}", (1, 3)))),
-                (&[4], None),
+                (&[1, 2, 3], Some(("x\u{2764}\u{fe0f}y", (1, 3)))),
+                (&[4, 5, 6], None),
                 (&[7, 10], Some(("next", (7, 10)))),
             ],
         ),
