@@ -455,22 +455,26 @@ fn kept_selection_renumbered_before_its_copy_key_copies_nothing_and_says_so() {
 }
 
 /// A double-click dragged on into the next rows, held across a renumbering. The
-/// range's rows are renumbered, and so is the word's own row, so nothing can be
-/// placed on screen any more: the highlight goes, the gesture stays on its
-/// frozen word, later motion (here to the pane's bottom edge) neither extends
-/// nor scrolls the view, and the release copies the word without highlighting
-/// it. A trim between the two clicks does not blind the gesture to a later one.
+/// range's rows are renumbered, and so is the word's own row, so nothing that
+/// was selected can be copied or shown: the highlight goes, and the release
+/// copies nothing and says so, like a plain drag. Copying only the word under a
+/// "copied" notice would hand over less than was selected. The gesture stays
+/// dropped: later motion (here to the pane's bottom edge, or back onto the word)
+/// neither extends, scrolls the view nor brings the word back. A trim between
+/// the two clicks does not blind the gesture to a later one.
 #[test]
-fn extended_double_click_across_a_renumbering_copies_only_its_word() {
+fn extended_double_click_across_a_renumbering_copies_nothing_and_says_so() {
     let mut failures = Vec::new();
     for offset in [0, 40] {
-        for (delivery, trim_between_clicks) in [
-            (Delivery::Surface, false),
-            (Delivery::Patch, false),
-            (Delivery::Surface, true),
+        for (delivery, trim_between_clicks, back_to_word) in [
+            (Delivery::Surface, false, false),
+            (Delivery::Patch, false, false),
+            (Delivery::Surface, true, false),
+            (Delivery::Surface, false, true),
         ] {
-            let case =
-                format!("offset {offset} {delivery:?} trim between clicks {trim_between_clicks}");
+            let case = format!(
+                "offset {offset} {delivery:?} trim between clicks {trim_between_clicks} back to word {back_to_word}"
+            );
             let mut terminal = TrimTerminal::new(60, offset);
             let mut state = trim_state(true, &mut terminal);
             mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 1, 8);
@@ -482,7 +486,6 @@ fn extended_double_click_across_a_renumbering_copies_only_its_word() {
                 deliver(&mut state, &mut terminal, Delivery::Surface);
             }
             let top = terminal.top();
-            let word = terminal.row(top + 1)[6..14].to_owned();
             mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 1, 8);
             let drag = mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 2, 18);
             if !drag.actions.is_empty()
@@ -515,19 +518,29 @@ fn extended_double_click_across_a_renumbering_copies_only_its_word() {
                     state.selection_autoscroll.is_some()
                 ));
             }
-            let release = mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 3, 30);
-            let (reads, copied) = serve(&mut state, &terminal, release.actions);
-            if reads != 0 || copied != [word.clone()] {
-                failures.push(format!(
-                    "{case}: {reads} reads, copied {copied:?}, want [{word:?}]"
-                ));
+            let (row, col) = if back_to_word { (1, 8) } else { (3, 30) };
+            if back_to_word {
+                let back = mouse(
+                    &mut state,
+                    MouseEventKind::Drag(MouseButton::Left),
+                    row,
+                    col,
+                );
+                if !back.actions.is_empty() || state.selection.is_some() {
+                    failures.push(format!("{case}: the word came back: {:?}", back.actions));
+                }
             }
-            if notice(&state) != Some(COPIED) {
+            let release = mouse(&mut state, MouseEventKind::Up(MouseButton::Left), row, col);
+            let (reads, copied) = serve(&mut state, &terminal, release.actions);
+            if reads != 0 || !copied.is_empty() {
+                failures.push(format!("{case}: {reads} reads, copied {copied:?}"));
+            }
+            if notice(&state) != Some(NOT_COPIED) {
                 failures.push(format!("{case}: notice {:?}", notice(&state)));
             }
             if state.selection.is_some() {
                 failures.push(format!(
-                    "{case}: copied word highlighted over renumbered rows: {:?}",
+                    "{case}: highlighted over renumbered rows after the release: {:?}",
                     state.selection.as_ref().map(|s| s.ordered_cells())
                 ));
             }
@@ -536,8 +549,9 @@ fn extended_double_click_across_a_renumbering_copies_only_its_word() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// A plain double-click is not affected: it copies its frozen word. Its short
-/// copied highlight sits on rows that are then renumbered, so it goes at once.
+/// A plain double-click, never extended, is not affected: it copies its frozen
+/// word, without a highlight, which would sit on renumbered rows. Its short
+/// copied highlight likewise goes at once when the rows are renumbered.
 #[test]
 fn plain_double_click_across_a_renumbering_copies_its_word() {
     let mut failures = Vec::new();
@@ -559,6 +573,9 @@ fn plain_double_click_across_a_renumbering_copies_its_word() {
                 "{case}: {reads} reads, copied {copied:?}, notice {:?}",
                 notice(&state)
             ));
+        }
+        if state.selection.is_some() {
+            failures.push(format!("{case}: word highlighted over renumbered rows"));
         }
         // The word was copied and is highlighted for a moment; then the rows move.
         let mut terminal = TrimTerminal::new(60, offset);
