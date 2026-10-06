@@ -70,12 +70,16 @@ impl Drop for Registration {
 
 fn connect(path: &str, socket_path: &Path) -> io::Result<Option<LocalStream>> {
     let timeout = Duration::from_millis(500);
-    let status = crate::api::read_runtime_status_at(socket_path, timeout)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotConnected,
-            "SSH agent status API is not ready",
-        )
-    })?;
+    // A server that has not answered yet is as "not ready" here as one without a status API.
+    let status = match crate::api::read_runtime_status_at(socket_path, timeout)? {
+        crate::api::RuntimeStatusProbe::Status(status) => status,
+        crate::api::RuntimeStatusProbe::NoApi | crate::api::RuntimeStatusProbe::Unanswered => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "SSH agent status API is not ready",
+            ));
+        }
+    };
     if !status
         .capabilities
         .is_some_and(|capabilities| capabilities.ssh_agent_registration)
