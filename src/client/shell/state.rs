@@ -914,6 +914,9 @@ pub(crate) struct ClientShellState {
     pub(super) copied_word_highlight: Option<word_selection::ClientCopiedWord>,
     pub(super) word_selection_gesture: Option<ClientWordSelection>,
     pub(super) word_selection_generation: u64,
+    /// The numbering of the mouse selection's rows, to see them renumbered.
+    pub(super) selection_rows: Option<super::history_rows::SelectionRows>,
+    pub(super) renumbered_selection: Option<super::history_rows::RenumberedSelection>,
     /// Which pane cells the terminal shows, for resolving a double-click.
     pub(super) painted_panes: super::painted::PaintedPanes,
     pub(super) copy_mode: Option<ClientCopyModeState>,
@@ -1083,6 +1086,8 @@ impl ClientShellState {
             selection_highlight_clear_deadline: None,
             copied_word_highlight: None,
             word_selection_gesture: None,
+            selection_rows: None,
+            renumbered_selection: None,
             painted_panes: Default::default(),
             word_selection_generation: 0,
             copy_mode: None,
@@ -1278,6 +1283,8 @@ impl ClientShellState {
         self.selection_autoscroll_deadline = None;
         self.selection_highlight_clear_deadline = None;
         self.word_selection_gesture = None;
+        self.selection_rows = None;
+        self.renumbered_selection = None;
         self.copy_mode = None;
         if self.mode == ClientShellMode::Copy {
             self.mode = ClientShellMode::Terminal;
@@ -1737,6 +1744,7 @@ impl ClientShellState {
             self.stop_selection_autoscroll();
             self.selection_highlight_clear_deadline = None;
         }
+        self.selection_sees_history(&surface);
         self.word_selection_sees_surface(&surface);
         // A copied token's highlight must not mark other text. Clear it only when
         // its own cells change: content_revision is pane-wide, and output elsewhere
@@ -1834,6 +1842,21 @@ impl ClientShellState {
         }
         self.copy_feedback = Some(crate::app::state::CopyFeedback {
             message: "copied to clipboard".to_owned(),
+            failed: false,
+        });
+        self.copy_feedback_deadline = Some(now + std::time::Duration::from_secs(2));
+        true
+    }
+
+    /// A copy the user asked for that cannot be made: the selected rows were
+    /// renumbered by a scrollback trim or clear (`history_rows`).
+    pub(crate) fn show_copy_failed_feedback(&mut self, now: std::time::Instant) -> bool {
+        if !self.config.clipboard_toast_enabled {
+            return false;
+        }
+        self.copy_feedback = Some(crate::app::state::CopyFeedback {
+            message: "not copied: scrollback was trimmed".to_owned(),
+            failed: true,
         });
         self.copy_feedback_deadline = Some(now + std::time::Duration::from_secs(2));
         true

@@ -144,6 +144,7 @@ fn notifications_and_clipboard_feedback_only_cover_their_drawn_corners() {
             state.set_pane_surface(surface());
             state.copy_feedback = Some(crate::app::state::CopyFeedback {
                 message: "copied".into(),
+                failed: false,
             });
             let layout = state.layout(cols, rows);
             let area = if layout.mobile_header.is_empty() {

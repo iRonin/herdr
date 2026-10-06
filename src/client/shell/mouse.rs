@@ -163,7 +163,7 @@ impl ClientShellState {
 
     fn active_selection_pane(&self) -> Option<PaneHit> {
         let pane_id = if let Some(gesture) = self.word_selection_gesture.as_ref() {
-            if gesture.released {
+            if gesture.released || gesture.renumbered {
                 return None;
             }
             &gesture.pane_id
@@ -697,6 +697,9 @@ impl ClientShellState {
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent, outcome: &mut ClientShellInput) {
         self.update_link_hover(mouse, outcome);
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            self.renumbered_selection = None;
+        }
         let point = (mouse.column, mouse.row);
         if self.mode == ClientShellMode::Navigate
             && self.workspace_preview_action_blocked()
@@ -1802,6 +1805,9 @@ impl ClientShellState {
         }
 
         if mouse.kind == MouseEventKind::Drag(MouseButton::Left) {
+            if self.drag_renumbered_selection() {
+                return;
+            }
             let selection_hit = self.active_selection_pane();
             if let Some(hit) = selection_hit {
                 self.update_selection_drag(&hit, mouse.column, mouse.row, outcome);
@@ -1816,6 +1822,11 @@ impl ClientShellState {
         {
             self.finish_word_selection(outcome);
             outcome.repaint = true;
+            return;
+        }
+        if mouse.kind == MouseEventKind::Up(MouseButton::Left)
+            && self.release_renumbered_selection(outcome)
+        {
             return;
         }
         if mouse.kind == MouseEventKind::Up(MouseButton::Left) && self.selection.is_some() {
@@ -2350,6 +2361,7 @@ impl ClientShellState {
                                 mouse.column.saturating_sub(hit.inner_rect.x),
                                 hit.scroll,
                             ));
+                            self.number_selection_rows(&hit);
                         }
                     }
                     self.push_endpoint_method(

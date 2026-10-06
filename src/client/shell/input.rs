@@ -535,6 +535,14 @@ impl ClientShellState {
         self.word_selection_gesture = None;
         if self.mode != ClientShellMode::Copy
             && self.copy_or_terminal_mode() != ClientShellMode::Copy
+            && is_retained_selection_copy_key(key)
+            && self.copy_renumbered_selection(outcome)
+        {
+            return None;
+        }
+        self.renumbered_selection = None;
+        if self.mode != ClientShellMode::Copy
+            && self.copy_or_terminal_mode() != ClientShellMode::Copy
             && !self.config.copy_on_select
             && is_retained_selection_copy_key(key)
             && self
@@ -961,7 +969,8 @@ impl ClientShellState {
             retained_selection: self
                 .selection
                 .as_ref()
-                .is_some_and(crate::selection::Selection::is_visible),
+                .is_some_and(crate::selection::Selection::is_visible)
+                || self.has_kept_renumbered_selection(),
         }
     }
 

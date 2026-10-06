@@ -32,6 +32,9 @@ pub(super) struct ClientWordSelection {
     /// An off-screen row whose read failed or was refused: not extended into,
     /// and not read again while the pointer stays there.
     ignored_row: Option<u32>,
+    /// The pane's rows were renumbered (`history_rows`): every row this gesture
+    /// holds names another line now. It keeps only its frozen word.
+    pub(super) renumbered: bool,
     pub(super) dragged: bool,
     pub(super) released: bool,
 }
@@ -192,9 +195,11 @@ impl ClientShellState {
             cached_row: None,
             pending_row: None,
             ignored_row: None,
+            renumbered: false,
             dragged: false,
             released: false,
         });
+        self.number_selection_rows(hit);
         self.update_word_selection(outcome);
     }
 
@@ -272,6 +277,20 @@ impl ClientShellState {
                 self.selection = None;
             }
         }
+    }
+
+    /// The pane's rows were renumbered while the double-click is held. Its word
+    /// and range rows name other lines now, so nothing can be highlighted: keep
+    /// only the frozen word, which the release copies.
+    pub(super) fn word_selection_renumbered(&mut self) {
+        let Some(gesture) = self.word_selection_gesture.as_mut() else {
+            return;
+        };
+        gesture.renumbered = true;
+        gesture.word_replaced = true;
+        gesture.extended = false;
+        gesture.cached_row = None;
+        self.selection = None;
     }
 
     fn request_word_selection_row(&mut self, row: u32, outcome: &mut ClientShellInput) {
@@ -355,7 +374,7 @@ impl ClientShellState {
             && (cursor.0 == gesture.anchor.0
                 || (gesture.cursor_viewport_row == gesture.press_viewport_row
                     && self.selection_autoscroll.is_none()));
-        let range = if in_word {
+        let range = if in_word || gesture.renumbered {
             Some(word_range)
         } else if let Some(text) = self.painted_row_text(&gesture.pane_id, cursor.0) {
             // A row on screen: bounds from its painted cells, no read.
