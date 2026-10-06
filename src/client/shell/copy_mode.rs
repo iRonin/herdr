@@ -98,6 +98,7 @@ impl ClientShellState {
             search_current_global: None,
             search_generation: 0,
             copy_after_search: false,
+            selection_renumbered: false,
         });
         self.mode = ClientShellMode::Copy;
         true
@@ -655,6 +656,7 @@ impl ClientShellState {
         let Some(copy_mode) = self.copy_mode.as_mut() else {
             return;
         };
+        copy_mode.selection_renumbered = false;
         if linewise {
             copy_mode.selection = Some(ClientCopySelection::Linewise {
                 anchor_row: copy_mode.cursor.row,
@@ -850,6 +852,8 @@ impl ClientShellState {
             // A visible explicit selection is live. If the fallback above supplied
             // a search match, retain the revision that established its boundaries.
             self.request_selection_copy(outcome, live_selection);
+        } else if copy && copy_mode.selection_renumbered {
+            self.show_copy_failed_feedback(std::time::Instant::now());
         }
         self.selection = None;
         self.selection_highlight_clear_deadline = None;

@@ -848,6 +848,9 @@ pub(super) struct ClientCopyModeState {
     pub(super) search_current_global: Option<u64>,
     pub(super) search_generation: u64,
     pub(super) copy_after_search: bool,
+    /// The selection was dropped because a scrollback trim or clear renumbered
+    /// its rows (`history_rows`): copying now says so instead of copying nothing.
+    pub(super) selection_renumbered: bool,
 }
 
 pub(crate) struct ClientShellState {
@@ -1802,8 +1805,16 @@ impl ClientShellState {
                     if !self.pane_scroll_targets.contains_key(&pane.pane_id) {
                         copy_mode.offset_from_bottom = actual_offset;
                     }
-                    copy_mode.max_offset_from_bottom =
+                    let max_offset_from_bottom =
                         usize::try_from(scroll.max_offset_from_bottom).unwrap_or(usize::MAX);
+                    // History lost rows: the selection's rows name later lines now.
+                    if max_offset_from_bottom < copy_mode.max_offset_from_bottom
+                        && copy_mode.selection.take().is_some()
+                    {
+                        copy_mode.selection_renumbered = true;
+                        invalidated_copy_pane = Some(copy_mode.pane_id.clone());
+                    }
+                    copy_mode.max_offset_from_bottom = max_offset_from_bottom;
                 }
             }
         }
