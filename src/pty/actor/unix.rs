@@ -98,6 +98,9 @@ pub(crate) struct PtyIoActorHandle {
     user_writes: Arc<Mutex<UserWriteGate>>,
     controls: Arc<Mutex<SharedPtyControls>>,
     response_order: Arc<Mutex<()>>,
+    /// How many times the typeahead guard has read the tty's state.
+    #[cfg(all(test, target_os = "macos"))]
+    typeahead_checks: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Debug)]
@@ -403,6 +406,8 @@ impl PtyIoActor {
             user_writes,
             controls: Arc::clone(&controls),
             response_order: Arc::clone(&response_order),
+            #[cfg(all(test, target_os = "macos"))]
+            typeahead_checks: Arc::clone(&typeahead_guard.checks),
         };
 
         let mut runner = PtyIoActorRunner {
@@ -1867,6 +1872,8 @@ mod tests {
             user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
             controls: Arc::clone(&controls),
             response_order: Arc::new(Mutex::new(())),
+            #[cfg(all(test, target_os = "macos"))]
+            typeahead_checks: Default::default(),
         };
 
         handle.resize(20, 80, 8, 16, vec![Bytes::from_static(b"old")]);
@@ -1948,6 +1955,8 @@ mod tests {
             user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
             controls,
             response_order,
+            #[cfg(all(test, target_os = "macos"))]
+            typeahead_checks: Default::default(),
         };
         let (changed_tx, changed_rx) = std_mpsc::channel();
         let (continue_tx, continue_rx) = std_mpsc::channel();
@@ -2017,6 +2026,8 @@ mod tests {
             user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
+            #[cfg(all(test, target_os = "macos"))]
+            typeahead_checks: Default::default(),
         };
 
         let handoff = std::thread::spawn(move || handle.begin_handoff(Duration::from_secs(1)));
