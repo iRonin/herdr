@@ -1,8 +1,9 @@
 use super::*;
 
 /// Held second press. The clicked word is resolved at the press from the cells
-/// on screen; rows the pointer drags into are read from the endpoint. Keep only
-/// one row read in flight and use the latest pointer position when it returns,
+/// on screen, and so are the rows the pointer drags into while they are on
+/// screen. Only rows off screen (autoscroll) are read from the endpoint: keep
+/// one such read in flight and use the latest pointer position when it returns,
 /// so remote latency cannot queue up motion.
 #[derive(Debug)]
 pub(super) struct ClientWordSelection {
@@ -18,11 +19,19 @@ pub(super) struct ClientWordSelection {
     word_replaced: bool,
     /// The range reaches past the clicked word.
     extended: bool,
+    /// The screen row the word was on at the press, inside the pane.
+    press_viewport_row: u16,
     cursor: (u32, u16),
+    /// The screen row of the pointer inside the pane.
+    cursor_viewport_row: u16,
     end_col: u16,
     content_revision: u64,
+    /// Text of an off-screen row, from its read.
     cached_row: Option<(u32, crate::app::actions::WordRow)>,
     pending_row: Option<u32>,
+    /// An off-screen row whose read failed or was refused: not extended into,
+    /// and not read again while the pointer stays there.
+    ignored_row: Option<u32>,
     pub(super) dragged: bool,
     pub(super) released: bool,
 }
@@ -94,8 +103,44 @@ struct PaintedWord {
     bounds: (u16, u16),
     text: String,
     cells: Vec<String>,
-    row_text: crate::app::actions::WordRow,
     content_revision: u64,
+}
+
+fn scroll_metrics(pane: &crate::protocol::PaneSurfacePane) -> Option<crate::pane::ScrollMetrics> {
+    pane.scroll.map(|metrics| crate::pane::ScrollMetrics {
+        offset_from_bottom: usize::try_from(metrics.offset_from_bottom).unwrap_or(usize::MAX),
+        max_offset_from_bottom: usize::try_from(metrics.max_offset_from_bottom)
+            .unwrap_or(usize::MAX),
+        viewport_rows: usize::try_from(metrics.viewport_rows).unwrap_or(usize::MAX),
+    })
+}
+
+/// Every cell symbol of one screen row of a pane, or None if the row is outside
+/// the pane or the frame does not carry all its cells.
+fn pane_row_symbols<'a>(
+    surface: &'a PaneSurfaceFrame,
+    pane: &crate::protocol::PaneSurfacePane,
+    viewport_row: u16,
+) -> Option<Vec<&'a str>> {
+    if viewport_row >= pane.inner_rect.height {
+        return None;
+    }
+    let y = usize::from(pane.inner_rect.y) + usize::from(viewport_row);
+    (0..pane.inner_rect.width)
+        .map(|x| {
+            surface_cell(surface, usize::from(pane.inner_rect.x) + usize::from(x), y)
+                .map(|cell| cell.symbol.as_str())
+        })
+        .collect()
+}
+
+/// A pane row's text placed in the columns the client draws it across.
+fn word_row(symbols: &[&str]) -> crate::app::actions::WordRow {
+    crate::app::actions::WordRow::from_display_cells(
+        symbols
+            .iter()
+            .map(|symbol| (*symbol, crate::protocol::render_ansi::symbol_width(symbol))),
+    )
 }
 
 impl ClientShellState {
@@ -139,11 +184,14 @@ impl ClientShellState {
             word_cells,
             word_replaced,
             extended: false,
+            press_viewport_row: viewport_row,
             cursor: (word.row, col),
+            cursor_viewport_row: viewport_row,
             end_col: hit.inner_rect.width.saturating_sub(1),
             content_revision: word.content_revision,
-            cached_row: (!word_replaced).then_some((word.row, word.row_text)),
+            cached_row: None,
             pending_row: None,
+            ignored_row: None,
             dragged: false,
             released: false,
         });
@@ -158,37 +206,18 @@ impl ClientShellState {
             .panes
             .iter()
             .find(|pane| pane.pane_id == hit.pane_id)?;
-        let scroll = pane.scroll.map(|metrics| crate::pane::ScrollMetrics {
-            offset_from_bottom: usize::try_from(metrics.offset_from_bottom).unwrap_or(usize::MAX),
-            max_offset_from_bottom: usize::try_from(metrics.max_offset_from_bottom)
-                .unwrap_or(usize::MAX),
-            viewport_rows: usize::try_from(metrics.viewport_rows).unwrap_or(usize::MAX),
-        });
+        let scroll = scroll_metrics(pane);
         let shown_at = Rect::new(
             origin.0.saturating_add(pane.inner_rect.x),
             origin.1.saturating_add(pane.inner_rect.y),
             pane.inner_rect.width,
             pane.inner_rect.height,
         );
-        if shown_at != hit.inner_rect
-            || scroll != hit.scroll
-            || viewport_row >= pane.inner_rect.height
-            || col >= pane.inner_rect.width
-        {
+        if shown_at != hit.inner_rect || scroll != hit.scroll || col >= pane.inner_rect.width {
             return None;
         }
-        let y = usize::from(pane.inner_rect.y) + usize::from(viewport_row);
-        let symbols = (0..pane.inner_rect.width)
-            .map(|x| {
-                surface_cell(surface, usize::from(pane.inner_rect.x) + usize::from(x), y)
-                    .map(|cell| cell.symbol.as_str())
-            })
-            .collect::<Option<Vec<_>>>()?;
-        let row_text = crate::app::actions::WordRow::from_display_cells(
-            symbols
-                .iter()
-                .map(|symbol| (*symbol, crate::protocol::render_ansi::symbol_width(symbol))),
-        );
+        let symbols = pane_row_symbols(surface, pane, viewport_row)?;
+        let row_text = word_row(&symbols);
         let bounds = row_text.bounds_at(col)?;
         Some(PaintedWord {
             row: crate::selection::absolute_row_for_viewport(viewport_row, scroll),
@@ -198,9 +227,21 @@ impl ClientShellState {
                 .iter()
                 .map(|symbol| (*symbol).to_owned())
                 .collect(),
-            row_text,
             content_revision: pane.content_revision,
         })
+    }
+
+    /// The text of absolute row `row` of a pane as the terminal shows it, if it is on screen.
+    fn painted_row_text(&self, pane_id: &str, row: u32) -> Option<crate::app::actions::WordRow> {
+        let (surface, _) = self.painted_pane_surface()?;
+        let pane = surface.panes.iter().find(|pane| pane.pane_id == pane_id)?;
+        let top = pane.scroll.map_or(0, |scroll| {
+            scroll
+                .max_offset_from_bottom
+                .saturating_sub(scroll.offset_from_bottom)
+        });
+        let viewport_row = u16::try_from(u64::from(row).checked_sub(top)?).ok()?;
+        Some(word_row(&pane_row_symbols(surface, pane, viewport_row)?))
     }
 
     fn cancel_word_selection(&mut self) {
@@ -211,8 +252,8 @@ impl ClientShellState {
 
     /// A new pane surface while a double-click is held. Output elsewhere keeps
     /// the clicked word. If the word's own cells change, stop highlighting it at
-    /// once; the release still copies the word that was clicked. Cached row text
-    /// from before the output no longer bounds words outside it.
+    /// once; the release still copies the word that was clicked. Text of an
+    /// off-screen row read before the output no longer bounds words in it.
     pub(super) fn word_selection_sees_surface(&mut self, surface: &PaneSurfaceFrame) {
         let Some(gesture) = self.word_selection_gesture.as_mut() else {
             return;
@@ -260,22 +301,29 @@ impl ClientShellState {
             },
             outcome,
         ) {
-            self.cancel_word_selection();
+            if let Some(gesture) = self.word_selection_gesture.as_mut() {
+                gesture.pending_row = None;
+                gesture.ignored_row = Some(row);
+            }
         }
     }
 
     pub(super) fn drag_word_selection(
         &mut self,
         cursor: (u32, u16),
+        viewport_row: u16,
         outcome: &mut ClientShellInput,
     ) {
         let Some(gesture) = self.word_selection_gesture.as_mut() else {
             return;
         };
-        if gesture.released || gesture.cursor == cursor {
+        if gesture.released
+            || (gesture.cursor, gesture.cursor_viewport_row) == (cursor, viewport_row)
+        {
             return;
         }
         gesture.cursor = cursor;
+        gesture.cursor_viewport_row = viewport_row;
         gesture.dragged = true;
         self.update_word_selection(outcome);
     }
@@ -290,7 +338,7 @@ impl ClientShellState {
     }
 
     fn update_word_selection(&mut self, outcome: &mut ClientShellInput) {
-        let Some(gesture) = self.word_selection_gesture.as_mut() else {
+        let Some(gesture) = self.word_selection_gesture.as_ref() else {
             return;
         };
         let (anchor_start, anchor_end) = gesture.anchor_bounds;
@@ -298,28 +346,45 @@ impl ClientShellState {
             (gesture.anchor.0, anchor_start),
             (gesture.anchor.0, anchor_end),
         );
-        // A pointer that moved but stayed inside the clicked word has not extended anything.
-        let (start, end) = if gesture.cursor.0 == gesture.anchor.0
-            && (anchor_start..=anchor_end).contains(&gesture.cursor.1)
+        let cursor = gesture.cursor;
+        let in_word_columns = (anchor_start..=anchor_end).contains(&cursor.1);
+        // A pointer that moved but stayed inside the clicked word has not extended
+        // anything: inside its row and columns, or inside the screen cells it
+        // occupied at the press, which output may since have scrolled other text into.
+        let in_word = in_word_columns
+            && (cursor.0 == gesture.anchor.0
+                || (gesture.cursor_viewport_row == gesture.press_viewport_row
+                    && self.selection_autoscroll.is_none()));
+        let range = if in_word {
+            Some(word_range)
+        } else if let Some(text) = self.painted_row_text(&gesture.pane_id, cursor.0) {
+            // A row on screen: bounds from its painted cells, no read.
+            Some(extend(word_range, cursor, text.bounds_at(cursor.1)))
+        } else if gesture.ignored_row == Some(cursor.0) {
+            // Its read failed or was refused: keep only the clicked word.
+            Some(word_range)
+        } else if let Some((_, text)) = gesture
+            .cached_row
+            .as_ref()
+            .filter(|(row, _)| *row == cursor.0)
         {
-            word_range
+            Some(extend(word_range, cursor, text.bounds_at(cursor.1)))
         } else {
-            let Some((_, text)) = gesture
-                .cached_row
+            None
+        };
+        let Some((start, end)) = range else {
+            self.request_word_selection_row(cursor.0, outcome);
+            if self
+                .word_selection_gesture
                 .as_ref()
-                .filter(|(row, _)| *row == gesture.cursor.0)
-            else {
-                let row = gesture.cursor.0;
-                self.request_word_selection_row(row, outcome);
-                return;
-            };
-            let (start_col, end_col) = text
-                .bounds_at(gesture.cursor.1)
-                .unwrap_or((gesture.cursor.1, gesture.cursor.1));
-            (
-                word_range.0.min((gesture.cursor.0, start_col)),
-                word_range.1.max((gesture.cursor.0, end_col)),
-            )
+                .is_some_and(|gesture| gesture.ignored_row == Some(cursor.0))
+            {
+                self.update_word_selection(outcome);
+            }
+            return;
+        };
+        let Some(gesture) = self.word_selection_gesture.as_mut() else {
+            return;
         };
         gesture.extended = (start, end) != word_range;
         let hidden = gesture.word_replaced && !gesture.extended;
@@ -397,8 +462,15 @@ impl ClientShellState {
                         "endpoint returned an unexpected word-selection result",
                     );
                 }
-                self.cancel_word_selection();
-                return (true, Vec::new());
+                // A failed or refused read drops only the extension into that row:
+                // the clicked word stands, and a waiting release copies it.
+                if let Some(gesture) = self.word_selection_gesture.as_mut() {
+                    gesture.pending_row = None;
+                    gesture.ignored_row = Some(absolute_row);
+                }
+                let mut outcome = ClientShellInput::default();
+                self.update_word_selection(&mut outcome);
+                return (true, outcome.actions);
             }
         };
         let Some(gesture) = self.word_selection_gesture.as_mut() else {
@@ -412,9 +484,16 @@ impl ClientShellState {
     }
 }
 
-impl ClientWordSelection {
-    /// The range reaches past the clicked word.
-    pub(super) fn extended(&self) -> bool {
-        self.extended
-    }
+/// The range from the clicked word to the token under the cursor, or the
+/// cursor's own cell where there is none.
+fn extend(
+    word_range: ((u32, u16), (u32, u16)),
+    cursor: (u32, u16),
+    bounds: Option<(u16, u16)>,
+) -> ((u32, u16), (u32, u16)) {
+    let (start_col, end_col) = bounds.unwrap_or((cursor.1, cursor.1));
+    (
+        word_range.0.min((cursor.0, start_col)),
+        word_range.1.max((cursor.0, end_col)),
+    )
 }

@@ -1727,14 +1727,9 @@ impl ClientShellState {
                 // its scroll metrics.
                 || (self.word_selection_gesture.is_some()
                     && previous.scroll.is_some() != next.scroll.is_some())
-                // A word gesture extended past its word bounds the range with
-                // cached rows that output can invalidate. A plain double-click
-                // keeps its word through output (`word_selection_sees_surface`).
-                || (self
-                    .word_selection_gesture
-                    .as_ref()
-                    .is_some_and(|gesture| gesture.extended())
-                    && previous.content_revision != next.content_revision)
+            // Output does not cancel a word gesture: its word is frozen, and
+            // rows it extends into are read from the screen when shown
+            // (`word_selection_sees_surface`, `update_word_selection`).
         });
         if selection_invalidated {
             self.word_selection_gesture = None;

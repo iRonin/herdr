@@ -197,7 +197,7 @@ impl ClientShellState {
                 .saturating_sub(hit.inner_rect.x)
                 .min(hit.inner_rect.width.saturating_sub(1));
             let absolute_row = crate::selection::absolute_row_for_viewport(viewport_row, metrics);
-            self.drag_word_selection((absolute_row, col), outcome);
+            self.drag_word_selection((absolute_row, col), viewport_row, outcome);
         } else if let Some(selection) = self.selection.as_mut() {
             selection.drag(column, row, hit.inner_rect, metrics);
         }
