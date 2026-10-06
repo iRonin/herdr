@@ -2265,6 +2265,13 @@ fn warn_if_remote_herdr_is_stock(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) {
     if !crate::build_info::FORK_BUILD {
         return;
     }
+    // At most one notice per remote per process: background reconnects adopt
+    // again and again, and a repeated notice would garble the full-screen
+    // client's frame on every reconnect.
+    let key = format!("{}:{}", ssh.target(), remote_herdr.executable.display());
+    if stock_notice_already_seen(key) {
+        return;
+    }
     let Ok(output) = ssh.shell_output(
         &remote_herdr.platform,
         &remote_herdr.executable.command(&["--version"]),
@@ -2278,6 +2285,19 @@ fn warn_if_remote_herdr_is_stock(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) {
     if let Some(notice) = stock_remote_notice(crate::build_info::FORK_BUILD, &stdout) {
         eprintln!("{notice}");
     }
+}
+
+/// Whether the stock-remote notice for `key` was already handled in this
+/// process (inserting it when not). The notice must appear once per remote:
+/// background reconnects re-adopt the same remote on every connect.
+fn stock_notice_already_seen(key: String) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let mut seen = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    !seen.insert(key)
 }
 
 /// The notice a fork build prints when it adopts a stock upstream remote
@@ -2296,6 +2316,16 @@ fn stock_remote_notice(fork_build: bool, version_output: &str) -> Option<String>
         .find(|line| !line.trim().is_empty())?
         .trim();
     let version = line.strip_prefix("herdr ")?.split_whitespace().next()?;
+    // The version comes from the REMOTE host and is printed into the local
+    // terminal: keep only the ASCII version alphabet so a hostile remote
+    // cannot inject ANSI/OSC escapes, and stay quiet when nothing survives.
+    let version: String = version
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+        .collect();
+    if version.is_empty() {
+        return None;
+    }
     Some(format!(
         "herdr: the remote herdr is upstream Herdr {version}, so the fork's features are missing there. Replace it with the fork's own release for the remote's platform (built from source), passed with {REMOTE_BINARY_ENV_VAR}=<path>; that installs the fork build as the remote's managed herdr, which must resolve as `herdr` (remove the upstream binary otherwise)"
     ))
@@ -5360,6 +5390,47 @@ mod tests {
             stock_remote_notice(false, "herdr 0.9.1\n"),
             None,
             "a stock build must stay quiet"
+        );
+    }
+
+    #[test]
+    fn stock_remote_notice_never_prints_control_characters_from_the_remote_version() {
+        // The version token comes from the REMOTE host: printing it raw would
+        // hand a hostile remote ANSI/OSC escape injection into the local
+        // terminal. Keep only [A-Za-z0-9._+-] and stay quiet if nothing
+        // survives the filter.
+        let notice = stock_remote_notice(true, "herdr 1.2.3\u{7}\u{1b}[2J\n")
+            .expect("the safe characters of the version must survive");
+        assert!(
+            notice.chars().all(|c| !c.is_control()),
+            "the notice must contain no control characters; got: {notice:?}"
+        );
+        assert!(
+            notice.contains("upstream Herdr 1.2.3"),
+            "the safe characters of the version must survive; got: {notice}"
+        );
+        assert_eq!(
+            stock_remote_notice(true, "herdr \u{1b};\u{7}]\n"),
+            None,
+            "a version that sanitizes to nothing must stay quiet"
+        );
+    }
+
+    #[test]
+    fn stock_remote_notice_is_suppressed_after_the_first_time_per_remote() {
+        // Background reconnects re-adopt the same remote repeatedly; the
+        // notice must fire once per remote per process, never per connect.
+        assert!(
+            !stock_notice_already_seen("unit-notice-host-a:/bin/herdr".to_string()),
+            "the first sighting of a remote must be reported"
+        );
+        assert!(
+            stock_notice_already_seen("unit-notice-host-a:/bin/herdr".to_string()),
+            "the same remote must not be reported twice"
+        );
+        assert!(
+            !stock_notice_already_seen("unit-notice-host-b:/bin/herdr".to_string()),
+            "a different remote must still be reported"
         );
     }
 
