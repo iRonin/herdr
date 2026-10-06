@@ -1677,10 +1677,10 @@ fn resolve_install_source_for(
 /// Why a fork build refuses to download the remote binary from the release
 /// feed: the feed publishes stock Herdr releases, so the remote would run
 /// without the fork's features. The remote needs a fork build for its own
-/// platform instead - built from source and passed with
-/// `HERDR_REMOTE_BINARY`, or uploaded from this machine when both ends run
-/// the same platform.
-const FORK_REMOTE_INSTALL_REFUSAL: &str = "this herdr is the iRonin fork: downloading the remote binary would install the upstream Herdr release there and drop the fork's features; the remote needs a fork build for its platform (built from source), passed with HERDR_REMOTE_BINARY=<path>";
+/// platform instead - the fork's own release, built from source - passed
+/// with `HERDR_REMOTE_BINARY`, or uploaded from this machine when both ends
+/// run the same platform.
+const FORK_REMOTE_INSTALL_REFUSAL: &str = "this herdr is the iRonin fork: downloading the remote binary would install the upstream Herdr release there and drop the fork's features; get the fork's own release for the remote's platform instead (built from source), passed with HERDR_REMOTE_BINARY=<path>";
 
 /// The refusal a fork build raises wherever the remote binary would be taken
 /// from the release feed, or `None` on a stock build. Returned through a
