@@ -122,3 +122,116 @@ fn update_refuses_on_fork_build_and_leaves_the_binary_untouched() {
 
     let _ = std::fs::remove_dir_all(&sandbox);
 }
+
+#[test]
+fn remote_attach_refuses_the_upstream_release_on_a_fork_build_and_fetches_nothing() {
+    // Remote attach from a fork build must never download the upstream
+    // release for the remote host: the release feed publishes stock Herdr, so
+    // the remote would silently run without the fork's features. The remote
+    // instead needs a fork build for its platform (built from source), passed
+    // with HERDR_REMOTE_BINARY - and no error may advise `herdr update`, which
+    // the fork refuses. Same discipline as the update refusal test above:
+    // cleared env, HOME/XDG in a temp sandbox, and fake `curl` and `ssh` first
+    // on PATH that log every invocation, so a missing guard cannot reach the
+    // network or a real host. The fake `ssh` answers only the probes remote
+    // attach makes before the refusal point (platform detection and remote
+    // binary discovery) and fails everything else.
+    let sandbox =
+        std::env::temp_dir().join(format!("herdr-branding-remote-{}", std::process::id()));
+    let home = sandbox.join("home");
+    let config = sandbox.join("config");
+    let state = sandbox.join("state");
+    let runtime = sandbox.join("run");
+    let tmp = sandbox.join("tmp");
+    let bin = sandbox.join("bin");
+    for dir in [&home, &config, &state, &runtime, &tmp, &bin] {
+        std::fs::create_dir_all(dir).expect("create sandbox dir");
+    }
+
+    let curl_log = sandbox.join("curl.log");
+    let curl = bin.join("curl");
+    std::fs::write(
+        &curl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 22\n",
+            curl_log.display()
+        ),
+    )
+    .expect("write fake curl");
+    std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake curl executable");
+
+    let ssh_log = sandbox.join("ssh.log");
+    let ssh = bin.join("ssh");
+    std::fs::write(
+        &ssh,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {log}
+input=$(cat 2>/dev/null || true)
+case "$* $input" in
+  *"uname -s"*)
+    printf '\nherdr-remote-output-ready:1\nLinux\nx86_64\n'
+    exit 0 ;;
+  *"command -v herdr"*)
+    exit 1 ;;
+  *emit*)
+    printf '\nherdr-remote-output-ready:1\n'
+    exit 0 ;;
+  *)
+    exit 1 ;;
+esac
+"#,
+            log = ssh_log.display()
+        ),
+    )
+    .expect("write fake ssh");
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake ssh executable");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("TMPDIR", &tmp)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .args(["--remote", "remote-fixture"])
+        .output()
+        .expect("herdr --remote should run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "remote attach must refuse on the fork build; got {:?} (stderr: {stderr})",
+        output.status.code()
+    );
+    assert!(
+        !curl_log.exists(),
+        "the refusal must fire before any release fetch; curl saw: {}",
+        std::fs::read_to_string(&curl_log).unwrap_or_default()
+    );
+    assert!(
+        ssh_log.exists(),
+        "the fixture must reach the remote-install decision (the fake ssh saw no probes at all); stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("iRonin fork"),
+        "stderr must name the fork; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("HERDR_REMOTE_BINARY"),
+        "stderr must say how to pass a fork build for the remote; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("built from source"),
+        "stderr must say where the remote build comes from; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("herdr update"),
+        "no error on a fork build may advise `herdr update`; got: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}

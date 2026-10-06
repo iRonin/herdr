@@ -1118,6 +1118,17 @@ pub(super) fn prepare_remote_herdr(
         }
     }
 
+    // A fork build cannot fetch the upstream release for the remote (see
+    // `resolve_install_source_for`), and every step below leads only there,
+    // so refuse before the install prompts offer something that cannot
+    // happen. The early returns above are untouched: an installed remote
+    // binary this client can use needs no download at all.
+    if override_binary.is_none() && local_binary_seed_path(&remote_herdr.platform)?.is_none() {
+        if let Some(message) = fork_remote_install_refusal() {
+            return Err(io::Error::other(message));
+        }
+    }
+
     let mut stop_after_install_approved = false;
     if let Some(status_probe_herdr) = remote_binary_candidates.first().or_else(|| {
         remote_binary_exists(ssh, &remote_herdr)
@@ -1200,6 +1211,15 @@ fn prepare_windows_remote_herdr(
                     stop_after_install_approved: false,
                 });
             }
+        }
+    }
+
+    // As in `prepare_remote_herdr`: without an override package the only
+    // source left is the upstream release download, which a fork build
+    // refuses - before the install prompts, not after them.
+    if override_package.is_none() {
+        if let Some(message) = fork_remote_install_refusal() {
+            return Err(io::Error::other(message));
         }
     }
 
@@ -1622,18 +1642,69 @@ fn resolve_install_source(
     platform: &RemotePlatform,
     override_binary: Option<PathBuf>,
 ) -> io::Result<InstallSource> {
+    resolve_install_source_for(platform, override_binary, crate::build_info::FORK_BUILD)
+}
+
+fn resolve_install_source_for(
+    platform: &RemotePlatform,
+    override_binary: Option<PathBuf>,
+    fork_build: bool,
+) -> io::Result<InstallSource> {
     if let Some(path) = override_binary {
         return Ok(InstallSource::persistent(path));
     }
 
+    if let Some(path) = local_binary_seed_path(platform)? {
+        return Ok(InstallSource::persistent(path));
+    }
+
+    // A fork build never installs the upstream release on a remote host: the
+    // feed publishes stock Herdr, so the remote would silently run without
+    // the fork's features. The two sources above are this fork's own binary
+    // and stay available; anything else refuses and says how to provide one.
+    if let Some(message) = fork_remote_install_refusal_for(fork_build) {
+        return Err(io::Error::other(message));
+    }
+
+    download_release_asset_for(platform, fork_build)
+}
+
+/// Why a fork build refuses to download the remote binary from the release
+/// feed: the feed publishes stock Herdr releases, so the remote would run
+/// without the fork's features. The remote needs a fork build for its own
+/// platform instead - built from source and passed with
+/// `HERDR_REMOTE_BINARY`, or uploaded from this machine when both ends run
+/// the same platform.
+const FORK_REMOTE_INSTALL_REFUSAL: &str = "this herdr is the iRonin fork: downloading the remote binary would install the upstream Herdr release there and drop the fork's features; the remote needs a fork build for its platform (built from source), passed with HERDR_REMOTE_BINARY=<path>";
+
+/// The refusal a fork build raises wherever the remote binary would be taken
+/// from the release feed, or `None` on a stock build. Returned through a
+/// function so call sites branch on a value the compiler cannot fold away
+/// (the same shape as `update::fork_update_refusal`).
+fn fork_remote_install_refusal() -> Option<&'static str> {
+    fork_remote_install_refusal_for(crate::build_info::FORK_BUILD)
+}
+
+fn fork_remote_install_refusal_for(fork_build: bool) -> Option<&'static str> {
+    if fork_build {
+        Some(FORK_REMOTE_INSTALL_REFUSAL)
+    } else {
+        None
+    }
+}
+
+/// The local binary `resolve_install_source` uploads to the remote when the
+/// remote runs this machine's platform and the local install is not managed
+/// by a package manager, or `None` when the release download is the only
+/// source left.
+fn local_binary_seed_path(platform: &RemotePlatform) -> io::Result<Option<PathBuf>> {
     if *platform == RemotePlatform::local() {
         let path = std::env::current_exe()?;
         if !crate::update::is_package_manager_managed_exe_path(&path) {
-            return Ok(InstallSource::persistent(path));
+            return Ok(Some(path));
         }
     }
-
-    download_release_asset(platform)
+    Ok(None)
 }
 
 fn local_binary_can_seed_remote(platform: &RemotePlatform) -> bool {
@@ -2180,6 +2251,21 @@ fn remote_shell_resolves_managed_install(stdout: &str) -> bool {
 }
 
 fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource> {
+    download_release_asset_for(platform, crate::build_info::FORK_BUILD)
+}
+
+fn download_release_asset_for(
+    platform: &RemotePlatform,
+    fork_build: bool,
+) -> io::Result<InstallSource> {
+    // Defense in depth behind the refusal in `resolve_install_source_for`:
+    // every fetch of a release asset - both update channels and the Windows
+    // flow's direct call - passes through here, and none may run on a fork
+    // build. The refusal precedes `remote_release_asset`, whose preview and
+    // stable branches are the only channel-dependent code in this path.
+    if let Some(message) = fork_remote_install_refusal_for(fork_build) {
+        return Err(io::Error::other(message));
+    }
     let asset_key = platform.asset_key();
     let asset = remote_release_asset(&asset_key)?;
 
@@ -4929,6 +5015,273 @@ mod tests {
         assert!(source.temporary_dir.is_none());
     }
 
+    /// The shared env lock, taken poison-tolerant: one test failing while
+    /// holding it must not cascade into unrelated failures of the others.
+    #[cfg(unix)]
+    fn remote_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        remote_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Points THIS process's environment into a throwaway sandbox (TMPDIR
+    /// inside a temp dir, a fake `curl` first on PATH that logs every
+    /// invocation and fails, and no HERDR_* variables) so a test may call the
+    /// real release-download code in-process: if the fork refusal is ever
+    /// lost, the call dies at the sandboxed manifest fetch instead of reaching
+    /// the network. Every touched variable is restored on drop; the sandbox
+    /// dir is kept when dropping during a panic so the failure evidence
+    /// survives.
+    #[cfg(unix)]
+    struct FetchSandbox {
+        dir: PathBuf,
+        saved: Vec<(String, Option<std::ffi::OsString>)>,
+    }
+
+    #[cfg(unix)]
+    impl FetchSandbox {
+        fn new(tag: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let dir = std::env::temp_dir()
+                .join(format!("herdr-attach-fetch-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(dir.join("bin")).expect("create sandbox bin");
+            std::fs::create_dir_all(dir.join("tmp")).expect("create sandbox tmp");
+            let curl = dir.join("bin/curl");
+            std::fs::write(
+                &curl,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 22\n",
+                    dir.join("curl.log").display()
+                ),
+            )
+            .expect("write fake curl");
+            std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755))
+                .expect("make fake curl executable");
+
+            let mut saved = Vec::new();
+            for key in ["TMPDIR", "PATH"] {
+                saved.push((key.to_string(), std::env::var_os(key)));
+            }
+            let herdr_keys: Vec<String> = std::env::vars_os()
+                .map(|(key, _)| key.to_string_lossy().into_owned())
+                .filter(|key| key.starts_with("HERDR_"))
+                .collect();
+            for key in herdr_keys {
+                saved.push((key.clone(), std::env::var_os(&key)));
+                std::env::remove_var(&key);
+            }
+            std::env::set_var("TMPDIR", dir.join("tmp"));
+            std::env::set_var(
+                "PATH",
+                format!("{}:/usr/bin:/bin", dir.join("bin").display()),
+            );
+
+            Self { dir, saved }
+        }
+
+        fn curl_was_called(&self) -> bool {
+            self.dir.join("curl.log").exists()
+        }
+
+        fn curl_log(&self) -> String {
+            std::fs::read_to_string(self.dir.join("curl.log")).unwrap_or_default()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FetchSandbox {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            if std::thread::panicking() {
+                eprintln!("sandbox kept for inspection: {}", self.dir.display());
+            } else {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+    }
+
+    /// A remote platform this machine can never seed with its own binary: a
+    /// different OS and architecture from the host running the test. Asserts
+    /// the mismatch so the fixture fails loudly instead of silently testing
+    /// the same-platform path.
+    #[cfg(unix)]
+    fn platform_mismatch() -> RemotePlatform {
+        let platform = RemotePlatform {
+            os: if cfg!(target_os = "macos") {
+                "linux"
+            } else {
+                "macos"
+            },
+            arch: if cfg!(target_arch = "aarch64") {
+                "x86_64"
+            } else {
+                "aarch64"
+            },
+        };
+        assert_ne!(
+            platform,
+            RemotePlatform::local(),
+            "the fixture must be a platform mismatch, or the test cannot return its failure"
+        );
+        platform
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_install_source_refuses_the_upstream_release_on_a_fork_build() {
+        // A fork build must never install the upstream release on a remote
+        // host: the release feed publishes stock Herdr, so the remote would
+        // silently run without the fork's features. When neither
+        // `HERDR_REMOTE_BINARY` nor the same-platform upload applies, the
+        // install source must refuse instead of downloading.
+        let _env = remote_env_guard();
+        let sandbox = FetchSandbox::new("resolve-refusal");
+
+        let Err(error) = resolve_install_source(&platform_mismatch(), None) else {
+            panic!("a fork build must refuse the upstream release as the remote binary");
+        };
+
+        assert!(
+            !sandbox.curl_was_called(),
+            "the refusal must fire before any release fetch; curl saw: {}",
+            sandbox.curl_log()
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("iRonin fork"),
+            "the refusal must name the fork; got: {message}"
+        );
+        assert!(
+            message.contains("HERDR_REMOTE_BINARY"),
+            "the refusal must say how to pass a fork build for the remote; got: {message}"
+        );
+        assert!(
+            message.contains("built from source"),
+            "the refusal must say where the remote build comes from; got: {message}"
+        );
+        assert!(
+            !message.contains("herdr update"),
+            "no error on a fork build may advise `herdr update`; got: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_download_refuses_on_a_fork_build_before_the_stable_or_preview_manifest_fetch() {
+        // `download_release_asset` is the only route to `remote_release_asset`,
+        // which holds BOTH update channels (the `is_preview` branch and the
+        // stable tail), and the Windows flow calls this function directly - so
+        // refusing before any fetch here covers every channel. The channel
+        // itself is compile-time (`build_info::is_preview`), which no runtime
+        // test can flip; the proof is that the refusal precedes every fetch.
+        // This is also the defense in depth behind the refusal in
+        // `resolve_install_source`.
+        let _env = remote_env_guard();
+        let sandbox = FetchSandbox::new("download-refusal");
+
+        let Err(error) = download_release_asset(&platform_mismatch()) else {
+            panic!("a fork build must refuse to download the release asset");
+        };
+
+        assert!(
+            !sandbox.curl_was_called(),
+            "the refusal must fire before any release fetch; curl saw: {}",
+            sandbox.curl_log()
+        );
+        assert!(
+            error.to_string().contains("iRonin fork"),
+            "the refusal must name the fork; got: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_install_source_still_uploads_the_local_binary_on_this_platform() {
+        // The refusal must not cover the same-platform upload: the local
+        // binary is this fork's own build, so seeding the remote with it keeps
+        // every feature. This is the upstream behaviour and must stay.
+        let _env = remote_env_guard();
+        let sandbox = FetchSandbox::new("local-seed");
+
+        let source = resolve_install_source(&RemotePlatform::local(), None)
+            .expect("same-platform seeding must keep working on a fork build");
+
+        assert_eq!(source.path, std::env::current_exe().unwrap());
+        assert!(
+            source.temporary_dir.is_none(),
+            "an uploaded local binary is not a download"
+        );
+        assert!(
+            !sandbox.curl_was_called(),
+            "same-platform seeding must not fetch a release; curl saw: {}",
+            sandbox.curl_log()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fork_remote_install_refusal_names_the_fork_the_source_and_never_herdr_update() {
+        // The refusal must say what the remote needs instead, and must not
+        // advise `herdr update`, which the fork refuses (the update guard).
+        let Some(message) = fork_remote_install_refusal() else {
+            panic!("this is a fork build; the refusal must exist");
+        };
+        assert!(
+            message.contains("iRonin fork"),
+            "the refusal must name the fork; got: {message}"
+        );
+        assert!(
+            message.contains("HERDR_REMOTE_BINARY"),
+            "the refusal must say how to pass a fork build for the remote; got: {message}"
+        );
+        assert!(
+            message.contains("built from source"),
+            "the refusal must say where the remote build comes from; got: {message}"
+        );
+        assert!(
+            !message.contains("herdr update"),
+            "no error on a fork build may advise `herdr update`; got: {message}"
+        );
+        assert_eq!(
+            fork_remote_install_refusal_for(false),
+            None,
+            "a stock build must keep upstream's behaviour unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_install_source_keeps_the_upstream_download_on_a_stock_build() {
+        // The stock build's behaviour must stay upstream's, byte for byte:
+        // with the fork flag off, a platform mismatch falls through to the
+        // release download - measured here as the manifest fetch reaching the
+        // sandboxed fake curl, with no fork refusal anywhere in the error.
+        // Only the fork branch may refuse.
+        let _env = remote_env_guard();
+        let sandbox = FetchSandbox::new("stock-download");
+
+        let Err(error) = resolve_install_source_for(&platform_mismatch(), None, false) else {
+            panic!("the sandboxed fake curl must fail the manifest fetch");
+        };
+
+        assert!(
+            sandbox.curl_was_called(),
+            "a stock build must attempt the upstream download; curl log: {}",
+            sandbox.curl_log()
+        );
+        let message = error.to_string();
+        assert!(
+            !message.contains("iRonin fork"),
+            "a stock build must not carry the fork refusal; got: {message}"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_local_forward_endpoint_uses_private_state_dir() {
@@ -4954,7 +5307,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_forward_socket_path_uses_readable_name_when_it_fits() {
-        let _guard = remote_env_lock().lock().unwrap();
+        let _guard = remote_env_guard();
         // Short target + session leave plenty of room — keep the human-
         // readable form so the socket path stays grep-friendly.
         let path = local_forward_socket_path("dev", "default");
@@ -4979,7 +5332,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_forward_socket_path_fits_in_sun_path() {
-        let _guard = remote_env_lock().lock().unwrap();
+        let _guard = remote_env_guard();
         // Worst case for the readable form: macOS-style 49-char TMPDIR +
         // max-length sanitized components. Should fall back to the hashed
         // short name, which fits under TMPDIR.
@@ -4997,7 +5350,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_forward_socket_path_falls_back_to_tmp_when_dir_is_long() {
-        let _guard = remote_env_lock().lock().unwrap();
+        let _guard = remote_env_guard();
         // Force a TMPDIR long enough that even the hashed short name cannot
         // fit inside it. The fallback should drop to /tmp.
         let prior = std::env::var_os("TMPDIR");
