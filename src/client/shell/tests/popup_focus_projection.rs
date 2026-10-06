@@ -126,6 +126,7 @@ fn modal_paste_target_requires_a_focused_editable_client_field() {
         search_generation: 0,
         copy_after_search: false,
         selection_renumbered: false,
+        total_rows: 0,
     });
     state.mode = ClientShellMode::Copy;
     assert!(state.modal_paste_target_active());

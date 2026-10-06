@@ -851,6 +851,8 @@ pub(super) struct ClientCopyModeState {
     /// The selection was dropped because a scrollback trim or clear renumbered
     /// its rows (`history_rows`): copying now says so instead of copying nothing.
     pub(super) selection_renumbered: bool,
+    /// The pane's total rows (history plus view) in the last update seen.
+    pub(super) total_rows: usize,
 }
 
 pub(crate) struct ClientShellState {
@@ -1807,10 +1809,17 @@ impl ClientShellState {
                     }
                     let max_offset_from_bottom =
                         usize::try_from(scroll.max_offset_from_bottom).unwrap_or(usize::MAX);
+                    let total_rows = usize::try_from(
+                        scroll
+                            .max_offset_from_bottom
+                            .saturating_add(scroll.viewport_rows),
+                    )
+                    .unwrap_or(usize::MAX);
                     // History lost rows: the selection's rows name later lines now.
-                    if max_offset_from_bottom < copy_mode.max_offset_from_bottom
-                        && copy_mode.selection.take().is_some()
-                    {
+                    // (A taller view lowers the max offset but loses no row.)
+                    let renumbered = total_rows < copy_mode.total_rows;
+                    copy_mode.total_rows = total_rows;
+                    if renumbered && copy_mode.selection.take().is_some() {
                         copy_mode.selection_renumbered = true;
                         invalidated_copy_pane = Some(copy_mode.pane_id.clone());
                     }

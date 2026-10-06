@@ -97,6 +97,7 @@ impl ClientShellState {
             search_generation: 0,
             copy_after_search: false,
             selection_renumbered: false,
+            total_rows: super::history_rows::history_rows(Some(metrics)),
         });
         self.mode = ClientShellMode::Copy;
         true
