@@ -265,6 +265,14 @@ struct RemoteAdoptionFixture {
 
 impl RemoteAdoptionFixture {
     fn run(name: &str, version_reply_script: &str) -> Self {
+        Self::run_with_env(name, version_reply_script, &[])
+    }
+
+    fn run_with_env(
+        name: &str,
+        version_reply_script: &str,
+        extra_env: &[(&str, &std::ffi::OsStr)],
+    ) -> Self {
         let sandbox = std::env::temp_dir().join(format!(
             "herdr-branding-adopt-{name}-{}",
             std::process::id()
@@ -334,14 +342,19 @@ esac
 
         let cleanup = SandboxDir(sandbox.clone());
 
-        let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+        command
             .env_clear()
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &config)
             .env("XDG_STATE_HOME", &state)
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("TMPDIR", &tmp)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let output = command
             .args(["--remote", "remote-fixture"])
             .output()
             .expect("herdr --remote should run");
@@ -438,6 +451,42 @@ fn remote_attach_stays_quiet_when_the_remote_herdr_carries_the_fork_banner() {
     assert!(
         !stderr.contains("upstream Herdr"),
         "a banner-carrying remote must stay quiet; got: {stderr}"
+    );
+}
+
+#[test]
+fn remote_attach_with_override_reaches_the_install_flow_instead_of_the_fork_refusal() {
+    // HERDR_REMOTE_BINARY is the documented remedy and must bypass the fork
+    // refusal before the install prompts: the given binary is what the user
+    // wants on the remote, fork or not. With a non-tty stdin the run then
+    // stops at the install approval - which is the proof it got past the
+    // refusal. The env is passed to the spawned process, never set_var.
+    let fixture = RemoteAdoptionFixture::run_with_env(
+        "override",
+        "#!/bin/sh\nexit 1\n",
+        &[(
+            "HERDR_REMOTE_BINARY",
+            std::path::Path::new(env!("CARGO_BIN_EXE_herdr")).as_os_str(),
+        )],
+    );
+    let stderr = fixture.stderr();
+
+    assert!(
+        !stderr.contains("iRonin fork"),
+        "the override must bypass the fork refusal; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("get the fork's own release"),
+        "the override must bypass the fork refusal; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("could not inspect the running remote herdr server"),
+        "the run must reach the install approval after the refusal point; got: {stderr}"
+    );
+    assert!(
+        !fixture.curl_log.exists(),
+        "no release fetch may happen; curl saw: {}",
+        std::fs::read_to_string(&fixture.curl_log).unwrap_or_default()
     );
 }
 
