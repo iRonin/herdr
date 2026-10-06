@@ -1218,6 +1218,144 @@ fn double_click_selects_nothing_without_complete_painted_cells() {
     }
 }
 
+/// A fast-path patch that reaches the terminal moves the painted cells with it;
+/// one that never reached the terminal leaves nothing safe to select.
+#[test]
+fn double_click_after_a_fast_path_patch_uses_the_cells_it_painted() {
+    for written in [true, false] {
+        let case = format!("patch written {written}");
+        let mut state = word_state(true, &WORD_ROWS);
+        let next = word_surface(
+            &["alpha NEWWORDXX charlie", WORD_ROWS[1], WORD_ROWS[2]],
+            2,
+            1,
+        );
+        let patch = patch_to(&state, &next);
+        assert!(
+            matches!(
+                state.apply_pane_surface_patch(patch),
+                super::super::surface_patch::ClientPaneSurfacePatchOutcome::Applied(Some(_))
+            ),
+            "{case}: fast path"
+        );
+        if written {
+            state.commit_presented_patch();
+        }
+        let second = press_twice_unchecked(&mut state, 0, 8);
+        assert!(selection_reads(&second).is_empty(), "{case}: no row read");
+        let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 8);
+        let copied = release
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                ClientShellAction::ClipboardWrite(bytes) => {
+                    Some(String::from_utf8_lossy(bytes).into_owned())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if written {
+            assert_eq!(copied, vec!["NEWWORDXX"], "{case}");
+        } else {
+            assert!(
+                copied.is_empty(),
+                "{case}: the screen may still show the old word: {copied:?}"
+            );
+            assert!(state.selection.is_none(), "{case}");
+        }
+    }
+}
+
+/// The hit map can move ahead of the screen: a frame composed with the pane
+/// somewhere else but never written. A press there must not be read against
+/// the painted pane's cells as if they were under the pointer.
+#[test]
+fn double_click_selects_nothing_when_the_painted_pane_is_elsewhere() {
+    let mut state = word_state(true, &WORD_ROWS);
+    let mut moved = word_surface(&[WORD_ROWS[1], WORD_ROWS[0], WORD_ROWS[2]], 2, 1);
+    moved.panes[0].inner_rect.y = 1;
+    moved.panes[0].inner_rect.height = 2;
+    state.set_pane_surface(moved);
+    state.compose(106, 20).expect("composed frame");
+    let second = press_twice_unchecked(&mut state, 0, 8);
+    assert!(selection_reads(&second).is_empty(), "no row read");
+    assert!(
+        state.selection.is_none(),
+        "{:?}",
+        state.selection.as_ref().map(|s| s.ordered_cells())
+    );
+    let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 8);
+    assert!(
+        !release
+            .actions
+            .iter()
+            .any(|action| matches!(action, ClientShellAction::ClipboardWrite(_))),
+        "{:?}",
+        release.actions
+    );
+}
+
+/// The gesture keeps absolute rows. When the pane gains or loses its scroll
+/// metrics those rows no longer name the same lines, so it is cancelled.
+#[test]
+fn held_double_click_is_cancelled_when_the_pane_scroll_metrics_appear_or_go() {
+    for had_scroll in [false, true] {
+        let mut state = word_state(true, &WORD_ROWS);
+        let scroll = crate::protocol::PaneSurfaceScrollMetrics {
+            offset_from_bottom: 0,
+            max_offset_from_bottom: 0,
+            viewport_rows: 3,
+        };
+        if had_scroll {
+            let mut scrolled = word_surface(&WORD_ROWS, 2, 0);
+            scrolled.panes[0].scroll = Some(scroll);
+            state.set_pane_surface(scrolled);
+            paint(&mut state);
+        }
+        press_twice(&mut state, 0, 8);
+        assert!(state.word_selection_gesture.is_some());
+        let mut next = word_surface(&WORD_ROWS, 3, 0);
+        next.panes[0].scroll = (!had_scroll).then_some(scroll);
+        state.set_pane_surface(next);
+        assert!(
+            state.word_selection_gesture.is_none(),
+            "had scroll {had_scroll}: cancelled"
+        );
+        let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 8);
+        assert!(
+            release.actions.is_empty(),
+            "had scroll {had_scroll}: {:?}",
+            release.actions
+        );
+    }
+}
+
+/// A double-click dragged past its word bounds its range with cached rows.
+/// Output still cancels it, as it did before plain double-clicks learned to
+/// keep their word; only the plain double-click changed.
+#[test]
+fn extended_double_click_is_still_cancelled_by_output() {
+    let mut state = word_state(true, &WORD_ROWS);
+    press_twice(&mut state, 0, 8);
+    word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 0, 18);
+    assert_eq!(
+        state
+            .selection
+            .as_ref()
+            .map(|selection| selection.ordered_cells()),
+        Some(((0, 6), (0, 22)))
+    );
+    state.set_pane_surface(word_surface(
+        &[WORD_ROWS[0], WORD_ROWS[1], "OUTPUT LINE HERE"],
+        2,
+        1,
+    ));
+    assert!(state.word_selection_gesture.is_none());
+    assert!(state.selection.is_none());
+    let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 18);
+    assert!(release.actions.is_empty(), "{:?}", release.actions);
+}
+
 /// The owner's report: the word is highlighted but the clipboard never changes.
 /// Output reaches the server after the press. Unrelated output, or the clicked
 /// row itself being rewritten there, must not stop the copy, and the copy must
