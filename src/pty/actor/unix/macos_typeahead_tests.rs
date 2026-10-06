@@ -177,29 +177,32 @@ fn type_lines(handle: &PtyIoActorHandle, idle: &std_mpsc::Receiver<()>, count: u
     }
 }
 
-/// Waits until the tty holds `expected` unread bytes, or until the actor has gone idle twice
-/// without the count changing (it is holding the rest itself). Returns the last count seen.
+/// Waits until the tty holds `expected` unread bytes, or the deadline passes. Returns the last
+/// count seen; callers assert on it, so a count that never arrives fails loudly.
 fn settle(fd: RawFd, expected: usize, idle: &std_mpsc::Receiver<()>) -> usize {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut last = unread_input(fd);
-    let mut unchanged_idles = 0;
-    while last != expected && Instant::now() < deadline {
-        match idle.recv_timeout(Duration::from_millis(1500)) {
+    settle_until(fd, idle, |unread| unread == expected)
+}
+
+/// Waits until the tty's unread count is one `accept` takes, or 20 s pass; returns the last
+/// count seen. It never stops early because the count looks steady: on a busy Mac the PTY
+/// actor's writes can stall for seconds in the middle of a fill (ledger #58).
+fn settle_until(fd: RawFd, idle: &std_mpsc::Receiver<()>, accept: impl Fn(usize) -> bool) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let unread = unread_input(fd);
+        if accept(unread) || Instant::now() >= deadline {
+            return unread;
+        }
+        match idle.recv_timeout(Duration::from_millis(100)) {
             Ok(()) | Err(std_mpsc::RecvTimeoutError::Timeout) => {}
             Err(std_mpsc::RecvTimeoutError::Disconnected) => panic!("PTY actor exited"),
         }
-        let now = unread_input(fd);
-        if now == last {
-            unchanged_idles += 1;
-            if unchanged_idles >= 2 {
-                break;
-            }
-        } else {
-            unchanged_idles = 0;
-            last = now;
-        }
     }
-    last
+}
+
+/// What the typeahead guard lets into a fresh tty that nobody reads: its whole ring budget.
+fn guard_budget() -> usize {
+    super::macos_typeahead_guard::RING_BUDGET
 }
 
 /// Reads until `until` returns true for everything read so far, or the deadline passes.
@@ -275,7 +278,18 @@ fn line_editor_scenario(typed_after_read: usize) -> (usize, Vec<u8>) {
     // Unread input now starts at slot 330. More lines extend it: past slot 1023 means
     // the ring wraps.
     type_lines(&handle, &idle, typed_after_read);
-    let unread = settle(slave, (20 + typed_after_read) * LINE.len(), &idle);
+    // Either the tty takes every typed line, or the typeahead guard stops at its budget: the
+    // 30 lines used 990 slots, so it lets 10 more bytes through and holds the rest.
+    let all_typed = (20 + typed_after_read) * LINE.len();
+    let guard_held = 20 * LINE.len() + (guard_budget() - 30 * LINE.len());
+    let unread = settle_until(slave, &idle, |unread| {
+        unread == all_typed || unread == guard_held
+    });
+    assert!(
+        unread == all_typed || unread == guard_held,
+        "setup: the tty must hold every typed line ({all_typed} bytes) or what the guard lets \
+         through ({guard_held}); it holds {unread}"
+    );
 
     set_termios(slave, &canonical);
     // A final Enter closes any line the kernel left open.
@@ -346,12 +360,13 @@ fn ctrl_c_scenario_in(lines: usize, raw: bool) -> (usize, Option<String>, usize)
     // A full tty holds 30 complete lines (1022 bytes); herdr keeps the rest.
     let accepted_lines = lines.min(30);
     let unread = if raw {
-        // In raw mode the tty reports every unread byte, partial lines included.
-        let unread = settle(observer.as_raw_fd(), 1022, &idle);
-        assert!(
-            (accepted_lines * LINE.len()..1021).contains(&unread),
-            "setup: herdr, not the tty, must hold the rest while the tty has room; {unread} \
-             bytes unread"
+        // In raw mode the tty reports every unread byte, partial lines included. The guard
+        // stops at its budget, while the tty would take 1022.
+        let unread = settle(observer.as_raw_fd(), guard_budget(), &idle);
+        assert_eq!(
+            unread,
+            guard_budget(),
+            "setup: herdr, not the tty, must hold the rest while the tty has room"
         );
         unread
     } else {
@@ -859,9 +874,31 @@ fn handoff_drains_input_the_typeahead_guard_is_holding() {
     let (handle, idle) = spawn_actor(master);
     type_lines(&handle, &idle, 30);
     assert_eq!(settle(slave, 30 * LINE.len(), &idle), 30 * LINE.len());
+    let checks_before = handle
+        .typeahead_checks
+        .load(std::sync::atomic::Ordering::Relaxed);
     type_input(&handle, &idle, b"echo held line\r");
+    // The guard writes 10 bytes within its budget, then reads the tty's state and holds the
+    // rest: wait for that look rather than for a count that has merely stopped changing.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while handle
+        .typeahead_checks
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == checks_before
+        && Instant::now() < deadline
+    {
+        let _ = idle.recv_timeout(Duration::from_millis(100));
+    }
+    let checks_after = handle
+        .typeahead_checks
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        checks_after > checks_before,
+        "setup: the guard must read the tty's state before the 15-byte line passes its budget"
+    );
+    let _ = idle.recv_timeout(Duration::from_millis(200));
     assert_eq!(
-        settle(slave, 30 * LINE.len() + 15, &idle),
+        unread_input(slave),
         30 * LINE.len(),
         "setup: the guard must hold the 15-byte line while the tty has room"
     );
