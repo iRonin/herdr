@@ -458,19 +458,31 @@ fn kept_selection_renumbered_before_its_copy_key_copies_nothing_and_says_so() {
 /// range's rows are renumbered, and so is the word's own row, so nothing can be
 /// placed on screen any more: the highlight goes, the gesture stays on its
 /// frozen word, later motion (here to the pane's bottom edge) neither extends
-/// nor scrolls the view, and the release copies the word.
+/// nor scrolls the view, and the release copies the word without highlighting
+/// it. A trim between the two clicks does not blind the gesture to a later one.
 #[test]
 fn extended_double_click_across_a_renumbering_copies_only_its_word() {
     let mut failures = Vec::new();
     for offset in [0, 40] {
-        for delivery in [Delivery::Surface, Delivery::Patch] {
-            let case = format!("offset {offset} {delivery:?}");
+        for (delivery, trim_between_clicks) in [
+            (Delivery::Surface, false),
+            (Delivery::Patch, false),
+            (Delivery::Surface, true),
+        ] {
+            let case =
+                format!("offset {offset} {delivery:?} trim between clicks {trim_between_clicks}");
             let mut terminal = TrimTerminal::new(60, offset);
             let mut state = trim_state(true, &mut terminal);
-            let top = terminal.top();
-            let word = terminal.row(top + 1)[6..14].to_owned();
             mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 1, 8);
             mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 1, 8);
+            if trim_between_clicks {
+                // The rows the second press numbers its word in are the new ones.
+                terminal.output(1);
+                terminal.trim(10);
+                deliver(&mut state, &mut terminal, Delivery::Surface);
+            }
+            let top = terminal.top();
+            let word = terminal.row(top + 1)[6..14].to_owned();
             mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 1, 8);
             let drag = mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 2, 18);
             if !drag.actions.is_empty()
@@ -512,6 +524,12 @@ fn extended_double_click_across_a_renumbering_copies_only_its_word() {
             }
             if notice(&state) != Some(COPIED) {
                 failures.push(format!("{case}: notice {:?}", notice(&state)));
+            }
+            if state.selection.is_some() {
+                failures.push(format!(
+                    "{case}: copied word highlighted over renumbered rows: {:?}",
+                    state.selection.as_ref().map(|s| s.ordered_cells())
+                ));
             }
         }
     }
