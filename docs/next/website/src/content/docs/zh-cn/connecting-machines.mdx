@@ -17,7 +17,7 @@ ssh workbox
 
 `workbox` 可以是 SSH 配置中的主机名，也可以使用 `ssh://you@server:2222` 这样的目标。
 
-多机器连接支持 Linux、macOS 和 Windows 客户端，连接目标可以是 x86_64 或 aarch64 的 Linux/macOS 服务器，也可以是 x86_64 的 Windows 服务器。交互式设置可在确认后安装或更新完整的远程软件包；后台重连只查找已安装的软件包。有关 SSH 配置、认证和自定义二进制文件，请参阅[通过 SSH 远程连接](/zh-cn/docs/persistence-remote/)。
+多机器连接支持 Linux、macOS 和 Windows 客户端，连接目标可以是 x86_64 或 aarch64 的 Linux/macOS 服务器，也可以是 x86_64 的 Windows 服务器。交互式设置可在确认后安装或更新完整的远程软件包；后台重连只查找已安装的软件包。在 iRonin fork 构建上，设置流程绝不会为远程主机下载上游发布版本；请通过 `HERDR_REMOTE_BINARY` 传入适用于远程平台的 fork 构建。有关 SSH 配置、认证和自定义二进制文件，请参阅[通过 SSH 远程连接](/zh-cn/docs/persistence-remote/)。
 
 ## 添加机器
 
