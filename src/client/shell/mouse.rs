@@ -163,7 +163,7 @@ impl ClientShellState {
 
     fn active_selection_pane(&self) -> Option<PaneHit> {
         let pane_id = if let Some(gesture) = self.word_selection_gesture.as_ref() {
-            if gesture.released || gesture.renumbered {
+            if gesture.released {
                 return None;
             }
             &gesture.pane_id
