@@ -947,6 +947,8 @@ pub(crate) struct ClientShellState {
     pub(super) copied_word_highlight: Option<word_selection::ClientCopiedWord>,
     pub(super) word_selection_gesture: Option<ClientWordSelection>,
     pub(super) word_selection_generation: u64,
+    /// Which pane cells the terminal shows, for resolving a double-click.
+    pub(super) painted_panes: super::painted::PaintedPanes,
     pub(super) copy_mode: Option<ClientCopyModeState>,
     pub(super) copy_session_generation: u64,
     pub(super) copy_operation_in_flight: bool,
@@ -1120,6 +1122,7 @@ impl ClientShellState {
             selection_highlight_clear_deadline: None,
             copied_word_highlight: None,
             word_selection_gesture: None,
+            painted_panes: Default::default(),
             word_selection_generation: 0,
             copy_mode: None,
             copy_session_generation: 0,
@@ -1267,7 +1270,8 @@ impl ClientShellState {
 
     pub(super) fn reset_endpoint_projection(&mut self) {
         self.hits = ShellHitMap::default();
-        self.pane_surface = None;
+        self.replace_pane_surface(None);
+        self.forget_presented_panes();
         self.pending_pane_surface = None;
         self.input_leases = ClientInputLeases::default();
         self.popup_terminal_id = None;
@@ -1766,9 +1770,18 @@ impl ClientShellState {
             previous.inner_rect.width != next.inner_rect.width
                 || previous.inner_rect.height != next.inner_rect.height
                 || previous.alternate_screen_active != next.alternate_screen_active
-                // Ordinary selections are live buffer ranges. Only word gestures
-                // cache content-dependent boundaries that output can invalidate.
+                // Ordinary selections are live buffer ranges. A word gesture keeps
+                // absolute rows, which mean nothing once the pane gains or loses
+                // its scroll metrics.
                 || (self.word_selection_gesture.is_some()
+                    && previous.scroll.is_some() != next.scroll.is_some())
+                // A word gesture extended past its word bounds the range with
+                // cached rows that output can invalidate. A plain double-click
+                // keeps its word through output (`word_selection_sees_surface`).
+                || (self
+                    .word_selection_gesture
+                    .as_ref()
+                    .is_some_and(|gesture| gesture.extended())
                     && previous.content_revision != next.content_revision)
         });
         if selection_invalidated {
@@ -1777,6 +1790,7 @@ impl ClientShellState {
             self.stop_selection_autoscroll();
             self.selection_highlight_clear_deadline = None;
         }
+        self.word_selection_sees_surface(&surface);
         // A copied token's highlight must not mark other text. Clear it only when
         // its own cells change: content_revision is pane-wide, and output elsewhere
         // would otherwise wipe it at once on a busy pane.
@@ -1850,7 +1864,7 @@ impl ClientShellState {
         self.popup_terminal_id = next_popup;
         self.graphics
             .set_scene(std::mem::take(&mut surface.graphics));
-        self.pane_surface = Some(surface);
+        self.replace_pane_surface(Some(surface));
         self.pane_surface_generation = self.active_snapshot_generation;
         self.invalidate_link_hover();
         self.resume_mobile_switcher_if_ready();
@@ -1937,7 +1951,8 @@ impl ClientShellState {
     }
 
     pub(crate) fn invalidate_pane_surface(&mut self) {
-        self.pane_surface = None;
+        self.replace_pane_surface(None);
+        self.forget_presented_panes();
         self.pending_pane_surface = None;
         self.hits = ShellHitMap::default();
         self.host_mouse_pixels = None;

@@ -1,64 +1,48 @@
 use super::*;
 
-/// Held second press. Keep only one row read in flight and use the latest
-/// pointer position when it returns, so remote latency cannot queue up motion.
+/// Held second press. The clicked word is resolved at the press from the cells
+/// on screen; rows the pointer drags into are read from the endpoint. Keep only
+/// one row read in flight and use the latest pointer position when it returns,
+/// so remote latency cannot queue up motion.
 #[derive(Debug)]
 pub(super) struct ClientWordSelection {
     pub(super) pane_id: String,
     pub(super) focus_confirmed: bool,
     anchor: (u32, u16),
-    anchor_bounds: Option<(u16, u16)>,
+    anchor_bounds: (u16, u16),
+    /// The clicked word exactly as the screen showed it at the press.
+    word: String,
+    /// Its cells as they showed then, to tell whether the screen still shows it.
+    word_cells: ClientCopiedWord,
+    /// The screen no longer shows the clicked word: do not highlight it.
+    word_replaced: bool,
+    /// The range reaches past the clicked word.
+    extended: bool,
     cursor: (u32, u16),
     end_col: u16,
-    content_revision: Option<u64>,
-    cached_row: Option<(u32, String)>,
+    content_revision: u64,
+    cached_row: Option<(u32, crate::app::actions::WordRow)>,
     pending_row: Option<u32>,
     pub(super) dragged: bool,
     pub(super) released: bool,
 }
 
-/// The token a plain double-click copied, where its highlight stands.
-#[derive(Debug)]
+/// A double-clicked token's cells, where its highlight stands.
+#[derive(Debug, Clone)]
 pub(super) struct ClientCopiedWord {
     pane_id: String,
     row: u32,
     start_col: u16,
     end_col: u16,
-    /// The highlighted cells' symbols when the word was copied, one per column.
+    /// The token's cells' symbols when it was clicked, one per column.
     shown: Vec<String>,
 }
 
 impl ClientCopiedWord {
-    /// Records what `surface` shows in the highlighted cells, if it shows them
-    /// and its pane is still at `revision`, the revision the word was read at.
-    fn new(
-        surface: &PaneSurfaceFrame,
-        pane_id: String,
-        row: u32,
-        start_col: u16,
-        end_col: u16,
-        revision: Option<u64>,
-    ) -> Option<Self> {
-        let mut word = Self {
-            pane_id,
-            row,
-            start_col,
-            end_col,
-            shown: Vec::new(),
-        };
-        let (shown_revision, shown) = word.cells_in(surface)?;
-        if Some(shown_revision) != revision {
-            return None;
-        }
-        word.shown = shown;
-        Some(word)
-    }
-
-    /// The pane's content revision and the highlighted cells' symbols in
-    /// `surface`, indexed by column, so no character-width table is involved: a
-    /// wide character's continuation cell is a cell like any other. None if the
-    /// surface does not show them all.
-    fn cells_in(&self, surface: &PaneSurfaceFrame) -> Option<(u64, Vec<String>)> {
+    /// The token's cells' symbols in `surface`, indexed by column, so no
+    /// character-width table is involved: a wide character's continuation cell
+    /// is a cell like any other. None if the surface does not show them all.
+    fn cells_in(&self, surface: &PaneSurfaceFrame) -> Option<Vec<String>> {
         let pane = surface
             .panes
             .iter()
@@ -72,28 +56,46 @@ impl ClientCopiedWord {
             .checked_sub(top)
             .filter(|row| *row < u64::from(pane.inner_rect.height))?;
         let y = usize::from(pane.inner_rect.y) + viewport_row as usize;
-        let cells = (self.start_col..=self.end_col)
+        (self.start_col..=self.end_col)
             .map(|col| {
-                surface
-                    .frame
-                    .cells
-                    .get(
-                        y * usize::from(surface.frame.width)
-                            + usize::from(pane.inner_rect.x)
-                            + usize::from(col),
-                    )
-                    .map(|cell| cell.symbol.clone())
+                surface_cell(
+                    surface,
+                    usize::from(pane.inner_rect.x) + usize::from(col),
+                    y,
+                )
+                .map(|cell| cell.symbol.clone())
             })
-            .collect::<Option<Vec<_>>>()?;
-        Some((pane.content_revision, cells))
+            .collect()
     }
 
     /// Whether `surface` shows something else in this token's own cells. Cells
     /// the surface does not show are left to the highlight's deadline.
     pub(super) fn replaced_in(&self, surface: &PaneSurfaceFrame) -> bool {
         self.cells_in(surface)
-            .is_some_and(|(_, cells)| cells != self.shown)
+            .is_some_and(|cells| cells != self.shown)
     }
+}
+
+fn surface_cell(
+    surface: &PaneSurfaceFrame,
+    x: usize,
+    y: usize,
+) -> Option<&crate::protocol::CellData> {
+    let width = usize::from(surface.frame.width);
+    if x >= width || y >= usize::from(surface.frame.height) {
+        return None;
+    }
+    surface.frame.cells.get(y * width + x)
+}
+
+/// The word a double-click landed on, read from the painted cells.
+struct PaintedWord {
+    row: u32,
+    bounds: (u16, u16),
+    text: String,
+    cells: Vec<String>,
+    row_text: crate::app::actions::WordRow,
+    content_revision: u64,
 }
 
 impl ClientShellState {
@@ -104,8 +106,26 @@ impl ClientShellState {
         col: u16,
         outcome: &mut ClientShellInput,
     ) {
-        let row = crate::selection::absolute_row_for_viewport(viewport_row, hit.scroll);
         self.word_selection_generation = self.word_selection_generation.saturating_add(1);
+        outcome.repaint = true;
+        // The word is the one on screen. Without complete painted cells there is
+        // nothing safe to select: a live row read could return other text.
+        let Some(word) = self.painted_word_at(hit, viewport_row, col) else {
+            self.cancel_word_selection();
+            return;
+        };
+        let word_cells = ClientCopiedWord {
+            pane_id: hit.pane_id.clone(),
+            row: word.row,
+            start_col: word.bounds.0,
+            end_col: word.bounds.1,
+            shown: word.cells,
+        };
+        // A newer surface the terminal has not drawn yet may already show other text there.
+        let word_replaced = self
+            .pane_surface
+            .as_ref()
+            .is_some_and(|surface| word_cells.replaced_in(surface));
         self.word_selection_gesture = Some(ClientWordSelection {
             pane_id: hit.pane_id.clone(),
             focus_confirmed: self
@@ -113,29 +133,104 @@ impl ClientShellState {
                 .as_deref()
                 .and_then(|snapshot| snapshot.focused_pane_id.as_deref())
                 == Some(hit.pane_id.as_str()),
-            anchor: (row, col),
-            anchor_bounds: None,
-            cursor: (row, col),
+            anchor: (word.row, col),
+            anchor_bounds: word.bounds,
+            word: word.text,
+            word_cells,
+            word_replaced,
+            extended: false,
+            cursor: (word.row, col),
             end_col: hit.inner_rect.width.saturating_sub(1),
-            content_revision: self.pane_surface.as_ref().and_then(|surface| {
-                surface
-                    .panes
-                    .iter()
-                    .find(|pane| pane.pane_id == hit.pane_id)
-                    .map(|pane| pane.content_revision)
-            }),
-            cached_row: None,
+            content_revision: word.content_revision,
+            cached_row: (!word_replaced).then_some((word.row, word.row_text)),
             pending_row: None,
             dragged: false,
             released: false,
         });
-        self.request_word_selection_row(row, outcome);
+        self.update_word_selection(outcome);
+    }
+
+    /// The word under `(viewport_row, col)` of `hit` in the painted cells, if the
+    /// terminal shows that pane where `hit` says and every cell of the row is there.
+    fn painted_word_at(&self, hit: &PaneHit, viewport_row: u16, col: u16) -> Option<PaintedWord> {
+        let (surface, origin) = self.painted_pane_surface()?;
+        let pane = surface
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == hit.pane_id)?;
+        let scroll = pane.scroll.map(|metrics| crate::pane::ScrollMetrics {
+            offset_from_bottom: usize::try_from(metrics.offset_from_bottom).unwrap_or(usize::MAX),
+            max_offset_from_bottom: usize::try_from(metrics.max_offset_from_bottom)
+                .unwrap_or(usize::MAX),
+            viewport_rows: usize::try_from(metrics.viewport_rows).unwrap_or(usize::MAX),
+        });
+        let shown_at = Rect::new(
+            origin.0.saturating_add(pane.inner_rect.x),
+            origin.1.saturating_add(pane.inner_rect.y),
+            pane.inner_rect.width,
+            pane.inner_rect.height,
+        );
+        if shown_at != hit.inner_rect
+            || scroll != hit.scroll
+            || viewport_row >= pane.inner_rect.height
+            || col >= pane.inner_rect.width
+        {
+            return None;
+        }
+        let y = usize::from(pane.inner_rect.y) + usize::from(viewport_row);
+        let symbols = (0..pane.inner_rect.width)
+            .map(|x| {
+                surface_cell(surface, usize::from(pane.inner_rect.x) + usize::from(x), y)
+                    .map(|cell| cell.symbol.as_str())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let row_text = crate::app::actions::WordRow::from_display_cells(
+            symbols
+                .iter()
+                .map(|symbol| (*symbol, crate::protocol::render_ansi::symbol_width(symbol))),
+        );
+        let bounds = row_text.bounds_at(col)?;
+        Some(PaintedWord {
+            row: crate::selection::absolute_row_for_viewport(viewport_row, scroll),
+            bounds,
+            text: row_text.text_in(bounds.0, bounds.1),
+            cells: symbols[usize::from(bounds.0)..=usize::from(bounds.1)]
+                .iter()
+                .map(|symbol| (*symbol).to_owned())
+                .collect(),
+            row_text,
+            content_revision: pane.content_revision,
+        })
     }
 
     fn cancel_word_selection(&mut self) {
         self.word_selection_gesture = None;
         self.selection = None;
         self.stop_selection_autoscroll();
+    }
+
+    /// A new pane surface while a double-click is held. Output elsewhere keeps
+    /// the clicked word. If the word's own cells change, stop highlighting it at
+    /// once; the release still copies the word that was clicked. Cached row text
+    /// from before the output no longer bounds words outside it.
+    pub(super) fn word_selection_sees_surface(&mut self, surface: &PaneSurfaceFrame) {
+        let Some(gesture) = self.word_selection_gesture.as_mut() else {
+            return;
+        };
+        let revision = surface
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == gesture.pane_id)
+            .map(|pane| pane.content_revision);
+        if revision.is_some_and(|revision| revision != gesture.content_revision) {
+            gesture.cached_row = None;
+        }
+        if !gesture.word_replaced && gesture.word_cells.replaced_in(surface) {
+            gesture.word_replaced = true;
+            if !gesture.extended {
+                self.selection = None;
+            }
+        }
     }
 
     fn request_word_selection_row(&mut self, row: u32, outcome: &mut ClientShellInput) {
@@ -154,7 +249,7 @@ impl ClientShellState {
                 row,
                 col: gesture.end_col,
             },
-            content_revision: gesture.content_revision,
+            content_revision: Some(gesture.content_revision),
         };
         if !self.push_endpoint_method_with_kind(
             crate::api::schema::Method::PaneSelectionRead(params),
@@ -195,78 +290,73 @@ impl ClientShellState {
     }
 
     fn update_word_selection(&mut self, outcome: &mut ClientShellInput) {
-        let Some(gesture) = self.word_selection_gesture.as_ref() else {
+        let Some(gesture) = self.word_selection_gesture.as_mut() else {
             return;
         };
-        let Some((anchor_start, anchor_end)) = gesture.anchor_bounds else {
-            return;
-        };
-        let Some((_, text)) = gesture
-            .cached_row
-            .as_ref()
-            .filter(|(row, _)| *row == gesture.cursor.0)
-        else {
-            self.request_word_selection_row(gesture.cursor.0, outcome);
-            return;
-        };
-        let (start_col, end_col) =
-            crate::app::actions::word_bounds_at_column(text, gesture.cursor.1)
+        let (anchor_start, anchor_end) = gesture.anchor_bounds;
+        let word_range = (
+            (gesture.anchor.0, anchor_start),
+            (gesture.anchor.0, anchor_end),
+        );
+        // A pointer that moved but stayed inside the clicked word has not extended anything.
+        let (start, end) = if gesture.cursor.0 == gesture.anchor.0
+            && (anchor_start..=anchor_end).contains(&gesture.cursor.1)
+        {
+            word_range
+        } else {
+            let Some((_, text)) = gesture
+                .cached_row
+                .as_ref()
+                .filter(|(row, _)| *row == gesture.cursor.0)
+            else {
+                let row = gesture.cursor.0;
+                self.request_word_selection_row(row, outcome);
+                return;
+            };
+            let (start_col, end_col) = text
+                .bounds_at(gesture.cursor.1)
                 .unwrap_or((gesture.cursor.1, gesture.cursor.1));
-        let start = (gesture.anchor.0, anchor_start).min((gesture.cursor.0, start_col));
-        let end = (gesture.anchor.0, anchor_end).max((gesture.cursor.0, end_col));
-        self.selection = Some(crate::selection::Selection::absolute_range(
-            gesture.pane_id.clone(),
-            start,
-            end,
-        ));
+            (
+                word_range.0.min((gesture.cursor.0, start_col)),
+                word_range.1.max((gesture.cursor.0, end_col)),
+            )
+        };
+        gesture.extended = (start, end) != word_range;
+        let hidden = gesture.word_replaced && !gesture.extended;
+        self.selection = (!hidden).then(|| {
+            crate::selection::Selection::absolute_range(gesture.pane_id.clone(), start, end)
+        });
         if gesture.released {
-            // A plain double-click copies the token its own validated row read
-            // highlighted. A later read can be refused by output anywhere in the
-            // pane, or return whatever those columns hold by then. A pointer that
-            // moved but ended inside the clicked word has not extended anything.
-            let plain = (start, end)
-                == (
-                    (gesture.anchor.0, anchor_start),
-                    (gesture.anchor.0, anchor_end),
-                );
-            let copied_word = plain.then(|| {
-                (
-                    gesture.pane_id.clone(),
-                    crate::app::actions::text_in_cell_range(text, start.1, end.1),
-                )
-            });
-            let pressed_revision = gesture.content_revision;
+            let Some(gesture) = self.word_selection_gesture.take() else {
+                return;
+            };
             if let Some(selection) = self.selection.as_mut() {
                 selection.finish();
             }
-            self.word_selection_gesture = None;
             if self.config.copy_on_select {
-                if let Some((pane_id, text)) = copied_word {
+                if !gesture.extended {
+                    // A plain double-click copies the word it landed on, exactly as
+                    // the screen showed it then. A row read could be refused by
+                    // output anywhere in the pane, or return text that replaced it.
                     let now = std::time::Instant::now();
                     outcome
                         .actions
-                        .push(ClientShellAction::ClipboardWrite(text.into_bytes()));
+                        .push(ClientShellAction::ClipboardWrite(gesture.word.into_bytes()));
                     self.show_copy_feedback(now);
-                    self.selection_highlight_clear_deadline =
-                        Some(now + std::time::Duration::from_millis(500));
-                    // The row was read at the revision on screen at the press. A patch
-                    // that arrived before the reply can show newer text without
-                    // cancelling the gesture (the patch fast path skips that check), so record the
-                    // cells only while the screen still shows that revision; otherwise
-                    // nothing on screen is the copied word, so drop the highlight now.
-                    self.copied_word_highlight = self.pane_surface.as_ref().and_then(|surface| {
-                        ClientCopiedWord::new(
-                            surface,
-                            pane_id,
-                            start.0,
-                            start.1,
-                            end.1,
-                            pressed_revision,
-                        )
-                    });
-                    if self.copied_word_highlight.is_none() {
+                    // Highlight it only while the screen still shows it.
+                    let shown = !gesture.word_replaced
+                        && !self
+                            .pane_surface
+                            .as_ref()
+                            .is_some_and(|surface| gesture.word_cells.replaced_in(surface));
+                    if shown {
+                        self.selection_highlight_clear_deadline =
+                            Some(now + std::time::Duration::from_millis(500));
+                        self.copied_word_highlight = Some(gesture.word_cells);
+                    } else {
                         self.selection = None;
                         self.selection_highlight_clear_deadline = None;
+                        self.copied_word_highlight = None;
                     }
                 } else {
                     // Extended whole-word selections copy a live range, like a plain drag.
@@ -320,17 +410,16 @@ impl ClientShellState {
             return (false, Vec::new());
         };
         gesture.pending_row = None;
-        if gesture.anchor_bounds.is_none() {
-            gesture.anchor_bounds =
-                crate::app::actions::word_bounds_at_column(&text, gesture.anchor.1);
-            if gesture.anchor_bounds.is_none() {
-                self.cancel_word_selection();
-                return (true, Vec::new());
-            }
-        }
-        gesture.cached_row = Some((absolute_row, text));
+        gesture.cached_row = Some((absolute_row, crate::app::actions::WordRow::from_text(&text)));
         let mut outcome = ClientShellInput::default();
         self.update_word_selection(&mut outcome);
         (outcome.repaint, outcome.actions)
+    }
+}
+
+impl ClientWordSelection {
+    /// The range reaches past the clicked word.
+    pub(super) fn extended(&self) -> bool {
+        self.extended
     }
 }
