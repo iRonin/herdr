@@ -763,6 +763,8 @@ pub struct AgentNotificationDelivery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyFeedback {
     pub message: String,
+    /// The copy was not made: drawn as a failure.
+    pub failed: bool,
 }
 
 #[derive(Debug)]
