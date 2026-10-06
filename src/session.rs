@@ -510,6 +510,8 @@ fn normalize_name(name: &str) -> Result<Option<String>, String> {
 mod tests {
     use super::*;
     #[cfg(unix)]
+    use crate::test_support::TestTempPath;
+    #[cfg(unix)]
     use interprocess::local_socket::traits::Listener as _;
     use std::sync::Mutex;
 
@@ -594,12 +596,12 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn local_stream_pair(name: &str) -> (LocalStream, LocalStream, std::path::PathBuf) {
+    fn local_stream_pair(name: &str) -> (LocalStream, LocalStream, TestTempPath) {
         let path = unique_test_path(name);
         let listener = crate::ipc::bind_local_listener(&path).unwrap();
         let client = crate::ipc::connect_local_stream(&path).unwrap();
         let server = listener.accept().unwrap();
-        (client, server, path)
+        (client, server, TestTempPath::owns(path))
     }
 
     #[test]
