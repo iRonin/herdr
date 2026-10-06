@@ -51,9 +51,11 @@ impl ClientShellState {
         else {
             return;
         };
-        let max = pane.scroll.map_or(0, |scroll| {
-            usize::try_from(scroll.max_offset_from_bottom).unwrap_or(usize::MAX)
-        });
+        // A frame without scroll metrics says nothing about the history.
+        let Some(scroll) = pane.scroll else {
+            return;
+        };
+        let max = usize::try_from(scroll.max_offset_from_bottom).unwrap_or(usize::MAX);
         if max >= rows.max_offset_from_bottom {
             rows.max_offset_from_bottom = max;
             return;
