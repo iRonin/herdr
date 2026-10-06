@@ -854,3 +854,176 @@ fn a_frame_without_scroll_metrics_is_not_a_renumbering() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// Real Ghostty: a pane that grows taller pulls lines from its history into
+/// the view. `max_offset_from_bottom` drops by the growth, but no row is
+/// renumbered: the total is unchanged and every absolute row shows the same line.
+#[tokio::test(flavor = "current_thread")]
+async fn review_a_taller_pane_drops_max_offset_but_renumbers_no_row() {
+    let history: String = (0..60).map(|line| format!("L{line:03}\r\n")).collect();
+    let runtime = crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+        40,
+        6,
+        1024 * 1024,
+        history.as_bytes(),
+    );
+    let line_at = |row: usize| {
+        let metrics = runtime.scroll_metrics().expect("metrics");
+        runtime.set_scroll_offset_from_bottom(metrics.max_offset_from_bottom - row);
+        let text = runtime.visible_text();
+        runtime.set_scroll_offset_from_bottom(0);
+        text.lines().next().unwrap_or_default().trim().to_owned()
+    };
+    let before = runtime.scroll_metrics().expect("metrics");
+    let rows = [0usize, 10, 30, 45];
+    let shown_before: Vec<String> = rows.iter().map(|row| line_at(*row)).collect();
+    assert!(
+        shown_before.iter().all(|line| line.starts_with('L')),
+        "the instrument reads lines: {shown_before:?}"
+    );
+    runtime.resize(11, 40, 0, 0);
+    let after = runtime.scroll_metrics().expect("metrics");
+    let shown_after: Vec<String> = rows.iter().map(|row| line_at(*row)).collect();
+    eprintln!(
+        "before {before:?} after {after:?} rows {rows:?} {shown_before:?} -> {shown_after:?}"
+    );
+    assert_eq!(after.viewport_rows, 11);
+    assert!(
+        after.max_offset_from_bottom < before.max_offset_from_bottom,
+        "max_offset_from_bottom drops: {before:?} -> {after:?}"
+    );
+    assert_eq!(
+        after.max_offset_from_bottom + after.viewport_rows,
+        before.max_offset_from_bottom + before.viewport_rows,
+        "the total is unchanged"
+    );
+    assert_eq!(
+        shown_after, shown_before,
+        "every absolute row shows the same line"
+    );
+}
+
+/// The pane's terminal grows taller (another client of the same tab took the
+/// tab's geometry) while this client's own pane rect stays the same, so the old
+/// resize guard does not fire. No row was renumbered: a kept selection must still
+/// copy exactly what it selected, with no "not copied" notice.
+#[test]
+fn review_a_taller_pane_is_not_a_trim_for_a_kept_selection() {
+    let mut terminal = TrimTerminal::new(60, 0);
+    let mut state = trim_state(false, &mut terminal);
+    let top = terminal.top();
+    let expected = format!(
+        "{}\n{}",
+        terminal.row(top + 1),
+        &terminal.row(top + 2)[..13]
+    );
+    mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 1, 0);
+    mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 2, 12);
+    let release = mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 2, 12);
+    assert!(serve(&mut state, &terminal, release.actions).1.is_empty());
+    assert!(state.selection.is_some(), "kept");
+    let mut taller = terminal.surface();
+    let scroll = taller.panes[0].scroll.as_mut().expect("metrics");
+    scroll.viewport_rows += 5;
+    scroll.max_offset_from_bottom -= 5;
+    state.set_pane_surface(taller);
+    state.compose(106, 20).expect("composed frame");
+    state.commit_presented_frame();
+    let copy = key(&mut state, KeyCode::Char('c'), KeyModifiers::CONTROL);
+    let (_, copied) = serve(&mut state, &terminal, copy.actions);
+    assert_eq!(
+        (copied, notice(&state)),
+        (vec![expected], Some(COPIED)),
+        "a taller pane renumbers nothing"
+    );
+}
+
+/// Real Ghostty: the pane's terminal changes WIDTH with lines longer than the
+/// new width. Pins the guard's known blind spot: narrowing renumbers rows while
+/// the total rises; widening back renumbers them and lowers the total.
+#[tokio::test(flavor = "current_thread")]
+async fn review_width_reflow_renumbers_rows_and_narrowing_raises_the_total() {
+    let history: String = (0..60)
+        .map(|line| format!("L{line:03} {}\r\n", "x".repeat(50)))
+        .collect();
+    let runtime = crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+        80,
+        6,
+        1024 * 1024,
+        history.as_bytes(),
+    );
+    let line_at = |row: usize| {
+        let metrics = runtime.scroll_metrics().expect("metrics");
+        runtime.set_scroll_offset_from_bottom(metrics.max_offset_from_bottom.saturating_sub(row));
+        let text = runtime.visible_text();
+        runtime.set_scroll_offset_from_bottom(0);
+        text.lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(4)
+            .collect::<String>()
+    };
+    let rows = [0usize, 10, 30, 50];
+    let report = |label: &str| {
+        let metrics = runtime.scroll_metrics().expect("metrics");
+        let shown: Vec<String> = rows.iter().map(|row| line_at(*row)).collect();
+        let total = metrics.max_offset_from_bottom + metrics.viewport_rows;
+        eprintln!(
+            "{label}: total {total} max {} rows {rows:?} -> {shown:?}",
+            metrics.max_offset_from_bottom
+        );
+        (total, shown)
+    };
+    let (total80, shown80) = report("80 cols");
+    runtime.resize(6, 40, 0, 0);
+    let (total40, shown40) = report("40 cols");
+    runtime.resize(6, 80, 0, 0);
+    let (total80b, shown80b) = report("80 cols again");
+    // Narrowing reflows long lines: rows are renumbered while the total RISES,
+    // so neither a max-offset nor a total-rows guard can see it (a documented
+    // limitation, like a burst larger than a trim). Widening back renumbers
+    // again and lowers the total, which the guard does see.
+    assert!(
+        total40 > total80 && shown40 != shown80,
+        "narrowing: {total80}->{total40}, {shown80:?} -> {shown40:?}"
+    );
+    assert!(
+        total80b < total40 && shown80b != shown40,
+        "widening: {total40}->{total80b}, {shown40:?} -> {shown80b:?}"
+    );
+}
+
+/// The same taller pane in copy mode: a `v` selection still copies on `y`.
+#[test]
+fn a_taller_pane_is_not_a_trim_for_a_copy_mode_selection() {
+    for offset in [0, 40] {
+        let mut terminal = TrimTerminal::new(60, offset);
+        let mut state = trim_state(true, &mut terminal);
+        let top = terminal.top();
+        let expected = format!("{}\na", terminal.row(top + 1));
+        let mut enter = ClientShellInput::default();
+        state.record_binding(
+            crate::input::KeybindMatch::Action(crate::input::KeybindAction::CopyMode),
+            &mut enter,
+        );
+        for byte in [b"k", b"k", b"v", b"j"] {
+            state.handle_input_bytes(byte);
+        }
+        assert!(state.selection.is_some(), "offset {offset}: selected");
+        let mut taller = terminal.surface();
+        let scroll = taller.panes[0].scroll.as_mut().expect("metrics");
+        scroll.viewport_rows += 5;
+        scroll.max_offset_from_bottom -= 5;
+        state.set_pane_surface(taller);
+        state.compose(106, 20).expect("composed frame");
+        state.commit_presented_frame();
+        let copy = state.handle_input_bytes(b"y");
+        let (_, copied) = serve(&mut state, &terminal, copy.actions);
+        assert_eq!(
+            (copied, notice(&state)),
+            (vec![expected], Some(COPIED)),
+            "offset {offset}: a taller pane renumbers nothing"
+        );
+    }
+}
