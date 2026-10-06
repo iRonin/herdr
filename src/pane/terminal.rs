@@ -186,9 +186,76 @@ pub(crate) enum TerminalCompressionStep {
 }
 
 pub(crate) struct GhosttyPaneTerminal {
-    pub core: Mutex<GhosttyPaneCore>,
+    pub core: CoreMutex,
     key_encoder: Mutex<crate::ghostty::KeyEncoder>,
     pending_pty_responses: Arc<Mutex<Vec<Bytes>>>,
+}
+
+/// The terminal core's lock. Every reader and writer of the terminal takes it.
+/// In tests a hook can change the terminal at the start of every acquisition on
+/// the hook's thread, so a test can tell one critical section from two.
+pub(crate) struct CoreMutex(Mutex<GhosttyPaneCore>);
+
+impl CoreMutex {
+    pub(crate) fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, GhosttyPaneCore>> {
+        #[allow(unused_mut)]
+        let mut guard = self.0.lock();
+        #[cfg(test)]
+        if let Ok(core) = guard.as_mut() {
+            on_core_locked(core);
+        }
+        guard
+    }
+
+    pub(crate) fn try_lock(
+        &self,
+    ) -> std::sync::TryLockResult<std::sync::MutexGuard<'_, GhosttyPaneCore>> {
+        self.0.try_lock()
+    }
+}
+
+#[cfg(test)]
+type CoreLockedHook = Box<dyn FnMut(&mut GhosttyPaneCore)>;
+
+#[cfg(test)]
+thread_local! {
+    static ON_CORE_LOCKED: std::cell::RefCell<Option<CoreLockedHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn on_core_locked(core: &mut GhosttyPaneCore) {
+    let hook = ON_CORE_LOCKED.with(|slot| slot.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        hook(core);
+        ON_CORE_LOCKED.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
+    }
+}
+
+/// Run `hook` on the terminal right after every acquisition of a terminal core
+/// lock on this thread, until the returned guard is dropped.
+#[cfg(test)]
+pub(crate) fn test_on_core_locked(
+    hook: impl FnMut(&mut crate::ghostty::Terminal) + 'static,
+) -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ON_CORE_LOCKED.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    let mut hook = hook;
+    ON_CORE_LOCKED.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |core: &mut GhosttyPaneCore| {
+            hook(&mut core.terminal)
+        }))
+    });
+    Reset
 }
 
 pub(crate) struct GhosttyPaneCore {
@@ -1169,7 +1236,7 @@ impl GhosttyPaneTerminal {
             crate::ghostty::KeyEncoder::new().map_err(|e| std::io::Error::other(e.to_string()))?;
         key_encoder.set_from_terminal(&terminal);
         Ok(Self {
-            core: Mutex::new(GhosttyPaneCore {
+            core: CoreMutex(Mutex::new(GhosttyPaneCore {
                 #[cfg(test)]
                 dirty_collection_hook: None,
                 terminal,
@@ -1191,7 +1258,7 @@ impl GhosttyPaneTerminal {
                 decscusr_tracker: DecscusrTracker::default(),
                 cursor_settle_state: CursorPositionSettleState::default(),
                 windows_powershell_prompt_cwd_reporting: false,
-            }),
+            })),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
         })

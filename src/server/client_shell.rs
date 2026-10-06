@@ -1086,6 +1086,47 @@ mod tests {
         assert_eq!(drawn_thumb(&after), thumb(offset + 3, max + 3));
     }
 
+    /// The cells and the scroll metrics of one pane must come from ONE terminal
+    /// critical section. A hook writes a new line to the terminal at the start of
+    /// every acquisition of its lock during the render: inside one section the
+    /// metrics and the cells both see the line; across two sections (metrics read,
+    /// lock released, lock taken again to draw) the cells see one line more than
+    /// the metrics, and the rows no longer match their absolute line numbers.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pane_scroll_metrics_and_cells_come_from_one_terminal_critical_section() {
+        let (mut app, target) = numbered_lines_app(30);
+        render_numbered(&mut app, target);
+        test_print_numbered_lines(&app, 30..40);
+        render_numbered(&mut app, target);
+
+        let written = std::rc::Rc::new(std::cell::Cell::new(40usize));
+        let counter = written.clone();
+        let hook = crate::pane::test_on_core_locked(move |terminal| {
+            let line = counter.get();
+            if line < 60 {
+                terminal.write(format!("L{line:03}\r\n").as_bytes());
+                counter.set(line + 1);
+            }
+        });
+        let raced = render_numbered(&mut app, target);
+        drop(hook);
+        assert!(
+            written.get() >= 42,
+            "the hook ran at more than one lock acquisition: {}",
+            written.get()
+        );
+        let rows = numbered_rows(&raced);
+        assert!(
+            rows.iter().any(|(_, _, shown)| *shown >= 40),
+            "lines written by the hook are in the frame: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|(_, absolute, shown)| absolute == shown),
+            "metrics and cells from one critical section: \
+             (viewport row, absolute row by the metrics, line shown) {rows:?}"
+        );
+    }
+
     /// A frame's scroll metrics must describe the cells the same frame carries: the
     /// client turns a clicked screen row into an absolute row with them, and a
     /// double-click anchors its word there. Output that lands after a pane's cells

@@ -31,6 +31,8 @@ mod kitty_keyboard;
 mod osc;
 mod state;
 mod terminal;
+#[cfg(test)]
+pub(crate) use terminal::test_on_core_locked;
 mod xtgettcap;
 
 use self::agent_detection::{
