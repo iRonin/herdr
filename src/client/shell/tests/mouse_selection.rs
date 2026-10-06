@@ -1356,6 +1356,130 @@ fn extended_double_click_is_still_cancelled_by_output() {
     assert!(release.actions.is_empty(), "{:?}", release.actions);
 }
 
+/// Mode 2027 off: the terminal keeps `❤️` in one narrow cell and puts `y` in the
+/// next, but the client draws the emoji two columns wide over `y`, which is
+/// therefore never drawn. A double-click selects and copies what is drawn, `x❤️`,
+/// never the hidden `y`, wherever it lands, including the column `y` occupies
+/// in the terminal. (0.8.0 copied the terminal's text, `y` included.)
+#[tokio::test]
+async fn double_click_never_selects_a_character_hidden_under_a_wide_emoji() {
+    let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(
+        40,
+        3,
+        "\x1b[?2027lx\u{2764}\u{fe0f}y next".as_bytes(),
+    );
+    let (buffer, cursor) =
+        crate::server::render_stream::render_terminal_virtual(&runtime, Rect::new(0, 0, 40, 3));
+    let mut drawn = word_surface(&["", "", ""], 1, 0);
+    drawn.frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &[]);
+    let symbols = drawn.frame.cells[..4]
+        .iter()
+        .map(|cell| cell.symbol.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        symbols,
+        ["x", "\u{2764}\u{fe0f}", "y", " "],
+        "the terminal puts y in the cell the client draws the emoji over"
+    );
+    for col in [0, 1, 2] {
+        let mut config = Config::default();
+        config.ui.copy_on_select = true;
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(drawn.clone());
+        paint(&mut state);
+        press_twice(&mut state, 0, col);
+        assert_eq!(
+            state
+                .selection
+                .as_ref()
+                .map(|selection| selection.ordered_cells()),
+            Some(((0, 0), (0, 2))),
+            "column {col}: x and the two columns of the emoji"
+        );
+        let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, col);
+        assert!(
+            matches!(&release.actions[..], [ClientShellAction::ClipboardWrite(bytes)]
+                if bytes == "x\u{2764}\u{fe0f}".as_bytes()),
+            "column {col}: copies what is drawn, without the hidden y: {:?}",
+            release.actions
+        );
+    }
+}
+
+/// A reconnect keeps a plain held double-click (upstream's behaviour), but
+/// nothing from the old connection may act on it afterwards: a row read still
+/// in flight is cancelled with the connection, and its late reply neither
+/// re-shows that gesture nor overwrites a newer one.
+#[test]
+fn old_connection_reply_cannot_reshow_or_overwrite_a_double_click_after_reconnect() {
+    for new_gesture in [false, true] {
+        let case = format!("new gesture {new_gesture}");
+        let mut state = word_drag_state(true);
+        start_word_drag(&mut state);
+        let drag = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 1, 8);
+        let old_read = word_read_id(&drag.actions);
+        let endpoint_id = state.active_endpoint_id.clone();
+        let snapshot = state.snapshot.as_ref().unwrap().clone();
+        state.mark_endpoint_disconnected(&endpoint_id);
+        assert!(
+            state.word_selection_gesture.is_none() && state.selection.is_none(),
+            "{case}: the read in flight is cancelled with its connection, and its gesture"
+        );
+        state.cache_endpoint_snapshot_inactive_for_generation(&endpoint_id, 1, snapshot);
+        state.set_endpoint_status(
+            &endpoint_id,
+            crate::client::endpoint::ClientEndpointStatus::Online,
+        );
+        assert!(state.activate_endpoint_projection(&endpoint_id));
+        let mut next = state.pane_surface.as_ref().unwrap().clone();
+        next.surface_revision += 1;
+        state.set_pane_surface(next);
+        paint(&mut state);
+        if new_gesture {
+            // The reconnect notice is drawn over this small pane; a click dismisses it.
+            assert!(state.visible_endpoint_notice.is_some());
+            word_drag_mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 2, 7);
+            word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 2, 7);
+            assert!(state.visible_endpoint_notice.is_none());
+            paint(&mut state);
+            word_drag_mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 2, 7);
+            word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 2, 7);
+            word_drag_mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 2, 7);
+            assert_eq!(
+                state
+                    .selection
+                    .as_ref()
+                    .map(|selection| selection.ordered_cells()),
+                Some(((2, 5), (2, 9))),
+                "{case}: the new double-click selects hotel"
+            );
+        }
+        let late = word_row_reply(&mut state, &old_read, "delta echo foxtrot");
+        assert!(late.is_empty(), "{case}: {late:?}");
+        if new_gesture {
+            assert_eq!(
+                state
+                    .selection
+                    .as_ref()
+                    .map(|selection| selection.ordered_cells()),
+                Some(((2, 5), (2, 9))),
+                "{case}: the late reply does not change the new selection"
+            );
+            let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 2, 7);
+            assert!(
+                matches!(&release.actions[..], [ClientShellAction::ClipboardWrite(bytes)] if bytes == b"hotel"),
+                "{case}: {:?}",
+                release.actions
+            );
+        } else {
+            assert!(state.selection.is_none(), "{case}: nothing re-shown");
+            let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 1, 8);
+            assert!(release.actions.is_empty(), "{case}: {:?}", release.actions);
+        }
+    }
+}
+
 /// The owner's report: the word is highlighted but the clipboard never changes.
 /// Output reaches the server after the press. Unrelated output, or the clicked
 /// row itself being rewritten there, must not stop the copy, and the copy must
