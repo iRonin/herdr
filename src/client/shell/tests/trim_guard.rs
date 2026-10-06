@@ -462,21 +462,23 @@ fn kept_selection_renumbered_before_its_copy_key_copies_nothing_and_says_so() {
 /// was selected can be copied or shown: the highlight goes, and the release
 /// copies nothing and says so, like a plain drag. Copying only the word under a
 /// "copied" notice would hand over less than was selected. The gesture stays
-/// dropped: later motion (here to the pane's bottom edge, or back onto the word)
-/// neither extends, scrolls the view nor brings the word back. A trim between
+/// dropped, with or without later motion (here to the pane's bottom edge, or back onto the word):
+/// motion neither extends, scrolls the view nor brings the word back. A trim between
 /// the two clicks does not blind the gesture to a later one.
 #[test]
 fn extended_double_click_across_a_renumbering_copies_nothing_and_says_so() {
     let mut failures = Vec::new();
     for offset in [0, 40] {
-        for (delivery, trim_between_clicks, back_to_word) in [
-            (Delivery::Surface, false, false),
-            (Delivery::Patch, false, false),
-            (Delivery::Surface, true, false),
-            (Delivery::Surface, false, true),
+        for (delivery, trim_between_clicks, later_motion) in [
+            (Delivery::Surface, false, "to the edge"),
+            (Delivery::Patch, false, "to the edge"),
+            (Delivery::Surface, true, "to the edge"),
+            (Delivery::Surface, false, "to the edge and back to the word"),
+            (Delivery::Surface, false, "none"),
         ] {
+            let back_to_word = later_motion == "to the edge and back to the word";
             let case = format!(
-                "offset {offset} {delivery:?} trim between clicks {trim_between_clicks} back to word {back_to_word}"
+                "offset {offset} {delivery:?} trim between clicks {trim_between_clicks} later motion {later_motion}"
             );
             let mut terminal = TrimTerminal::new(60, offset);
             let mut state = trim_state(true, &mut terminal);
@@ -511,8 +513,12 @@ fn extended_double_click_across_a_renumbering_copies_nothing_and_says_so() {
                     state.selection.as_ref().map(|s| s.ordered_cells())
                 ));
             }
-            let later = mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 3, 30);
-            let (later_reads, _) = serve(&mut state, &terminal, later.actions);
+            let (later_reads, _) = if later_motion == "none" {
+                (0, Vec::new())
+            } else {
+                let later = mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 3, 30);
+                serve(&mut state, &terminal, later.actions)
+            };
             if later_reads != 0 || state.selection.is_some() || state.selection_autoscroll.is_some()
             {
                 failures.push(format!(
@@ -521,7 +527,11 @@ fn extended_double_click_across_a_renumbering_copies_nothing_and_says_so() {
                     state.selection_autoscroll.is_some()
                 ));
             }
-            let (row, col) = if back_to_word { (1, 8) } else { (3, 30) };
+            let (row, col) = match later_motion {
+                "none" => (2, 18),
+                _ if back_to_word => (1, 8),
+                _ => (3, 30),
+            };
             if back_to_word {
                 let back = mouse(
                     &mut state,
