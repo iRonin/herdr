@@ -1352,11 +1352,20 @@ impl WordRow {
         }
     }
 
-    /// Columns from displayed cells, one `(symbol, drawn width)` per column, left
-    /// to right. Every codepoint of a symbol occupies the columns its cell is drawn
-    /// across. A cell drawn `width` columns wide covers the next `width - 1` cells,
-    /// which are not drawn, so they contribute columns but no text. An empty symbol
+    /// Columns from one pane row's cells, one `(symbol, drawn width)` per column,
+    /// left to right, so that each character sits where the program printed it.
+    /// Every codepoint of a symbol occupies the columns its cell spans. A cell
+    /// spanning `width` columns covers the next `width - 1` cells, which contribute
+    /// columns but no text (they arrive empty or as a space). An empty symbol
     /// contributes a column and no text.
+    ///
+    /// One exception, a symbol with U+FE0F drawn wider than one column (a VS16
+    /// emoji). The server's frame build sends such a symbol's tail as an empty
+    /// cell, and an empty cell comes only from a wide character's tail. So when
+    /// the next cell in the row is not empty, the terminal laid the emoji out
+    /// narrow (grapheme clusters off): it spans one column, and the next cell is
+    /// real text at its own column, even though the client draws the emoji over
+    /// it. In the row's last column there is no next cell: one column.
     pub(crate) fn from_display_cells<'a>(
         cells: impl IntoIterator<Item = (&'a str, usize)>,
     ) -> Self {
@@ -1364,13 +1373,18 @@ impl WordRow {
         let last_col = u16::try_from(cells.len().saturating_sub(1)).unwrap_or(u16::MAX);
         let mut text_cells = Vec::new();
         let mut covered = 0usize;
-        for (col, (symbol, width)) in cells.into_iter().enumerate() {
+        for (index, &(symbol, width)) in cells.iter().enumerate() {
             if covered > 0 {
                 covered -= 1;
                 continue;
             }
-            let col = u16::try_from(col).unwrap_or(u16::MAX);
-            let span = width.max(1);
+            let col = u16::try_from(index).unwrap_or(u16::MAX);
+            let laid_out_narrow = width > 1
+                && symbol.contains('\u{fe0f}')
+                && cells
+                    .get(index + 1)
+                    .is_none_or(|(next, _)| !next.is_empty());
+            let span = if laid_out_narrow { 1 } else { width.max(1) };
             let end_col = col
                 .saturating_add(u16::try_from(span - 1).unwrap_or(u16::MAX))
                 .min(last_col);
