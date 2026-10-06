@@ -21,6 +21,8 @@ pub(super) struct ClientWordSelection {
     extended: bool,
     /// The screen row the word was on at the press, inside the pane.
     press_viewport_row: u16,
+    /// The word's screen cells at the press: row and first and last column.
+    word_screen_cells: (u16, u16, u16),
     cursor: (u32, u16),
     /// The screen row of the pointer inside the pane.
     cursor_viewport_row: u16,
@@ -191,6 +193,11 @@ impl ClientShellState {
             word_replaced,
             extended: false,
             press_viewport_row: viewport_row,
+            word_screen_cells: (
+                hit.inner_rect.y.saturating_add(viewport_row),
+                hit.inner_rect.x.saturating_add(word.bounds.0),
+                hit.inner_rect.x.saturating_add(word.bounds.1),
+            ),
             cursor: (word.row, col),
             cursor_viewport_row: viewport_row,
             end_col: hit.inner_rect.width.saturating_sub(1),
@@ -334,33 +341,27 @@ impl ClientShellState {
         }
     }
 
-    /// Motion after the double-click's rows were renumbered. Inside the screen
-    /// cells the word occupied at the press it is still on the word; anywhere
-    /// else it selects rows that name other lines, so the gesture is dropped
-    /// and stays dropped. Returns whether the motion was this gesture's.
-    pub(super) fn drag_renumbered_word(&mut self, column: u16, row: u16) -> bool {
-        let Some(gesture) = self.word_selection_gesture.as_ref() else {
-            return false;
+    /// Motion after the double-click's rows were renumbered: it extends
+    /// nothing, so it is consumed. Where the gesture ends is decided at release.
+    pub(super) fn drag_renumbered_word(&mut self) -> bool {
+        self.word_selection_gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.renumbered && !gesture.released)
+    }
+
+    /// The release of a double-click whose rows were renumbered while it was
+    /// held. On the screen cells the word occupied at the press, the frozen word
+    /// is exactly what is selected; anywhere else the selection would be rows
+    /// that name other lines, so the gesture is dropped.
+    pub(super) fn release_renumbered_word(&mut self, column: u16, row: u16) {
+        let Some(gesture) = self.word_selection_gesture.as_mut() else {
+            return;
         };
-        if !gesture.renumbered || gesture.released {
-            return false;
+        if !gesture.renumbered {
+            return;
         }
-        let on_word = self
-            .hits
-            .panes
-            .iter()
-            .find(|hit| hit.pane_id == gesture.pane_id)
-            .is_some_and(|hit| {
-                let inner = hit.inner_rect;
-                row.checked_sub(inner.y) == Some(gesture.press_viewport_row)
-                    && column.checked_sub(inner.x).is_some_and(|col| {
-                        (gesture.anchor_bounds.0..=gesture.anchor_bounds.1).contains(&col)
-                    })
-            });
-        if let Some(gesture) = self.word_selection_gesture.as_mut() {
-            gesture.dropped |= !on_word;
-        }
-        true
+        let (word_row, start, end) = gesture.word_screen_cells;
+        gesture.dropped |= row != word_row || !(start..=end).contains(&column);
     }
 
     pub(super) fn drag_word_selection(
