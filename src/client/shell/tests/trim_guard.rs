@@ -552,3 +552,32 @@ fn plain_double_click_across_a_renumbering_copies_its_word() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// The no-copy notice is drawn as a failure (the palette's red), never with the
+/// green mark of a copy that was made.
+#[test]
+fn the_no_copy_notice_is_drawn_in_red() {
+    let mut terminal = TrimTerminal::new(60, 40);
+    let mut state = trim_state(true, &mut terminal);
+    mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 1, 0);
+    mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 2, 12);
+    terminal.trim(10);
+    deliver(&mut state, &mut terminal, Delivery::Surface);
+    mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 2, 12);
+    assert_eq!(notice(&state), Some(NOT_COPIED));
+    let frame = state.compose(106, 20).expect("composed frame");
+    let buffer = frame.to_ratatui_buffer().expect("buffer");
+    let dot = buffer
+        .content()
+        .iter()
+        .position(|cell| cell.symbol() == "●")
+        .expect("the notice's mark is drawn");
+    let palette = &state.config.palette;
+    assert_eq!(buffer.content()[dot].fg, palette.red, "a failure mark");
+    assert_ne!(palette.red, palette.green, "the palette tells them apart");
+    let text: String = buffer.content()[dot + 2..dot + 2 + NOT_COPIED.len()]
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert_eq!(text, NOT_COPIED);
+}
