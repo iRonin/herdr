@@ -42,6 +42,9 @@ pub(super) struct TypeaheadGuard {
     ring_bound: Option<usize>,
     /// Bytes at the front of the queued writes that may be written without another check.
     granted: usize,
+    /// The grant reaches past the budget on the current-line rule, which holds only while the
+    /// tty stays canonical: its mode is read again before each write that uses it.
+    line_grant: bool,
     /// The last bytes written, to find where the current line starts.
     tail: VecDeque<u8>,
     /// True while `tail` holds every byte written since the queues were known to be empty.
@@ -67,6 +70,7 @@ impl TypeaheadGuard {
             suspended: false,
             ring_bound: fresh.then_some(0),
             granted: 0,
+            line_grant: false,
             tail: VecDeque::with_capacity(TAIL),
             tail_from_start: fresh,
             hold_until: None,
@@ -95,6 +99,7 @@ impl TypeaheadGuard {
     /// The queued bytes changed other than by appending or writing: forget the grant.
     pub(super) fn reset_grant(&mut self) {
         self.granted = 0;
+        self.line_grant = false;
     }
 
     /// How many of the queued bytes (`pending`, from the front) may be written now, or `None`
@@ -113,13 +118,19 @@ impl TypeaheadGuard {
             if let Some(hook) = self.before_cached_write.as_mut() {
                 hook();
             }
-            return Some(self.granted);
+            if !self.line_grant || still_canonical(fd) {
+                return Some(self.granted);
+            }
+            // The program left canonical mode while a current-line allowance was being
+            // written: the rest of it could run unread input past the ring's end. Look again.
+            self.reset_grant();
         }
         if let Some(bound) = self.ring_bound {
             let fits = fit(pending.clone(), RING_BUDGET.saturating_sub(bound));
             if fits > 0 {
                 self.release_hold();
                 self.granted = fits;
+                self.line_grant = false;
                 return Some(fits);
             }
         }
@@ -190,7 +201,9 @@ impl TypeaheadGuard {
             // and one line moved into the empty canonical queue cannot wrap either. Without
             // this, a long unfinished line would hold its own Backspace, Ctrl-U and Enter.
             let current_line = line_ends.through_next_possible_end(pending);
-            return self.grant(within_budget.max(current_line), partial);
+            let granted = self.grant(within_budget.max(current_line), partial);
+            self.line_grant = current_line > within_budget;
+            return granted;
         }
         if after.c_cc[libc::VMIN] > 1 && after.c_cc[libc::VTIME] == 0 {
             // FIONREAD reads 0 below VMIN, so emptiness cannot be seen; holding could starve
@@ -208,6 +221,7 @@ impl TypeaheadGuard {
         self.ring_bound = ring_bound;
         self.release_hold();
         self.granted = bytes.max(1);
+        self.line_grant = false;
         Some(self.granted)
     }
 
@@ -272,6 +286,11 @@ fn modes(fd: RawFd) -> std::io::Result<libc::termios> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(termios)
+}
+
+/// Whether the tty is in canonical mode now; false when its modes cannot be read.
+fn still_canonical(fd: RawFd) -> bool {
+    modes(fd).is_ok_and(|termios| termios.c_lflag & libc::ICANON != 0)
 }
 
 fn unread_input(fd: RawFd) -> std::io::Result<usize> {
