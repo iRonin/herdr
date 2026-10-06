@@ -373,14 +373,21 @@ fn press_before_a_renumbering_then_drag_copies_nothing_and_says_so() {
 /// `ui.copy_on_select` off: a finished drag stays selected until copied by key.
 /// Renumbered before the key, it is dropped at once; the copy key then copies
 /// nothing, says so and is not passed to the program. Only that one key is
-/// taken: the next Ctrl+C reaches the program again, and any other key first
-/// gives Ctrl+C back to the program. With output alone the key copies the text.
+/// taken: the next Ctrl+C reaches the program again, and any other key or a
+/// click first gives Ctrl+C back to the program. With output alone the key
+/// copies the text.
 #[test]
 fn kept_selection_renumbered_before_its_copy_key_copies_nothing_and_says_so() {
     let mut failures = Vec::new();
     for offset in [0, 40] {
-        for (renumber, other_key_first) in [(true, false), (true, true), (false, false)] {
-            let case = format!("offset {offset} renumber {renumber} other key {other_key_first}");
+        for (renumber, first) in [
+            (true, "nothing"),
+            (true, "a key"),
+            (true, "a click"),
+            (false, "nothing"),
+        ] {
+            let other_key_first = first != "nothing";
+            let case = format!("offset {offset} renumber {renumber}, first {first}");
             let mut terminal = TrimTerminal::new(60, offset);
             let mut state = trim_state(false, &mut terminal);
             let top = terminal.top();
@@ -406,8 +413,11 @@ fn kept_selection_renumbered_before_its_copy_key_copies_nothing_and_says_so() {
             if renumber && state.selection.is_some() {
                 failures.push(format!("{case}: highlight kept over renumbered rows"));
             }
-            if other_key_first {
+            if first == "a key" {
                 key(&mut state, KeyCode::Char('x'), KeyModifiers::empty());
+            } else if first == "a click" {
+                mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 0, 30);
+                mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 30);
             }
             let copy = key(&mut state, KeyCode::Char('c'), KeyModifiers::CONTROL);
             let to_program = !copy.requests.is_empty();
@@ -425,9 +435,7 @@ fn kept_selection_renumbered_before_its_copy_key_copies_nothing_and_says_so() {
             }
             if other_key_first {
                 if !to_program {
-                    failures.push(format!(
-                        "{case}: Ctrl+C after another key must reach the program"
-                    ));
+                    failures.push(format!("{case}: Ctrl+C afterwards must reach the program"));
                 }
                 continue;
             }
@@ -449,7 +457,8 @@ fn kept_selection_renumbered_before_its_copy_key_copies_nothing_and_says_so() {
 /// A double-click dragged on into the next rows, held across a renumbering. The
 /// range's rows are renumbered, and so is the word's own row, so nothing can be
 /// placed on screen any more: the highlight goes, the gesture stays on its
-/// frozen word, later motion extends nothing, and the release copies the word.
+/// frozen word, later motion (here to the pane's bottom edge) neither extends
+/// nor scrolls the view, and the release copies the word.
 #[test]
 fn extended_double_click_across_a_renumbering_copies_only_its_word() {
     let mut failures = Vec::new();
@@ -486,10 +495,12 @@ fn extended_double_click_across_a_renumbering_copies_only_its_word() {
             }
             let later = mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 3, 30);
             let (later_reads, _) = serve(&mut state, &terminal, later.actions);
-            if later_reads != 0 || state.selection.is_some() {
+            if later_reads != 0 || state.selection.is_some() || state.selection_autoscroll.is_some()
+            {
                 failures.push(format!(
-                    "{case}: extended after the renumbering: {later_reads} reads, {:?}",
-                    state.selection.as_ref().map(|s| s.ordered_cells())
+                    "{case}: extended or autoscrolled after the renumbering: {later_reads} reads, {:?}, autoscroll {}",
+                    state.selection.as_ref().map(|s| s.ordered_cells()),
+                    state.selection_autoscroll.is_some()
                 ));
             }
             let release = mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 3, 30);
@@ -547,6 +558,15 @@ fn plain_double_click_across_a_renumbering_copies_its_word() {
         if state.selection.is_some() {
             failures.push(format!(
                 "{case}: copied highlight kept over renumbered rows"
+            ));
+        }
+        // The copy is done: nothing is left to say "not copied" later, and the
+        // highlight's deadline no longer holds patches off the fast path.
+        if state.renumbered_selection.is_some()
+            || state.selection_highlight_clear_deadline.is_some()
+        {
+            failures.push(format!(
+                "{case}: leftover state after the copied highlight went"
             ));
         }
     }
@@ -636,6 +656,55 @@ fn copy_mode_selection_renumbered_before_y_copies_nothing_and_says_so() {
                 ));
             }
         }
+        // After the drop, a new selection the user then cancels is not "trimmed".
+        let mut terminal = TrimTerminal::new(60, offset);
+        let mut state = trim_state(true, &mut terminal);
+        let mut enter = ClientShellInput::default();
+        state.record_binding(
+            crate::input::KeybindMatch::Action(crate::input::KeybindAction::CopyMode),
+            &mut enter,
+        );
+        state.handle_input_bytes(b"v");
+        state.handle_input_bytes(b"k");
+        terminal.output(1);
+        terminal.trim(10);
+        deliver(&mut state, &mut terminal, Delivery::Surface);
+        state.handle_input_bytes(b"v");
+        key(&mut state, KeyCode::Esc, KeyModifiers::empty());
+        let copy = state.handle_input_bytes(b"y");
+        let (_, copied) = serve(&mut state, &terminal, copy.actions);
+        if !copied.is_empty() || notice(&state).is_some() {
+            failures.push(format!(
+                "offset {offset}: cancelled new selection: copied {copied:?}, notice {:?}",
+                notice(&state)
+            ));
+        }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The drop is judged between two updates the client sees, not against the
+/// history at the press: output first grows the history past where it was,
+/// then a trim drops lines. The second update renumbers the rows.
+#[test]
+fn a_trim_after_the_history_grew_still_renumbers_a_held_drag() {
+    for delivery in [Delivery::Surface, Delivery::Patch] {
+        let mut terminal = TrimTerminal::new(60, 40);
+        let mut state = trim_state(true, &mut terminal);
+        mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 1, 0);
+        mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 2, 12);
+        terminal.output(15);
+        deliver(&mut state, &mut terminal, delivery);
+        assert!(
+            state.selection.is_some(),
+            "{delivery:?}: growth renumbers nothing"
+        );
+        terminal.trim(10);
+        deliver(&mut state, &mut terminal, delivery);
+        assert!(state.selection.is_none(), "{delivery:?}: dropped at once");
+        let release = mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 2, 12);
+        let (reads, copied) = serve(&mut state, &terminal, release.actions);
+        assert_eq!((reads, copied), (0, Vec::<String>::new()), "{delivery:?}");
+        assert_eq!(notice(&state), Some(NOT_COPIED), "{delivery:?}");
+    }
 }
