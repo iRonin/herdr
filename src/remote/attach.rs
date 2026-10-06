@@ -1100,6 +1100,7 @@ pub(super) fn prepare_remote_herdr(
             if remote_binary_supports_endpoint_requirement(ssh, candidate, require_surface_interest)
                 .unwrap_or(false)
             {
+                warn_if_remote_herdr_is_stock(ssh, candidate);
                 return Ok(PreparedRemoteHerdr {
                     remote_herdr: candidate.clone(),
                     stop_after_install_approved: false,
@@ -1111,6 +1112,7 @@ pub(super) fn prepare_remote_herdr(
             &remote_herdr,
             require_surface_interest,
         )? {
+            warn_if_remote_herdr_is_stock(ssh, &remote_herdr);
             return Ok(PreparedRemoteHerdr {
                 remote_herdr,
                 stop_after_install_approved: false,
@@ -1175,6 +1177,7 @@ pub(super) fn find_installed_remote_herdr(ssh: &RemoteSsh) -> io::Result<RemoteH
     for mut candidate in candidates {
         if let Some(status) = remote_client_status(ssh, &candidate)? {
             if status.supports_endpoint_requirement(&candidate.platform, true) {
+                warn_if_remote_herdr_is_stock(ssh, &candidate);
                 candidate.bridge_idle_timeout = status.remote_bridge_idle_timeout;
                 return Ok(candidate);
             }
@@ -1206,6 +1209,7 @@ fn prepare_windows_remote_herdr(
                 candidate,
                 require_surface_interest,
             )? {
+                warn_if_remote_herdr_is_stock(ssh, candidate);
                 return Ok(PreparedRemoteHerdr {
                     remote_herdr: candidate.clone(),
                     stop_after_install_approved: false,
@@ -1284,6 +1288,7 @@ pub(super) fn find_installed_remote_api_herdr(
         if probe.status.success()
             && String::from_utf8_lossy(&probe.stdout).trim() == "herdr-api-bridge-v1"
         {
+            warn_if_remote_herdr_is_stock(ssh, &candidate);
             return Ok(candidate);
         }
     }
@@ -2248,6 +2253,47 @@ fn remote_shell_resolves_managed_install(stdout: &str) -> bool {
         .next()
         .map(str::trim)
         .is_some_and(|path| path.ends_with("/.local/bin/herdr"))
+}
+
+/// One notice when a fork build adopts a remote herdr that is stock upstream:
+/// the fork's features are missing on the remote. Costs one remote command
+/// (`--version`); when that fails or its output cannot be read as a version
+/// line, nothing is printed - an unclear answer is not evidence.
+fn warn_if_remote_herdr_is_stock(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) {
+    let Ok(output) = ssh.shell_output(
+        &remote_herdr.platform,
+        &remote_herdr.executable.command(&["--version"]),
+    ) else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(notice) = stock_remote_notice(crate::build_info::FORK_BUILD, &stdout) {
+        eprintln!("{notice}");
+    }
+}
+
+/// The notice a fork build prints when it adopts a stock upstream remote
+/// herdr, or `None` (silence) on a stock build, on a remote that already
+/// carries the fork's banner in its `--version` output, and on output that
+/// cannot be read as a version line. The named remedy is
+/// `HERDR_REMOTE_BINARY`: with it set, attach skips adoption and installs the
+/// given binary as the remote's managed herdr, which must then resolve as
+/// `herdr` (otherwise the upstream binary has to go).
+fn stock_remote_notice(fork_build: bool, version_output: &str) -> Option<String> {
+    if !fork_build || version_output.contains("iRonin fork") {
+        return None;
+    }
+    let line = version_output
+        .lines()
+        .find(|line| !line.trim().is_empty())?
+        .trim();
+    let version = line.strip_prefix("herdr ")?.split_whitespace().next()?;
+    Some(format!(
+        "herdr: the remote herdr is upstream Herdr {version}, so the fork's features are missing there. Replace it with the fork's own release for the remote's platform (built from source), passed with {REMOTE_BINARY_ENV_VAR}=<path>; that installs the fork build as the remote's managed herdr, which must resolve as `herdr` (remove the upstream binary otherwise)"
+    ))
 }
 
 fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource> {
@@ -5254,6 +5300,61 @@ mod tests {
         assert!(
             !message.contains("iRonin fork"),
             "a stock build must not carry the fork refusal; got: {message}"
+        );
+    }
+
+    #[test]
+    fn stock_remote_notice_names_the_remote_version_and_the_remedy() {
+        let notice =
+            stock_remote_notice(true, "herdr 0.9.1\n").expect("a stock remote must be named");
+        assert!(
+            notice.contains("upstream Herdr 0.9.1"),
+            "the notice must name the remote's stock version; got: {notice}"
+        );
+        assert!(
+            notice.contains("features are missing"),
+            "the notice must say the fork's features are missing there; got: {notice}"
+        );
+        assert!(
+            notice.contains("built from source"),
+            "the notice must say where the remote build comes from; got: {notice}"
+        );
+        assert!(
+            notice.contains("HERDR_REMOTE_BINARY"),
+            "the notice must name the supported remedy; got: {notice}"
+        );
+        assert!(
+            !notice.contains("herdr update"),
+            "no fork-build message may advise `herdr update`; got: {notice}"
+        );
+    }
+
+    #[test]
+    fn stock_remote_notice_stays_quiet_on_banner_unclear_and_stock_builds() {
+        assert_eq!(
+            stock_remote_notice(true, "herdr 0.9.1 (iRonin fork)\n"),
+            None,
+            "a remote carrying the fork's banner must stay quiet"
+        );
+        assert_eq!(
+            stock_remote_notice(true, "not a version line\n"),
+            None,
+            "an unclear answer must stay quiet"
+        );
+        assert_eq!(
+            stock_remote_notice(true, ""),
+            None,
+            "an empty answer must stay quiet"
+        );
+        assert_eq!(
+            stock_remote_notice(true, "herdr\n"),
+            None,
+            "a version line without a version must stay quiet"
+        );
+        assert_eq!(
+            stock_remote_notice(false, "herdr 0.9.1\n"),
+            None,
+            "a stock build must stay quiet"
         );
     }
 
