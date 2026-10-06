@@ -757,20 +757,27 @@ fn a_trim_after_the_history_grew_still_renumbers_a_held_drag() {
     }
 }
 
-/// A double-click never extended keeps its word across a renumbering, but only
-/// while the pointer stays on it. Dragging off it afterwards selects rows that
-/// name other lines, so the release copies nothing and says so, even if the
-/// pointer comes back. A slip inside the word's screen cells is not a drag.
+/// A double-click never extended keeps its frozen word across a renumbering. It
+/// is decided where it is released (herdr-lead's ruling): on the screen cells
+/// the word occupied at the press, the word is exactly what is selected, so it
+/// is copied; anywhere else the selection would be rows that name other lines,
+/// so nothing is copied and the notice says so. A slip off and back is fine.
+/// "On the word" is those press-time screen cells, not the current hit map, so a
+/// moment without pane hits does not count as off the word.
 #[test]
-fn double_click_dragged_only_after_a_renumbering_copies_nothing_and_says_so() {
+fn double_click_renumbered_while_held_is_decided_where_it_is_released() {
     let mut failures = Vec::new();
     for offset in [0, 40] {
-        for (motion, copies_word) in [
-            (&[(2, 18)][..], false),
-            (&[(2, 18), (1, 8)][..], false),
-            (&[(1, 10)][..], true),
+        for (motion, copies_word, hits_gone) in [
+            (&[(2, 18)][..], false, false),
+            (&[(2, 18), (1, 8)][..], true, false),
+            (&[(1, 10)][..], true, false),
+            (&[(1, 10), (1, 30)][..], false, false),
+            (&[(1, 5)][..], false, false),
+            (&[(1, 13)][..], true, false),
+            (&[(1, 10)][..], true, true),
         ] {
-            let case = format!("offset {offset} motion {motion:?}");
+            let case = format!("offset {offset} motion {motion:?} hits gone {hits_gone}");
             let mut terminal = TrimTerminal::new(60, offset);
             let mut state = trim_state(true, &mut terminal);
             let word = terminal.row(terminal.top() + 1)[6..14].to_owned();
@@ -780,21 +787,36 @@ fn double_click_dragged_only_after_a_renumbering_copies_nothing_and_says_so() {
             terminal.output(1);
             terminal.trim(10);
             deliver(&mut state, &mut terminal, Delivery::Surface);
+            let inner = state.hits.panes[0].inner_rect;
+            if hits_gone {
+                state.hits.panes.clear();
+            }
+            let send = |state: &mut ClientShellState, kind, row: u16, col: u16| {
+                state
+                    .handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                        kind,
+                        column: inner.x + col,
+                        row: inner.y + row,
+                        modifiers: KeyModifiers::empty(),
+                    })])
+                    .actions
+            };
             let mut actions = Vec::new();
             for &(row, col) in motion {
-                actions.extend(
-                    mouse(
-                        &mut state,
-                        MouseEventKind::Drag(MouseButton::Left),
-                        row,
-                        col,
-                    )
-                    .actions,
-                );
+                actions.extend(send(
+                    &mut state,
+                    MouseEventKind::Drag(MouseButton::Left),
+                    row,
+                    col,
+                ));
             }
             let (row, col) = *motion.last().unwrap();
-            actions
-                .extend(mouse(&mut state, MouseEventKind::Up(MouseButton::Left), row, col).actions);
+            actions.extend(send(
+                &mut state,
+                MouseEventKind::Up(MouseButton::Left),
+                row,
+                col,
+            ));
             let (reads, copied) = serve(&mut state, &terminal, actions);
             let (want_copy, want_notice) = if copies_word {
                 (vec![word.clone()], COPIED)
