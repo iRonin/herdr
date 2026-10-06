@@ -980,8 +980,9 @@ fn plan_running_server_updates(
                 target.stop_command
             )
         })? {
-            Some(server) => server,
-            None if target.must_be_running => {
+            crate::api::RuntimeStatusProbe::Status(server) => server,
+            crate::api::RuntimeStatusProbe::NoApi | crate::api::RuntimeStatusProbe::Unanswered
+                if target.must_be_running => {
                 return Err(format!(
                         "herdr target {} looked running, but its status API did not respond at {}. stop it with `{}` and run `herdr update` again",
                     target.label,
@@ -989,7 +990,8 @@ fn plan_running_server_updates(
                     target.stop_command
                 ));
             }
-            None if client_protocol_server_is_running_at(&target.client_socket_path) => {
+            crate::api::RuntimeStatusProbe::NoApi | crate::api::RuntimeStatusProbe::Unanswered
+                if client_protocol_server_is_running_at(&target.client_socket_path) => {
                 return Err(format!(
                     "herdr target {} has a client socket, but its status API did not respond at {}. stop it with `{}` and run `herdr update` again",
                     target.label,
@@ -997,7 +999,9 @@ fn plan_running_server_updates(
                     target.stop_command
                 ));
             }
-            None => continue,
+            crate::api::RuntimeStatusProbe::NoApi | crate::api::RuntimeStatusProbe::Unanswered => {
+                continue;
+            }
         };
 
         plans.push(RunningServerUpdatePlan {
@@ -1395,11 +1399,17 @@ fn classify_failed_live_handoff_state_at(
     release: &ReleaseInfo,
 ) -> FailedHandoffServerState {
     match crate::api::read_runtime_status_at(socket_path, SERVER_STOP_RESPONSE_TIMEOUT) {
-        Ok(Some(status)) if runtime_matches_release(&status, release) => {
+        Ok(crate::api::RuntimeStatusProbe::Status(status))
+            if runtime_matches_release(&status, release) =>
+        {
             FailedHandoffServerState::UpdatedServerRunning
         }
-        Ok(Some(status)) => FailedHandoffServerState::OldServerRunning(status),
-        Ok(None) => FailedHandoffServerState::NoServerResponding,
+        Ok(crate::api::RuntimeStatusProbe::Status(status)) => {
+            FailedHandoffServerState::OldServerRunning(status)
+        }
+        Ok(crate::api::RuntimeStatusProbe::NoApi | crate::api::RuntimeStatusProbe::Unanswered) => {
+            FailedHandoffServerState::NoServerResponding
+        }
         Err(err) => FailedHandoffServerState::Unknown(err.to_string()),
     }
 }
@@ -1719,7 +1729,7 @@ fn wait_for_running_server_protocol_at(
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(status) =
+        if let crate::api::RuntimeStatusProbe::Status(status) =
             crate::api::read_runtime_status_at(socket_path, SERVER_STOP_RESPONSE_TIMEOUT)
                 .map_err(|e| format!("failed to read server status after handoff: {e}"))?
         {

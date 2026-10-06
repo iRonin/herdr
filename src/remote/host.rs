@@ -38,11 +38,17 @@ pub(crate) fn run_remote_client_bridge(args: &[String]) -> io::Result<()> {
 fn ensure_remote_server_running() -> io::Result<()> {
     let socket_path = crate::server::socket_paths::client_socket_path();
     if crate::server::autodetect::is_server_listening() {
-        let status = crate::api::read_runtime_status_at(
+        let status = match crate::api::read_runtime_status_at(
             &crate::api::socket_path(),
             Duration::from_millis(500),
-        )?
-        .ok_or_else(|| io::Error::other("remote server status API is unavailable"))?;
+        )? {
+            crate::api::RuntimeStatusProbe::Status(status) => status,
+            // Nothing listened (NoApi) or it did not answer within the tight budget
+            // (Unanswered - a slow server is not a missing API).
+            crate::api::RuntimeStatusProbe::NoApi | crate::api::RuntimeStatusProbe::Unanswered => {
+                return Err(io::Error::other("remote server status API is unavailable"));
+            }
+        };
         if status
             .capabilities
             .as_ref()

@@ -50,7 +50,10 @@ fn is_server_listening_at(socket_path: &Path) -> bool {
     #[cfg(windows)]
     {
         let _ = socket_path;
-        read_server_status().ok().flatten().is_some()
+        matches!(
+            read_server_status(),
+            Ok(crate::api::RuntimeStatusProbe::Status(_))
+        )
     }
 
     #[cfg(not(windows))]
@@ -88,7 +91,7 @@ fn is_server_listening_at(socket_path: &Path) -> bool {
     }
 }
 
-fn read_server_status() -> io::Result<Option<crate::api::RuntimeStatus>> {
+fn read_server_status() -> io::Result<crate::api::RuntimeStatusProbe> {
     crate::api::read_runtime_status_at(&crate::api::socket_path(), STATUS_REQUEST_TIMEOUT)
 }
 
@@ -143,11 +146,21 @@ fn client_protocol_accepts_hello(socket_path: &Path) -> io::Result<bool> {
 }
 
 fn validate_running_server_compatibility(saved_federation: bool) -> io::Result<()> {
-    let Some(status) = read_server_status()? else {
-        return Err(io::Error::other(format!(
-            "a herdr server is listening, but its status API is unavailable.\n\n{}\nIf that fails, stop the old server process manually.",
-            crate::session::active_restart_after_update_guidance()
-        )));
+    let status = match read_server_status()? {
+        crate::api::RuntimeStatusProbe::Status(status) => status,
+        crate::api::RuntimeStatusProbe::NoApi => {
+            return Err(io::Error::other(format!(
+                "a herdr server is listening, but its status API is unavailable.\n\n{}\nIf that fails, stop the old server process manually.",
+                crate::session::active_restart_after_update_guidance()
+            )));
+        }
+        // The server accepted the status connection but did not answer within the
+        // probe's budget: slow, held or still starting - not evidence of an
+        // incompatible server (ledger #54: this path used to abort the client with a
+        // bare `Resource temporarily unavailable` before it ever attached). The
+        // handshake is the authoritative compatibility gate, so proceed and let it
+        // decide.
+        crate::api::RuntimeStatusProbe::Unanswered => return Ok(()),
     };
 
     let capabilities = status.capabilities.as_ref();
@@ -521,9 +534,11 @@ test "$sid" = "$$"
             stream.flush().unwrap();
         });
 
-        let status = crate::api::read_runtime_status_at(&path, Duration::from_millis(200))
-            .unwrap()
-            .unwrap();
+        let status =
+            match crate::api::read_runtime_status_at(&path, Duration::from_millis(200)).unwrap() {
+                crate::api::RuntimeStatusProbe::Status(status) => status,
+                other => panic!("expected a reported status, got {other:?}"),
+            };
         let _ = handle.join();
         assert_eq!(status.version.as_deref(), Some("0.5.5"));
         assert_eq!(status.protocol, Some(2));
@@ -595,5 +610,45 @@ test "$sid" = "$$"
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_status_api_that_never_answers_still_allows_attach() {
+        // Ledger #54: a held, overloaded or still-starting server at client startup must
+        // not abort the client before the handshake - the handshake is the authoritative
+        // compatibility gate. (The client exited with a bare "Resource temporarily
+        // unavailable (os error 35)".)
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = unique_test_dir("status-unanswered");
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = TempDir(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("api.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let handle = std::thread::spawn(move || {
+            // Accept the status probe and never answer for longer than its 2s budget.
+            let accepted = listener.accept();
+            std::thread::sleep(std::time::Duration::from_millis(3_000));
+            drop(accepted);
+        });
+        let previous = std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR);
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &path);
+        let result = validate_running_server_compatibility(false);
+        match previous {
+            Some(value) => std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, value),
+            None => std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR),
+        }
+        let _ = handle.join();
+        assert!(
+            result.is_ok(),
+            "a silent status API must not abort the client: {result:?}"
+        );
     }
 }
