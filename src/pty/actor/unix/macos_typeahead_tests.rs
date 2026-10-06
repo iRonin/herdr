@@ -325,23 +325,44 @@ fn typeahead_within_the_tty_ring_survives_a_return_to_canonical_mode() {
 /// then Ctrl-C. Returns the tty's unread complete lines before the Ctrl-C (in bytes), how the
 /// program ended within 5 s (None: still running), and the unread bytes afterwards.
 fn ctrl_c_scenario(lines: usize) -> (usize, Option<String>, usize) {
+    ctrl_c_scenario_in(lines, false)
+}
+
+/// `ctrl_c_scenario`, with the tty in raw mode (ISIG still on) when `raw` is set.
+fn ctrl_c_scenario_in(lines: usize, raw: bool) -> (usize, Option<String>, usize) {
     let mut command = portable_pty::CommandBuilder::new("/bin/sleep");
     command.arg("30");
     let mut spawned =
         crate::pty::backend::spawn_with_portable_pty(24, 80, command).expect("spawn sleep");
     let observer = fd::duplicate_cloexec_fd(spawned.master_fd.as_raw_fd()).expect("dup master");
     let observer = unsafe { OwnedFd::from_raw_fd(observer) };
+    if raw {
+        let canonical = termios_of(observer.as_raw_fd());
+        set_termios(observer.as_raw_fd(), &line_editor_mode(&canonical));
+    }
     let (handle, idle) = spawn_actor(spawned.master_fd);
 
     type_lines(&handle, &idle, lines);
     // A full tty holds 30 complete lines (1022 bytes); herdr keeps the rest.
     let accepted_lines = lines.min(30);
-    let unread = settle(observer.as_raw_fd(), accepted_lines * LINE.len(), &idle);
-    assert_eq!(
-        unread,
-        accepted_lines * LINE.len(),
-        "setup: the tty must hold {accepted_lines} unread lines"
-    );
+    let unread = if raw {
+        // In raw mode the tty reports every unread byte, partial lines included.
+        let unread = settle(observer.as_raw_fd(), 1022, &idle);
+        assert!(
+            (accepted_lines * LINE.len()..1021).contains(&unread),
+            "setup: herdr, not the tty, must hold the rest while the tty has room; {unread} \
+             bytes unread"
+        );
+        unread
+    } else {
+        let unread = settle(observer.as_raw_fd(), accepted_lines * LINE.len(), &idle);
+        assert_eq!(
+            unread,
+            accepted_lines * LINE.len(),
+            "setup: the tty must hold {accepted_lines} unread lines"
+        );
+        unread
+    };
 
     type_input(&handle, &idle, b"\x03");
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -385,6 +406,24 @@ fn ctrl_c_reaches_a_program_that_is_not_reading_its_input() {
     assert_eq!(
         unread_after, 0,
         "Ctrl-C discards the unread typeahead, as the tty does for an interrupt"
+    );
+}
+
+#[test]
+fn ctrl_c_held_by_the_typeahead_guard_reaches_a_raw_mode_program() {
+    // In raw mode the tty would take 1022 bytes before refusing input; herdr's typeahead
+    // guard stops at 990 while nothing reads, so the tty still has room and never refuses
+    // the Ctrl-C. The signal character must still act at once.
+    let (unread, ended_by, unread_after) = ctrl_c_scenario_in(40, true);
+    assert_eq!(
+        ended_by,
+        Some(interrupt_signal_name()),
+        "Ctrl-C must interrupt a raw-mode program that is not reading its input; with {unread} \
+         bytes of typeahead unread, the program had not ended 5 s after the Ctrl-C"
+    );
+    assert_eq!(
+        unread_after, 0,
+        "the interrupt discards the unread typeahead"
     );
 }
 
@@ -646,8 +685,11 @@ fn input_to_a_program_that_keeps_reading_arrives_complete_and_in_order() {
             // A long run without any line end, as in a paste into an editor.
             sent.push(&long_run);
         }
-        // A paste arrives as one write, typing as many small ones.
+        // A paste arrives as one write, typing as many small ones. Bracketed-paste markers
+        // keep their place around the paste.
+        sent.push(b"\x1b[200~");
         sent.push(&lines);
+        sent.push(b"\x1b[201~");
         for chunk in lines.chunks(33) {
             sent.push(chunk);
         }
@@ -681,4 +723,242 @@ fn input_to_a_program_that_keeps_reading_arrives_complete_and_in_order() {
                 .position(|(got, want)| got != want)
         );
     }
+}
+
+/// Spawns the actor the way a live handoff's receiving server does (quiesced, so nothing is
+/// known about the input already in the tty), then lets it run.
+fn spawn_handoff_receiver(
+    master: OwnedFd,
+) -> (
+    PtyIoActorHandle,
+    std_mpsc::Receiver<()>,
+    std_mpsc::Receiver<Vec<u8>>,
+) {
+    let (idle_tx, idle_rx) = std_mpsc::channel();
+    let (output_tx, output_rx) = std_mpsc::channel();
+    let handle = PtyIoActor::spawn_with_poll_observer(
+        PtyIoActorConfig {
+            pane_id: 1,
+            master_fd: master,
+            initially_quiesced: true,
+            on_read: Box::new(move |bytes| {
+                let _ = output_tx.send(bytes.to_vec());
+                PtyReadResult::empty()
+            }),
+            on_reader_exit: None,
+        },
+        idle_tx,
+    )
+    .expect("actor spawn");
+    handle.rollback_handoff().expect("receiver starts running");
+    (handle, idle_rx, output_rx)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+#[test]
+fn keys_and_small_pastes_are_written_without_reading_the_tty_state() {
+    // Goal: nothing changes while unread input is small. 900 keys into a tty nobody reads stay
+    // under the guard's budget, so the guard never reads the tty's state (no added syscalls),
+    // and every key reaches the tty.
+    let (master, slave) = open_pty();
+    let slave = slave.as_raw_fd();
+    let canonical = termios_of(slave);
+    set_termios(slave, &line_editor_mode(&canonical));
+    let (handle, idle) = spawn_actor(master);
+    while idle.try_recv().is_ok() {}
+    for _ in 0..900 {
+        send(&handle, b"k");
+    }
+    assert_eq!(settle(slave, 900, &idle), 900, "every key reaches the tty");
+    assert_eq!(
+        handle
+            .typeahead_checks
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "900 keys must not make the guard read the tty's state"
+    );
+
+    // Sustained typing into a program that keeps reading: about one look per KiB.
+    let reader = std::thread::spawn(move || {
+        read_until(slave, Duration::from_secs(20), |read| {
+            read.len() >= 900 + 4000
+        })
+    });
+    for _ in 0..4000 {
+        send(&handle, b"k");
+    }
+    let received = reader.join().expect("reader thread");
+    let checks = handle
+        .typeahead_checks
+        .load(std::sync::atomic::Ordering::Relaxed);
+    handle.shutdown();
+    assert_eq!(received.len(), 4900, "every key reaches the program");
+    assert!(
+        checks <= 100,
+        "4900 keys into a reading program made the guard read the tty's state {checks} times"
+    );
+}
+
+#[test]
+fn a_long_unfinished_line_can_still_be_erased_and_ended() {
+    // A line longer than the guard's budget, never ended, is followed by Ctrl-U (erase the
+    // line) and a new line. Holding until the long line ends would hold its own Ctrl-U and
+    // Enter forever: the program must receive the new line.
+    let (master, slave) = open_pty();
+    let slave = slave.as_raw_fd();
+    let (handle, idle) = spawn_actor(master);
+    type_input(&handle, &idle, &[b'x'; 1500]);
+    type_input(&handle, &idle, b"\x15ok\r");
+    let received = read_until(slave, Duration::from_secs(5), |read| read.contains(&b'\n'));
+    handle.shutdown();
+    assert_eq!(
+        String::from_utf8_lossy(&received),
+        "ok\n",
+        "Ctrl-U and Enter after a 1500-character unfinished line must reach the program"
+    );
+}
+
+#[test]
+fn a_reader_waiting_for_several_bytes_receives_everything() {
+    // A raw reader with VMIN > 1 and VTIME = 0: the tty reports no unread input until VMIN
+    // bytes are there, so emptiness cannot be seen. Holding input here could starve the
+    // reader; everything must arrive.
+    let (master, slave) = open_pty();
+    let slave = slave.as_raw_fd();
+    let mut modes = line_editor_mode(&termios_of(slave));
+    modes.c_cc[libc::VMIN] = 4;
+    set_termios(slave, &modes);
+    let (handle, _idle) = spawn_actor(master);
+    let reader = std::thread::spawn(move || {
+        read_until(slave, Duration::from_secs(10), |read| read.len() >= 1500)
+    });
+    for _ in 0..3 {
+        send(&handle, &[b'y'; 500]);
+    }
+    let received = reader.join().expect("reader thread");
+    handle.shutdown();
+    assert_eq!(
+        received.len(),
+        1500,
+        "a VMIN=4 reader must receive all 1500 bytes"
+    );
+}
+
+#[test]
+fn handoff_drains_input_the_typeahead_guard_is_holding() {
+    // The tty holds 30 unread lines and has room for 15 more bytes, but the guard holds
+    // them. A live handoff drains the queued input before it moves the pane: it must not
+    // wait on the guard.
+    let (master, slave) = open_pty();
+    let slave = slave.as_raw_fd();
+    let (handle, idle) = spawn_actor(master);
+    type_lines(&handle, &idle, 30);
+    assert_eq!(settle(slave, 30 * LINE.len(), &idle), 30 * LINE.len());
+    type_input(&handle, &idle, b"echo held line\r");
+    assert_eq!(
+        settle(slave, 30 * LINE.len() + 15, &idle),
+        30 * LINE.len(),
+        "setup: the guard must hold the 15-byte line while the tty has room"
+    );
+    let handoff = handle.begin_handoff(Duration::from_secs(5));
+    let unread = unread_input(slave);
+    handle.shutdown();
+    handoff.expect("the handoff drains the held line");
+    assert_eq!(
+        unread,
+        30 * LINE.len() + 15,
+        "the held line reached the tty"
+    );
+}
+
+#[test]
+fn a_handoff_receiver_lets_a_line_typed_before_the_handoff_continue() {
+    // A line was half typed before a live handoff, so it sits unfinished in the tty and the
+    // receiving server knows nothing about it. Further keys of that line must reach the tty at
+    // once, not wait for a line end the user has not typed.
+    let (master, slave) = open_pty();
+    let slave = slave.as_raw_fd();
+    let typed_before = b"echo par";
+    assert_eq!(
+        unsafe {
+            libc::write(
+                master.as_raw_fd(),
+                typed_before.as_ptr().cast(),
+                typed_before.len(),
+            )
+        },
+        typed_before.len() as isize
+    );
+    let (handle, idle, output) = spawn_handoff_receiver(master);
+    type_input(&handle, &idle, b"tial");
+    // The tty echoes what it receives: "tial" echoed means it arrived.
+    let echoed = collect_output(&output, Duration::from_secs(3), |out| {
+        contains(out, b"tial")
+    });
+    type_input(&handle, &idle, &[b'x'; 1200]);
+    type_input(&handle, &idle, b"\x15ok\r");
+    let received = read_until(slave, Duration::from_secs(5), |read| read.contains(&b'\n'));
+    handle.shutdown();
+    assert!(
+        contains(&echoed, b"tial"),
+        "keys continuing a line typed before the handoff must reach the tty without a line end"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&received),
+        "ok\n",
+        "Ctrl-U and Enter after a long unfinished line must reach the program"
+    );
+}
+
+#[test]
+fn an_agent_submission_larger_than_the_tty_ring_arrives_intact() {
+    // An agent submission (text, a pause, then Enter) of 40 lines into a program that reads
+    // line by line, slowly: the guard holds part of the text, and Enter must still follow
+    // the complete text.
+    let (master, slave) = open_pty();
+    let slave = slave.as_raw_fd();
+    let mut modes = termios_of(slave);
+    modes.c_lflag &= !libc::ECHO;
+    set_termios(slave, &modes);
+    let (handle, _idle) = spawn_actor(master);
+    let text = LINE.repeat(40);
+    let reply = handle
+        .queue_user_input_submission(
+            Bytes::from(text),
+            Bytes::from_static(b"\r"),
+            Duration::from_millis(10),
+        )
+        .expect("submission queued");
+    let mut received = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while count_line_ends(&received) < 41 && Instant::now() < deadline {
+        // One line at a time, with a pause: a slow line-by-line reader.
+        let line = read_until(slave, Duration::from_millis(500), |read| {
+            read.contains(&b'\n')
+        });
+        received.extend_from_slice(&line);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let outcome = reply.recv_timeout(Duration::from_secs(5));
+    handle.shutdown();
+    let expected = [line_as_read().repeat(40), b"\n".to_vec()].concat();
+    assert!(
+        received == expected,
+        "received {} of {} bytes; first difference at byte {:?}",
+        received.len(),
+        expected.len(),
+        received
+            .iter()
+            .zip(expected.iter())
+            .position(|(got, want)| got != want)
+    );
+    assert!(
+        matches!(outcome, Ok(Ok(()))),
+        "the submission completes: {outcome:?}"
+    );
 }
