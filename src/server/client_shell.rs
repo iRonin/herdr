@@ -980,6 +980,110 @@ mod tests {
             .collect()
     }
 
+    /// The rows of a frame's scrollbar thumb, `(top, len)`, drawn beside the pane.
+    fn drawn_thumb(rendered: &RenderedPaneSurface) -> (u16, u16) {
+        let pane = &rendered.panes[0];
+        assert!(
+            pane.focused,
+            "a focused pane draws its thumb as a full block"
+        );
+        let track = pane
+            .scrollbar_rect
+            .expect("the pane reserves a scrollbar column");
+        let width = usize::from(rendered.frame.width);
+        let rows: Vec<u16> = (track.y..track.y + track.height)
+            .filter(|y| {
+                rendered.frame.cells[usize::from(*y) * width + usize::from(track.x)].symbol
+                    == "\u{2590}"
+            })
+            .collect();
+        assert!(!rows.is_empty(), "the thumb is drawn");
+        (rows[0], rows.len() as u16)
+    }
+
+    /// The scrollbar thumb is drawn into the same frame as the cells. With the view
+    /// scrolled up onto history, output moves nothing on screen but moves the thumb;
+    /// output that lands after the pane's cells are drawn must not move the thumb of
+    /// that frame, nor its metrics.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pane_scrollbar_thumb_matches_its_cells_when_output_lands_mid_render() {
+        let (mut app, target) = numbered_lines_app(30);
+        render_numbered(&mut app, target);
+        test_print_numbered_lines(&app, 30..40);
+        let quiet = render_numbered(&mut app, target);
+        let track = quiet.panes[0].scrollbar_rect.expect("scrollbar column");
+        let track = Rect::new(track.x, track.y, track.width, track.height);
+        let at_bottom = quiet.panes[0].scroll.expect("scroll metrics");
+        let metrics = |offset: u64, max: u64| crate::pane::ScrollMetrics {
+            offset_from_bottom: offset as usize,
+            max_offset_from_bottom: max as usize,
+            viewport_rows: at_bottom.viewport_rows as usize,
+        };
+        let thumb = |offset, max| {
+            crate::ui::scrollbar_thumb(metrics(offset, max), track)
+                .map(|thumb| (thumb.top, thumb.len))
+                .expect("thumb")
+        };
+        // A view position where three more lines of history move the thumb, so
+        // this test can tell the two apart.
+        let max = at_bottom.max_offset_from_bottom;
+        let offset = (1..max)
+            .find(|offset| thumb(*offset, max) != thumb(offset + 3, max + 3))
+            .expect("some view position moves the thumb");
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        app.state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane)
+            .expect("pane runtime")
+            .set_scroll_offset_from_bottom(offset as usize);
+
+        let control = render_numbered(&mut app, target);
+        let control_rows = numbered_rows(&control);
+        assert_eq!(
+            control.panes[0]
+                .scroll
+                .map(|scroll| scroll.offset_from_bottom),
+            Some(offset),
+            "control: the view is scrolled up"
+        );
+        assert_eq!(drawn_thumb(&control), thumb(offset, max), "control");
+
+        let mut fired = false;
+        let hook = crate::ui::test_after_pane_cells_rendered(move |runtime| {
+            if !std::mem::replace(&mut fired, true) {
+                runtime.test_process_pty_bytes(b"L040\r\nL041\r\nL042\r\n");
+            }
+        });
+        let raced = render_numbered(&mut app, target);
+        drop(hook);
+        assert_eq!(
+            numbered_rows(&raced),
+            control_rows,
+            "the view stays on history: the cells do not move"
+        );
+        assert_eq!(
+            drawn_thumb(&raced),
+            thumb(offset, max),
+            "the thumb is drawn for the cells beside it, not for the output after them"
+        );
+        assert_eq!(
+            raced.panes[0]
+                .scroll
+                .map(|scroll| (scroll.offset_from_bottom, scroll.max_offset_from_bottom)),
+            Some((offset, max)),
+            "the frame's metrics are the ones its cells and thumb were drawn with"
+        );
+
+        let after = render_numbered(&mut app, target);
+        assert_eq!(
+            after.panes[0]
+                .scroll
+                .map(|scroll| (scroll.offset_from_bottom, scroll.max_offset_from_bottom)),
+            Some((offset + 3, max + 3)),
+            "the output did reach the pane, and kept the view on history"
+        );
+        assert_eq!(drawn_thumb(&after), thumb(offset + 3, max + 3));
+    }
+
     /// A frame's scroll metrics must describe the cells the same frame carries: the
     /// client turns a clicked screen row into an absolute row with them, and a
     /// double-click anchors its word there. Output that lands after a pane's cells
