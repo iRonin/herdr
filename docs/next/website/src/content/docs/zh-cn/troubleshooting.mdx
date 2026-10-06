@@ -95,6 +95,14 @@ herdr
 
 如果新启动的服务器仍出现此问题，请在 `herdr-server.log` 中查找 `could not select persistent user service context`。所需的 macOS API 不可用时，Herdr 会保留继承的上下文。详情见 [Herdr issue #4100](https://github.com/herdrdev/herdr/issues/4100)。
 
+## macOS 上粘贴的内容随程序读取逐步到达
+
+在 macOS 上，当窗格中约 1 KB 的输入尚未被读取时，Herdr 会暂缓其余输入，并在程序读取时继续发送。因此，长段粘贴，或在 shell 仍在启动、正在运行命令时提前输入的文本，会分批到达，而不是一次全部到达。按键和短粘贴不受影响。如果不暂缓，程序切换输入模式时，macOS 可能损坏尚未读取的输入，shell 可能执行与输入不同的命令，例如某一行变成 `pppp…`。
+
+暂缓输入期间，`ctrl+c`、`ctrl+\` 和 `ctrl+z` 仍会立即生效，暂缓的输入会像终端在中断时丢弃未读输入一样被丢弃。程序使用流量控制时，`ctrl+s` 和 `ctrl+q` 也会立即生效。
+
+对于按固定大小的块读取且不设超时的程序（`VMIN` 大于 1 的 raw 模式），Herdr 无法判断它是否已读完全部输入，因此不会暂缓；实时移交迁移会话期间也不会暂缓。暂缓只针对 Herdr 写入窗格的输入，其他程序写入同一终端的内容不在此列。
+
 ## 找不到 `herdr` 命令
 
 重启终端以重新加载环境，然后确认 Herdr 安装目录位于 `PATH` 中。通过软件包管理器安装的 Herdr 必须通过该管理器更新并加入环境。见[安装 Herdr](/zh-cn/docs/install/#verify)。
