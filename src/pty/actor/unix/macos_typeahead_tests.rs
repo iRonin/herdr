@@ -1041,3 +1041,74 @@ fn settle_waits_through_a_stall_in_the_middle_of_a_fill() {
         "settle must wait through a 5 s stall for all 30 lines, not return a partial count"
     );
 }
+
+/// A PTY actor runner driven synchronously by the test (no actor thread), writing into `master`.
+fn runner_for_pty(master: OwnedFd) -> PtyIoActorRunner {
+    fd::set_nonblocking(master.as_raw_fd()).expect("nonblocking master");
+    let (_data_tx, data_rx) = mpsc::channel(ACTOR_COMMAND_BUFFER);
+    let (_control_tx, control_rx) = std_mpsc::channel();
+    PtyIoActorRunner {
+        pane_id: 1,
+        file: std::fs::File::from(master),
+        data_rx,
+        control_rx,
+        state: ActorState::Running,
+        pending_writes: VecDeque::new(),
+        current_write_offset: 0,
+        active_submission: None,
+        pending_handoff: None,
+        wake_read_fd: fd::create_wake_pipe().expect("wake pipe").read_fd,
+        controls: Arc::new(Mutex::new(SharedPtyControls::default())),
+        response_order: Arc::new(Mutex::new(())),
+        on_read: Box::new(|_| PtyReadResult::empty()),
+        on_reader_exit: None,
+        poll_observer: None,
+        typeahead_guard: super::macos_typeahead_guard::TypeaheadGuard::new(true),
+    }
+}
+
+#[test]
+fn a_long_line_allowance_ends_when_the_tty_leaves_canonical_mode() {
+    // A canonical line longer than the guard's budget is let through to its end, which is
+    // safe only while the tty stays canonical. Here the program switches to raw mode between
+    // two writes of that allowance and reads part of its input, as a line editor or TUI that
+    // starts up does. Writing the rest of the allowance then would run unread input past the
+    // ring's end: the guard must look again and hold it.
+    let (master, slave) = open_pty();
+    let slave_fd = slave.as_raw_fd();
+    let mut canonical = termios_of(slave_fd);
+    canonical.c_lflag &= !libc::ECHO;
+    set_termios(slave_fd, &canonical);
+    let mut runner = runner_for_pty(master);
+    let switched = Arc::new(Mutex::new(None::<usize>));
+    let switched_in_hook = Arc::clone(&switched);
+    runner.typeahead_guard.before_cached_write = Some(Box::new(move || {
+        let mut switched = switched_in_hook.lock().expect("hook state");
+        if switched.is_none() {
+            set_termios(slave_fd, &line_editor_mode(&canonical));
+            let read = read_exactly(slave_fd, 600, Duration::from_secs(5));
+            *switched = Some(read.len());
+        }
+    }));
+    // Two queued writes, no line end: the budget takes 1000 bytes, then the current-line
+    // allowance covers the rest, written as two writes.
+    runner.enqueue_write(Bytes::from(vec![b'x'; 1500]));
+    runner.enqueue_write(Bytes::from(vec![b'y'; 500]));
+    runner
+        .flush_pending_writes_once()
+        .expect("flush the queued input");
+    let read_at_switch = *switched.lock().expect("hook state");
+    assert_eq!(
+        read_at_switch,
+        Some(600),
+        "setup: the program must switch to raw mode and read 600 bytes between two writes of \
+         the allowance"
+    );
+    // The tty held 1024 bytes of the line (the rest overflowed); 600 were read.
+    assert_eq!(
+        unread_input(slave_fd),
+        424,
+        "with 424 bytes unread in slots 600..1023, the guard must hold the rest of the \
+         allowance instead of writing it past the ring's end"
+    );
+}
