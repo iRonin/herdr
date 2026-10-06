@@ -22,7 +22,7 @@ use std::{
 };
 
 /// Upper bound on the ring slots unread input may use: a margin under the 1024-slot ring.
-const RING_BUDGET: usize = 1000;
+pub(super) const RING_BUDGET: usize = 1000;
 /// How many written bytes are remembered to find the current line's start.
 const TAIL: usize = 1024;
 /// First re-check after the guard starts holding.
