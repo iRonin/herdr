@@ -41,6 +41,7 @@ fn pasted_help_and_copy_queries_normalize_single_line_text() {
         search_generation: 0,
         copy_after_search: false,
         selection_renumbered: false,
+        total_rows: 0,
     });
 
     assert!(state.insert_copy_search_text("needle\r\n"));

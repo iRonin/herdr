@@ -3,14 +3,17 @@ use super::*;
 /// The numbering a mouse selection's rows were taken in. Rows count from the
 /// top of the pane's retained history (`crate::selection`), so when a full
 /// scrollback drops its oldest lines, or the history is cleared, every row
-/// number names a later line. The client sees that as `max_offset_from_bottom`
-/// falling between two updates. Output larger than the dropped lines between two
-/// updates hides the drop (a known limitation).
+/// number names a later line. The client sees that as the pane's total rows
+/// (`history_rows`) falling between two updates. Not `max_offset_from_bottom`
+/// alone: a terminal that grows taller lowers it by the growth while every row
+/// keeps its line. Known limitations: output larger than the dropped lines
+/// between two updates hides the drop, and so does a narrower terminal, whose
+/// reflow renumbers rows while the total rises.
 #[derive(Debug)]
 pub(super) struct SelectionRows {
     pane_id: String,
-    /// The pane's `max_offset_from_bottom` in the last update seen.
-    max_offset_from_bottom: usize,
+    /// The pane's total rows (`history_rows`) in the last update seen.
+    total_rows: usize,
 }
 
 /// A plain selection dropped because its rows were renumbered, until the gesture
@@ -23,8 +26,13 @@ pub(super) struct RenumberedSelection {
     kept: bool,
 }
 
-fn max_offset(scroll: Option<crate::pane::ScrollMetrics>) -> usize {
-    scroll.map_or(0, |scroll| scroll.max_offset_from_bottom)
+/// History plus view: the rows a selection's row numbers index.
+pub(super) fn history_rows(scroll: Option<crate::pane::ScrollMetrics>) -> usize {
+    scroll.map_or(0, |scroll| {
+        scroll
+            .max_offset_from_bottom
+            .saturating_add(scroll.viewport_rows)
+    })
 }
 
 impl ClientShellState {
@@ -34,7 +42,7 @@ impl ClientShellState {
         self.renumbered_selection = None;
         self.selection_rows = Some(SelectionRows {
             pane_id: hit.pane_id.clone(),
-            max_offset_from_bottom: max_offset(hit.scroll),
+            total_rows: history_rows(hit.scroll),
         });
     }
 
@@ -55,9 +63,14 @@ impl ClientShellState {
         let Some(scroll) = pane.scroll else {
             return;
         };
-        let max = usize::try_from(scroll.max_offset_from_bottom).unwrap_or(usize::MAX);
-        if max >= rows.max_offset_from_bottom {
-            rows.max_offset_from_bottom = max;
+        let total = usize::try_from(
+            scroll
+                .max_offset_from_bottom
+                .saturating_add(scroll.viewport_rows),
+        )
+        .unwrap_or(usize::MAX);
+        if total >= rows.total_rows {
+            rows.total_rows = total;
             return;
         }
         self.selection_rows = None;
