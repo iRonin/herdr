@@ -2147,6 +2147,16 @@ impl HeadlessServer {
                 if let Some(message) = projection_message {
                     self.send_to_client(client_id, message);
                 }
+                // Test seam, debug builds only: hold back an attaching shell client's first
+                // snapshot, so integration tests can type into a client that is connected but
+                // has no snapshot yet without loading the machine.
+                #[cfg(debug_assertions)]
+                if let Some(delay) = std::env::var("HERDR_TEST_SHELL_SNAPSHOT_DELAY_MS")
+                    .ok()
+                    .and_then(|ms| ms.parse::<u64>().ok())
+                {
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
                 self.send_to_client(client_id, snapshot_message);
                 if surface_active {
                     self.foreground_client_id = Some(client_id);

@@ -1043,6 +1043,221 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
     }
 }
 
+struct RecordedStartup {
+    base: PathBuf,
+    api_socket: PathBuf,
+    client: SpawnedHerdr,
+    output: SharedOutput,
+    input: Box<dyn Write + Send>,
+    recording: PathBuf,
+    _server_guard: LocalServerGuard,
+}
+
+impl RecordedStartup {
+    /// Starts a client whose server holds back the client's first snapshot for `delay_ms` (a
+    /// debug-build test seam, no load) and whose pane "shell" records every byte herdr writes
+    /// into the pane. `saved`: None for no saved endpoint, Some(select_remote) for a saved SSH
+    /// endpoint that never answers, with Local or that remote selected at startup.
+    fn start(saved: Option<bool>, delay_ms: u64) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = unique_test_dir();
+        let config_home = base.join("config");
+        let runtime_dir = base.join("runtime");
+        let api_socket = runtime_dir.join("herdr.sock");
+        fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
+        fs::write(
+            config_home.join(app_dir_name()).join("config.toml"),
+            "onboarding = false\n",
+        )
+        .unwrap();
+        let catalog_dir = runtime_dir
+            .join("state")
+            .join(app_dir_name())
+            .join("client");
+        fs::create_dir_all(&catalog_dir).unwrap();
+        let profile = "0123456789abcdef0123456789abcdef";
+        if let Some(select_remote) = saved {
+            fs::write(catalog_dir.join("endpoints.json"), serde_json::json!({
+                "version": 1, "selected_profile": select_remote.then_some(profile),
+                "ssh": [{"id": profile, "label": "Unreachable remote", "target": "test-only", "session": "default", "enabled": true}],
+            }).to_string()).unwrap();
+        }
+        let bin = base.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        // An unreachable host: the connection neither succeeds nor fails while the client
+        // starts. It gives up once the client is gone, and after 60 s at most.
+        fs::write(
+            bin.join("ssh"),
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 300 ] && kill -0 $PPID 2>/dev/null; do i=$((i+1)); sleep 0.2; done\nexit 255\n",
+        )
+        .unwrap();
+        fs::set_permissions(bin.join("ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+        // The pane's shell: raw mode, no echo, every byte appended to the recording.
+        let recording = base.join("pane-input");
+        let recorder = bin.join("record-pane-input");
+        fs::write(
+            &recorder,
+            format!(
+                "#!/bin/sh\n/bin/stty raw -echo\nexec /bin/cat >> '{}'\n",
+                recording.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&recorder, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let recorder_path = recorder.display().to_string();
+        let delay = delay_ms.to_string();
+        let server_guard = LocalServerGuard {
+            api_socket: api_socket.clone(),
+        };
+        let client = spawn_client_process_with_args_and_env(
+            &config_home,
+            &runtime_dir,
+            &api_socket,
+            &[],
+            &[
+                ("PATH", &path),
+                ("SHELL", &recorder_path),
+                ("HERDR_TEST_SHELL_SNAPSHOT_DELAY_MS", &delay),
+            ],
+        );
+        let output = spawn_pty_drain(client._master.as_ref().unwrap().try_clone_reader().unwrap());
+        let input = client._master.as_ref().unwrap().take_writer().unwrap();
+        Self {
+            base,
+            api_socket,
+            client,
+            output,
+            input,
+            recording,
+            _server_guard: server_guard,
+        }
+    }
+
+    fn type_key(&mut self, key: u8) {
+        self.input.write_all(&[key]).unwrap();
+        self.input.flush().unwrap();
+    }
+
+    /// What the pane received. Keys typed before the client switches its terminal to raw mode,
+    /// or before the pane's recorder switches the pane's, pass a terminal that maps CR to LF.
+    /// That mapping is the terminal driver's, not herdr's, so line ends are unified.
+    fn received(&self) -> String {
+        String::from_utf8_lossy(&fs::read(&self.recording).unwrap_or_default()).replace('\r', "\n")
+    }
+
+    /// Waits until the pane holds at least `expected`'s length, then a little longer so that
+    /// any surplus shows, and returns what it received.
+    fn settle(&self, expected: &str) -> String {
+        wait_until(Duration::from_secs(15), Duration::from_millis(50), || {
+            self.received().len() >= expected.len()
+        });
+        thread::sleep(Duration::from_millis(300));
+        self.received()
+    }
+
+    fn finish(mut self) {
+        assert!(
+            self.client.child.try_wait().unwrap().is_none(),
+            "client must keep running: {}",
+            read_output(&self.output)
+        );
+        let _ = send_json_request(
+            &self.api_socket,
+            r#"{"id":"stop","method":"server.stop","params":{}}"#,
+        );
+        let base = self.base.clone();
+        drop(self);
+        cleanup_test_base(&base);
+    }
+}
+
+/// Keys typed while a client starts must reach the pane complete and in order: never a tail,
+/// a gap or a reordering. The client is connected but has no snapshot, so no pane to send keys
+/// to, and the typing runs across the moment its first snapshot arrives. Three startups: no
+/// saved endpoint, and a saved SSH endpoint that never answers with Local or the remote
+/// selected.
+#[test]
+fn startup_keys_typed_before_the_first_snapshot_reach_the_pane_whole() {
+    let _lock = test_lock();
+    let mut failures = Vec::new();
+    for saved in [None, Some(false), Some(true)] {
+        let mut startup = RecordedStartup::start(saved, 1500);
+        let typed = (1..=30)
+            .map(|line| {
+                format!(
+                    "echo L{line:02}{}\r",
+                    char::from(b'a' + (line % 26) as u8).to_string().repeat(6)
+                )
+            })
+            .collect::<String>();
+        let started = Instant::now();
+        let mut empty_at_one_second = None;
+        let mut delivered_while_typing = false;
+        for (index, key) in typed.bytes().enumerate() {
+            startup.type_key(key);
+            thread::sleep(Duration::from_millis(10));
+            if empty_at_one_second.is_none() && started.elapsed() >= Duration::from_secs(1) {
+                empty_at_one_second = Some(startup.received().is_empty());
+            }
+            if index + 1 < typed.len() && !startup.received().is_empty() {
+                delivered_while_typing = true;
+            }
+        }
+        // Both guards keep the check from passing vacuously: the snapshot really was late (no
+        // key reached the pane during the first second of typing), and it arrived while keys
+        // were still being typed, so the typing crossed it.
+        assert_eq!(
+            empty_at_one_second,
+            Some(true),
+            "the first snapshot must still be held back after 1 s of typing (saved endpoint {saved:?})"
+        );
+        assert!(
+            delivered_while_typing,
+            "the first snapshot must arrive before the typing ends (saved endpoint {saved:?})"
+        );
+        let expected = typed.replace('\r', "\n");
+        let got = startup.settle(&expected);
+        if got != expected {
+            failures.push(format!(
+                "saved endpoint {saved:?}: typed {expected:?}, the pane received {got:?}"
+            ));
+        }
+        startup.finish();
+    }
+    assert!(
+        failures.is_empty(),
+        "every typed key must reach the pane once, in order:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// A line typed entirely before the client's first snapshot, with nothing typed after it, must
+/// still reach the pane once the snapshot arrives: the client must not wait for another key.
+#[test]
+fn a_line_typed_only_before_the_first_snapshot_arrives_without_further_typing() {
+    let _lock = test_lock();
+    let mut startup = RecordedStartup::start(None, 1500);
+    let typed = "echo only-before-the-snapshot\r";
+    for key in typed.bytes() {
+        startup.type_key(key);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        startup.received(),
+        "",
+        "the first snapshot must still be held back when the typing ends"
+    );
+    let expected = typed.replace('\r', "\n");
+    assert_eq!(startup.settle(&expected), expected);
+    startup.finish();
+}
+
 #[test]
 fn federated_client_starts_without_local_and_survives_its_restart() {
     use std::os::unix::fs::PermissionsExt;
