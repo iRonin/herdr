@@ -581,3 +581,61 @@ fn the_no_copy_notice_is_drawn_in_red() {
         .collect();
     assert_eq!(text, NOT_COPIED);
 }
+
+/// Keyboard copy mode numbers rows the same way (measured on the real client:
+/// a `v` selection held across a trim copied lines 273 later). A selection in
+/// copy mode is dropped at once when its rows are renumbered, and `y` then
+/// copies nothing and says so. With output alone `y` copies what was selected.
+#[test]
+fn copy_mode_selection_renumbered_before_y_copies_nothing_and_says_so() {
+    let mut failures = Vec::new();
+    for offset in [0, 40] {
+        for renumber in [true, false] {
+            let case = format!("offset {offset} renumber {renumber}");
+            let mut terminal = TrimTerminal::new(60, offset);
+            let mut state = trim_state(true, &mut terminal);
+            let top = terminal.top();
+            let expected = format!("{}\na", terminal.row(top + 1));
+            let mut enter = ClientShellInput::default();
+            state.record_binding(
+                crate::input::KeybindMatch::Action(crate::input::KeybindAction::CopyMode),
+                &mut enter,
+            );
+            for byte in [b"k", b"k", b"v", b"j"] {
+                state.handle_input_bytes(byte);
+            }
+            if state.selection.as_ref().map(|s| s.ordered_cells())
+                != Some(((top as u32 + 1, 0), (top as u32 + 2, 0)))
+            {
+                failures.push(format!(
+                    "{case}: copy-mode selection {:?}",
+                    state.selection.as_ref().map(|s| s.ordered_cells())
+                ));
+                continue;
+            }
+            terminal.output(1);
+            if renumber {
+                terminal.trim(10);
+            }
+            deliver(&mut state, &mut terminal, Delivery::Surface);
+            if renumber && state.selection.is_some() {
+                failures.push(format!("{case}: highlight kept over renumbered rows"));
+            }
+            let copy = state.handle_input_bytes(b"y");
+            let (reads, copied) = serve(&mut state, &terminal, copy.actions);
+            if renumber {
+                if reads != 0 || !copied.is_empty() {
+                    failures.push(format!("{case}: {reads} reads, copied {copied:?}"));
+                }
+                if notice(&state) != Some(NOT_COPIED) {
+                    failures.push(format!("{case}: notice {:?}", notice(&state)));
+                }
+            } else if copied != [expected.clone()] {
+                failures.push(format!(
+                    "{case}: control copied {copied:?}, want {expected:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
