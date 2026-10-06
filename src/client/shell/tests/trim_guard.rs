@@ -18,6 +18,8 @@ struct TrimTerminal {
     offset: usize,
     content_revision: u64,
     surface_revision: u64,
+    /// The next surfaces carry no scroll metrics (a transient frame).
+    scroll_hidden: bool,
 }
 
 impl TrimTerminal {
@@ -28,6 +30,7 @@ impl TrimTerminal {
             offset: 0,
             content_revision: 0,
             surface_revision: 1,
+            scroll_hidden: false,
         };
         terminal.push(lines);
         terminal.offset = offset;
@@ -98,7 +101,7 @@ impl TrimTerminal {
         pane.rect.width = buffer.area.width;
         pane.rect.height = buffer.area.height;
         pane.inner_rect = pane.rect;
-        pane.scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        pane.scroll = (!self.scroll_hidden).then(|| crate::protocol::PaneSurfaceScrollMetrics {
             offset_from_bottom: self.offset as u64,
             max_offset_from_bottom: self.max() as u64,
             viewport_rows: VIEW as u64,
@@ -742,4 +745,112 @@ fn a_trim_after_the_history_grew_still_renumbers_a_held_drag() {
         assert_eq!((reads, copied), (0, Vec::<String>::new()), "{delivery:?}");
         assert_eq!(notice(&state), Some(NOT_COPIED), "{delivery:?}");
     }
+}
+
+/// A double-click never extended keeps its word across a renumbering, but only
+/// while the pointer stays on it. Dragging off it afterwards selects rows that
+/// name other lines, so the release copies nothing and says so, even if the
+/// pointer comes back. A slip inside the word's screen cells is not a drag.
+#[test]
+fn double_click_dragged_only_after_a_renumbering_copies_nothing_and_says_so() {
+    let mut failures = Vec::new();
+    for offset in [0, 40] {
+        for (motion, copies_word) in [
+            (&[(2, 18)][..], false),
+            (&[(2, 18), (1, 8)][..], false),
+            (&[(1, 10)][..], true),
+        ] {
+            let case = format!("offset {offset} motion {motion:?}");
+            let mut terminal = TrimTerminal::new(60, offset);
+            let mut state = trim_state(true, &mut terminal);
+            let word = terminal.row(terminal.top() + 1)[6..14].to_owned();
+            mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 1, 8);
+            mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 1, 8);
+            mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 1, 8);
+            terminal.output(1);
+            terminal.trim(10);
+            deliver(&mut state, &mut terminal, Delivery::Surface);
+            let mut actions = Vec::new();
+            for &(row, col) in motion {
+                actions.extend(
+                    mouse(
+                        &mut state,
+                        MouseEventKind::Drag(MouseButton::Left),
+                        row,
+                        col,
+                    )
+                    .actions,
+                );
+            }
+            let (row, col) = *motion.last().unwrap();
+            actions
+                .extend(mouse(&mut state, MouseEventKind::Up(MouseButton::Left), row, col).actions);
+            let (reads, copied) = serve(&mut state, &terminal, actions);
+            let (want_copy, want_notice) = if copies_word {
+                (vec![word.clone()], COPIED)
+            } else {
+                (Vec::new(), NOT_COPIED)
+            };
+            if reads != 0 || copied != want_copy || notice(&state) != Some(want_notice) {
+                failures.push(format!(
+                    "{case}: {reads} reads, copied {copied:?} want {want_copy:?}, notice {:?}",
+                    notice(&state)
+                ));
+            }
+            if state.selection.is_some() {
+                failures.push(format!("{case}: highlighted over renumbered rows"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A frame without scroll metrics says nothing about the history: it is not a
+/// renumbering. A held drag and a kept selection across one still copy exactly
+/// what was selected.
+#[test]
+fn a_frame_without_scroll_metrics_is_not_a_renumbering() {
+    let mut failures = Vec::new();
+    for offset in [0, 40] {
+        for copy_on_select in [true, false] {
+            let case = format!("offset {offset} copy_on_select {copy_on_select}");
+            let mut terminal = TrimTerminal::new(60, offset);
+            let mut state = trim_state(copy_on_select, &mut terminal);
+            let top = terminal.top();
+            let expected = format!(
+                "{}\n{}",
+                terminal.row(top + 1),
+                &terminal.row(top + 2)[..13]
+            );
+            mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 1, 0);
+            mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 2, 12);
+            let mut actions = Vec::new();
+            if !copy_on_select {
+                actions.extend(
+                    mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 2, 12).actions,
+                );
+            }
+            terminal.scroll_hidden = true;
+            deliver(&mut state, &mut terminal, Delivery::Surface);
+            terminal.scroll_hidden = false;
+            deliver(&mut state, &mut terminal, Delivery::Surface);
+            if state.selection.is_none() {
+                failures.push(format!("{case}: selection dropped"));
+            }
+            let finish = if copy_on_select {
+                mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 2, 12)
+            } else {
+                key(&mut state, KeyCode::Char('c'), KeyModifiers::CONTROL)
+            };
+            actions.extend(finish.actions);
+            let (_, copied) = serve(&mut state, &terminal, actions);
+            if copied != [expected.clone()] || notice(&state) != Some(COPIED) {
+                failures.push(format!(
+                    "{case}: copied {copied:?} want {expected:?}, notice {:?}",
+                    notice(&state)
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
