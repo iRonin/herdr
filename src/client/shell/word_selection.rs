@@ -35,6 +35,9 @@ pub(super) struct ClientWordSelection {
     /// The pane's rows were renumbered (`history_rows`): every row this gesture
     /// holds names another line now. It keeps only its frozen word.
     pub(super) renumbered: bool,
+    /// It was renumbered while extended past its word: what was selected is
+    /// gone, so the release copies nothing and says so.
+    dropped: bool,
     pub(super) dragged: bool,
     pub(super) released: bool,
 }
@@ -196,6 +199,7 @@ impl ClientShellState {
             pending_row: None,
             ignored_row: None,
             renumbered: false,
+            dropped: false,
             dragged: false,
             released: false,
         });
@@ -280,13 +284,16 @@ impl ClientShellState {
     }
 
     /// The pane's rows were renumbered while the double-click is held. Its word
-    /// and range rows name other lines now, so nothing can be highlighted: keep
-    /// only the frozen word, which the release copies.
+    /// and range rows name other lines now, so nothing can be highlighted. A
+    /// double-click never extended keeps its frozen word, which the release
+    /// copies; one extended past it is dropped: copying the word alone would
+    /// hand over less than was selected.
     pub(super) fn word_selection_renumbered(&mut self) {
         let Some(gesture) = self.word_selection_gesture.as_mut() else {
             return;
         };
         gesture.renumbered = true;
+        gesture.dropped = gesture.extended;
         gesture.word_replaced = true;
         gesture.extended = false;
         gesture.cached_row = None;
@@ -414,6 +421,12 @@ impl ClientShellState {
             let Some(gesture) = self.word_selection_gesture.take() else {
                 return;
             };
+            if gesture.dropped {
+                self.selection = None;
+                self.show_copy_failed_feedback(std::time::Instant::now());
+                outcome.repaint = true;
+                return;
+            }
             if let Some(selection) = self.selection.as_mut() {
                 selection.finish();
             }
