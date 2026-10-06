@@ -1023,6 +1023,7 @@ fn error_response_json(id: String, code: &str, message: String) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::test_support::TestTempPath;
     use interprocess::local_socket::traits::Listener as _;
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader};
@@ -1051,12 +1052,12 @@ mod tests {
         line
     }
 
-    fn local_stream_pair(name: &str) -> (LocalStream, LocalStream, PathBuf) {
+    fn local_stream_pair(name: &str) -> (LocalStream, LocalStream, TestTempPath) {
         let path = unique_test_path(name);
         let listener = crate::ipc::bind_local_listener(&path).unwrap();
         let client = crate::ipc::connect_local_stream(&path).unwrap();
         let server = listener.accept().unwrap();
-        (client, server, path)
+        (client, server, TestTempPath::owns(path))
     }
 
     fn pane_info(
@@ -1201,6 +1202,7 @@ mod tests {
     #[test]
     fn restrict_socket_permissions_sets_user_only_mode() {
         let dir = unique_test_path("socket-perms");
+        let _dir_guard = TestTempPath::owns(dir.clone());
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("api.sock");
         let _listener = UnixListener::bind(&path).unwrap();

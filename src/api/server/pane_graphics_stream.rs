@@ -632,9 +632,9 @@ mod tests {
     #[cfg(unix)]
     use crate::api::EventHub;
     use crate::ipc::LocalStream;
+    use crate::test_support::TestTempPath;
     use interprocess::local_socket::traits::Listener as _;
     use std::io::{BufRead, BufReader, Write};
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -642,7 +642,7 @@ mod tests {
 
     static NEXT_LOCAL_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
-    fn local_stream_pair(_name: &str) -> (LocalStream, LocalStream, PathBuf) {
+    fn local_stream_pair(_name: &str) -> (LocalStream, LocalStream, TestTempPath) {
         let unique = format!(
             "hpg-{}-{}.sock",
             std::process::id(),
@@ -652,7 +652,7 @@ mod tests {
         let listener = crate::ipc::bind_local_listener(&path).unwrap();
         let client = crate::ipc::connect_local_stream(&path).unwrap();
         let server = listener.accept().unwrap();
-        (client, server, path)
+        (client, server, TestTempPath::owns(path))
     }
 
     fn read_response_line(stream: &mut LocalStream) -> String {
