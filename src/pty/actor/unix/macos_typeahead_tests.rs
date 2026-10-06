@@ -962,3 +962,36 @@ fn an_agent_submission_larger_than_the_tty_ring_arrives_intact() {
         "the submission completes: {outcome:?}"
     );
 }
+
+#[test]
+fn settle_waits_through_a_stall_in_the_middle_of_a_fill() {
+    // The tests' `settle` helper must wait for the count it was asked for. On a busy Mac the
+    // PTY actor's writes can stall for seconds in the middle of a fill; a helper that stops as
+    // soon as the count looks steady then returns a partial count and the test fails in its
+    // own setup (ledger #58: 363 of 990 bytes, at load about 198). Here the input itself stops
+    // for 5 s after 10 of 30 lines, longer than any steadiness window the helper could use.
+    let (master, slave) = open_pty();
+    let slave = slave.as_raw_fd();
+    let (handle, idle) = spawn_actor(master);
+    while idle.try_recv().is_ok() {}
+    let feeder = {
+        let handle = handle.clone();
+        std::thread::spawn(move || {
+            for _ in 0..10 {
+                send(&handle, LINE);
+            }
+            std::thread::sleep(Duration::from_secs(5));
+            for _ in 0..20 {
+                send(&handle, LINE);
+            }
+        })
+    };
+    let unread = settle(slave, 30 * LINE.len(), &idle);
+    feeder.join().expect("feeder thread");
+    handle.shutdown();
+    assert_eq!(
+        unread,
+        30 * LINE.len(),
+        "settle must wait through a 5 s stall for all 30 lines, not return a partial count"
+    );
+}
