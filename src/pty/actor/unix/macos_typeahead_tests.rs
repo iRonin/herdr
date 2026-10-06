@@ -361,7 +361,9 @@ fn ctrl_c_scenario_in(lines: usize, raw: bool) -> (usize, Option<String>, usize)
     let accepted_lines = lines.min(30);
     let unread = if raw {
         // In raw mode the tty reports every unread byte, partial lines included. The guard
-        // stops at its budget, while the tty would take 1022.
+        // stops at exactly its budget, however the input is chunked: on a fresh pty it counts
+        // every accepted byte and cuts the write that would pass the budget at the budget,
+        // and the tty (which would take 1022) accepts all of it. Without a guard: 1022.
         let unread = settle(observer.as_raw_fd(), guard_budget(), &idle);
         assert_eq!(
             unread,
@@ -896,7 +898,14 @@ fn handoff_drains_input_the_typeahead_guard_is_holding() {
         checks_after > checks_before,
         "setup: the guard must read the tty's state before the 15-byte line passes its budget"
     );
-    let _ = idle.recv_timeout(Duration::from_millis(200));
+    // Two fresh idle signals: the actor has finished at least one whole loop, write attempt
+    // included, after the guard decided to hold. A guard that wrote the line anyway would have
+    // written it by then.
+    while idle.try_recv().is_ok() {}
+    for _ in 0..2 {
+        idle.recv_timeout(Duration::from_secs(20))
+            .expect("setup: the PTY actor must keep looping while the guard holds input");
+    }
     assert_eq!(
         unread_input(slave),
         30 * LINE.len(),
