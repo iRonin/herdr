@@ -258,6 +258,12 @@ pub struct HeadlessServer {
     server_event_rx: mpsc::Receiver<ServerEvent>,
     /// Sender for server events (cloned for each client thread).
     server_event_tx: mpsc::Sender<ServerEvent>,
+    /// Test-only: owns the per-server temp dir the test helper creates (client
+    /// socket + state), removed when the server drops.
+    /// Write-only on purpose: the value is held for its `Drop` impl.
+    #[allow(dead_code)]
+    #[cfg(test)]
+    pub(crate) test_server_dir: Option<crate::test_support::TestTempPath>,
 }
 
 #[cfg(windows)]
@@ -384,6 +390,8 @@ impl HeadlessServer {
             should_quit,
             server_event_rx,
             server_event_tx,
+            #[cfg(test)]
+            test_server_dir: None,
         })
     }
 
