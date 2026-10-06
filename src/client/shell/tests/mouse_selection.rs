@@ -485,11 +485,19 @@ fn double_click_drag_selects_whole_words_in_both_directions() {
     assert!(state.selection.as_ref().unwrap().is_finalized());
 }
 
+/// Rows the pointer drags into that are on screen come from the painted cells,
+/// with no read; the release copies the live range. (Rows off screen still wait
+/// for their read: `double_click_drag_autoscroll_keeps_absolute_word_anchor`.)
 #[test]
 fn double_click_drag_waits_for_latest_row_before_copying() {
     let mut state = word_drag_state(true);
     start_word_drag(&mut state);
     let first_motion = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 1, 8);
+    assert!(
+        selection_reads(&first_motion.actions).is_empty(),
+        "a visible row is read from the screen: {:?}",
+        first_motion.actions
+    );
     for col in [1, 3, 7] {
         assert!(
             word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 2, col)
@@ -497,27 +505,18 @@ fn double_click_drag_waits_for_latest_row_before_copying() {
                 .is_empty()
         );
     }
-    assert!(
-        word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 2, 7)
-            .actions
-            .is_empty()
+    assert_eq!(
+        state.selection.as_ref().unwrap().ordered_cells(),
+        ((0, 6), (2, 9))
     );
-    let final_read = word_row_reply(
-        &mut state,
-        &word_read_id(&first_motion.actions),
-        "delta echo foxtrot",
-    );
-    assert!(
-        matches!(&final_read[..], [ClientShellAction::Endpoint { request, .. }]
-        if matches!(&request.method, crate::api::schema::Method::PaneSelectionRead(params)
-            if params.anchor.row == 2 && params.cursor.row == 2))
-    );
-    let copy = word_row_reply(&mut state, &word_read_id(&final_read), "golf hotel india");
+    let copy = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 2, 7).actions;
     assert!(
         matches!(&copy[..], [ClientShellAction::Endpoint { request, .. }]
         if matches!(&request.method, crate::api::schema::Method::PaneSelectionRead(params)
             if params.anchor == crate::api::schema::PaneTextPoint { row: 0, col: 6 }
-                && params.cursor == crate::api::schema::PaneTextPoint { row: 2, col: 9 }))
+                && params.cursor == crate::api::schema::PaneTextPoint { row: 2, col: 9 }
+                && params.content_revision.is_none())),
+        "{copy:?}"
     );
     let copied = word_row_reply(
         &mut state,
@@ -533,15 +532,12 @@ fn double_click_drag_waits_for_latest_row_before_copying() {
 #[test]
 fn double_click_drag_ignores_row_reply_after_typing_or_new_click() {
     for typing in [false, true] {
-        let mut state = word_drag_state(false);
-        start_word_drag(&mut state);
-        let drag = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 1, 8);
-        let row_id = word_read_id(&drag.actions);
+        let (mut state, row_id) = offscreen_extension(false);
         if typing {
             state.handle_input_bytes(b"x");
         } else {
-            word_drag_mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 0, 0);
-            word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 0);
+            word_drag_mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 1, 0);
+            word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 1, 0);
         }
         assert!(word_row_reply(&mut state, &row_id, "delta echo foxtrot").is_empty());
         assert!(state.selection.is_none());
@@ -577,7 +573,7 @@ fn double_click_drag_invalidates_cached_boundaries_outside_selected_cells() {
         changed.frame.cells[14].symbol = " ".into();
         state.set_pane_surface(changed);
         paint(&mut state);
-        // Output outside the clicked word no longer cancels a plain double-click (#46)...
+        // Output outside the clicked word does not cancel a plain double-click (#46)...
         assert_eq!(
             state
                 .selection
@@ -586,34 +582,33 @@ fn double_click_drag_invalidates_cached_boundaries_outside_selected_cells() {
             Some(((0, 6), (0, 10))),
             "unchanged selected cells keep the highlight"
         );
-        // ...but they do not validate the cached boundaries outside the word:
-        // extending into the changed cells reads the row again, pinned to the press,
-        // and the server refuses that read after the output.
+        // ...and the row's boundaries outside the word come from the cells on
+        // screen now, not from text cached before the output: column 14 is blank,
+        // so "charlie" (12-18) is no longer one word there.
         let drag = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 0, 14);
-        let reads = selection_reads(&drag.actions);
-        assert_eq!(
-            reads.len(),
-            1,
-            "re-read, not the stale row: {:?}",
+        assert!(
+            selection_reads(&drag.actions).is_empty(),
+            "a visible row needs no read: {:?}",
             drag.actions
         );
-        assert_eq!(reads[0].content_revision, Some(0));
-        let (_, refused) = state.handle_endpoint_result(
-            "boot-1",
-            &word_read_id(&drag.actions),
-            Err(ClientShellEndpointError {
-                code: Some("stale_content".into()),
-                message: "pane content changed".into(),
-            }),
+        assert_eq!(
+            state
+                .selection
+                .as_ref()
+                .map(|selection| selection.ordered_cells()),
+            Some(((0, 6), (0, 14)))
         );
-        assert!(refused.is_empty());
-        assert!(state.selection.is_none());
-        assert!(
-            word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 14)
-                .actions
-                .is_empty()
-        );
-        assert!(state.selection.is_none());
+        let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 14);
+        if copy_on_select {
+            let reads = selection_reads(&release.actions);
+            assert_eq!(reads.len(), 1, "{:?}", release.actions);
+            assert_eq!(
+                reads[0].content_revision, None,
+                "the extension copies the live range"
+            );
+        } else {
+            assert!(release.actions.is_empty());
+        }
     }
 }
 
@@ -703,12 +698,14 @@ fn double_click_release_after_content_change_copies_the_clicked_word() {
 #[test]
 fn double_click_drag_resize_cancels_pending_word_lookup() {
     for pending_extension in [false, true] {
-        let mut state = word_drag_state(true);
-        start_word_drag(&mut state);
-        let pending = pending_extension.then(|| {
-            let motion = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 1, 8);
-            word_read_id(&motion.actions)
-        });
+        let (mut state, pending) = if pending_extension {
+            let (state, read) = offscreen_extension(true);
+            (state, Some(read))
+        } else {
+            let mut state = word_drag_state(true);
+            start_word_drag(&mut state);
+            (state, None)
+        };
         let mut resized = state.pane_surface.as_ref().unwrap().clone();
         resized.surface_revision += 1;
         resized.panes[0].rect.width += 5;
@@ -724,6 +721,92 @@ fn double_click_drag_resize_cancels_pending_word_lookup() {
             "a late reply must not restore a resized selection"
         );
         assert!(state.selection_autoscroll.is_none());
+    }
+}
+
+/// A double-click held on "bravo" at absolute row 5 of a scrolled pane (rows 5-7
+/// on screen), dragged to "charlie" and autoscrolled up one row: absolute row 4
+/// is off screen, so it is read from the endpoint, pinned to the press. Returns
+/// that read's id.
+fn offscreen_extension(copy_on_select: bool) -> (ClientShellState, String) {
+    let mut state = word_drag_state(copy_on_select);
+    let mut scrolled = state.pane_surface.as_ref().unwrap().clone();
+    scrolled.surface_revision += 1;
+    scrolled.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        max_offset_from_bottom: 10,
+        offset_from_bottom: 5,
+        viewport_rows: 3,
+    });
+    state.set_pane_surface(scrolled);
+    paint(&mut state);
+    press_twice(&mut state, 0, 8);
+    assert_eq!(
+        state
+            .selection
+            .as_ref()
+            .map(|selection| selection.ordered_cells()),
+        Some(((5, 6), (5, 10)))
+    );
+    let drag = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 0, 14);
+    assert!(
+        selection_reads(&drag.actions).is_empty(),
+        "{:?}",
+        drag.actions
+    );
+    let tick = state.tick_selection_autoscroll(state.selection_autoscroll_deadline.unwrap());
+    let reads = selection_reads(&tick.actions);
+    assert!(
+        matches!(&reads[..], [params] if params.anchor.row == 4 && params.content_revision == Some(0)),
+        "{:?}",
+        tick.actions
+    );
+    let id = word_read_id(&tick.actions);
+    (state, id)
+}
+
+/// An off-screen row's read is refused (output reached the server): only the
+/// extension is dropped. The clicked word stays selected, and the release copies it.
+#[test]
+fn refused_offscreen_extension_read_keeps_the_clicked_word() {
+    for release_first in [false, true] {
+        let case = format!("release first {release_first}");
+        let (mut state, read) = offscreen_extension(true);
+        let mut copied = Vec::new();
+        if release_first {
+            copied.extend(
+                word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 14).actions,
+            );
+        }
+        let (_, refused) = state.handle_endpoint_result(
+            "boot-1",
+            &read,
+            Err(ClientShellEndpointError {
+                code: Some("stale_content".into()),
+                message: "pane content changed".into(),
+            }),
+        );
+        copied.extend(refused);
+        assert!(
+            state.word_selection_gesture.is_some() || release_first,
+            "{case}: kept"
+        );
+        if !release_first {
+            assert_eq!(
+                state
+                    .selection
+                    .as_ref()
+                    .map(|selection| selection.ordered_cells()),
+                Some(((5, 6), (5, 10))),
+                "{case}: back to the clicked word"
+            );
+            copied.extend(
+                word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 14).actions,
+            );
+        }
+        assert!(
+            matches!(&copied[..], [ClientShellAction::ClipboardWrite(bytes)] if bytes == b"bravo"),
+            "{case}: {copied:?}"
+        );
     }
 }
 
@@ -1330,12 +1413,13 @@ fn held_double_click_is_cancelled_when_the_pane_scroll_metrics_appear_or_go() {
     }
 }
 
-/// A double-click dragged past its word bounds its range with cached rows.
-/// Output still cancels it, as it did before plain double-clicks learned to
-/// keep their word; only the plain double-click changed.
+/// A double-click dragged past its word on a pane printing output is not
+/// cancelled by that output: it stays a live range, and the release copies the
+/// text in it, like a drag (#4193).
 #[test]
-fn extended_double_click_is_still_cancelled_by_output() {
+fn extended_double_click_survives_output_and_copies_the_live_range() {
     let mut state = word_state(true, &WORD_ROWS);
+    let mut endpoint = WordEndpoint::new(&WORD_ROWS);
     press_twice(&mut state, 0, 8);
     word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 0, 18);
     assert_eq!(
@@ -1345,15 +1429,27 @@ fn extended_double_click_is_still_cancelled_by_output() {
             .map(|selection| selection.ordered_cells()),
         Some(((0, 6), (0, 22)))
     );
-    state.set_pane_surface(word_surface(
-        &[WORD_ROWS[0], WORD_ROWS[1], "OUTPUT LINE HERE"],
-        2,
-        1,
-    ));
-    assert!(state.word_selection_gesture.is_none());
-    assert!(state.selection.is_none());
+    let shown = [WORD_ROWS[0], WORD_ROWS[1], "OUTPUT LINE HERE"];
+    endpoint.output(2, shown[2]);
+    state.set_pane_surface(word_surface(&shown, 2, 1));
+    paint(&mut state);
+    assert!(
+        state.word_selection_gesture.is_some(),
+        "output does not cancel it"
+    );
+    assert_eq!(
+        state
+            .selection
+            .as_ref()
+            .map(|selection| selection.ordered_cells()),
+        Some(((0, 6), (0, 22)))
+    );
     let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 18);
-    assert!(release.actions.is_empty(), "{:?}", release.actions);
+    assert_eq!(
+        copies_as_text(&endpoint.serve(&mut state, release.actions)),
+        vec!["BRAVOCOPY charlie"]
+    );
+    assert_eq!(endpoint.reads.last().unwrap().content_revision, None);
 }
 
 /// Mode 2027 off: the terminal keeps `❤️` in one narrow cell and puts `y` in the
@@ -1408,23 +1504,24 @@ async fn double_click_never_selects_a_character_hidden_under_a_wide_emoji() {
 }
 
 /// A reconnect keeps a plain held double-click (upstream's behaviour), but
-/// nothing from the old connection may act on it afterwards: a row read still
-/// in flight is cancelled with the connection, and its late reply neither
-/// re-shows that gesture nor overwrites a newer one.
+/// nothing from the old connection may act on it afterwards. A row read still in
+/// flight is cancelled with the connection: that drops only the extension, and
+/// its late reply neither changes that gesture nor a newer one.
 #[test]
 fn old_connection_reply_cannot_reshow_or_overwrite_a_double_click_after_reconnect() {
     for new_gesture in [false, true] {
         let case = format!("new gesture {new_gesture}");
-        let mut state = word_drag_state(true);
-        start_word_drag(&mut state);
-        let drag = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 1, 8);
-        let old_read = word_read_id(&drag.actions);
+        let (mut state, old_read) = offscreen_extension(true);
         let endpoint_id = state.active_endpoint_id.clone();
         let snapshot = state.snapshot.as_ref().unwrap().clone();
         state.mark_endpoint_disconnected(&endpoint_id);
-        assert!(
-            state.word_selection_gesture.is_none() && state.selection.is_none(),
-            "{case}: the read in flight is cancelled with its connection, and its gesture"
+        assert_eq!(
+            state
+                .selection
+                .as_ref()
+                .map(|selection| selection.ordered_cells()),
+            Some(((5, 6), (5, 10))),
+            "{case}: the cancelled read drops only the extension"
         );
         state.cache_endpoint_snapshot_inactive_for_generation(&endpoint_id, 1, snapshot);
         state.set_endpoint_status(
@@ -1438,11 +1535,11 @@ fn old_connection_reply_cannot_reshow_or_overwrite_a_double_click_after_reconnec
         paint(&mut state);
         if new_gesture {
             // The reconnect notice is drawn over this small pane; a click dismisses it.
-            assert!(state.visible_endpoint_notice.is_some());
-            word_drag_mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 2, 7);
-            word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 2, 7);
-            assert!(state.visible_endpoint_notice.is_none());
-            paint(&mut state);
+            if state.visible_endpoint_notice.is_some() {
+                word_drag_mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 2, 7);
+                word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 2, 7);
+                paint(&mut state);
+            }
             word_drag_mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 2, 7);
             word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 2, 7);
             word_drag_mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 2, 7);
@@ -1451,7 +1548,7 @@ fn old_connection_reply_cannot_reshow_or_overwrite_a_double_click_after_reconnec
                     .selection
                     .as_ref()
                     .map(|selection| selection.ordered_cells()),
-                Some(((2, 5), (2, 9))),
+                Some(((7, 5), (7, 9))),
                 "{case}: the new double-click selects hotel"
             );
         }
@@ -1463,7 +1560,7 @@ fn old_connection_reply_cannot_reshow_or_overwrite_a_double_click_after_reconnec
                     .selection
                     .as_ref()
                     .map(|selection| selection.ordered_cells()),
-                Some(((2, 5), (2, 9))),
+                Some(((7, 5), (7, 9))),
                 "{case}: the late reply does not change the new selection"
             );
             let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 2, 7);
@@ -1473,11 +1570,257 @@ fn old_connection_reply_cannot_reshow_or_overwrite_a_double_click_after_reconnec
                 release.actions
             );
         } else {
-            assert!(state.selection.is_none(), "{case}: nothing re-shown");
-            let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 1, 8);
-            assert!(release.actions.is_empty(), "{case}: {:?}", release.actions);
+            assert_eq!(
+                state
+                    .selection
+                    .as_ref()
+                    .map(|selection| selection.ordered_cells()),
+                Some(((5, 6), (5, 10))),
+                "{case}: the late reply changes nothing"
+            );
+            let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 14);
+            assert!(
+                matches!(&release.actions[..], [ClientShellAction::ClipboardWrite(bytes)] if bytes == b"bravo"),
+                "{case}: {:?}",
+                release.actions
+            );
         }
     }
+}
+
+/// The pointer slips off the clicked word while the second press is held, on a
+/// pane printing output, then comes back. The double-click must survive: a
+/// refused or unneeded row read must not throw away the clicked word.
+#[test]
+fn review_held_double_click_survives_pointer_jitter_off_the_word_during_output() {
+    let mut failures = Vec::new();
+    for (row, col) in [(1u16, 8u16), (0, 15)] {
+        for output_first in [true, false] {
+            let case = format!("off to ({row},{col}), output first {output_first}");
+            let mut state = word_state(true, &WORD_ROWS);
+            let mut endpoint = WordEndpoint::new(&WORD_ROWS);
+            let shown = [WORD_ROWS[0], WORD_ROWS[1], "OUTPUT LINE HERE"];
+            let output = |state: &mut ClientShellState, endpoint: &mut WordEndpoint| {
+                endpoint.output(2, shown[2]);
+                state.set_pane_surface(word_surface(&shown, 2, 1));
+                paint(state);
+            };
+            let held = press_twice(&mut state, 0, 8);
+            let mut copied = endpoint.serve(&mut state, held);
+            assert!(
+                state.selection.is_some(),
+                "{case}: highlighted at the press"
+            );
+            if output_first {
+                output(&mut state, &mut endpoint);
+            }
+            let off = word_drag_mouse(
+                &mut state,
+                MouseEventKind::Drag(MouseButton::Left),
+                row,
+                col,
+            );
+            copied.extend(endpoint.serve(&mut state, off.actions));
+            if !output_first {
+                output(&mut state, &mut endpoint);
+            }
+            let back = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 0, 8);
+            copied.extend(endpoint.serve(&mut state, back.actions));
+            let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 8);
+            copied.extend(endpoint.serve(&mut state, release.actions));
+            let got = copies_as_text(&copied);
+            if got != vec!["BRAVOCOPY".to_owned()] {
+                failures.push(format!(
+                    "{case}: copied {got:?}; reads {:?}",
+                    endpoint
+                        .reads
+                        .iter()
+                        .map(|read| (read.anchor.row, read.content_revision))
+                        .collect::<Vec<_>>()
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+fn review_scrolled_surface(
+    rows: &[&str],
+    surface_revision: u64,
+    content_revision: u64,
+    max_offset_from_bottom: u64,
+) -> PaneSurfaceFrame {
+    let mut surface = word_surface(rows, surface_revision, content_revision);
+    surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        offset_from_bottom: 0,
+        max_offset_from_bottom,
+        viewport_rows: rows.len() as u64,
+    });
+    surface
+}
+
+/// Real panes always carry scroll metrics. Output scrolls the clicked line up
+/// while the second press is held. (a) Scrollback grows: the absolute row still
+/// names the word, so the highlight follows it. (b) Scrollback is at its limit:
+/// the same absolute row now holds other text, so the highlight hides. Either
+/// way the release copies the clicked word, once.
+#[test]
+fn review_held_double_click_on_a_scrolling_pane() {
+    let before = [
+        "golf hotel india",
+        "alpha BRAVOCOPY charlie",
+        "delta echo foxtrot",
+    ];
+    let after = [
+        "alpha BRAVOCOPY charlie",
+        "delta echo foxtrot",
+        "OUTPUT LINE HERE",
+    ];
+    for scrollback_full in [false, true] {
+        let case = format!("scrollback full {scrollback_full}");
+        let mut config = Config::default();
+        config.ui.copy_on_select = true;
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(review_scrolled_surface(&before, 1, 0, 5));
+        paint(&mut state);
+        press_twice(&mut state, 1, 8);
+        assert_eq!(
+            state.selection.as_ref().map(|s| s.ordered_cells()),
+            Some(((6, 6), (6, 14))),
+            "{case}: absolute row 5 + viewport row 1"
+        );
+        let max = if scrollback_full { 5 } else { 6 };
+        state.set_pane_surface(review_scrolled_surface(&after, 2, 1, max));
+        paint(&mut state);
+        let selected = state.selection.as_ref().map(|s| s.ordered_cells());
+        if scrollback_full {
+            assert_eq!(
+                selected, None,
+                "{case}: row 6 now shows other text: no highlight"
+            );
+        } else {
+            assert_eq!(
+                selected,
+                Some(((6, 6), (6, 14))),
+                "{case}: highlight follows the word"
+            );
+        }
+        let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 8);
+        assert!(
+            matches!(&release.actions[..], [ClientShellAction::ClipboardWrite(bytes)] if bytes == b"BRAVOCOPY"),
+            "{case}: {:?}",
+            release.actions
+        );
+    }
+}
+
+/// The pane's output scrolls the clicked line up under a still pointer. A small
+/// motion inside the screen cells the word occupied at the press lands on another
+/// absolute row, but it has not left the word: no read, no extension, and the
+/// release copies the word. A pointer that really leaves extends as usual.
+#[test]
+fn held_double_click_survives_jitter_inside_its_screen_cells_while_output_scrolls() {
+    let before = [
+        "golf hotel india",
+        "alpha BRAVOCOPY charlie",
+        "delta echo foxtrot",
+    ];
+    let after = [
+        "alpha BRAVOCOPY charlie",
+        "delta echo foxtrot",
+        "OUTPUT LINE HERE",
+    ];
+    let mut config = Config::default();
+    config.ui.copy_on_select = true;
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(review_scrolled_surface(&before, 1, 0, 5));
+    paint(&mut state);
+    let mut endpoint = WordEndpoint::new(&[
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "alpha BRAVOCOPY charlie",
+        "delta echo foxtrot",
+        "OUTPUT LINE HERE",
+    ]);
+    let held = press_twice(&mut state, 1, 8);
+    assert!(endpoint.serve(&mut state, held).is_empty());
+    state.set_pane_surface(review_scrolled_surface(&after, 2, 1, 6));
+    endpoint.output(8, "OUTPUT LINE HERE");
+    paint(&mut state);
+    assert_eq!(
+        state.selection.as_ref().map(|s| s.ordered_cells()),
+        Some(((6, 6), (6, 14))),
+        "the highlight follows the word up"
+    );
+    let mut actions = Vec::new();
+    for col in [9, 7, 14, 6] {
+        let jitter = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 1, col);
+        actions.extend(jitter.actions);
+        assert_eq!(
+            state.selection.as_ref().map(|s| s.ordered_cells()),
+            Some(((6, 6), (6, 14))),
+            "column {col} of the press-time screen cells is still the word"
+        );
+    }
+    assert!(selection_reads(&actions).is_empty(), "{actions:?}");
+    let away = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 2, 3);
+    assert!(
+        selection_reads(&away.actions).is_empty(),
+        "a visible row needs no read"
+    );
+    assert_eq!(
+        state.selection.as_ref().map(|s| s.ordered_cells()),
+        Some(((6, 6), (8, 5))),
+        "really leaving extends: OUTPUT on screen row 2 (absolute 8)"
+    );
+    let back = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 1, 8);
+    assert!(back.actions.is_empty());
+    let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 1, 8);
+    assert!(
+        matches!(&release.actions[..], [ClientShellAction::ClipboardWrite(bytes)] if bytes == b"BRAVOCOPY"),
+        "{:?}",
+        release.actions
+    );
+    assert!(endpoint.reads.is_empty(), "{:?}", endpoint.reads);
+}
+
+/// The pointer is off the word at the release, on a visible row, after output:
+/// the extension's bounds come from the cells on screen (no read to refuse), and
+/// the release copies the live range, like a drag.
+#[test]
+fn double_click_released_on_a_visible_row_after_output_copies_the_live_range() {
+    let mut state = word_state(true, &WORD_ROWS);
+    let held = press_twice(&mut state, 0, 8);
+    assert!(selection_reads(&held).is_empty());
+    let shown = [WORD_ROWS[0], WORD_ROWS[1], "OUTPUT LINE HERE"];
+    state.set_pane_surface(word_surface(&shown, 2, 1));
+    paint(&mut state);
+    let drag = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 1, 8);
+    assert!(
+        selection_reads(&drag.actions).is_empty(),
+        "no read for a visible row: {:?}",
+        drag.actions
+    );
+    assert_eq!(
+        state.selection.as_ref().map(|s| s.ordered_cells()),
+        Some(((0, 6), (1, 9)))
+    );
+    let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 1, 8);
+    let reads = selection_reads(&release.actions);
+    assert!(
+        matches!(&reads[..], [params]
+            if params.anchor == crate::api::schema::PaneTextPoint { row: 0, col: 6 }
+                && params.cursor == crate::api::schema::PaneTextPoint { row: 1, col: 9 }
+                && params.content_revision.is_none()),
+        "{:?}",
+        release.actions
+    );
 }
 
 /// The owner's report: the word is highlighted but the clipboard never changes.
@@ -2260,32 +2603,33 @@ fn double_click_copies_at_most_once_across_duplicate_or_obsolete_replies() {
     );
 
     // A row reply that arrives after a new click belongs to an obsolete gesture.
-    let mut state = word_state(true, &WORD_ROWS);
-    press_twice(&mut state, 0, 8);
-    let away = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 1, 8);
-    word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 1, 8);
+    let (mut state, read) = offscreen_extension(true);
+    word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 14);
     word_drag_mouse(&mut state, MouseEventKind::Down(MouseButton::Left), 2, 0);
     word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 2, 0);
     assert!(
-        endpoint.serve(&mut state, away.actions).is_empty(),
+        word_row_reply(&mut state, &read, "delta echo foxtrot").is_empty(),
         "obsolete gesture"
     );
 
-    // A row reply for another pane copies nothing.
-    let mut state = word_state(true, &WORD_ROWS);
-    press_twice(&mut state, 0, 8);
-    let away = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 1, 8);
-    word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 1, 8);
+    // A row reply for another pane is a failed read: it drops only the
+    // extension, and the release that was waiting for it copies the word once.
+    let (mut state, read) = offscreen_extension(true);
+    word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 14);
     let (_, result) = state.handle_endpoint_result(
         "boot-1",
-        &word_read_id(&away.actions),
+        &read,
         Ok(crate::api::schema::ResponseResult::PaneSelection {
             pane_id: "pane_2".into(),
             text: WORD_ROWS[1].into(),
         }),
     );
-    assert!(endpoint.serve(&mut state, result).is_empty(), "wrong pane");
-    assert!(state.selection.is_none());
+    assert!(
+        matches!(&result[..], [ClientShellAction::ClipboardWrite(bytes)] if bytes == b"bravo"),
+        "wrong pane: {result:?}"
+    );
+    let again = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 14);
+    assert!(again.actions.is_empty(), "copies once");
 }
 
 /// #47. The highlight and the copy come from the cells the client draws, built
