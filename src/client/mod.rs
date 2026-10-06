@@ -31,6 +31,8 @@ mod notifications;
 mod shell;
 mod shell_runtime;
 mod startup;
+#[cfg(unix)]
+mod startup_input;
 mod state;
 mod terminal_geometry;
 mod terminal_sessions;
@@ -73,6 +75,27 @@ use terminal_setup::{
     effective_mouse_capture, effective_sgr_pixel_mouse, set_mouse_capture,
     setup_direct_attach_terminal, setup_terminal, should_draw_host_cursor,
 };
+
+#[cfg(unix)]
+fn startup_input_view<'a>(
+    endpoints: &'a endpoint::EndpointRegistry,
+    shell: Option<&'a shell::ClientShellState>,
+    now: std::time::Instant,
+) -> startup_input::StartupView<'a> {
+    let active = endpoints.active_id();
+    startup_input::StartupView {
+        connected: endpoints
+            .active_surface_available()
+            .then(|| {
+                endpoints
+                    .connection(active)
+                    .map(|connection| (active, connection.generation))
+            })
+            .flatten(),
+        snapshot: shell.and_then(shell::ClientShellState::projected_snapshot_identity),
+        now,
+    }
+}
 
 fn refresh_host_mouse_capture(enabled: bool, sgr_pixels: bool) {
     if let Err(err) = set_mouse_capture(enabled, sgr_pixels) {
@@ -593,6 +616,10 @@ async fn run_client_loop(
     // (implemented on macOS and Windows; a no-op on other platforms).
     let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
 
+    // Keys read while the first connection waits for its first snapshot (startup_input.rs).
+    #[cfg(unix)]
+    let mut startup_input = startup_input::StartupInputHold::new();
+
     // Main event loop.
     let mut client_timer = timer::ClientLoopTimer::new();
     #[cfg(windows)]
@@ -710,6 +737,24 @@ async fn run_client_loop(
                 shell.timer_delay(std::time::Instant::now())
             });
         let timer_deadline = client_timer.deadline(std::time::Instant::now(), timer_delay);
+        // Keys held for the first snapshot are older than anything else waiting, so they are
+        // processed before any later read and before a scheduled activation.
+        #[cfg(unix)]
+        let startup_replay = if state.shell.is_some() {
+            startup_input.take_release(startup_input_view(
+                &write_stream,
+                state.shell.as_ref(),
+                std::time::Instant::now(),
+            ))
+        } else {
+            None
+        };
+        #[cfg(unix)]
+        let immediate_event = match startup_replay {
+            Some(bytes) => Some(ClientLoopEvent::StdinInput(bytes)),
+            None => scheduled_activation.take(),
+        };
+        #[cfg(not(unix))]
         let immediate_event = scheduled_activation.take();
         #[cfg(windows)]
         let event = if let Some(event) = immediate_event {
@@ -761,6 +806,12 @@ async fn run_client_loop(
                             store_reported_cell_size(&reported_cell_size, width_px, height_px);
                         }
                     }
+                    let Some(data) = startup_input.input(
+                        data,
+                        startup_input_view(&write_stream, state.shell.as_ref(), now),
+                    ) else {
+                        continue;
+                    };
                     let image_target = state
                         .shell
                         .as_ref()

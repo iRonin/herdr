@@ -1614,6 +1614,13 @@ impl ClientShellState {
         self.pane_surface.is_some()
     }
 
+    /// The endpoint and connection generation of the projected snapshot, once there is one.
+    pub(crate) fn projected_snapshot_identity(&self) -> Option<(&ClientEndpointId, Option<u64>)> {
+        self.snapshot
+            .as_ref()
+            .map(|_| (&self.active_endpoint_id, self.active_snapshot_generation))
+    }
+
     pub(crate) fn set_pane_surface(&mut self, surface: PaneSurfaceFrame) {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return;
