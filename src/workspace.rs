@@ -216,6 +216,12 @@ pub struct Workspace {
     pub active_tab: usize,
     #[cfg(test)]
     pub(crate) test_runtimes: HashMap<PaneId, TerminalRuntime>,
+    /// Owns the fresh temp identity dir created by `test_new`; removed when the
+    /// workspace drops, so test runs leave no directories behind in `TMPDIR`.
+    /// Write-only on purpose: the value is held for its `Drop` impl.
+    #[allow(dead_code)]
+    #[cfg(test)]
+    pub(crate) test_identity_dir: Option<crate::test_support::TestTempPath>,
 }
 
 impl Deref for Workspace {
@@ -282,6 +288,8 @@ impl Workspace {
             active_tab: 0,
             #[cfg(test)]
             test_runtimes: HashMap::new(),
+            #[cfg(test)]
+            test_identity_dir: None,
         }
     }
 
@@ -435,6 +443,8 @@ impl Workspace {
                 active_tab: 0,
                 #[cfg(test)]
                 test_runtimes: HashMap::new(),
+                #[cfg(test)]
+                test_identity_dir: None,
             },
             terminal,
             runtime,
@@ -1233,8 +1243,8 @@ impl Workspace {
         // Sandbox the identity_cwd to a fresh tempdir so tests that drive the
         // workspace-rename path (handle_workspace_rename -> persist_workspace_name)
         // do not write `.herdr/settings.toml` into the worktree root. The
-        // tempdir is untracked (under std::env::temp_dir()) and is reused by the
-        // surrounding temp-test scaffolding; git_branch / git_space_metadata
+        // tempdir is untracked (under std::env::temp_dir()) and is removed when
+        // the workspace drops (test_identity_dir); git_branch / git_space_metadata
         // naturally resolve to None because the tempdir has no `.git` marker.
         let identity_cwd = std::env::temp_dir().join(format!(
             "herdr-workspace-test-{}-{}",
@@ -1245,6 +1255,7 @@ impl Workspace {
                 .unwrap_or(0)
         ));
         std::fs::create_dir_all(&identity_cwd).ok();
+        let test_identity_dir = crate::test_support::TestTempPath::owns(identity_cwd.clone());
         let (layout, root_id) = TileLayout::new();
         let terminal_id = TerminalId::alloc();
         let mut panes = HashMap::new();
@@ -1283,6 +1294,7 @@ impl Workspace {
             tabs: vec![tab],
             active_tab: 0,
             test_runtimes: HashMap::new(),
+            test_identity_dir: Some(test_identity_dir),
         }
     }
 
@@ -1501,6 +1513,24 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_new_identity_dir_is_removed_when_the_workspace_drops() {
+        // The dir must exist while the workspace lives (the rename path writes
+        // `.herdr/settings.toml` into it) and must NOT outlive it: every test
+        // workspace used to leave one behind in TMPDIR.
+        let ws = Workspace::test_new("tmp-cleanup");
+        let identity_dir = ws.identity_cwd.clone();
+        assert!(
+            identity_dir.is_dir(),
+            "test_new must create its identity dir"
+        );
+        drop(ws);
+        assert!(
+            !identity_dir.exists(),
+            "dropping a test workspace must remove its identity dir"
+        );
+    }
 
     #[test]
     fn generated_workspace_ids_are_short_base32_handles() {
