@@ -548,6 +548,16 @@ impl PaneTerminal {
         self.ghostty.render(frame, area, show_cursor);
     }
 
+    pub fn render_with_scroll_metrics(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        show_cursor: bool,
+    ) -> Option<ScrollMetrics> {
+        self.ghostty
+            .render_with_scroll_metrics(frame, area, show_cursor)
+    }
+
     pub fn collect_dirty_patch(
         &self,
         area_width: u16,
@@ -1820,14 +1830,7 @@ impl GhosttyPaneTerminal {
         let Ok(core) = self.core.lock() else {
             return None;
         };
-        let scrollbar = core.terminal.scrollbar().ok()?;
-        Some(ScrollMetrics {
-            offset_from_bottom: scrollbar
-                .total
-                .saturating_sub(scrollbar.offset + scrollbar.len),
-            max_offset_from_bottom: scrollbar.total.saturating_sub(scrollbar.len),
-            viewport_rows: scrollbar.len,
-        })
+        terminal_scroll_metrics(&core.terminal)
     }
 
     pub fn keyboard_protocol(&self) -> Option<crate::input::KeyboardProtocol> {
@@ -2355,15 +2358,31 @@ impl GhosttyPaneTerminal {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
+        self.render_with_scroll_metrics(frame, area, show_cursor);
+    }
+
+    /// Draws the pane's cells into `frame` and returns the scroll metrics of the
+    /// screen it drew, read under the same lock, so they describe those cells
+    /// even if output lands before the caller reads anything else.
+    pub fn render_with_scroll_metrics(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        show_cursor: bool,
+    ) -> Option<ScrollMetrics> {
         let Ok(mut core) = self.core.lock() else {
-            return;
+            return None;
         };
+        let scroll = terminal_scroll_metrics(&core.terminal);
+        // Cells are not drawn while the pane is inside a synchronized-output update (the
+        // caller defers or reuses its frame); the metrics are still returned so the
+        // scrollbar thumb draws as it did before.
         if core
             .terminal
             .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
             .unwrap_or(false)
         {
-            return;
+            return scroll;
         }
         let host_theme = core.host_terminal_theme;
         let initial_default_foreground = core.initial_default_foreground;
@@ -2375,7 +2394,7 @@ impl GhosttyPaneTerminal {
             ..
         } = &mut *core;
         if render_state.update(terminal).is_err() {
-            return;
+            return scroll;
         }
         let colors = render_state.colors().ok();
         let default_bg = colors
@@ -2391,17 +2410,17 @@ impl GhosttyPaneTerminal {
 
         let mut row_iterator = match crate::ghostty::RowIterator::new() {
             Ok(iterator) => iterator,
-            Err(_) => return,
+            Err(_) => return scroll,
         };
         let mut row_cells = match crate::ghostty::RowCells::new() {
             Ok(cells) => cells,
-            Err(_) => return,
+            Err(_) => return scroll,
         };
         {
             let buf = frame.buffer_mut();
             let mut rows = match render_state.populate_row_iterator(&mut row_iterator) {
                 Ok(rows) => rows,
-                Err(_) => return,
+                Err(_) => return scroll,
             };
             let mut grapheme_bytes = Vec::new();
             let mut symbol_scratch = String::new();
@@ -2471,6 +2490,7 @@ impl GhosttyPaneTerminal {
                 }
             }
         }
+        scroll
     }
 
     pub fn collect_dirty_patch(
@@ -2497,6 +2517,17 @@ impl GhosttyPaneTerminal {
             })
             .unwrap_or(TerminalDirtyPatchOutcome::Fallback)
     }
+}
+
+fn terminal_scroll_metrics(terminal: &crate::ghostty::Terminal) -> Option<ScrollMetrics> {
+    let scrollbar = terminal.scrollbar().ok()?;
+    Some(ScrollMetrics {
+        offset_from_bottom: scrollbar
+            .total
+            .saturating_sub(scrollbar.offset + scrollbar.len),
+        max_offset_from_bottom: scrollbar.total.saturating_sub(scrollbar.len),
+        viewport_rows: scrollbar.len,
+    })
 }
 
 /// Encode one key with an encoder configured for the same mode snapshot as
