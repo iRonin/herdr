@@ -163,8 +163,9 @@ mod tests {
     use crate::persist::snapshot::{
         PaneHistorySnapshot, TabHistorySnapshot, WorkspaceHistorySnapshot,
     };
+    use crate::test_support::TestTempPath;
 
-    fn temp_session_path(name: &str) -> PathBuf {
+    fn temp_session_path(name: &str) -> TestTempPath {
         let unique = format!(
             "herdr-session-tests-{}-{}-{}",
             name,
@@ -174,12 +175,13 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        std::env::temp_dir().join(unique).join("session.json")
+        let root = std::env::temp_dir().join(unique);
+        TestTempPath::owns_root(root.clone(), root.join("session.json"))
     }
 
-    fn temp_session_paths(name: &str) -> (PathBuf, PathBuf) {
+    fn temp_session_paths(name: &str) -> (TestTempPath, TestTempPath) {
         let session = temp_session_path(name);
-        let history = session.with_file_name("session-history.json");
+        let history = session.sibling("session-history.json");
         (session, history)
     }
 

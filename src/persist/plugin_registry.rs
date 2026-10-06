@@ -160,18 +160,18 @@ pub fn reload_manifests(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestTempPath;
 
-    fn temp_registry_path(name: &str) -> PathBuf {
+    fn temp_registry_path(name: &str) -> TestTempPath {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir()
-            .join(format!(
-                "herdr-registry-{name}-{}-{nanos}",
-                std::process::id()
-            ))
-            .join("plugins.json")
+        let root = std::env::temp_dir().join(format!(
+            "herdr-registry-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        TestTempPath::owns_root(root.clone(), root.join("plugins.json"))
     }
 
     fn sample_plugin(id: &str) -> InstalledPluginInfo {
@@ -228,7 +228,7 @@ mod tests {
 
         assert!(load_from_path_strict(&path).is_err());
         assert!(load_from_path(&path).is_empty());
-        assert_eq!(std::fs::read(path).unwrap(), corrupt);
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
     }
 
     #[test]
