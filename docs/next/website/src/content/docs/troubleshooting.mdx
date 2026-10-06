@@ -95,6 +95,14 @@ An older server can survive logout while losing user lookup and DNS. Symptoms in
 
 If a newly started server still has this problem, check `herdr-server.log` for `could not select persistent user service context`. Herdr keeps the inherited context if the required macOS APIs are unavailable. See [Herdr issue #4100](https://github.com/herdrdev/herdr/issues/4100).
 
+## A paste on macOS arrives only as the program reads it
+
+On macOS, once about 1 KB of input to a pane is waiting unread, Herdr holds the rest and sends it as the program reads. A long paste, or text typed ahead into a shell that is still starting or busy running a command, therefore arrives in steps instead of all at once. Keys and short pastes are not affected. Without the hold, macOS can damage text that waits unread while the program switches input modes, and the shell can run a different command than the one typed, for example a line that arrives as `pppp…`.
+
+While input is held, `ctrl+c`, `ctrl+\` and `ctrl+z` still act at once, and the held input is discarded the way the terminal discards unread input on an interrupt. `ctrl+s` and `ctrl+q` also act at once when the program uses flow control.
+
+Input is not held for a program that reads in fixed-size blocks without a timeout (raw mode with `VMIN` above 1), because Herdr cannot tell when such a program has read everything, nor while a live handoff moves the session. The hold covers only what Herdr writes into the pane; other programs writing into the same terminal are not covered.
+
 ## The `herdr` command is not found
 
 Restart the terminal so it reloads its environment, then confirm the Herdr install directory is on `PATH`. For package-manager installs, use that package manager to update Herdr and expose it on `PATH`. See [Install Herdr](/docs/install/#verify).
