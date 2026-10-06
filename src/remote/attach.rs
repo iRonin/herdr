@@ -1124,9 +1124,11 @@ pub(super) fn prepare_remote_herdr(
     // `resolve_install_source_for`), and every step below leads only there,
     // so refuse before the install prompts offer something that cannot
     // happen. The early returns above are untouched: an installed remote
-    // binary this client can use needs no download at all.
-    if override_binary.is_none() && local_binary_seed_path(&remote_herdr.platform)?.is_none() {
-        if let Some(message) = fork_remote_install_refusal() {
+    // binary this client can use needs no download at all. The fork check is
+    // the outer condition so a stock build keeps upstream's exact behaviour,
+    // including when the local-seed probe errors (it must not run at all).
+    if let Some(message) = fork_remote_install_refusal() {
+        if override_binary.is_none() && local_binary_seed_path(&remote_herdr.platform)?.is_none() {
             return Err(io::Error::other(message));
         }
     }
