@@ -1561,23 +1561,13 @@ fn word_selection_result_survives_focus_snapshot_lag() {
     let hit = state.hits.panes[0].clone();
     let mut request = ClientShellInput::default();
     state.request_word_selection(&hit, 0, 1, &mut request);
-    let request_id = match &request.actions[0] {
-        ClientShellAction::Endpoint { request, .. } => request.id.clone(),
-        _ => unreachable!(),
-    };
+    // The word comes from the painted cells: there is no row read to wait for.
+    assert!(request.actions.is_empty(), "{:?}", request.actions);
+    assert!(request.repaint);
     let mut lagging = snapshot();
     lagging.focused_pane_id = None;
     lagging.panes[0].focused = false;
     state.set_snapshot(Box::new(lagging));
-    let (repaint, _) = state.handle_endpoint_result(
-        "boot-1",
-        &request_id,
-        Ok(crate::api::schema::ResponseResult::PaneSelection {
-            pane_id: "pane_1".into(),
-            text: "hello world".into(),
-        }),
-    );
-    assert!(repaint);
     assert!(state
         .selection
         .as_ref()
