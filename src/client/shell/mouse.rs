@@ -1802,9 +1802,7 @@ impl ClientShellState {
         }
 
         if mouse.kind == MouseEventKind::Drag(MouseButton::Left) {
-            if self.drag_renumbered_selection()
-                || self.drag_renumbered_word(mouse.column, mouse.row)
-            {
+            if self.drag_renumbered_selection() || self.drag_renumbered_word() {
                 return;
             }
             let selection_hit = self.active_selection_pane();
@@ -1819,6 +1817,7 @@ impl ClientShellState {
         if mouse.kind == MouseEventKind::Up(MouseButton::Left)
             && self.word_selection_gesture.is_some()
         {
+            self.release_renumbered_word(mouse.column, mouse.row);
             self.finish_word_selection(outcome);
             outcome.repaint = true;
             return;
