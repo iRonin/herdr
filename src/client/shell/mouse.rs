@@ -1852,7 +1852,9 @@ impl ClientShellState {
         }
 
         if mouse.kind == MouseEventKind::Drag(MouseButton::Left) {
-            if self.drag_renumbered_selection() {
+            if self.drag_renumbered_selection()
+                || self.drag_renumbered_word(mouse.column, mouse.row)
+            {
                 return;
             }
             let selection_hit = self.active_selection_pane();

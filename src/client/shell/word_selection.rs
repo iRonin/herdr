@@ -334,6 +334,35 @@ impl ClientShellState {
         }
     }
 
+    /// Motion after the double-click's rows were renumbered. Inside the screen
+    /// cells the word occupied at the press it is still on the word; anywhere
+    /// else it selects rows that name other lines, so the gesture is dropped
+    /// and stays dropped. Returns whether the motion was this gesture's.
+    pub(super) fn drag_renumbered_word(&mut self, column: u16, row: u16) -> bool {
+        let Some(gesture) = self.word_selection_gesture.as_ref() else {
+            return false;
+        };
+        if !gesture.renumbered || gesture.released {
+            return false;
+        }
+        let on_word = self
+            .hits
+            .panes
+            .iter()
+            .find(|hit| hit.pane_id == gesture.pane_id)
+            .is_some_and(|hit| {
+                let inner = hit.inner_rect;
+                row.checked_sub(inner.y) == Some(gesture.press_viewport_row)
+                    && column.checked_sub(inner.x).is_some_and(|col| {
+                        (gesture.anchor_bounds.0..=gesture.anchor_bounds.1).contains(&col)
+                    })
+            });
+        if let Some(gesture) = self.word_selection_gesture.as_mut() {
+            gesture.dropped |= !on_word;
+        }
+        true
+    }
+
     pub(super) fn drag_word_selection(
         &mut self,
         cursor: (u32, u16),
