@@ -428,6 +428,8 @@ fn restore_workspace(
             tabs,
             #[cfg(test)]
             test_runtimes: HashMap::new(),
+            #[cfg(test)]
+            test_identity_dir: None,
         })
         .map(|workspace| (workspace, terminals, terminal_runtimes)),
         failed_imports,
