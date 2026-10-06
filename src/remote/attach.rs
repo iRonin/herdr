@@ -2260,6 +2260,11 @@ fn remote_shell_resolves_managed_install(stdout: &str) -> bool {
 /// (`--version`); when that fails or its output cannot be read as a version
 /// line, nothing is printed - an unclear answer is not evidence.
 fn warn_if_remote_herdr_is_stock(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) {
+    // A stock build prints nothing here, so it must not pay for the check
+    // either: upstream behaviour includes no extra remote command.
+    if !crate::build_info::FORK_BUILD {
+        return;
+    }
     let Ok(output) = ssh.shell_output(
         &remote_herdr.platform,
         &remote_herdr.executable.command(&["--version"]),
