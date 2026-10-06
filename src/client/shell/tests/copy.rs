@@ -1558,6 +1558,7 @@ fn word_selection_result_survives_focus_snapshot_lag() {
     state.set_snapshot(Box::new(snapshot()));
     state.set_pane_surface(surface());
     state.compose(106, 20).expect("composed frame");
+    state.commit_presented_frame();
     let hit = state.hits.panes[0].clone();
     let mut request = ClientShellInput::default();
     state.request_word_selection(&hit, 0, 1, &mut request);

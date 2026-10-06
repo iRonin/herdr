@@ -353,6 +353,7 @@ fn client_double_click_selects_word_and_copies_only_after_release() {
 /// client's presentation commit does after a frame reaches the terminal.
 fn paint(state: &mut ClientShellState) {
     state.compose(106, 20).expect("composed frame");
+    state.commit_presented_frame();
 }
 
 fn word_drag_state(copy_on_select: bool) -> ClientShellState {

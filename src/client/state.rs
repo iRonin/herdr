@@ -209,10 +209,25 @@ impl ClientState {
         crate::render_prof::duration_since("client_surface_patch.encode", encode_started);
         let write_started = crate::render_prof::timer();
         let mut stdout = io::stdout();
-        stdout.write_all(&encoded.bytes)?;
-        stdout.flush()?;
+        if let Err(error) = stdout
+            .write_all(&encoded.bytes)
+            .and_then(|()| stdout.flush())
+        {
+            // Part of the patch may have reached the terminal.
+            if let Some(shell) = self.shell.as_mut() {
+                shell.forget_presented_panes();
+            }
+            return Err(error);
+        }
         crate::render_prof::duration_since("client_surface_patch.write", write_started);
         let committed = self.blit_encoder.commit_patch(&rows, patch.cursor, encoded);
+        if let Some(shell) = self.shell.as_mut() {
+            if committed {
+                shell.commit_presented_patch();
+            } else {
+                shell.forget_presented_panes();
+            }
+        }
         crate::render_prof::event(if committed {
             "client_surface_patch.success"
         } else {
@@ -270,5 +285,9 @@ impl ClientState {
         let _ = stdout.flush();
         self.blit_encoder.commit(frame_data, encoded);
         self.repaint_pending = false;
+        // The pane cells a double-click resolves against are now the ones on screen.
+        if let Some(shell) = self.shell.as_mut() {
+            shell.commit_presented_frame();
+        }
     }
 }

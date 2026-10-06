@@ -80,6 +80,10 @@ fn fast_path_blocker(
         Some("client_surface_patch.fallback.copy_mode")
     } else if state.selection_highlight_clear_deadline.is_some() {
         Some("client_surface_patch.fallback.selection_deadline")
+    } else if state.word_selection_gesture.is_some() {
+        // A held double-click checks every update against its word, even once
+        // that word's highlight is gone.
+        Some("client_surface_patch.fallback.word_selection")
     } else if patch.panes.iter().any(|pane| {
         !state
             .hits
@@ -197,6 +201,7 @@ impl ClientShellState {
                 }),
         });
         if let Some(area) = fast_path_area {
+            self.note_pane_surface_patched();
             let applied = self
                 .pane_surface
                 .as_mut()

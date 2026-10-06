@@ -132,6 +132,7 @@ impl ClientShellState {
     }
 
     pub(crate) fn compose(&mut self, cols: u16, rows: u16) -> Option<FrameData> {
+        self.clear_composed_panes();
         self.last_composed_at = Some(std::time::Instant::now());
         self.selection_repaint_deadline = None;
         if self.last_composed_size != Some((cols, rows)) && self.mode == ClientShellMode::Navigate {
@@ -145,7 +146,9 @@ impl ClientShellState {
                 .as_ref()
                 .is_some_and(|target| self.navigation_target_valid(target));
         if self.snapshot.is_none() || self.pane_surface.is_none() {
-            return Some(self.compose_unavailable(cols, rows));
+            let frame = self.compose_unavailable(cols, rows);
+            self.record_composed_panes(None);
+            return Some(frame);
         }
         let snapshot = self.snapshot.as_deref()?;
         // Do not compose a retained surface while waiting for its matching snapshot or
@@ -713,6 +716,7 @@ impl ClientShellState {
             self.hits.popup = None;
         }
         self.compose_graphics(&mut frame, layout, &occlusion);
+        self.record_composed_panes(Some((layout.pane_surface.x, layout.pane_surface.y)));
         Some(frame)
     }
 }

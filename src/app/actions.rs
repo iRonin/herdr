@@ -1324,28 +1324,91 @@ impl CellSpan {
 /// zero-width marks use display columns, then prefers structured spans that
 /// users expect to copy whole (URLs and quoted paths), and finally falls back
 /// to a separator-delimited token.
+#[cfg(test)]
 pub(crate) fn word_bounds_at_column(row: &str, col: u16) -> Option<(u16, u16)> {
-    // Map the row into display cells before doing any word-boundary work.
-    let cells = text_cells(row);
-    let clicked_idx = cell_index_at_column(&cells, col)?;
-
-    // Prefer spans that can legally include punctuation or spaces.
-    let span = url_span_at_column(&cells, clicked_idx)
-        .or_else(|| quoted_path_span_at_column(&cells, clicked_idx))
-        .or_else(|| token_span_at_column(&cells, clicked_idx))?;
-
-    // Convert the internal cell span back to inclusive terminal columns.
-    Some(span.columns(&cells))
+    WordRow::from_text(row).bounds_at(col)
 }
 
 /// The text a row shows in inclusive display columns, mapped by the same cells
 /// as `word_bounds_at_column`, so wide characters and zero-width marks stay whole.
+#[cfg(test)]
 pub(crate) fn text_in_cell_range(row: &str, start_col: u16, end_col: u16) -> String {
-    text_cells(row)
-        .into_iter()
-        .filter(|cell| cell.start_col >= start_col && cell.end_col <= end_col)
-        .map(|cell| cell.ch)
-        .collect()
+    WordRow::from_text(row).text_in(start_col, end_col)
+}
+
+/// A row's characters placed in display columns, for finding the token under a
+/// double-click. Where the columns come from is the constructor's business; the
+/// token rules (URLs, quoted paths, separators, trimming) are the same for all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WordRow {
+    cells: Vec<TextCell>,
+}
+
+impl WordRow {
+    /// Columns from per-codepoint widths, for row text read from a pane.
+    pub(crate) fn from_text(row: &str) -> Self {
+        Self {
+            cells: text_cells(row),
+        }
+    }
+
+    /// Columns from displayed cells, one `(symbol, drawn width)` per column, left
+    /// to right. Every codepoint of a symbol occupies the columns its cell is drawn
+    /// across. A cell drawn `width` columns wide covers the next `width - 1` cells,
+    /// which are not drawn, so they contribute columns but no text. An empty symbol
+    /// contributes a column and no text.
+    pub(crate) fn from_display_cells<'a>(
+        cells: impl IntoIterator<Item = (&'a str, usize)>,
+    ) -> Self {
+        let cells = cells.into_iter().collect::<Vec<_>>();
+        let last_col = u16::try_from(cells.len().saturating_sub(1)).unwrap_or(u16::MAX);
+        let mut text_cells = Vec::new();
+        let mut covered = 0usize;
+        for (col, (symbol, width)) in cells.into_iter().enumerate() {
+            if covered > 0 {
+                covered -= 1;
+                continue;
+            }
+            let col = u16::try_from(col).unwrap_or(u16::MAX);
+            let span = width.max(1);
+            let end_col = col
+                .saturating_add(u16::try_from(span - 1).unwrap_or(u16::MAX))
+                .min(last_col);
+            text_cells.extend(symbol.chars().map(|ch| TextCell {
+                ch,
+                start_col: col,
+                end_col,
+            }));
+            covered = span - 1;
+        }
+        Self { cells: text_cells }
+    }
+
+    /// Finds the terminal display-column bounds for the token under a double-click.
+    ///
+    /// Prefers structured spans that users expect to copy whole (URLs and quoted
+    /// paths), and finally falls back to a separator-delimited token.
+    pub(crate) fn bounds_at(&self, col: u16) -> Option<(u16, u16)> {
+        let cells = &self.cells;
+        let clicked_idx = cell_index_at_column(cells, col)?;
+
+        // Prefer spans that can legally include punctuation or spaces.
+        let span = url_span_at_column(cells, clicked_idx)
+            .or_else(|| quoted_path_span_at_column(cells, clicked_idx))
+            .or_else(|| token_span_at_column(cells, clicked_idx))?;
+
+        // Convert the internal cell span back to inclusive terminal columns.
+        Some(span.columns(cells))
+    }
+
+    /// The characters that lie wholly inside inclusive display columns.
+    pub(crate) fn text_in(&self, start_col: u16, end_col: u16) -> String {
+        self.cells
+            .iter()
+            .filter(|cell| cell.start_col >= start_col && cell.end_col <= end_col)
+            .map(|cell| cell.ch)
+            .collect()
+    }
 }
 
 fn url_at_byte(text: &str, clicked_byte: usize) -> Option<&str> {

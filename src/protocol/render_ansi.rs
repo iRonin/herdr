@@ -726,10 +726,16 @@ fn repeat_ime_anchor_after_sync() -> bool {
 
 /// Writes all cells in the frame (full redraw).
 fn cell_width(cell: &CellData) -> usize {
-    if is_halfwidth_katakana_voiced_grapheme(&cell.symbol) {
+    symbol_width(&cell.symbol)
+}
+
+/// How many columns the client draws `symbol` across. The cells after it that it
+/// covers are not drawn.
+pub(crate) fn symbol_width(symbol: &str) -> usize {
+    if is_halfwidth_katakana_voiced_grapheme(symbol) {
         return 2;
     }
-    cell.symbol.width()
+    symbol.width()
 }
 
 fn is_halfwidth_katakana_voiced_grapheme(symbol: &str) -> bool {
