@@ -80,6 +80,14 @@ Herdr's naming dialogs, worktree branch fields, filters, and copy-mode search su
 
 Typing and paste insert at the cursor. Movement and deletion respect Unicode grapheme boundaries, and long values scroll horizontally. Cut text stays within the current field; it does not use the system clipboard. Alt shortcuts require the terminal to report Alt/Meta. Enter and Esc retain the dialog's confirm and cancel behavior.
 
+## Typing while Herdr starts
+
+On macOS and Linux, keys you type while `herdr` is starting, before it has drawn your session, are kept. They are delivered once the session appears, in the order you typed them and before anything you type afterwards. This happens once, when the client starts. Reconnects and machine switches later on do not keep keys, and keys typed before Herdr has connected to any machine are handled as before.
+
+Herdr keeps at most 1 KiB of input this way. If more arrives before the session appears, for example a paste, all of it is discarded rather than delivered in part, and so is everything else typed until the session appears. If the session has not appeared 10 seconds after the first kept key, the kept keys are discarded and Herdr stops keeping keys; a line typed across that moment can then reach the pane without its beginning. Kept keys are also discarded, never sent anywhere else, if the connection drops or is replaced, or if another machine's session appears first. On Windows, keys typed before the session appears are not kept.
+
+To be sure a paste arrives intact, wait for your session to appear before pasting.
+
 ## Copy mode
 
 Press `prefix+[` to enter copy mode for the focused pane. Use `h/j/k/l`, tmux-style `w/b/e` and big-word `W/B/E`, `{`/`}`, `PageUp`/`PageDown`, `ctrl+b`/`ctrl+f`, and `ctrl+u`/`ctrl+d` to move. Press `/` or `?` for forward or backward literal search, then `n` or `N` to repeat in the same or opposite direction. Search is case-insensitive unless the query contains an uppercase letter. Use `v` or Space to start a selection, `y` or Enter to copy it, and `q` or Esc to leave without copying. Esc clears an active selection or search before exiting. Copy mode does not pause the pane process: output remains live, follows at the bottom, and stays pinned when you navigate into history. The configured prefix keeps its normal meaning in copy mode; with the default prefix, `ctrl+b` enters prefix mode instead of paging up, so use a different prefix if you want `ctrl+b` for copy-mode page-up. Mouse drag-select copies without entering copy mode at all.
