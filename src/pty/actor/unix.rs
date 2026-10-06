@@ -393,6 +393,9 @@ impl PtyIoActor {
         }));
         let controls = Arc::new(Mutex::new(SharedPtyControls::default()));
         let response_order = Arc::new(Mutex::new(()));
+        #[cfg(target_os = "macos")]
+        let typeahead_guard =
+            macos_typeahead_guard::TypeaheadGuard::new(!config.initially_quiesced);
         let handle = PtyIoActorHandle {
             data_tx,
             control_tx,
@@ -422,6 +425,8 @@ impl PtyIoActor {
             on_read: config.on_read,
             on_reader_exit: config.on_reader_exit,
             poll_observer,
+            #[cfg(target_os = "macos")]
+            typeahead_guard,
         };
         std::thread::Builder::new()
             .name(format!("herdr-pty-{}", config.pane_id))
@@ -456,6 +461,8 @@ struct PtyIoActorRunner {
     on_read: ReadCallback,
     on_reader_exit: Option<ReaderExitCallback>,
     poll_observer: Option<std_mpsc::Sender<()>>,
+    #[cfg(target_os = "macos")]
+    typeahead_guard: macos_typeahead_guard::TypeaheadGuard,
 }
 
 struct ActiveSubmission {
@@ -499,6 +506,10 @@ impl PtyIoActorRunner {
                 bytes,
                 boundary: None,
             });
+            #[cfg(target_os = "macos")]
+            {
+                self.typeahead_guard.rescan_signals = true;
+            }
         }
     }
 
@@ -508,6 +519,10 @@ impl PtyIoActorRunner {
                 bytes,
                 boundary: Some(boundary),
             });
+            #[cfg(target_os = "macos")]
+            {
+                self.typeahead_guard.rescan_signals = true;
+            }
         }
     }
 
@@ -544,7 +559,9 @@ impl PtyIoActorRunner {
                 self.file.as_raw_fd(),
                 self.wake_read_fd.as_raw_fd(),
                 self.state == ActorState::Running,
-                !self.pending_writes.is_empty(),
+                // While the typeahead guard holds input the pty may well have room, so
+                // POLLOUT would fire at once; the guard's re-check deadline wakes the loop.
+                !self.pending_writes.is_empty() && self.typeahead_hold_deadline().is_none(),
                 self.poll_timeout_ms(),
             ) {
                 Ok(readiness) => {
@@ -716,6 +733,8 @@ impl PtyIoActorRunner {
             PtyIoControlCommand::ReleaseAfterCommit(reply) => {
                 self.state = ActorState::Released;
                 self.pending_writes.clear();
+                #[cfg(target_os = "macos")]
+                self.typeahead_guard.reset_grant();
                 let _ = reply.send(Ok(()));
                 return true;
             }
@@ -751,6 +770,24 @@ impl PtyIoActorRunner {
                 "PTY actor was released before handoff quiesce",
             ));
         }
+        // The typeahead guard is off while draining for a handoff, as it was before the
+        // guard existed: holding here would fail the handoff.
+        #[cfg(target_os = "macos")]
+        {
+            self.typeahead_guard.suspended = true;
+        }
+        let drained = self.drain_pending_writes_for_handoff();
+        #[cfg(target_os = "macos")]
+        {
+            self.typeahead_guard.suspended = false;
+            self.typeahead_guard.reset_grant();
+        }
+        drained?;
+        self.state = ActorState::Quiesced;
+        Ok(())
+    }
+
+    fn drain_pending_writes_for_handoff(&mut self) -> std::io::Result<()> {
         let deadline = Instant::now() + HANDOFF_DRAIN_TIMEOUT;
         let _ = self.flush_pending_writes_once()?;
         while !self.pending_writes.is_empty() {
@@ -782,7 +819,6 @@ impl PtyIoActorRunner {
                 let _ = self.flush_pending_writes_once()?;
             }
         }
-        self.state = ActorState::Quiesced;
         Ok(())
     }
 
@@ -907,18 +943,32 @@ impl PtyIoActorRunner {
     }
 
     fn poll_timeout_ms(&self) -> i32 {
-        let Some(ActiveSubmission {
-            phase: SubmissionPhase::WaitingUntil(deadline),
-            ..
-        }) = self.active_submission.as_ref()
-        else {
-            return ACTOR_IDLE_POLL_MS;
+        let submission_deadline = match self.active_submission.as_ref() {
+            Some(ActiveSubmission {
+                phase: SubmissionPhase::WaitingUntil(deadline),
+                ..
+            }) => Some(*deadline),
+            _ => None,
+        };
+        let deadline = match (submission_deadline, self.typeahead_hold_deadline()) {
+            (Some(submission), Some(hold)) => submission.min(hold),
+            (Some(deadline), None) | (None, Some(deadline)) => deadline,
+            (None, None) => return ACTOR_IDLE_POLL_MS,
         };
         deadline
             .saturating_duration_since(Instant::now())
             .as_millis()
             .max(1)
             .min(ACTOR_IDLE_POLL_MS as u128) as i32
+    }
+
+    /// When the typeahead guard looks again, while it holds queued input (macOS only).
+    fn typeahead_hold_deadline(&self) -> Option<Instant> {
+        #[cfg(target_os = "macos")]
+        if !self.pending_writes.is_empty() {
+            return self.typeahead_guard.hold_deadline();
+        }
+        None
     }
 
     fn fail_active_submission(&mut self, err: std::io::Error) {
@@ -938,8 +988,17 @@ impl PtyIoActorRunner {
     }
 
     fn flush_pending_writes_once(&mut self) -> std::io::Result<Option<SubmissionBoundary>> {
-        while let Some(write) = self.pending_writes.front() {
+        while !self.pending_writes.is_empty() {
+            #[cfg(target_os = "macos")]
+            let Some(allowed) = self.typeahead_allowance() else {
+                self.deliver_signal_chars_held_by_guard();
+                return Ok(None);
+            };
+            #[cfg(not(target_os = "macos"))]
+            let allowed = usize::MAX;
+            let write = self.pending_writes.front().expect("pending write");
             let chunk = &write.bytes[self.current_write_offset..];
+            let chunk = &chunk[..chunk.len().min(allowed)];
             match self.file.write(chunk) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
@@ -948,6 +1007,8 @@ impl PtyIoActorRunner {
                     ));
                 }
                 Ok(written) => {
+                    #[cfg(target_os = "macos")]
+                    self.typeahead_guard.record_written(&chunk[..written]);
                     self.current_write_offset += written;
                     if self.current_write_offset >= write.bytes.len() {
                         let completed = self.pending_writes.pop_front().unwrap();
@@ -960,7 +1021,9 @@ impl PtyIoActorRunner {
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     #[cfg(target_os = "macos")]
-                    self.bypass_held_signal_chars();
+                    if self.bypass_held_signal_chars() {
+                        self.typeahead_guard.reset_grant();
+                    }
                     return Ok(None);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return Ok(None),
@@ -968,12 +1031,46 @@ impl PtyIoActorRunner {
                     warn!(pane = self.pane_id, err = %err, "PTY actor write failed");
                     self.pending_writes.clear();
                     self.current_write_offset = 0;
+                    #[cfg(target_os = "macos")]
+                    self.typeahead_guard.reset_grant();
                     return Err(err);
                 }
             }
         }
         self.file.flush()?;
         Ok(None)
+    }
+
+    /// How many queued bytes the typeahead guard lets through now; `None` while it holds them.
+    #[cfg(target_os = "macos")]
+    fn typeahead_allowance(&mut self) -> Option<usize> {
+        let offset = self.current_write_offset;
+        let pending = self
+            .pending_writes
+            .iter()
+            .enumerate()
+            .flat_map(move |(index, write)| {
+                let start = if index == 0 { offset } else { 0 };
+                write.bytes[start..].iter().copied()
+            });
+        self.typeahead_guard
+            .allowance(Instant::now(), self.file.as_raw_fd(), pending)
+    }
+
+    /// While the typeahead guard holds input, a signal character typed behind it must still
+    /// act at once, as when the tty itself refuses the input. The held bytes are scanned again
+    /// only when input has been queued since the last scan.
+    #[cfg(target_os = "macos")]
+    fn deliver_signal_chars_held_by_guard(&mut self) {
+        if !std::mem::take(&mut self.typeahead_guard.rescan_signals) {
+            return;
+        }
+        if self.bypass_held_signal_chars() {
+            // More may be held, and the tty may have been flushed: look again at once.
+            self.typeahead_guard.rescan_signals = true;
+            self.typeahead_guard.reset_grant();
+            self.typeahead_guard.release_hold();
+        }
     }
 
     /// macOS: a pty refuses every byte once about 1 KiB of input is unread, so a signal
@@ -985,12 +1082,12 @@ impl PtyIoActorRunner {
     /// ioctl(TIOCSIG) signals the foreground process group (and flushes the same way).
     /// VSTART/VSTOP with IXON never enter the kernel's input queue, so they are moved
     /// ahead of the backlog, with TIOCSTART/TIOCSTOP as the fallback. Everything else
-    /// keeps its order.
+    /// keeps its order. Returns whether a held character was delivered.
     #[cfg(target_os = "macos")]
-    fn bypass_held_signal_chars(&mut self) {
+    fn bypass_held_signal_chars(&mut self) -> bool {
         let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
         if unsafe { libc::tcgetattr(self.file.as_raw_fd(), &mut termios) } != 0 {
-            return;
+            return false;
         }
         const VDISABLE: libc::cc_t = 0xff;
         let noflush = termios.c_lflag & libc::NOFLSH != 0;
@@ -1040,7 +1137,7 @@ impl PtyIoActorRunner {
             }
         }
         let Some((write_idx, byte_idx, action)) = found else {
-            return;
+            return false;
         };
         let byte = self.pending_writes[write_idx].bytes[byte_idx];
 
@@ -1104,6 +1201,7 @@ impl PtyIoActorRunner {
         for boundary in dropped_boundaries {
             self.complete_submission_boundary(boundary);
         }
+        true
     }
 
     fn resize(&self, resize: PtyResize) {
@@ -1175,6 +1273,9 @@ fn input_submission_closed_error() -> std::io::Error {
         "PTY actor closed during input submission",
     )
 }
+
+#[cfg(target_os = "macos")]
+mod macos_typeahead_guard;
 
 #[cfg(all(test, target_os = "macos"))]
 mod macos_typeahead_tests;
@@ -1258,6 +1359,8 @@ mod tests {
             on_read: Box::new(|_| PtyReadResult::empty()),
             on_reader_exit: None,
             poll_observer: None,
+            #[cfg(target_os = "macos")]
+            typeahead_guard: macos_typeahead_guard::TypeaheadGuard::new(true),
         };
         (runner, peer)
     }
@@ -1835,6 +1938,8 @@ mod tests {
             }),
             on_reader_exit: None,
             poll_observer: None,
+            #[cfg(target_os = "macos")]
+            typeahead_guard: macos_typeahead_guard::TypeaheadGuard::new(true),
         };
         let handle = PtyIoActorHandle {
             data_tx,
@@ -1962,6 +2067,8 @@ mod tests {
             on_read: Box::new(|_| PtyReadResult::empty()),
             on_reader_exit: None,
             poll_observer: None,
+            #[cfg(target_os = "macos")]
+            typeahead_guard: macos_typeahead_guard::TypeaheadGuard::new(true),
         };
 
         runner.begin_handoff().expect("handoff drains queued write");
