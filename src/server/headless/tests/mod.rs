@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::TestTempPath;
 
 mod event_fairness;
 mod native_graphics;
@@ -140,6 +141,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         server_stop,
         server_event_rx,
         server_event_tx,
+        test_server_dir: Some(TestTempPath::owns(dir)),
     }
 }
 
