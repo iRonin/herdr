@@ -5017,6 +5017,9 @@ mod tests {
 
     /// The shared env lock, taken poison-tolerant: one test failing while
     /// holding it must not cascade into unrelated failures of the others.
+    /// Only tests that actually change the process environment take it (the
+    /// socket-path tests below); the fetch tests intercept their own curl
+    /// per thread and touch no environment at all.
     #[cfg(unix)]
     fn remote_env_guard() -> std::sync::MutexGuard<'static, ()> {
         remote_env_lock()
@@ -5024,18 +5027,19 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Points THIS process's environment into a throwaway sandbox (TMPDIR
-    /// inside a temp dir, a fake `curl` first on PATH that logs every
-    /// invocation and fails, and no HERDR_* variables) so a test may call the
-    /// real release-download code in-process: if the fork refusal is ever
-    /// lost, the call dies at the sandboxed manifest fetch instead of reaching
-    /// the network. Every touched variable is restored on drop; the sandbox
-    /// dir is kept when dropping during a panic so the failure evidence
-    /// survives.
+    /// A fake `curl` that logs every invocation and fails, plus the per-thread
+    /// redirect that points `curl_command()` at it: a test may call the real
+    /// release-download code and, if the fork refusal is ever lost, the call
+    /// dies at the fake manifest fetch instead of reaching the network. No
+    /// process environment is touched (parallel tests read PATH and TMPDIR,
+    /// and one test's redirect must not affect another), and the sandbox
+    /// removes its directory on drop - on success and on a failing assertion
+    /// alike, so a test run leaves nothing in `$TMPDIR` (the assertion
+    /// messages carry the evidence instead).
     #[cfg(unix)]
     struct FetchSandbox {
         dir: PathBuf,
-        saved: Vec<(String, Option<std::ffi::OsString>)>,
+        _curl_override: crate::noninteractive_process::CurlProgramOverride,
     }
 
     #[cfg(unix)]
@@ -5045,9 +5049,8 @@ mod tests {
 
             let dir = std::env::temp_dir()
                 .join(format!("herdr-attach-fetch-{tag}-{}", std::process::id()));
-            std::fs::create_dir_all(dir.join("bin")).expect("create sandbox bin");
-            std::fs::create_dir_all(dir.join("tmp")).expect("create sandbox tmp");
-            let curl = dir.join("bin/curl");
+            std::fs::create_dir_all(&dir).expect("create sandbox dir");
+            let curl = dir.join("curl");
             std::fs::write(
                 &curl,
                 format!(
@@ -5058,26 +5061,12 @@ mod tests {
             .expect("write fake curl");
             std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755))
                 .expect("make fake curl executable");
+            let curl_override = crate::noninteractive_process::CurlProgramOverride::new(&curl);
 
-            let mut saved = Vec::new();
-            for key in ["TMPDIR", "PATH"] {
-                saved.push((key.to_string(), std::env::var_os(key)));
+            Self {
+                dir,
+                _curl_override: curl_override,
             }
-            let herdr_keys: Vec<String> = std::env::vars_os()
-                .map(|(key, _)| key.to_string_lossy().into_owned())
-                .filter(|key| key.starts_with("HERDR_"))
-                .collect();
-            for key in herdr_keys {
-                saved.push((key.clone(), std::env::var_os(&key)));
-                std::env::remove_var(&key);
-            }
-            std::env::set_var("TMPDIR", dir.join("tmp"));
-            std::env::set_var(
-                "PATH",
-                format!("{}:/usr/bin:/bin", dir.join("bin").display()),
-            );
-
-            Self { dir, saved }
         }
 
         fn curl_was_called(&self) -> bool {
@@ -5092,17 +5081,7 @@ mod tests {
     #[cfg(unix)]
     impl Drop for FetchSandbox {
         fn drop(&mut self) {
-            for (key, value) in self.saved.drain(..) {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-            if std::thread::panicking() {
-                eprintln!("sandbox kept for inspection: {}", self.dir.display());
-            } else {
-                let _ = std::fs::remove_dir_all(&self.dir);
-            }
+            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -5140,7 +5119,6 @@ mod tests {
         // silently run without the fork's features. When neither
         // `HERDR_REMOTE_BINARY` nor the same-platform upload applies, the
         // install source must refuse instead of downloading.
-        let _env = remote_env_guard();
         let sandbox = FetchSandbox::new("resolve-refusal");
 
         let Err(error) = resolve_install_source(&platform_mismatch(), None) else {
@@ -5182,7 +5160,6 @@ mod tests {
         // test can flip; the proof is that the refusal precedes every fetch.
         // This is also the defense in depth behind the refusal in
         // `resolve_install_source`.
-        let _env = remote_env_guard();
         let sandbox = FetchSandbox::new("download-refusal");
 
         let Err(error) = download_release_asset(&platform_mismatch()) else {
@@ -5206,7 +5183,6 @@ mod tests {
         // The refusal must not cover the same-platform upload: the local
         // binary is this fork's own build, so seeding the remote with it keeps
         // every feature. This is the upstream behaviour and must stay.
-        let _env = remote_env_guard();
         let sandbox = FetchSandbox::new("local-seed");
 
         let source = resolve_install_source(&RemotePlatform::local(), None)
@@ -5263,7 +5239,6 @@ mod tests {
         // release download - measured here as the manifest fetch reaching the
         // sandboxed fake curl, with no fork refusal anywhere in the error.
         // Only the fork branch may refuse.
-        let _env = remote_env_guard();
         let sandbox = FetchSandbox::new("stock-download");
 
         let Err(error) = resolve_install_source_for(&platform_mismatch(), None, false) else {

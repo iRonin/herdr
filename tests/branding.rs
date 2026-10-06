@@ -3,6 +3,16 @@ pub mod support;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Command;
 
+/// Removes its directory on drop - on success AND on a failing assertion - so
+/// a test run leaves nothing behind in `$TMPDIR`.
+struct SandboxDir(std::path::PathBuf);
+
+impl Drop for SandboxDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn version_identifies_branded_fork() {
     let mut herdr_command = Command::new(env!("CARGO_BIN_EXE_herdr"));
@@ -38,9 +48,12 @@ fn update_refuses_on_fork_build_and_leaves_the_binary_untouched() {
     //     and fails, so an unguarded run dies at the manifest fetch instead
     //     of downloading a release.
     // A regression therefore fails the assertions below loudly, having
-    // touched nothing outside the sandbox.
+    // touched nothing outside the sandbox. The sandbox removes itself on
+    // drop - on success and on a failing assertion alike - so a run leaves
+    // nothing in `$TMPDIR`.
     let sandbox =
         std::env::temp_dir().join(format!("herdr-branding-update-{}", std::process::id()));
+    let _cleanup = SandboxDir(sandbox.clone());
     let home = sandbox.join("home");
     let config = sandbox.join("config");
     let state = sandbox.join("state");
@@ -119,8 +132,6 @@ fn update_refuses_on_fork_build_and_leaves_the_binary_untouched() {
         "the binary inode must not change"
     );
     assert_eq!(before, after, "the binary bytes must not change");
-
-    let _ = std::fs::remove_dir_all(&sandbox);
 }
 
 #[test]
@@ -138,6 +149,7 @@ fn remote_attach_refuses_the_upstream_release_on_a_fork_build_and_fetches_nothin
     // binary discovery) and fails everything else.
     let sandbox =
         std::env::temp_dir().join(format!("herdr-branding-remote-{}", std::process::id()));
+    let _cleanup = SandboxDir(sandbox.clone());
     let home = sandbox.join("home");
     let config = sandbox.join("config");
     let state = sandbox.join("state");
