@@ -67,8 +67,6 @@ impl ClientShellState {
                 col: 0,
             });
         self.selection = None;
-        self.selection_rows = None;
-        self.renumbered_selection = None;
         self.stop_selection_autoscroll();
         self.selection_highlight_clear_deadline = None;
         self.reset_copy_pipeline();

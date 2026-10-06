@@ -41,10 +41,6 @@ impl ClientShellState {
     /// A new pane surface: if the selection's pane history lost rows, the
     /// selection's rows name other lines now.
     pub(super) fn selection_sees_history(&mut self, surface: &PaneSurfaceFrame) {
-        if self.selection.is_none() && self.word_selection_gesture.is_none() {
-            self.selection_rows = None;
-            return;
-        }
         let Some(rows) = self.selection_rows.as_mut() else {
             return;
         };
