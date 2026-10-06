@@ -344,12 +344,7 @@ impl ClientShellState {
                         .push(ClientShellAction::ClipboardWrite(gesture.word.into_bytes()));
                     self.show_copy_feedback(now);
                     // Highlight it only while the screen still shows it.
-                    let shown = !gesture.word_replaced
-                        && !self
-                            .pane_surface
-                            .as_ref()
-                            .is_some_and(|surface| gesture.word_cells.replaced_in(surface));
-                    if shown {
+                    if !gesture.word_replaced {
                         self.selection_highlight_clear_deadline =
                             Some(now + std::time::Duration::from_millis(500));
                         self.copied_word_highlight = Some(gesture.word_cells);
