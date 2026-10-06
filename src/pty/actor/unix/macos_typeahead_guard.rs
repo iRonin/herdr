@@ -53,6 +53,9 @@ pub(super) struct TypeaheadGuard {
     pub(super) rescan_signals: bool,
     #[cfg(test)]
     pub(super) checks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Test only: runs between two writes of one grant, just before a cached grant is used.
+    #[cfg(test)]
+    pub(super) before_cached_write: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl TypeaheadGuard {
@@ -72,6 +75,8 @@ impl TypeaheadGuard {
             rescan_signals: false,
             #[cfg(test)]
             checks: Default::default(),
+            #[cfg(test)]
+            before_cached_write: None,
         }
     }
 
@@ -104,6 +109,10 @@ impl TypeaheadGuard {
             return Some(usize::MAX);
         }
         if self.granted > 0 {
+            #[cfg(test)]
+            if let Some(hook) = self.before_cached_write.as_mut() {
+                hook();
+            }
             return Some(self.granted);
         }
         if let Some(bound) = self.ring_bound {
