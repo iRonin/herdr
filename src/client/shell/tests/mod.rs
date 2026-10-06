@@ -350,3 +350,4 @@ mod tab_agent_status;
 mod tab_bar_wrap;
 mod tab_close_button;
 mod tab_drag_move_workspace;
+mod trim_guard;
