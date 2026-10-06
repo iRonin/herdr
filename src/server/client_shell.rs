@@ -576,6 +576,102 @@ fn split_hit_rect(
     Some(hit)
 }
 
+/// A one-pane app whose pane printed `L000`..`L{lines-1}`, one per line, so the
+/// text of a row names its absolute row. Shared by the server and client tests of
+/// how a frame's scroll metrics line up with its cells.
+#[cfg(test)]
+pub(crate) fn test_numbered_lines_app(lines: usize) -> (app::App, crate::ui::TabSurfaceTarget) {
+    let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app::App::new(
+        &crate::config::Config::default(),
+        crate::app::AppPolicy::TEST,
+        None,
+        api_rx,
+        crate::api::EventHub::default(),
+    );
+    let mut workspace = crate::workspace::Workspace::test_new("lines");
+    let root = workspace.tabs[0].root_pane;
+    let history: String = (0..lines).map(|line| format!("L{line:03}\r\n")).collect();
+    workspace.insert_test_runtime(
+        root,
+        crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+            40,
+            6,
+            1024 * 1024,
+            history.as_bytes(),
+        ),
+    );
+    app.state.workspaces = vec![workspace];
+    app.state.active = Some(0);
+    app.state.selected = 0;
+    app.state.ensure_test_terminals();
+    (
+        app,
+        crate::ui::TabSurfaceTarget {
+            workspace_index: 0,
+            tab_index: 0,
+        },
+    )
+}
+
+/// Print `L{first}`..`L{end-1}` in the numbered pane of `test_numbered_lines_app`.
+#[cfg(test)]
+pub(crate) fn test_print_numbered_lines(app: &app::App, lines: std::ops::Range<usize>) {
+    let pane = app.state.workspaces[0].tabs[0].root_pane;
+    let text: String = lines.map(|line| format!("L{line:03}\r\n")).collect();
+    app.state
+        .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane)
+        .expect("pane runtime")
+        .test_process_pty_bytes(text.as_bytes());
+}
+
+#[cfg(test)]
+fn test_render_pane_surface(
+    app: &mut app::App,
+    target: crate::ui::TabSurfaceTarget,
+    area: Rect,
+) -> RenderedPaneSurface {
+    render_pane_surface(
+        app,
+        Some(target),
+        area,
+        true,
+        false,
+        crate::kitty_graphics::HostCellSize {
+            width_px: 1,
+            height_px: 1,
+        },
+        &crate::kitty_graphics::surface::DeliveryCache::default(),
+        1,
+    )
+}
+
+/// The full surface frame a client receives for `app`'s numbered pane.
+#[cfg(test)]
+pub(crate) fn test_pane_surface_frame(
+    app: &mut app::App,
+    target: crate::ui::TabSurfaceTarget,
+    area: Rect,
+    surface_revision: u64,
+) -> protocol::PaneSurfaceFrame {
+    let rendered = test_render_pane_surface(app, target, area);
+    protocol::PaneSurfaceFrame {
+        boot_id: "boot-1".into(),
+        projection_revision: 1,
+        surface_revision,
+        frame: rendered.frame,
+        panes: rendered.panes,
+        splits: rendered.splits,
+        popup: rendered.popup,
+        graphics: rendered.graphics,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_snapshot(app: &app::App) -> protocol::ClientShellSnapshot {
+    snapshot(app, "boot-1", 1, None, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -849,6 +945,114 @@ mod tests {
         assert_eq!(
             split_hit_rect(&horizontal, false, true, &[Rect::new(19, 3, 1, 12)]),
             None
+        );
+    }
+
+    fn numbered_lines_app(lines: usize) -> (app::App, crate::ui::TabSurfaceTarget) {
+        test_numbered_lines_app(lines)
+    }
+
+    fn render_numbered(
+        app: &mut app::App,
+        target: crate::ui::TabSurfaceTarget,
+    ) -> RenderedPaneSurface {
+        test_render_pane_surface(app, target, Rect::new(0, 0, 40, 8))
+    }
+
+    /// For each pane row that shows a numbered line: (viewport row, absolute row the
+    /// frame's scroll metrics give it, the line number the cells show).
+    fn numbered_rows(rendered: &RenderedPaneSurface) -> Vec<(u16, u64, u64)> {
+        let pane = &rendered.panes[0];
+        let scroll = pane.scroll.expect("a real pane carries scroll metrics");
+        let top = scroll.max_offset_from_bottom - scroll.offset_from_bottom;
+        let width = usize::from(rendered.frame.width);
+        (0..pane.inner_rect.height)
+            .filter_map(|y| {
+                let row = usize::from(pane.inner_rect.y + y);
+                let start = row * width + usize::from(pane.inner_rect.x);
+                let text: String = rendered.frame.cells[start..start + 4]
+                    .iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect();
+                let shown = text.strip_prefix('L')?.parse::<u64>().ok()?;
+                Some((y, top + u64::from(y), shown))
+            })
+            .collect()
+    }
+
+    /// A frame's scroll metrics must describe the cells the same frame carries: the
+    /// client turns a clicked screen row into an absolute row with them, and a
+    /// double-click anchors its word there. Output that lands after a pane's cells
+    /// are drawn but before the frame is finished must not move the metrics away
+    /// from those cells. The frame is still marked as changed during the render.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pane_surface_scroll_metrics_match_its_cells_when_output_lands_mid_render() {
+        let (mut app, target) = numbered_lines_app(30);
+        // The first render sizes the pane to the layout, which is a content change
+        // and leaves blank rows under the last line; fill them.
+        render_numbered(&mut app, target);
+        test_print_numbered_lines(&app, 30..40);
+        render_numbered(&mut app, target);
+
+        let control = render_numbered(&mut app, target);
+        let control_rows = numbered_rows(&control);
+        assert!(
+            control_rows.len() >= 5,
+            "control: the pane shows numbered lines: {control_rows:?}"
+        );
+        assert!(
+            control_rows
+                .iter()
+                .all(|(_, absolute, shown)| absolute == shown),
+            "control: a quiet frame's metrics match its cells: {control_rows:?}"
+        );
+        assert!(
+            control.panes[0].content_revision.is_multiple_of(2),
+            "control: nothing changed during the render"
+        );
+        let control_max = control.panes[0].scroll.unwrap().max_offset_from_bottom;
+
+        let mut fired = false;
+        let hook = crate::ui::test_after_pane_cells_rendered(move |runtime| {
+            if !std::mem::replace(&mut fired, true) {
+                runtime.test_process_pty_bytes(b"L040\r\nL041\r\nL042\r\n");
+            }
+        });
+        let raced = render_numbered(&mut app, target);
+        drop(hook);
+        let raced_rows = numbered_rows(&raced);
+        assert!(
+            raced_rows.iter().all(|(_, _, shown)| *shown < 40),
+            "the cells were drawn before the output: {raced_rows:?}"
+        );
+        assert!(
+            !raced.panes[0].content_revision.is_multiple_of(2),
+            "output during the render still marks the frame as changed"
+        );
+        assert!(
+            raced_rows
+                .iter()
+                .all(|(_, absolute, shown)| absolute == shown),
+            "the frame's scroll metrics describe its own cells, not the output after them: \
+             (viewport row, absolute row by the metrics, line shown) {raced_rows:?}"
+        );
+
+        let after = render_numbered(&mut app, target);
+        let after_rows = numbered_rows(&after);
+        assert!(
+            after_rows.iter().any(|(_, _, shown)| *shown == 42),
+            "the output did reach the pane: {after_rows:?}"
+        );
+        assert_eq!(
+            after.panes[0].scroll.unwrap().max_offset_from_bottom,
+            control_max + 3,
+            "three lines scrolled the pane"
+        );
+        assert!(
+            after_rows
+                .iter()
+                .all(|(_, absolute, shown)| absolute == shown),
+            "{after_rows:?}"
         );
     }
 }

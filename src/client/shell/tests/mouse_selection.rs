@@ -3367,3 +3367,158 @@ fn context_menu_keyboard_and_outside_click_are_client_owned() {
     assert!(outside.repaint);
     assert!(state.overlay.is_none());
 }
+
+/// Answer the client's `pane.selection.read` requests from the real server state.
+fn serve_from_app(
+    app: &mut crate::app::App,
+    state: &mut ClientShellState,
+    actions: Vec<ClientShellAction>,
+) -> Vec<String> {
+    let mut copied = Vec::new();
+    let mut pending = actions;
+    while !pending.is_empty() {
+        let mut next = Vec::new();
+        for action in pending {
+            match action {
+                ClientShellAction::Endpoint { request, .. } => {
+                    let id = request.id.clone();
+                    let crate::api::schema::Method::PaneSelectionRead(params) = &request.method
+                    else {
+                        continue;
+                    };
+                    let pane_id = params.pane_id.clone();
+                    let reply: serde_json::Value =
+                        serde_json::from_str(&app.handle_api_request(*request))
+                            .expect("JSON reply");
+                    let text = reply["result"]["text"]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("selection read reply: {reply}"))
+                        .to_owned();
+                    next.extend(
+                        state
+                            .handle_endpoint_result(
+                                "boot-1",
+                                &id,
+                                Ok(crate::api::schema::ResponseResult::PaneSelection {
+                                    pane_id,
+                                    text,
+                                }),
+                            )
+                            .1,
+                    );
+                }
+                ClientShellAction::ClipboardWrite(bytes) => {
+                    copied.push(String::from_utf8_lossy(&bytes).into_owned());
+                }
+                _ => {}
+            }
+        }
+        pending = next;
+    }
+    copied
+}
+
+/// A double-click on a frame the server built while the pane's output scrolled
+/// it (output landed after the pane's cells were drawn). The real server frame
+/// build and the real server's row reads, so the frame's scroll metrics are the
+/// ones the server sends. The word must be anchored at the absolute row of the
+/// line it shows: (a) a plain double-click keeps its highlight on the next frame
+/// and copies the word; (b) a double-click dragged over two more lines copies
+/// those lines, not the lines the output brought under them.
+#[tokio::test(flavor = "current_thread")]
+async fn double_click_on_a_frame_drawn_while_output_scrolled_the_pane_anchors_its_own_lines() {
+    let mut failures = Vec::new();
+    for extend in [false, true] {
+        let case = format!("extended {extend}");
+        let (mut app, target) = crate::server::client_shell::test_numbered_lines_app(30);
+        let mut config = Config::default();
+        config.ui.copy_on_select = true;
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+        state.set_snapshot(Box::new(crate::server::client_shell::test_snapshot(&app)));
+        let size = state.surface_size(106, 20);
+        let area = Rect::new(0, 0, size.cols, size.rows);
+        let frame = |app: &mut crate::app::App, revision| {
+            crate::server::client_shell::test_pane_surface_frame(app, target, area, revision)
+        };
+        // Size the pane, then fill the rows that sizing left blank.
+        frame(&mut app, 1);
+        crate::server::client_shell::test_print_numbered_lines(&app, 30..60);
+        state.set_pane_surface(frame(&mut app, 2));
+        paint(&mut state);
+
+        let mut fired = false;
+        let hook = crate::ui::test_after_pane_cells_rendered(move |runtime| {
+            if !std::mem::replace(&mut fired, true) {
+                runtime.test_process_pty_bytes(b"L060\r\nL061\r\nL062\r\n");
+            }
+        });
+        let raced = frame(&mut app, 3);
+        drop(hook);
+        state.set_pane_surface(raced);
+        paint(&mut state);
+
+        // The line on screen row 2, by the cells the client painted.
+        let pane = state.hits.panes[0].clone();
+        let shown = |state: &ClientShellState, row: u16| -> u32 {
+            let surface = state.pane_surface.as_ref().expect("surface");
+            let surface_pane = &surface.panes[0];
+            let width = usize::from(surface.frame.width);
+            let start = usize::from(surface_pane.inner_rect.y + row) * width
+                + usize::from(surface_pane.inner_rect.x);
+            let text: String = surface.frame.cells[start..start + 4]
+                .iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect();
+            text.strip_prefix('L')
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("row {row} shows {text:?}"))
+        };
+        let line = shown(&state, 2);
+        assert!(
+            line < 60,
+            "{case}: the raced frame's cells predate the output"
+        );
+        assert!(
+            pane.inner_rect.height > 5,
+            "{case}: room to drag two rows down"
+        );
+
+        let held = press_twice(&mut state, 2, 1);
+        assert!(serve_from_app(&mut app, &mut state, held).is_empty());
+        let anchored = state.selection.as_ref().map(|s| s.ordered_cells());
+        if anchored != Some(((line, 0), (line, 3))) {
+            failures.push(format!(
+                "{case}: line {line} highlighted at absolute cells {anchored:?}"
+            ));
+        }
+        if extend {
+            let drag = word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 4, 2);
+            assert!(serve_from_app(&mut app, &mut state, drag.actions).is_empty());
+            let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 4, 2);
+            let copied = serve_from_app(&mut app, &mut state, release.actions);
+            let expected = format!("L{:03}\nL{:03}\nL{:03}", line, line + 1, line + 2);
+            if copied != vec![expected.clone()] {
+                failures.push(format!(
+                    "{case}: dragged over the lines shown as {expected:?}, copied {copied:?}"
+                ));
+            }
+        } else {
+            state.set_pane_surface(frame(&mut app, 4));
+            paint(&mut state);
+            let kept = state.selection.as_ref().map(|s| s.ordered_cells());
+            if kept != Some(((line, 0), (line, 3))) {
+                failures.push(format!(
+                    "{case}: the next frame still shows L{line:03} at its row, highlight {kept:?}"
+                ));
+            }
+            let release = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 2, 1);
+            let copied = serve_from_app(&mut app, &mut state, release.actions);
+            assert_eq!(
+                copied,
+                vec![format!("L{line:03}")],
+                "{case}: the copy is the clicked word either way"
+            );
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

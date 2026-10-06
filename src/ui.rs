@@ -18,6 +18,8 @@ pub(crate) use self::onboarding::{
 #[cfg(all(test, unix))]
 pub(crate) use self::panes::popup_pane_rects;
 use self::panes::resize_popup_pane;
+#[cfg(test)]
+pub(crate) use self::panes::test_after_pane_cells_rendered;
 pub(crate) use self::panes::{
     apply_pane_chrome, pane_inner_rect, pane_is_scrolled_back, render_selection_highlight,
 };

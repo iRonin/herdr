@@ -412,11 +412,51 @@ pub(super) fn render_panes(
                 && !pane_is_scrolled_back(rt)
                 && app.pane_exposes_host_cursor(ws_idx, info.id);
             rt.render(frame, info.inner_rect, show_cursor);
+            #[cfg(test)]
+            after_pane_cells_rendered(rt);
             render_pane_scrollbar(app, frame, info, rt);
         }
     }
 
     render_pane_borders(app, ws, pane_infos, split_borders, frame);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook run right after a pane's cells are drawn into the frame, so a test
+    /// can land pane output exactly between the cells and anything read after them.
+    static AFTER_PANE_CELLS_RENDERED: std::cell::RefCell<Option<Box<dyn FnMut(&TerminalRuntime)>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Run `hook` after every pane's cells are drawn on this thread, until the returned
+/// guard is dropped.
+#[cfg(test)]
+pub(crate) fn test_after_pane_cells_rendered(
+    hook: impl FnMut(&TerminalRuntime) + 'static,
+) -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            AFTER_PANE_CELLS_RENDERED.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    AFTER_PANE_CELLS_RENDERED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    Reset
+}
+
+#[cfg(test)]
+fn after_pane_cells_rendered(rt: &TerminalRuntime) {
+    let hook = AFTER_PANE_CELLS_RENDERED.with(|slot| slot.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        hook(rt);
+        AFTER_PANE_CELLS_RENDERED.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
+    }
 }
 
 pub(crate) fn popup_pane_rects(app: &AppState, area: Rect) -> Option<(Rect, Rect)> {
