@@ -244,6 +244,218 @@ esac
         !stderr.contains("herdr update"),
         "no error on a fork build may advise `herdr update`; got: {stderr}"
     );
+}
 
-    let _ = std::fs::remove_dir_all(&sandbox);
+/// Sandbox + fake `ssh`/`curl` for the remote-adoption runs: the fake remote
+/// reports Linux x86_64 with one installed herdr (at a non-managed path) whose
+/// client status passes the endpoint requirement, so attach ADOPTS it. The
+/// `--version` reply is the variant under test (written to
+/// `bin/version_reply.sh`, which must print the
+/// `herdr-remote-output-ready:1` marker every remote reply carries);
+/// everything else answers only what the adoption
+/// path needs, and fails the later server-status probe so the run stops right
+/// after the adoption with no bridge or client process. The sandbox removes
+/// itself on drop, on success and on failure alike.
+struct RemoteAdoptionFixture {
+    _cleanup: SandboxDir,
+    ssh_log: std::path::PathBuf,
+    curl_log: std::path::PathBuf,
+    output: std::process::Output,
+}
+
+impl RemoteAdoptionFixture {
+    fn run(name: &str, version_reply_script: &str) -> Self {
+        let sandbox = std::env::temp_dir().join(format!(
+            "herdr-branding-adopt-{name}-{}",
+            std::process::id()
+        ));
+        let home = sandbox.join("home");
+        let config = sandbox.join("config");
+        let state = sandbox.join("state");
+        let runtime = sandbox.join("run");
+        let tmp = sandbox.join("tmp");
+        let bin = sandbox.join("bin");
+        for dir in [&home, &config, &state, &runtime, &tmp, &bin] {
+            std::fs::create_dir_all(dir).expect("create sandbox dir");
+        }
+
+        let curl_log = sandbox.join("curl.log");
+        let curl = bin.join("curl");
+        std::fs::write(
+            &curl,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 22\n",
+                curl_log.display()
+            ),
+        )
+        .expect("write fake curl");
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake curl executable");
+
+        let version_reply = bin.join("version_reply.sh");
+        std::fs::write(&version_reply, version_reply_script).expect("write version reply");
+        std::fs::set_permissions(&version_reply, std::fs::Permissions::from_mode(0o755))
+            .expect("make version reply executable");
+
+        let ssh_log = sandbox.join("ssh.log");
+        let ssh = bin.join("ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                r#"#!/bin/sh
+input=$(cat 2>/dev/null || true)
+printf 'ARGS %s | STDIN %s\n' "$*" "$input" >> {log}
+case "$* $input" in
+  *"uname -s"*)
+    printf '\nherdr-remote-output-ready:1\nLinux\nx86_64\n'
+    exit 0 ;;
+  *--version*)
+    exec /bin/sh {reply} ;;
+  *"status client --json"*)
+    printf '\nherdr-remote-output-ready:1\n%s\n' '{{"version":"0.9.1","protocol":22,"endpoint_protocol_generation":1}}'
+    exit 0 ;;
+  *"command -v herdr"*)
+    printf '\nherdr-remote-output-ready:1\n/home/fixture/.local/bin/herdr\n'
+    exit 0 ;;
+  *emit*)
+    printf '\nherdr-remote-output-ready:1\n'
+    exit 0 ;;
+  *)
+    exit 1 ;;
+esac
+"#,
+                log = ssh_log.display(),
+                reply = version_reply.display()
+            ),
+        )
+        .expect("write fake ssh");
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake ssh executable");
+
+        let cleanup = SandboxDir(sandbox.clone());
+
+        let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+            .env_clear()
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("TMPDIR", &tmp)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .args(["--remote", "remote-fixture"])
+            .output()
+            .expect("herdr --remote should run");
+
+        Self {
+            _cleanup: cleanup,
+            ssh_log,
+            curl_log,
+            output,
+        }
+    }
+
+    fn stderr(&self) -> String {
+        String::from_utf8_lossy(&self.output.stderr).into_owned()
+    }
+
+    fn ssh_log(&self) -> String {
+        std::fs::read_to_string(&self.ssh_log).unwrap_or_default()
+    }
+
+    fn version_command_count(&self) -> usize {
+        // The remote command travels on the fake ssh's stdin (attach runs it
+        // through `/bin/sh -s`), so the log records stdin too.
+        self.ssh_log()
+            .lines()
+            .filter(|line| line.contains("--version"))
+            .count()
+    }
+}
+
+#[test]
+fn remote_attach_warns_when_it_adopts_a_stock_remote_herdr() {
+    // A fork build adopting a stock upstream herdr on the remote must say so:
+    // a stock remote runs without any fork feature, and it is exactly what
+    // older fork clients installed through the release download. The notice
+    // must name the remote's version and the remedy the code really supports -
+    // HERDR_REMOTE_BINARY forces an install over the managed remote binary -
+    // and the version check must cost at most one extra remote command.
+    let fixture = RemoteAdoptionFixture::run(
+        "stock",
+        "#!/bin/sh\nprintf '\\nherdr-remote-output-ready:1\\nherdr 0.9.1\\n'\nexit 0\n",
+    );
+    let stderr = fixture.stderr();
+
+    assert!(
+        stderr.contains("upstream Herdr 0.9.1"),
+        "the notice must name the remote's stock version; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("features are missing"),
+        "the notice must say the fork's features are missing there; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("built from source"),
+        "the notice must say where the remote build comes from; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("HERDR_REMOTE_BINARY"),
+        "the notice must name the supported remedy; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("herdr update"),
+        "no fork-build message may advise `herdr update`; got: {stderr}"
+    );
+    assert!(
+        !fixture.curl_log.exists(),
+        "adoption must not fetch a release; curl saw: {}",
+        std::fs::read_to_string(&fixture.curl_log).unwrap_or_default()
+    );
+    assert_eq!(
+        fixture.version_command_count(),
+        1,
+        "the stock check must cost exactly one remote command; ssh log:\n{}",
+        fixture.ssh_log()
+    );
+}
+
+#[test]
+fn remote_attach_stays_quiet_when_the_remote_herdr_carries_the_fork_banner() {
+    // A remote already running a fork build needs no notice: it carries the
+    // banner in its `--version` output.
+    let fixture = RemoteAdoptionFixture::run(
+        "banner",
+        "#!/bin/sh\nprintf '\\nherdr-remote-output-ready:1\\nherdr 0.9.1 (iRonin fork)\\n'\nexit 0\n",
+    );
+    let stderr = fixture.stderr();
+
+    assert_eq!(
+        fixture.version_command_count(),
+        1,
+        "the check must still run (positive control); ssh log:\n{}",
+        fixture.ssh_log()
+    );
+    assert!(
+        !stderr.contains("upstream Herdr"),
+        "a banner-carrying remote must stay quiet; got: {stderr}"
+    );
+}
+
+#[test]
+fn remote_attach_stays_quiet_when_the_remote_version_check_fails() {
+    // An unclear answer is not evidence: if `--version` fails, print nothing
+    // rather than guess that the remote is stock.
+    let fixture = RemoteAdoptionFixture::run("nofail", "#!/bin/sh\nexit 1\n");
+    let stderr = fixture.stderr();
+
+    assert_eq!(
+        fixture.version_command_count(),
+        1,
+        "the check must still run (positive control); ssh log:\n{}",
+        fixture.ssh_log()
+    );
+    assert!(
+        !stderr.contains("upstream Herdr"),
+        "a failed version check must stay quiet; got: {stderr}"
+    );
 }
