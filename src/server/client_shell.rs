@@ -320,7 +320,7 @@ pub(super) fn render_pane_surface(
             )
         })
         .unwrap_or_default();
-    let (buffer, cursor, hyperlinks, layout) =
+    let (buffer, cursor, hyperlinks, layout, rendered_scroll) =
         crate::server::render_stream::render_tab_surface_virtual(
             &app.state,
             &app.terminal_runtimes,
@@ -370,7 +370,9 @@ pub(super) fn render_pane_surface(
                             rect: pane.rect.into(),
                             inner_rect: pane.inner_rect.into(),
                             scrollbar_rect: pane.scrollbar_rect.map(Into::into),
-                            scroll: runtime.and_then(|runtime| runtime.scroll_metrics()).map(
+                            // The metrics the cells were drawn with, not a later
+                            // read: output may have scrolled the pane since.
+                            scroll: rendered_scroll.get(&pane.id).copied().flatten().map(
                                 |metrics| protocol::PaneSurfaceScrollMetrics {
                                     offset_from_bottom: metrics.offset_from_bottom as u64,
                                     max_offset_from_bottom: metrics.max_offset_from_bottom as u64,

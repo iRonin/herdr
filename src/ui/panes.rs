@@ -391,6 +391,11 @@ fn compute_pane_infos(
     )
 }
 
+/// The scroll metrics each pane's cells were drawn with, read under the same
+/// terminal lock as the cells. `None` for a pane whose metrics could not be read.
+pub(crate) type RenderedPaneScroll =
+    std::collections::HashMap<crate::layout::PaneId, Option<crate::pane::ScrollMetrics>>;
+
 pub(super) fn render_panes(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -398,12 +403,13 @@ pub(super) fn render_panes(
     target: Option<super::tab_surface::TabSurfaceTarget>,
     pane_infos: &[PaneInfo],
     split_borders: &[crate::layout::SplitBorder],
-) {
+) -> RenderedPaneScroll {
+    let mut rendered = RenderedPaneScroll::new();
     let Some(ws_idx) = target.map(|target| target.workspace_index) else {
-        return;
+        return rendered;
     };
     let Some(ws) = app.workspaces.get(ws_idx) else {
-        return;
+        return rendered;
     };
 
     for info in pane_infos {
@@ -411,14 +417,16 @@ pub(super) fn render_panes(
             let show_cursor = info.is_focused
                 && !pane_is_scrolled_back(rt)
                 && app.pane_exposes_host_cursor(ws_idx, info.id);
-            rt.render(frame, info.inner_rect, show_cursor);
+            let scroll = rt.render_with_scroll_metrics(frame, info.inner_rect, show_cursor);
             #[cfg(test)]
             after_pane_cells_rendered(rt);
-            render_pane_scrollbar(app, frame, info, rt);
+            render_pane_scrollbar(app, frame, info, scroll);
+            rendered.insert(info.id, scroll);
         }
     }
 
     render_pane_borders(app, ws, pane_infos, split_borders, frame);
+    rendered
 }
 
 #[cfg(test)]

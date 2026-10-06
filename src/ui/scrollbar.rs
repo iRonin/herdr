@@ -212,13 +212,15 @@ pub(crate) fn pane_scrollbar_track(
     }
 }
 
+/// Draws a pane's scrollbar from `metrics`, the scroll metrics its cells were
+/// drawn with, so the thumb matches the cells in the same frame.
 pub(super) fn render_pane_scrollbar(
     app: &AppState,
     frame: &mut Frame,
     info: &PaneInfo,
-    rt: &crate::terminal::TerminalRuntime,
+    metrics: Option<crate::pane::ScrollMetrics>,
 ) {
-    let Some(metrics) = rt.scroll_metrics() else {
+    let Some(metrics) = metrics else {
         return;
     };
     let Some(track) = pane_scrollbar_track(app, info, metrics, std::time::Instant::now()) else {

@@ -411,6 +411,17 @@ impl TerminalRuntime {
         self.0.render(frame, area, show_cursor);
     }
 
+    /// Draws the pane's cells and returns the scroll metrics of the screen it
+    /// drew, read under the same terminal lock as the cells.
+    pub fn render_with_scroll_metrics(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        show_cursor: bool,
+    ) -> Option<crate::pane::ScrollMetrics> {
+        self.0.render_with_scroll_metrics(frame, area, show_cursor)
+    }
+
     pub(crate) fn collect_dirty_patch_snapshot(
         &self,
         area_width: u16,

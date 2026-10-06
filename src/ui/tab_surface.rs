@@ -116,12 +116,13 @@ pub(crate) fn resize_tab_surface(
     );
 }
 
+/// Draws the tab's panes and returns the scroll metrics each pane was drawn with.
 pub(crate) fn render_tab_surface(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     surface: TabSurfaceView<'_>,
     frame: &mut Frame,
-) {
+) -> super::panes::RenderedPaneScroll {
     render_panes(
         app,
         terminal_runtimes,
@@ -129,7 +130,7 @@ pub(crate) fn render_tab_surface(
         surface.target,
         surface.pane_infos,
         surface.split_borders,
-    );
+    )
 }
 
 pub(crate) fn tab_surface_hyperlinks(
@@ -264,7 +265,7 @@ mod tests {
             Terminal::new(TestBackend::new(full_area.width, full_area.height)).unwrap();
         terminal
             .draw(|frame| {
-                render_tab_surface(&app, &TerminalRuntimeRegistry::new(), surface_view, frame)
+                render_tab_surface(&app, &TerminalRuntimeRegistry::new(), surface_view, frame);
             })
             .unwrap();
 

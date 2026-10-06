@@ -466,6 +466,7 @@ pub(crate) type RenderedTabSurface = (
     Option<CursorState>,
     Vec<((u16, u16), String, String)>,
     crate::ui::TabSurfaceLayout,
+    crate::ui::RenderedPaneScroll,
 );
 
 /// Renders only the active tab's pane surface at an origin-relative client viewport.
@@ -495,9 +496,10 @@ pub(crate) fn render_tab_surface_virtual(
 
     let backend = CursorTrackingBackend::new(area.width, area.height);
     let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
+    let mut scroll = crate::ui::RenderedPaneScroll::new();
     terminal
         .draw(|frame| {
-            crate::ui::render_tab_surface(app_state, terminal_runtimes, surface, frame);
+            scroll = crate::ui::render_tab_surface(app_state, terminal_runtimes, surface, frame);
         })
         .expect("render to TestBackend should never fail");
 
@@ -506,6 +508,7 @@ pub(crate) fn render_tab_surface_virtual(
         cursor,
         hyperlinks,
         layout,
+        scroll,
     )
 }
 

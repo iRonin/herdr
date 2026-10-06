@@ -3144,6 +3144,16 @@ impl PaneRuntime {
         self.terminal.render(frame, area, show_cursor);
     }
 
+    pub fn render_with_scroll_metrics(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        show_cursor: bool,
+    ) -> Option<ScrollMetrics> {
+        self.terminal
+            .render_with_scroll_metrics(frame, area, show_cursor)
+    }
+
     pub(crate) fn collect_dirty_patch_snapshot(
         &self,
         area_width: u16,

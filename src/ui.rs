@@ -22,6 +22,7 @@ use self::panes::resize_popup_pane;
 pub(crate) use self::panes::test_after_pane_cells_rendered;
 pub(crate) use self::panes::{
     apply_pane_chrome, pane_inner_rect, pane_is_scrolled_back, render_selection_highlight,
+    RenderedPaneScroll,
 };
 pub(crate) use self::release_notes::{
     product_announcement_display_lines, product_announcement_scroll_metrics,
