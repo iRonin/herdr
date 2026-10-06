@@ -101,16 +101,21 @@ impl StartupInputHold {
             }
             HoldState::Done => return None,
         };
+        // Expiry and the connection are settled first: a snapshot that is first seen after the
+        // expiry, or whose connection no longer accepts input, must not release the keys.
+        if view.connected != Some((endpoint, generation))
+            || view.now.saturating_duration_since(since) >= STARTUP_INPUT_HOLD_EXPIRY
+        {
+            self.state = HoldState::Done;
+            return None;
+        }
         if view.snapshot == Some((endpoint, Some(generation))) {
             return match std::mem::replace(&mut self.state, HoldState::Done) {
                 HoldState::Holding { bytes, .. } if !bytes.is_empty() => Some(bytes),
                 _ => None,
             };
         }
-        if view.snapshot.is_some()
-            || view.connected != Some((endpoint, generation))
-            || view.now.saturating_duration_since(since) >= STARTUP_INPUT_HOLD_EXPIRY
-        {
+        if view.snapshot.is_some() {
             self.state = HoldState::Done;
         }
         None
