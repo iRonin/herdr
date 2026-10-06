@@ -1,6 +1,14 @@
-//! Ctrl-C through a real macOS pty whose input queue is full.
+//! Typeahead through a real macOS pty.
 //!
-//! A pty stops accepting input once about 1 KiB is unread. A Ctrl-C byte waiting behind
+//! XNU keeps a tty's pending input in a 1024-byte ring. When a line editor such as bash's
+//! readline returns the tty from raw to canonical mode (it does this before running every
+//! command), the kernel re-feeds the unread raw input through its line discipline
+//! (`ttypend()` in bsd/kern/tty.c). It writes that input back into the same ring it is
+//! reading, and restarts at the ring's first slot after every line end. If the pending input
+//! wraps past the ring's end, the reader receives the current line's first characters
+//! repeated instead of the typed text.
+//!
+//! A pty also stops accepting input once about 1 KiB is unread. A Ctrl-C byte waiting behind
 //! that backlog can then never be written, so a program that is not reading its input
 //! cannot be interrupted.
 
@@ -8,7 +16,8 @@ use super::*;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 /// A 32-character shell command plus Enter: 33 bytes. A full tty holds 30 complete lines
-/// (1022 bytes); herdr keeps whatever does not fit.
+/// (1022 bytes); herdr keeps whatever does not fit. 1024 = 31 * 33 + 1, so once 31 lines have
+/// been typed into an empty tty, the next line starts in the ring's last slot.
 const LINE: &[u8] = b"printf 'LOCAL_%s\\n' DIRECT_READY\r";
 
 /// What a reader receives for one intact `LINE`: the tty maps the Enter (CR) to LF.
@@ -195,10 +204,25 @@ fn settle(fd: RawFd, expected: usize, idle: &std_mpsc::Receiver<()>) -> usize {
 
 /// Reads until `until` returns true for everything read so far, or the deadline passes.
 fn read_until(fd: RawFd, timeout: Duration, until: impl Fn(&[u8]) -> bool) -> Vec<u8> {
+    read_at_most(fd, usize::MAX, timeout, until)
+}
+
+/// Reads exactly `count` bytes (a raw-mode read returns everything available, so each read is
+/// capped), or fewer if the deadline passes.
+fn read_exactly(fd: RawFd, count: usize, timeout: Duration) -> Vec<u8> {
+    read_at_most(fd, count, timeout, |read| read.len() >= count)
+}
+
+fn read_at_most(
+    fd: RawFd,
+    limit: usize,
+    timeout: Duration,
+    until: impl Fn(&[u8]) -> bool,
+) -> Vec<u8> {
     let deadline = Instant::now() + timeout;
     let mut out = Vec::new();
     let mut buf = [0u8; 8192];
-    while !until(&out) {
+    while !until(&out) && out.len() < limit {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
@@ -212,11 +236,89 @@ fn read_until(fd: RawFd, timeout: Duration, until: impl Fn(&[u8]) -> bool) -> Ve
         if unsafe { libc::poll(&mut pollfd, 1, millis) } <= 0 {
             continue;
         }
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        let want = buf.len().min(limit - out.len());
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), want) };
         assert!(n >= 0, "read: {}", std::io::Error::last_os_error());
         out.extend_from_slice(&buf[..n as usize]);
     }
     out
+}
+
+fn count_line_ends(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|byte| **byte == b'\n').count()
+}
+
+/// A line editor's pattern: it waits for a line in raw mode while 30 lines are typed ahead,
+/// reads 10 of them, `typed_after_read` more lines arrive, and it returns the tty to canonical
+/// mode (as bash does before running a command) and reads the rest. Returns the bytes unread
+/// in the tty at the switch, and everything read after it.
+fn line_editor_scenario(typed_after_read: usize) -> (usize, Vec<u8>) {
+    let (master, slave) = open_pty();
+    let slave = slave.as_raw_fd();
+    let canonical = termios_of(slave);
+    set_termios(slave, &line_editor_mode(&canonical));
+    let (handle, idle) = spawn_actor(master);
+
+    // 30 lines fill the ring's first 990 slots.
+    type_lines(&handle, &idle, 30);
+    assert_eq!(
+        settle(slave, 30 * LINE.len(), &idle),
+        30 * LINE.len(),
+        "setup: the tty must accept 30 lines of typeahead"
+    );
+    let consumed = read_exactly(slave, 10 * LINE.len(), Duration::from_secs(5));
+    assert_eq!(
+        String::from_utf8_lossy(&consumed),
+        String::from_utf8_lossy(&line_as_read().repeat(10)),
+        "setup: the first 10 lines read back intact in raw mode"
+    );
+    // Unread input now starts at slot 330. More lines extend it: past slot 1023 means
+    // the ring wraps.
+    type_lines(&handle, &idle, typed_after_read);
+    let unread = settle(slave, (20 + typed_after_read) * LINE.len(), &idle);
+
+    set_termios(slave, &canonical);
+    // A final Enter closes any line the kernel left open.
+    type_input(&handle, &idle, b"\r");
+    let lines = 20 + typed_after_read + 1;
+    let rest = read_until(slave, Duration::from_secs(5), |read| {
+        count_line_ends(read) >= lines
+    });
+    handle.shutdown();
+    (unread, rest)
+}
+
+fn assert_lines_intact(typed_after_read: usize, unread: usize, rest: &[u8]) {
+    let intact = 20 + typed_after_read;
+    let expected = [line_as_read().repeat(intact), b"\n".to_vec()].concat();
+    let damaged: Vec<String> = rest
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter(|line| *line != line_as_read().as_slice() && *line != b"\n")
+        .map(|line| String::from_utf8_lossy(line).into_owned())
+        .collect();
+    assert!(
+        rest == expected,
+        "{intact} typed lines must reach the program intact after it returns the tty to \
+         canonical mode; {unread} bytes were unread in the tty at the switch. Received {} \
+         lines, damaged: {damaged:?}",
+        count_line_ends(rest)
+    );
+}
+
+#[test]
+fn typeahead_survives_a_line_editor_returning_the_tty_to_canonical_mode() {
+    // Two more lines put unread input in slots 330..1056: past the ring's end.
+    let (unread, rest) = line_editor_scenario(2);
+    assert_lines_intact(2, unread, &rest);
+}
+
+#[test]
+fn typeahead_within_the_tty_ring_survives_a_return_to_canonical_mode() {
+    // Control for the test above, passing with or without a guard: one more line puts
+    // unread input in slots 330..1023, inside the ring, so the kernel's re-input is harmless.
+    // If this fails, the scenario itself is broken, not the ring.
+    let (unread, rest) = line_editor_scenario(1);
+    assert_lines_intact(1, unread, &rest);
 }
 
 /// `sleep` owns the pty as its controlling terminal and never reads it. `lines` are typed,
