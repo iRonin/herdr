@@ -374,6 +374,80 @@ mod tests {
         );
     }
 
+    /// A hold with one line typed toward local connection 1 at `start`.
+    fn holding_a_line(local: &ClientEndpointId, start: Instant) -> StartupInputHold {
+        let mut hold = StartupInputHold::new();
+        assert_eq!(
+            hold.input(b"rm x\r".to_vec(), waiting(local, 1, start)),
+            None
+        );
+        hold
+    }
+
+    #[test]
+    fn a_matching_snapshot_inside_the_expiry_releases_the_held_keys() {
+        let local = local();
+        let start = Instant::now();
+        let mut hold = holding_a_line(&local, start);
+        let before = start + STARTUP_INPUT_HOLD_EXPIRY - Duration::from_millis(1);
+        assert_eq!(
+            hold.take_release(projected(&local, 1, before)),
+            Some(b"rm x\r".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_matching_snapshot_first_seen_at_the_expiry_does_not_replay_the_held_keys() {
+        let local = local();
+        let start = Instant::now();
+        let mut hold = holding_a_line(&local, start);
+        let after = start + STARTUP_INPUT_HOLD_EXPIRY;
+        assert_eq!(hold.take_release(projected(&local, 1, after)), None);
+        assert!(hold.is_done());
+        assert_eq!(
+            hold.input(b"x".to_vec(), projected(&local, 1, after)),
+            Some(b"x".to_vec()),
+            "only the new key reaches the pane"
+        );
+    }
+
+    #[test]
+    fn a_matching_snapshot_of_a_frozen_connection_does_not_release_the_held_keys() {
+        let local = local();
+        let start = Instant::now();
+        let mut hold = holding_a_line(&local, start);
+        let frozen = StartupView {
+            connected: None,
+            snapshot: Some((&local, Some(1))),
+            now: start,
+        };
+        assert_eq!(hold.take_release(frozen), None);
+        assert!(hold.is_done());
+        assert_eq!(hold.take_release(projected(&local, 1, start)), None);
+    }
+
+    #[test]
+    fn a_retained_snapshot_does_not_release_the_held_keys_to_another_active_connection() {
+        let local = local();
+        let remote = remote();
+        let start = Instant::now();
+        for active in [(&local, 2), (&remote, 1)] {
+            let mut hold = holding_a_line(&local, start);
+            let changed = StartupView {
+                connected: Some(active),
+                snapshot: Some((&local, Some(1))),
+                now: start,
+            };
+            assert_eq!(hold.take_release(changed), None, "active {active:?}");
+            assert!(hold.is_done());
+            assert_eq!(
+                hold.input(b"y".to_vec(), changed),
+                Some(b"y".to_vec()),
+                "only the new key reaches the new connection"
+            );
+        }
+    }
+
     #[test]
     fn a_snapshot_that_never_comes_releases_the_keyboard_after_the_expiry() {
         let local = local();
