@@ -218,7 +218,23 @@ pub(super) fn do_handshake(
         Some(read_timeout),
         "client handshake read timeout unavailable",
     )?;
-    let welcome: ServerMessage = protocol::read_message(stream, MAX_FRAME_SIZE)?;
+    let welcome: ServerMessage = match protocol::read_message(stream, MAX_FRAME_SIZE) {
+        Ok(welcome) => welcome,
+        // A recv-timeout expiry arrives as EAGAIN (WouldBlock): the server did not
+        // answer within the budget - busy or still starting, not a lost connection.
+        // Ledger #62: say so plainly instead of printing an errno.
+        Err(protocol::FramingError::Io(err))
+            if matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Err(ClientError::HandshakeTimedOut {
+                seconds: read_timeout.as_secs(),
+            });
+        }
+        Err(err) => return Err(err.into()),
+    };
     set_handshake_recv_timeout(
         stream,
         None,
@@ -293,5 +309,55 @@ pub(super) fn do_handshake(
         _ => Err(ClientError::Protocol(protocol::FramingError::Io(
             io::Error::new(io::ErrorKind::InvalidData, "expected Welcome message"),
         ))),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    struct TempDir(std::path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_silent_server_says_did_not_answer_not_lost_connection() {
+        // Ledger #62: when the server does not answer the Welcome within the handshake
+        // budget, the client exits - and the message must say the server did not answer
+        // and to retry. It used to say "lost connection to server: ... (os error 35)",
+        // which describes neither the situation (a busy or still-starting server) nor the
+        // remedy. A never-answering listener is exactly what a held server looks like.
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-handshake-tests-{}-silent",
+            std::process::id()
+        ));
+        let _cleanup = TempDir(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("client.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let handle = std::thread::spawn(move || {
+            // Accept the client's connection and never send a Welcome.
+            let accepted = listener.accept();
+            std::thread::sleep(Duration::from_secs(7));
+            drop(accepted);
+        });
+        let mut stream = crate::ipc::connect_local_stream(&path).unwrap();
+        let outcome = do_handshake(&mut stream, 80, 24, 0, 0, false, None, false, false, false);
+        let _ = handle.join();
+        let text = outcome
+            .expect_err("a server that never answers cannot complete a handshake")
+            .to_string();
+        assert!(
+            text.contains("did not answer"),
+            "a handshake timeout must say the server did not answer, got: {text}"
+        );
+        assert!(
+            !text.contains("lost connection") && !text.contains("os error"),
+            "a handshake timeout must not present itself as a lost connection or an errno, got: {text}"
+        );
     }
 }

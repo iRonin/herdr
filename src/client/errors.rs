@@ -14,6 +14,9 @@ pub enum ClientError {
     ServerShutdown { reason: Option<String> },
     /// Lost connection to the server.
     ConnectionLost(io::Error),
+    /// The server did not answer the handshake within its budget: busy or still
+    /// starting - not a lost connection (ledger #62).
+    HandshakeTimedOut { seconds: u64 },
     /// Protocol error (framing, deserialization).
     Protocol(protocol::FramingError),
 }
@@ -68,6 +71,13 @@ impl std::fmt::Display for ClientError {
                 } else {
                     write!(f, "lost connection to server: {err}")
                 }
+            }
+            ClientError::HandshakeTimedOut { seconds } => {
+                write!(
+                    f,
+                    "the server did not answer within {seconds}s; it may be busy or still \
+                     starting - run `herdr` again to retry"
+                )
             }
             ClientError::Protocol(err) => write!(f, "protocol error: {err}"),
         }
