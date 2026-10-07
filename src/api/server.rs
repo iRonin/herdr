@@ -1716,6 +1716,182 @@ mod tests {
         assert!(result.is_ok());
         server_thread.join().unwrap();
     }
+    /// Starts reading a request line on the server side of a fresh connection, then writes
+    /// `first` at once and `rest` after `delay`. Returns what the reader returned, how long it
+    /// took from the moment it started, and the server stream for further checks.
+    fn read_request_written_in_parts(
+        name: &str,
+        timeout: Duration,
+        first: &[u8],
+        delay: Duration,
+        rest: &[u8],
+    ) -> (
+        std::io::Result<Option<String>>,
+        Duration,
+        LocalStream,
+        LocalStream,
+    ) {
+        let (mut client, mut server, path) = local_stream_pair(name);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let start = Instant::now();
+            let result = read_initial_request_line_with_timeout(&mut server, timeout);
+            (result, start.elapsed(), server)
+        });
+        started_rx.recv().unwrap();
+        client.write_all(first).unwrap();
+        std::thread::sleep(delay);
+        client.write_all(rest).unwrap();
+        let (result, elapsed, server) = reader.join().unwrap();
+        let _ = std::fs::remove_file(path);
+        (result, elapsed, server, client)
+    }
+
+    // A request whose bytes come a moment after the server starts reading is answered at
+    // once, not after a fixed 100 ms sleep (ledger #60).
+    #[test]
+    fn a_request_arriving_just_after_the_reader_starts_is_read_without_a_fixed_sleep() {
+        let line = br#"{"id":"late","method":"ping","params":{}}"#;
+        let mut whole = line.to_vec();
+        whole.push(b'\n');
+        let (result, elapsed, _server, _client) = read_request_written_in_parts(
+            "late-request",
+            Duration::from_secs(5),
+            b"",
+            Duration::from_millis(20),
+            &whole,
+        );
+        assert_eq!(
+            result.unwrap().as_deref(),
+            Some(std::str::from_utf8(&whole).unwrap())
+        );
+        assert!(
+            elapsed < Duration::from_millis(80),
+            "the request was written 20 ms after the reader started, but it took {elapsed:?}"
+        );
+    }
+
+    // The CLI writes the JSON and the newline separately; a newline arriving a moment later
+    // must not cost another fixed sleep.
+    #[test]
+    fn a_newline_arriving_just_after_the_body_is_read_without_a_fixed_sleep() {
+        let body = br#"{"id":"split","method":"ping","params":{}}"#;
+        let (result, elapsed, _server, _client) = read_request_written_in_parts(
+            "split-request",
+            Duration::from_secs(5),
+            body,
+            Duration::from_millis(20),
+            b"\n",
+        );
+        let mut expected = std::str::from_utf8(body).unwrap().to_owned();
+        expected.push('\n');
+        assert_eq!(result.unwrap(), Some(expected));
+        assert!(
+            elapsed < Duration::from_millis(80),
+            "the newline was written 20 ms after the body, but reading took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_partial_request_still_waits_for_its_newline() {
+        let (mut client, mut server, path) = local_stream_pair("partial-request");
+        let reader = std::thread::spawn(move || {
+            read_initial_request_line_with_timeout(&mut server, Duration::from_secs(5))
+        });
+        client.write_all(b"{\"id\":").unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !reader.is_finished(),
+            "a request without its newline must not be returned"
+        );
+        client.write_all(b"1}\n").unwrap();
+        assert_eq!(
+            reader.join().unwrap().unwrap().as_deref(),
+            Some("{\"id\":1}\n")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_client_that_disconnects_before_its_newline_ends_the_read_without_an_error() {
+        let (mut client, mut server, path) = local_stream_pair("disconnected-request");
+        let reader = std::thread::spawn(move || {
+            let start = Instant::now();
+            let result =
+                read_initial_request_line_with_timeout(&mut server, Duration::from_secs(5));
+            (result, start.elapsed())
+        });
+        client.write_all(b"{\"id\":").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        drop(client);
+        let (result, elapsed) = reader.join().unwrap();
+        assert!(result.unwrap().is_none());
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a disconnect must end the read before the deadline, took {elapsed:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_idle_client_times_out_at_the_deadline_and_not_before() {
+        let (_client, mut server, path) = local_stream_pair("idle-request");
+        let timeout = Duration::from_millis(300);
+        let start = Instant::now();
+        let err = read_initial_request_line_with_timeout(&mut server, timeout).unwrap_err();
+        let elapsed = start.elapsed();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(err.to_string(), "timed out reading api request");
+        assert!(elapsed >= timeout, "timed out early, after {elapsed:?}");
+        assert!(
+            elapsed < timeout + Duration::from_secs(1),
+            "timed out late, after {elapsed:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_request_line_over_the_limit_or_not_utf8_is_refused() {
+        let (mut client, mut server, path) = local_stream_pair("large-request");
+        client.write_all(b"12345\n").unwrap();
+        let err = read_initial_request_line_with_limits(&mut server, Duration::from_secs(1), 4)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "api request line is too large");
+        let _ = std::fs::remove_file(path);
+
+        let (mut client, mut server, path) = local_stream_pair("invalid-utf8-request");
+        client.write_all(b"\xff\n").unwrap();
+        let err = read_initial_request_line_with_timeout(&mut server, Duration::from_secs(1))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bytes_after_the_newline_stay_unread_and_the_stream_blocks_again() {
+        use std::io::Read as _;
+
+        let (result, _elapsed, mut server, mut client) = read_request_written_in_parts(
+            "trailing-request",
+            Duration::from_secs(5),
+            b"req\nEX",
+            Duration::from_millis(0),
+            b"",
+        );
+        assert_eq!(result.unwrap().as_deref(), Some("req\n"));
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            client.write_all(b"TRA").unwrap();
+            client
+        });
+        // A stream left non-blocking would fail here with WouldBlock instead of waiting.
+        let mut rest = [0u8; 5];
+        server.read_exact(&mut rest).unwrap();
+        assert_eq!(&rest, b"EXTRA");
+        drop(writer.join().unwrap());
+    }
 }
 
 #[cfg(test)]
