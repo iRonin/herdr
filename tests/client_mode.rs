@@ -554,6 +554,13 @@ fn server_unreachable_shows_clear_error() {
 fn server_crash_after_attach_causes_lost_connection_error() {
     // attach a real thin client connection, kill server unexpectedly,
     // assert clean non-zero client exit plus lost-connection signal.
+    //
+    // The crash is gated on a PROVEN attach (ledger #63): the computed marker typed
+    // below can only appear in the output once the pane's shell ran it, so the typed
+    // text being echoed cannot count as proof. A client that dies PRE-attach is the
+    // known environment race - the server closes a connection whose hello is late
+    // (its 4s handshake timeout, src/server/client_transport.rs:42) - so the attach is
+    // retried with a fresh client instead of racing this post-attach crash.
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -565,49 +572,8 @@ fn server_crash_after_attach_causes_lost_connection_error() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
-    // Attach a real thin client (client subcommand) through PTY so handshake and
-    // terminal setup paths are exercised.
-    let mut thin_client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
-
-    // Prove attached before kill by waiting for recognizable rendered app content.
-    let mut thin_reader = thin_client
-        ._master
-        .as_ref()
-        .expect("thin client master")
-        .try_clone_reader()
-        .expect("clone client PTY reader");
-    let (attached_before_kill, attach_output) = {
-        let deadline = Instant::now() + Duration::from_secs(8);
-        let mut buf = [0u8; 4096];
-        let mut seen = false;
-        let mut output = String::new();
-        while Instant::now() < deadline {
-            match thin_reader.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    let out = String::from_utf8_lossy(&buf[..n]);
-                    output.push_str(&out);
-                    if out.contains("\u{2500}")
-                        || out.contains("workspace")
-                        || out.contains("pane")
-                        || out.contains("terminal")
-                    {
-                        seen = true;
-                        break;
-                    }
-                    if output.to_lowercase().contains("herdr:") {
-                        break;
-                    }
-                }
-                Ok(_) => thread::sleep(Duration::from_millis(30)),
-                Err(_) => thread::sleep(Duration::from_millis(30)),
-            }
-        }
-        (seen, output)
-    };
-    assert!(
-        attached_before_kill,
-        "thin client must complete attach and receive frame before server crash; output: {attach_output:?}"
-    );
+    let (mut thin_client, output) =
+        attach_with_proven_marker(&config_home, &runtime_dir, &api_socket);
 
     // Kill server unexpectedly.
     if let Some(pid) = spawned.child.process_id() {
@@ -627,13 +593,7 @@ fn server_crash_after_attach_causes_lost_connection_error() {
                 exited = true;
                 break;
             }
-            // Keep draining client output so the process can progress to exit.
-            let mut buf = [0u8; 1024];
-            if let Ok(n) = thin_reader.read(&mut buf) {
-                if n > 0 {
-                    crash_output.push_str(&String::from_utf8_lossy(&buf[..n]));
-                }
-            }
+            crash_output = output.lock().unwrap().text.clone();
             thread::sleep(Duration::from_millis(20));
         }
         exited
@@ -646,14 +606,17 @@ fn server_crash_after_attach_causes_lost_connection_error() {
         "thin client should exit non-zero after lost server connection"
     );
 
-    // Drain trailing output and require the explicit user-visible lost-connection message.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut buf = [0u8; 2048];
+    // Require the explicit user-visible lost-connection message (the POST-ATTACH
+    // phase error; the pre-attach phase error is asserted by
+    // server_death_mid_attach_reports_the_pre_attach_phase_error).
+    let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        match thin_reader.read(&mut buf) {
-            Ok(n) if n > 0 => crash_output.push_str(&String::from_utf8_lossy(&buf[..n])),
-            Ok(_) => break,
-            Err(_) => break,
+        crash_output = output.lock().unwrap().text.clone();
+        if crash_output
+            .to_lowercase()
+            .contains("lost connection to server")
+        {
+            break;
         }
         thread::sleep(Duration::from_millis(30));
     }
@@ -667,6 +630,123 @@ fn server_crash_after_attach_causes_lost_connection_error() {
     // Ensure server is gone.
     let _ = spawned.child.wait();
 
+    cleanup_test_base(&base);
+}
+
+/// The computed marker the attach proof types: only the pane's shell can turn
+/// `echo $((7000000+654321))` into `7654321`, so the typed text being echoed (or
+/// split by cursor repaints) cannot count as attach proof.
+const ATTACH_MARKER_LINE: &[u8] = b"echo $((7000000+654321))\r";
+const ATTACH_MARKER_OUTPUT: &str = "7654321";
+
+/// Spawns a thin client and proves it attached: a computed marker line is typed
+/// into the client's PTY and the proof is the marker's OUTPUT appearing - which only
+/// the pane's shell can produce (ledger #63; the same lesson as the #54 acceptance
+/// check). A client that dies PRE-attach is the known environment race (the server
+/// closes a connection whose hello is late - its 4s handshake timeout), so a failed
+/// attempt is dropped and retried with a fresh client instead of racing the scenario
+/// that calls this.
+fn attach_with_proven_marker(
+    config_home: &PathBuf,
+    runtime_dir: &PathBuf,
+    api_socket: &PathBuf,
+) -> (SpawnedHerdr, SharedOutput) {
+    let mut last_output = String::new();
+    for _attempt in 0..3 {
+        let mut thin_client = spawn_client_process(config_home, runtime_dir, api_socket);
+        let reader = thin_client
+            ._master
+            .as_ref()
+            .expect("thin client master")
+            .try_clone_reader()
+            .expect("clone client PTY reader");
+        let output = spawn_pty_drain(reader);
+        let mut writer = thin_client
+            ._master
+            .as_ref()
+            .expect("thin client master")
+            .take_writer()
+            .expect("client PTY writer");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut seen = false;
+        while Instant::now() < deadline {
+            {
+                let guard = output.lock().unwrap();
+                if guard.text.contains(ATTACH_MARKER_OUTPUT) {
+                    seen = true;
+                    break;
+                }
+                last_output = guard.text.clone();
+            }
+            if thin_client.child.try_wait().ok().flatten().is_some() {
+                break; // died pre-attach: the #63 race - retry below
+            }
+            let _ = writer.write_all(ATTACH_MARKER_LINE);
+            thread::sleep(Duration::from_millis(300));
+        }
+        if seen {
+            return (thin_client, output);
+        }
+        let _ = thin_client.child.kill();
+        let _ = thin_client.child.wait();
+    }
+    panic!("thin client never proved attach with the computed marker; output: {last_output:?}");
+}
+
+/// Deterministic form of ledger #63's race: a connection that is ACCEPTED and then
+/// CLOSED without a Welcome - exactly what the server's 4s handshake timeout
+/// (src/server/client_transport.rs:42) does to a client whose hello is late under
+/// load - must produce the PRE-ATTACH phase error
+/// `lost connection to server: server closed connection`, not a hang and not some
+/// other text. (Deterministic RED probe: docs/rebase/tools/v0.9.1-crash-test-red2.py,
+/// 3/3 against `619abce1`.)
+#[test]
+fn server_death_mid_attach_reports_the_pre_attach_phase_error() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    std::fs::create_dir_all(&config_home).unwrap();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+
+    let listener = std::os::unix::net::UnixListener::bind(&client_socket).unwrap();
+    let accept_loop = std::thread::spawn(move || {
+        while let Ok((connection, _)) = listener.accept() {
+            // Accepted, then closed with no Welcome: the mid-attach server death.
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                drop(connection);
+            });
+        }
+    });
+
+    let mut thin_client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    let reader = thin_client
+        ._master
+        .as_ref()
+        .expect("thin client master")
+        .try_clone_reader()
+        .expect("clone client PTY reader");
+    let output = spawn_pty_drain(reader);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while thin_client.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let status = thin_client.child.wait().expect("wait thin client status");
+    let text = output.lock().unwrap().text.clone();
+    assert!(
+        !status.success(),
+        "a client whose server died mid-attach must exit non-zero; output: {text:?}"
+    );
+    assert!(
+        text.contains("lost connection to server: server closed connection"),
+        "the pre-attach phase error must say the connection closed at attach; output: {text:?}"
+    );
+
+    drop(accept_loop);
     cleanup_test_base(&base);
 }
 
