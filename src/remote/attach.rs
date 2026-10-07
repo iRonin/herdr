@@ -1124,13 +1124,13 @@ pub(super) fn prepare_remote_herdr(
     // `resolve_install_source_for`), and every step below leads only there,
     // so refuse before the install prompts offer something that cannot
     // happen. The early returns above are untouched: an installed remote
-    // binary this client can use needs no download at all. The fork check is
-    // the outer condition so a stock build keeps upstream's exact behaviour,
-    // including when the local-seed probe errors (it must not run at all).
-    if let Some(message) = fork_remote_install_refusal() {
-        if override_binary.is_none() && local_binary_seed_path(&remote_herdr.platform)?.is_none() {
-            return Err(io::Error::other(message));
-        }
+    // binary this client can use needs no download at all.
+    if let Some(message) = remote_install_refusal_for(
+        crate::build_info::FORK_BUILD,
+        override_binary.is_some(),
+        || local_binary_seed_path(&remote_herdr.platform),
+    )? {
+        return Err(io::Error::other(message));
     }
 
     let mut stop_after_install_approved = false;
@@ -1222,11 +1222,14 @@ fn prepare_windows_remote_herdr(
 
     // As in `prepare_remote_herdr`: without an override package the only
     // source left is the upstream release download, which a fork build
-    // refuses - before the install prompts, not after them.
-    if override_package.is_none() {
-        if let Some(message) = fork_remote_install_refusal() {
-            return Err(io::Error::other(message));
-        }
+    // refuses - before the install prompts, not after them. Windows never
+    // seeds from the local binary, so its seed probe is empty.
+    if let Some(message) = remote_install_refusal_for(
+        crate::build_info::FORK_BUILD,
+        override_package.is_some(),
+        || Ok(None),
+    )? {
+        return Err(io::Error::other(message));
     }
 
     let stop_after_install_approved = if let Some(candidate) = candidates.first() {
@@ -1685,19 +1688,39 @@ fn resolve_install_source_for(
 const FORK_REMOTE_INSTALL_REFUSAL: &str = "this herdr is the iRonin fork: downloading the remote binary would install the upstream Herdr release there and drop the fork's features; get the fork's own release for the remote's platform instead (built from source), passed with HERDR_REMOTE_BINARY=<path>";
 
 /// The refusal a fork build raises wherever the remote binary would be taken
-/// from the release feed, or `None` on a stock build. Returned through a
-/// function so call sites branch on a value the compiler cannot fold away
-/// (the same shape as `update::fork_update_refusal`).
-fn fork_remote_install_refusal() -> Option<&'static str> {
-    fork_remote_install_refusal_for(crate::build_info::FORK_BUILD)
-}
-
+/// from the release feed, or `None` on a stock build (the same shape as
+/// `update::fork_update_refusal`, keyed off the build flag by its callers).
 fn fork_remote_install_refusal_for(fork_build: bool) -> Option<&'static str> {
     if fork_build {
         Some(FORK_REMOTE_INSTALL_REFUSAL)
     } else {
         None
     }
+}
+
+/// The pre-prompt refusal for the remote-install source decision: `Some`
+/// message when a fork build would have to fetch the upstream release (no
+/// override, nothing uploadable), `None` otherwise. The seed probe runs ONLY
+/// on fork builds and only after the fork check - a stock build must keep
+/// upstream's exact behaviour, which includes never probing at all (the probe
+/// is fallible, and an error from it must not surface earlier than upstream
+/// would raise it). Extracted with the probe injectable so tests pin that
+/// ordering: a reorder here is invisible in diff review.
+fn remote_install_refusal_for(
+    fork: bool,
+    override_binary: bool,
+    seed_probe: impl FnOnce() -> io::Result<Option<PathBuf>>,
+) -> io::Result<Option<String>> {
+    let Some(message) = fork_remote_install_refusal_for(fork) else {
+        return Ok(None);
+    };
+    if override_binary {
+        return Ok(None);
+    }
+    if seed_probe()?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(message.to_string()))
 }
 
 /// The local binary `resolve_install_source` uploads to the remote when the
@@ -5288,7 +5311,7 @@ mod tests {
     fn fork_remote_install_refusal_names_the_fork_the_source_and_never_herdr_update() {
         // The refusal must say what the remote needs instead, and must not
         // advise `herdr update`, which the fork refuses (the update guard).
-        let Some(message) = fork_remote_install_refusal() else {
+        let Some(message) = fork_remote_install_refusal_for(crate::build_info::FORK_BUILD) else {
             panic!("this is a fork build; the refusal must exist");
         };
         assert!(
@@ -5434,6 +5457,63 @@ mod tests {
             !stock_notice_already_seen("unit-notice-host-b:/bin/herdr".to_string()),
             "a different remote must still be reported"
         );
+    }
+
+    #[test]
+    fn remote_install_refusal_never_probes_on_a_stock_build() {
+        // A stock build must keep upstream's exact behaviour: the local-seed
+        // probe (current_exe, fallible) must not run at all, so its errors can
+        // never surface earlier than upstream would raise them.
+        let result = remote_install_refusal_for(false, false, || {
+            panic!("the seed probe must not run on a stock build")
+        });
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "a stock build never refuses at the prompts"
+        );
+
+        let probed = std::cell::Cell::new(false);
+        let result = remote_install_refusal_for(false, false, || {
+            probed.set(true);
+            Err(io::Error::other("probe failure"))
+        });
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "a stock build stays quiet even when the probe would error"
+        );
+        assert!(!probed.get(), "the probe must not run on a stock build");
+    }
+
+    #[test]
+    fn remote_install_refusal_probes_and_refuses_on_a_fork_build_without_override() {
+        let probed = std::cell::Cell::new(false);
+        let result = remote_install_refusal_for(true, false, || {
+            probed.set(true);
+            Ok(None)
+        });
+        let message = result
+            .unwrap()
+            .expect("a fork build with no source must refuse at the prompts");
+        assert!(
+            message.contains("iRonin fork"),
+            "the refusal must name the fork; got: {message}"
+        );
+        assert!(
+            probed.get(),
+            "the probe must run when the outcome depends on it"
+        );
+    }
+
+    #[test]
+    fn remote_install_refusal_is_quiet_with_an_override_on_a_fork_build() {
+        // HERDR_REMOTE_BINARY is the user's chosen binary for this remote:
+        // no refusal, and the seed probe is irrelevant.
+        let result = remote_install_refusal_for(true, true, || {
+            panic!("an override means the seed probe must not run")
+        });
+        assert_eq!(result.unwrap(), None, "an override bypasses the refusal");
     }
 
     #[cfg(windows)]
