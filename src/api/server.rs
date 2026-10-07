@@ -610,18 +610,36 @@ fn read_initial_request_line_with_limits(
                 }
             }
             LocalStreamRead::Pending => {
-                if Instant::now() >= deadline {
+                let now = Instant::now();
+                if now >= deadline {
                     break Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out reading api request",
                     ));
                 }
-                std::thread::sleep(CONNECTION_POLL_INTERVAL);
+                wait_for_request_bytes(stream, deadline - now);
             }
         }
     };
     set_local_stream_polling(stream, false)?;
     result
+}
+
+/// Waits for the next request byte, the client closing, or `remaining` to pass. A fixed sleep
+/// here made a request that arrived just after a read wait the whole interval.
+fn wait_for_request_bytes(stream: &LocalStream, remaining: Duration) {
+    #[cfg(unix)]
+    if let Err(err) = crate::ipc::wait_local_stream_readable(stream, remaining) {
+        debug!(err = %err, "api request readiness wait failed, sleeping instead");
+        std::thread::sleep(CONNECTION_POLL_INTERVAL.min(remaining));
+    }
+    // Named pipes have no readiness wait here, and the Windows path cannot be tested on this
+    // fork's machines, so it keeps the fixed sleep.
+    #[cfg(windows)]
+    {
+        let _ = (stream, remaining);
+        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+    }
 }
 
 #[cfg(all(test, windows))]

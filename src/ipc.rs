@@ -206,6 +206,35 @@ pub(crate) fn poll_local_stream_read_count(
     }
 }
 
+/// Waits until `stream` has a byte to read or its peer has closed, for at most `timeout`. An
+/// interrupted wait returns early; the caller reads again and rechecks its own deadline.
+#[cfg(unix)]
+pub(crate) fn wait_local_stream_readable(
+    stream: &LocalStream,
+    timeout: std::time::Duration,
+) -> io::Result<()> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+
+    let LocalStream::UdSocket(socket) = stream;
+    let mut descriptor = libc::pollfd {
+        fd: socket.as_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // Round up so a sub-millisecond remainder still waits rather than spinning.
+    let wait_ms = timeout
+        .as_nanos()
+        .div_ceil(1_000_000)
+        .clamp(1, i32::MAX as u128) as i32;
+    if unsafe { libc::poll(&mut descriptor, 1, wait_ms) } < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn probe_stream_closed(stream: &mut LocalStream) -> io::Result<bool> {
     stream.set_nonblocking(true)?;
