@@ -2330,6 +2330,137 @@ mod tests {
         (app, public_pane_id)
     }
 
+    fn read_state_request(pane_id: &str) -> crate::api::schema::Request {
+        serde_json::from_value(serde_json::json!({
+            "id": "read-state",
+            "method": "pane.read_state",
+            "params": { "pane_id": pane_id }
+        }))
+        .expect("pane.read_state must be a supported socket method")
+    }
+
+    fn assert_read_state(app: &mut App, pane_id: &str, seen: bool, status: &str) {
+        let request = read_state_request(pane_id);
+        assert!(!crate::api::request_changes_ui(&request));
+        assert_eq!(
+            crate::api::api_method_name(&request.method),
+            "pane.read_state"
+        );
+        let (ws_idx, internal_id) = app.parse_pane_id(pane_id).unwrap();
+        let before = app.state.workspaces[ws_idx]
+            .pane_state(internal_id)
+            .unwrap()
+            .seen;
+        let sequence = app.event_hub.current_sequence();
+        let response = app.handle_api_request(request);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "id": "read-state",
+                "result": {
+                    "type": "pane_read_state",
+                    "read_state": {
+                        "pane_id": app.public_pane_id(ws_idx, internal_id).unwrap(),
+                        "workspace_id": app.public_workspace_id(ws_idx),
+                        "seen": seen,
+                        "agent_status": status
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            app.state.workspaces[ws_idx]
+                .pane_state(internal_id)
+                .unwrap()
+                .seen,
+            before,
+            "reading the flag must not acknowledge the pane"
+        );
+        assert_eq!(
+            app.event_hub.current_sequence(),
+            sequence,
+            "read-only queries must not emit events"
+        );
+    }
+
+    fn read_state_transition(app: &mut App, pane_id: PaneId, state: AgentState) {
+        app.handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+    }
+
+    #[test]
+    fn api_pane_read_state_distinguishes_blocked_unread_from_viewed() {
+        let (mut app, _) = app_with_test_workspace();
+        let background = app.state.workspaces[0].test_add_tab(Some("background"));
+        let pane_id = app.state.workspaces[0].tabs[background].root_pane;
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.workspaces[0].switch_tab(0);
+        app.state.outer_terminal_focus = Some(true);
+        let public_id = app.public_pane_id(0, pane_id).unwrap();
+        read_state_transition(&mut app, pane_id, AgentState::Working);
+        assert_read_state(&mut app, &public_id, true, "working");
+        read_state_transition(&mut app, pane_id, AgentState::Blocked);
+        assert_read_state(&mut app, &public_id, false, "blocked");
+        assert_read_state(&mut app, &public_id, false, "blocked");
+
+        let tab_id = app.public_tab_id(0, background).unwrap();
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "view".into(),
+            method: crate::api::schema::Method::TabFocus(crate::api::schema::TabTarget { tab_id }),
+        });
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_read_state(&mut app, &public_id, true, "blocked");
+    }
+
+    #[test]
+    fn api_pane_read_state_distinguishes_completion_unread_from_viewed() {
+        let (mut app, _) = app_with_test_workspace();
+        let background = app.state.workspaces[0].test_add_tab(Some("background"));
+        let pane_id = app.state.workspaces[0].tabs[background].root_pane;
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.workspaces[0].switch_tab(0);
+        app.state.outer_terminal_focus = Some(true);
+        let public_id = app.public_pane_id(0, pane_id).unwrap();
+        read_state_transition(&mut app, pane_id, AgentState::Working);
+        read_state_transition(&mut app, pane_id, AgentState::Idle);
+        assert_read_state(&mut app, &public_id, false, "done");
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "view".into(),
+            method: crate::api::schema::Method::PaneFocus(PaneTarget {
+                pane_id: public_id.clone(),
+            }),
+        });
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_read_state(&mut app, &public_id, true, "idle");
+    }
+
+    #[test]
+    fn api_pane_read_state_unknown_pane_matches_get_error() {
+        let (mut app, _) = app_with_test_workspace();
+        let response = app.handle_api_request(read_state_request("missing"));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        let get_response = app.handle_pane_get(
+            "read-state".into(),
+            PaneTarget {
+                pane_id: "missing".into(),
+            },
+        );
+        let get_error: ErrorResponse = serde_json::from_str(&get_response).unwrap();
+        assert_eq!(error, get_error);
+        assert_eq!(error.error.code, "pane_not_found");
+    }
+
     #[test]
     fn pane_input_set_changes_only_the_target_pane() {
         let (mut app, public_pane_id) = app_with_test_workspace();
