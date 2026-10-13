@@ -168,6 +168,36 @@ impl App {
         encode_success(id, ResponseResult::PaneInfo { pane })
     }
 
+    pub(super) fn handle_pane_read_state(&mut self, id: String, target: PaneTarget) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+        let Some(pane) = self.state.workspaces[ws_idx].pane_state(pane_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+        let Some(terminal) = self.state.terminals.get(&pane.attached_terminal_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+
+        encode_success(
+            id,
+            ResponseResult::PaneReadState {
+                read_state: crate::api::schema::PaneReadState {
+                    pane_id: public_pane_id,
+                    workspace_id: self.public_workspace_id(ws_idx),
+                    seen: pane.seen,
+                    agent_status: super::super::api_helpers::pane_agent_status(
+                        terminal.display_state(),
+                        pane.seen,
+                    ),
+                },
+            },
+        )
+    }
+
     pub(super) fn handle_pane_scroll(&mut self, id: String, params: PaneScrollParams) -> String {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);

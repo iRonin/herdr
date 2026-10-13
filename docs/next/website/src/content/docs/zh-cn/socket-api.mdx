@@ -99,7 +99,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | 工作区 | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.read_state`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
 | 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
@@ -144,6 +144,35 @@ CLI 的 `herdr api snapshot` 会把当前 `session.snapshot` 响应输出为 JSO
 ```
 
 客户端可以把 `offset_from_bottom == 0` 视为位于底部。
+
+### 窗格已读状态
+
+`pane.read_state` 返回窗格的原始已读/未读标志，不会把它标为已读或改变焦点。
+`pane_id` 必填，并按照 `pane.get` 的规则解析，包括已移动窗格的别名。
+返回的 id 是窗格当前的公开 id。标志和显示用的 `agent_status` 在同一次处理调用中读取。
+
+```json
+{"id":"req_read_state","method":"pane.read_state","params":{"pane_id":"w1:p1"}}
+{"id":"req_read_state","result":{"type":"pane_read_state","read_state":{"pane_id":"w1:p1","workspace_id":"w1","seen":true,"agent_status":"blocked"}}}
+```
+
+`seen` 是 Herdr 的已确认标志，并不能证明输出已被阅读：
+
+- 查看标签页会把其中所有窗格标为已读。向 blocked 窗格成功转发非空输入，也会把
+  该窗格标为已读，即使它在后台标签页中。智能体仍然保持 `blocked`。
+- 进入 `working` 时标为已读。进入 `blocked` 或完成时，如果所在标签页是活动标签页，
+  且没有已知的外层终端失焦，则标为已读。否则这些转换会标为未读。带有 `auto_read`
+  元数据令牌的完成，即使在后台标签页中也会标为已读。
+- 启动期间被抑制通知的 blocked 到 idle 转换会标为已读。blocked 状态未变的更新会
+  保留该标志，直到确认或发生另一种转换。
+
+`agent_status` 与 `pane.get` 使用相同投影：idle 且未读为 `done`，idle 且已读为
+`idle`；`working`、`blocked` 和 `unknown` 不编码该标志。特别是，已读和未读的
+blocked 窗格都返回 `blocked`；调用方必须使用 `seen` 来区分其标记。
+
+未知窗格与 `pane.get` 一样返回 `pane_not_found`。旧服务器会拒绝这个新方法，而不是
+返回猜测的标志。这是一次性查询，不是订阅；现有状态事件不会报告 `seen` 的每次变化。
+需要最新已读状态时，请重新查询。
 
 ### 窗格图形
 

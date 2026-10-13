@@ -5882,6 +5882,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.read_state",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.focus",
               "type": "string"
             },
@@ -8523,6 +8539,30 @@
           ],
           "type": "object"
         },
+        "PaneReadState": {
+          "description": "A pane's read flag and displayed agent status from one server-side observation.",
+          "properties": {
+            "agent_status": {
+              "$ref": "#/schemas/success_response/$defs/AgentStatus"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "seen": {
+              "type": "boolean"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "workspace_id",
+            "seen",
+            "agent_status"
+          ],
+          "type": "object"
+        },
         "PaneResizeReason": {
           "enum": [
             "unchanged"
@@ -9708,6 +9748,22 @@
               "required": [
                 "type",
                 "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "read_state": {
+                  "$ref": "#/schemas/success_response/$defs/PaneReadState"
+                },
+                "type": {
+                  "const": "pane_read_state",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "read_state"
               ],
               "type": "object"
             },
