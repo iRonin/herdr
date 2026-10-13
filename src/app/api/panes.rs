@@ -2382,8 +2382,23 @@ mod tests {
             .unwrap()
             .seen;
         let sequence = app.event_hub.current_sequence();
+        let get_response = app.handle_api_request(crate::api::schema::Request {
+            id: "get-state".into(),
+            method: crate::api::schema::Method::PaneGet(PaneTarget {
+                pane_id: pane_id.into(),
+            }),
+        });
+        let get_response: SuccessResponse = serde_json::from_str(&get_response).unwrap();
+        let ResponseResult::PaneInfo { pane } = get_response.result else {
+            panic!("expected pane.get response");
+        };
         let response = app.handle_api_request(request);
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["result"]["read_state"]["agent_status"],
+            serde_json::to_value(pane.agent_status).unwrap(),
+            "read-state must use the same status projection as pane.get"
+        );
         assert_eq!(
             response,
             serde_json::json!({
@@ -2473,6 +2488,85 @@ mod tests {
         });
         let _: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_read_state(&mut app, &public_id, true, "idle");
+
+        let other = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        app.state.workspaces[0].tabs[background]
+            .layout
+            .focus_pane(other);
+        assert!(!app.pane_info(0, pane_id).unwrap().focused);
+        assert!(app.state.workspaces[0].pane_state(pane_id).unwrap().seen);
+        assert_read_state(&mut app, &public_id, true, "idle");
+    }
+
+    #[tokio::test]
+    async fn api_pane_read_state_uses_display_state_during_compact() {
+        let (mut app, public_id, mut rx) = app_with_send_key_runtime(1);
+        app.state.active = Some(0);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("worker".into());
+        terminal.state = AgentState::Idle;
+        app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .seen = false;
+        let response = app.handle_pane_send_text(
+            "compact".into(),
+            PaneSendTextParams {
+                pane_id: public_id.clone(),
+                text: "/compact\r".into(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"/compact\r")
+        );
+        assert_eq!(app.state.terminals[&terminal_id].state, AgentState::Idle);
+        assert_eq!(
+            app.state.terminals[&terminal_id].display_state(),
+            AgentState::Working
+        );
+        assert_read_state(&mut app, &public_id, false, "working");
+    }
+
+    #[test]
+    fn api_pane_read_state_handles_panes_without_an_agent() {
+        let (mut app, public_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        assert!(app.state.terminals[&terminal_id]
+            .effective_agent_label()
+            .is_none());
+        assert_read_state(&mut app, &public_id, true, "unknown");
+        app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .seen = false;
+        assert_read_state(&mut app, &public_id, false, "unknown");
+    }
+
+    #[test]
+    fn api_pane_read_state_handles_an_inactive_workspace() {
+        let (mut app, _) = app_with_test_workspace();
+        app.state.workspaces.push(Workspace::test_new("inactive"));
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.outer_terminal_focus = Some(true);
+        let pane_id = app.state.workspaces[1].tabs[0].root_pane;
+        let public_id = app.public_pane_id(1, pane_id).unwrap();
+        read_state_transition(&mut app, pane_id, AgentState::Working);
+        assert_read_state(&mut app, &public_id, true, "working");
+        read_state_transition(&mut app, pane_id, AgentState::Blocked);
+        assert_read_state(&mut app, &public_id, false, "blocked");
+        assert_eq!(
+            app.state.active,
+            Some(0),
+            "query must not activate the target workspace"
+        );
     }
 
     #[test]

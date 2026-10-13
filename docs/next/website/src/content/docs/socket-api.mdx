@@ -177,10 +177,13 @@ Clients can treat `offset_from_bottom == 0` as at-bottom state.
 
 ### Pane read state
 
-`pane.read_state` returns the pane's raw read/unread flag without marking it
-read or changing focus. It requires `pane_id` and resolves it like `pane.get`,
+`pane.read_state` returns the pane's raw read/unread flag. Its handler changes
+neither the flag nor focus. It requires `pane_id` and resolves it like `pane.get`,
 including moved-pane aliases. The returned ids are the pane's current public
 ids. The flag and displayed `agent_status` are sampled in the same handler.
+Like every API request, including `pane.get`, it first syncs the foreground
+client's view; if that client is focused, this can mark its active tab seen
+before the handler reads the flag.
 
 ```json
 {"id":"req_read_state","method":"pane.read_state","params":{"pane_id":"w1:p1"}}
@@ -189,15 +192,20 @@ ids. The flag and displayed `agent_status` are sampled in the same handler.
 
 `seen` is Herdr's acknowledgement flag, not proof that output was read:
 
+- New panes start with `seen: true`. The flag is never saved, so a server
+  restart or live handoff also restores every pane as seen and clears all
+  unread marks.
 - Viewing a tab marks every pane in that tab seen. Successfully forwarding
   non-empty input to a blocked pane also marks that pane seen, even in a
   background tab. The agent stays `blocked`.
 - Entering `working` marks the pane seen. Entering `blocked`, or completing,
-  marks it seen when its tab is active and the outer terminal is not known to
-  have lost focus. Otherwise those transitions mark it unseen. Completions
-  with the `auto_read` metadata token are seen even in a background tab.
-- A suppressed startup transition from blocked to idle is seen. An unchanged
-  blocked state preserves the flag until acknowledgement or another transition.
+  marks it seen when it is in the active tab of the active workspace and the
+  outer terminal is not known to have lost focus. Otherwise those transitions
+  mark it unseen. Completions with the `auto_read` metadata token are seen even
+  in a background tab.
+- A notification-suppressed transition from blocked to idle is seen, including
+  startup and worktree removal. An unchanged blocked state preserves the flag
+  until acknowledgement or another transition.
 
 `agent_status` uses the same projection as `pane.get`: idle and unseen is
 `done`, idle and seen is `idle`; `working`, `blocked`, and `unknown` do not
