@@ -559,6 +559,15 @@ pub struct PaneInfo {
     pub revision: u64,
 }
 
+/// A pane's read flag and displayed agent status from one server-side observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneReadState {
+    pub pane_id: String,
+    pub workspace_id: String,
+    pub seen: bool,
+    pub agent_status: AgentStatus,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneScrollInfo {
     pub offset_from_bottom: u64,

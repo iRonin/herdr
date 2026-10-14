@@ -168,6 +168,36 @@ impl App {
         encode_success(id, ResponseResult::PaneInfo { pane })
     }
 
+    pub(super) fn handle_pane_read_state(&mut self, id: String, target: PaneTarget) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+        let Some(pane) = self.state.workspaces[ws_idx].pane_state(pane_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+        let Some(terminal) = self.state.terminals.get(&pane.attached_terminal_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+
+        encode_success(
+            id,
+            ResponseResult::PaneReadState {
+                read_state: crate::api::schema::PaneReadState {
+                    pane_id: public_pane_id,
+                    workspace_id: self.public_workspace_id(ws_idx),
+                    seen: pane.seen,
+                    agent_status: super::super::api_helpers::pane_agent_status(
+                        terminal.display_state(),
+                        pane.seen,
+                    ),
+                },
+            },
+        )
+    }
+
     pub(super) fn handle_pane_scroll(&mut self, id: String, params: PaneScrollParams) -> String {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
@@ -2282,6 +2312,231 @@ mod tests {
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
         (app, public_pane_id)
+    }
+
+    fn read_state_request(pane_id: &str) -> crate::api::schema::Request {
+        serde_json::from_value(serde_json::json!({
+            "id": "read-state",
+            "method": "pane.read_state",
+            "params": { "pane_id": pane_id }
+        }))
+        .expect("pane.read_state must be a supported socket method")
+    }
+
+    fn assert_read_state(app: &mut App, pane_id: &str, seen: bool, status: &str) {
+        let request = read_state_request(pane_id);
+        assert!(!crate::api::request_changes_ui(&request));
+        assert_eq!(
+            crate::api::api_method_name(&request.method),
+            "pane.read_state"
+        );
+        let (ws_idx, internal_id) = app.parse_pane_id(pane_id).unwrap();
+        let before = app.state.workspaces[ws_idx]
+            .pane_state(internal_id)
+            .unwrap()
+            .seen;
+        let sequence = app.event_hub.current_sequence();
+        let get_response = app.handle_api_request(crate::api::schema::Request {
+            id: "get-state".into(),
+            method: crate::api::schema::Method::PaneGet(PaneTarget {
+                pane_id: pane_id.into(),
+            }),
+        });
+        let get_response: SuccessResponse = serde_json::from_str(&get_response).unwrap();
+        let ResponseResult::PaneInfo { pane } = get_response.result else {
+            panic!("expected pane.get response");
+        };
+        let response = app.handle_api_request(request);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["result"]["read_state"]["agent_status"],
+            serde_json::to_value(pane.agent_status).unwrap(),
+            "read-state must use the same status projection as pane.get"
+        );
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "id": "read-state",
+                "result": {
+                    "type": "pane_read_state",
+                    "read_state": {
+                        "pane_id": app.public_pane_id(ws_idx, internal_id).unwrap(),
+                        "workspace_id": app.public_workspace_id(ws_idx),
+                        "seen": seen,
+                        "agent_status": status
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            app.state.workspaces[ws_idx]
+                .pane_state(internal_id)
+                .unwrap()
+                .seen,
+            before,
+            "reading the flag must not acknowledge the pane"
+        );
+        assert_eq!(
+            app.event_hub.current_sequence(),
+            sequence,
+            "read-only queries must not emit events"
+        );
+    }
+
+    fn read_state_transition(app: &mut App, pane_id: PaneId, state: AgentState) {
+        app.handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+    }
+
+    #[test]
+    fn api_pane_read_state_distinguishes_blocked_unread_from_viewed() {
+        let (mut app, _) = app_with_test_workspace();
+        let background = app.state.workspaces[0].test_add_tab(Some("background"));
+        let pane_id = app.state.workspaces[0].tabs[background].root_pane;
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.workspaces[0].switch_tab(0);
+        app.state.outer_terminal_focus = Some(true);
+        let public_id = app.public_pane_id(0, pane_id).unwrap();
+        read_state_transition(&mut app, pane_id, AgentState::Working);
+        assert_read_state(&mut app, &public_id, true, "working");
+        read_state_transition(&mut app, pane_id, AgentState::Blocked);
+        assert_read_state(&mut app, &public_id, false, "blocked");
+        assert_read_state(&mut app, &public_id, false, "blocked");
+
+        let tab_id = app.public_tab_id(0, background).unwrap();
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "view".into(),
+            method: crate::api::schema::Method::TabFocus(crate::api::schema::TabTarget { tab_id }),
+        });
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_read_state(&mut app, &public_id, true, "blocked");
+    }
+
+    #[test]
+    fn api_pane_read_state_distinguishes_completion_unread_from_viewed() {
+        let (mut app, _) = app_with_test_workspace();
+        let background = app.state.workspaces[0].test_add_tab(Some("background"));
+        let pane_id = app.state.workspaces[0].tabs[background].root_pane;
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.workspaces[0].switch_tab(0);
+        app.state.outer_terminal_focus = Some(true);
+        let public_id = app.public_pane_id(0, pane_id).unwrap();
+        read_state_transition(&mut app, pane_id, AgentState::Working);
+        read_state_transition(&mut app, pane_id, AgentState::Idle);
+        assert_read_state(&mut app, &public_id, false, "done");
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "view".into(),
+            method: crate::api::schema::Method::PaneFocus(PaneTarget {
+                pane_id: public_id.clone(),
+            }),
+        });
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_read_state(&mut app, &public_id, true, "idle");
+
+        let other = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        app.state.workspaces[0].tabs[background]
+            .layout
+            .focus_pane(other);
+        assert!(!app.pane_info(0, pane_id).unwrap().focused);
+        assert!(app.state.workspaces[0].pane_state(pane_id).unwrap().seen);
+        assert_read_state(&mut app, &public_id, true, "idle");
+    }
+
+    #[tokio::test]
+    async fn api_pane_read_state_uses_display_state_during_compact() {
+        let (mut app, public_id, mut rx) = app_with_send_key_runtime(1);
+        app.state.active = Some(0);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("worker".into());
+        terminal.state = AgentState::Idle;
+        app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .seen = false;
+        let response = app.handle_pane_send_text(
+            "compact".into(),
+            PaneSendTextParams {
+                pane_id: public_id.clone(),
+                text: "/compact\r".into(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"/compact\r")
+        );
+        assert_eq!(app.state.terminals[&terminal_id].state, AgentState::Idle);
+        assert_eq!(
+            app.state.terminals[&terminal_id].display_state(),
+            AgentState::Working
+        );
+        assert_read_state(&mut app, &public_id, false, "working");
+    }
+
+    #[test]
+    fn api_pane_read_state_handles_panes_without_an_agent() {
+        let (mut app, public_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        assert!(app.state.terminals[&terminal_id]
+            .effective_agent_label()
+            .is_none());
+        assert_read_state(&mut app, &public_id, true, "unknown");
+        app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .seen = false;
+        assert_read_state(&mut app, &public_id, false, "unknown");
+    }
+
+    #[test]
+    fn api_pane_read_state_handles_an_inactive_workspace() {
+        let (mut app, _) = app_with_test_workspace();
+        app.state.workspaces.push(Workspace::test_new("inactive"));
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.outer_terminal_focus = Some(true);
+        let pane_id = app.state.workspaces[1].tabs[0].root_pane;
+        let public_id = app.public_pane_id(1, pane_id).unwrap();
+        read_state_transition(&mut app, pane_id, AgentState::Working);
+        assert_read_state(&mut app, &public_id, true, "working");
+        read_state_transition(&mut app, pane_id, AgentState::Blocked);
+        assert_read_state(&mut app, &public_id, false, "blocked");
+        assert_eq!(
+            app.state.active,
+            Some(0),
+            "query must not activate the target workspace"
+        );
+    }
+
+    #[test]
+    fn api_pane_read_state_unknown_pane_matches_get_error() {
+        let (mut app, _) = app_with_test_workspace();
+        let response = app.handle_api_request(read_state_request("missing"));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        let get_response = app.handle_pane_get(
+            "read-state".into(),
+            PaneTarget {
+                pane_id: "missing".into(),
+            },
+        );
+        let get_error: ErrorResponse = serde_json::from_str(&get_response).unwrap();
+        assert_eq!(error, get_error);
+        assert_eq!(error.error.code, "pane_not_found");
     }
 
     #[test]
