@@ -202,7 +202,8 @@ before the handler reads the flag.
   marks it seen when it is in the active tab of the active workspace and the
   outer terminal is not known to have lost focus. Otherwise those transitions
   mark it unseen. Completions with the `auto_read` metadata token are seen even
-  in a background tab.
+  in a background tab, and a report carrying that token marks an idle, unseen
+  pane seen.
 - A notification-suppressed transition from blocked to idle is seen, including
   startup and worktree removal. An unchanged blocked state preserves the flag
   until acknowledgement or another transition.

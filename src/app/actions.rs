@@ -2184,6 +2184,52 @@ impl AppState {
             .is_some_and(|terminal| terminal.metadata_tokens.contains(AUTO_READ_METADATA_TOKEN))
     }
 
+    /// Applies a newly reported `auto_read` token to a completion that already
+    /// happened: an idle, unread pane becomes read, and a completion
+    /// notification still waiting out the toast delay is dropped. Working,
+    /// blocked and already-read panes are left alone. Returns whether the
+    /// pane changed.
+    pub(crate) fn mark_auto_read_pane_seen_if_done(
+        &mut self,
+        ws_idx: usize,
+        pane_id: PaneId,
+    ) -> bool {
+        let Some(terminal_id) = self
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone())
+        else {
+            return false;
+        };
+        if self
+            .terminals
+            .get(&terminal_id)
+            .is_none_or(|terminal| terminal.state != AgentState::Idle)
+        {
+            return false;
+        }
+        let Some(pane) = self
+            .workspaces
+            .get_mut(ws_idx)
+            .and_then(|workspace| workspace.pane_state_mut(pane_id))
+        else {
+            return false;
+        };
+        if pane.seen {
+            return false;
+        }
+        pane.seen = true;
+        if self
+            .pending_agent_notifications
+            .get(&pane_id)
+            .is_some_and(|pending| pending.state == AgentState::Idle)
+        {
+            self.pending_agent_notifications.remove(&pane_id);
+        }
+        true
+    }
+
     fn record_or_deliver_agent_notification(
         &mut self,
         ws_idx: usize,
