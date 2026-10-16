@@ -1897,12 +1897,61 @@ impl AppState {
     /// `apply_pane_state_change`). Presence-only contract: the token's value is
     /// a placeholder; reporters set it via `pane.report_metadata` and clear it
     /// with a null patch.
-    fn pane_has_auto_read_token(&self, ws_idx: usize, pane_id: PaneId) -> bool {
+    pub(crate) fn pane_has_auto_read_token(&self, ws_idx: usize, pane_id: PaneId) -> bool {
         self.workspaces
             .get(ws_idx)
             .and_then(|workspace| workspace.pane_state(pane_id))
             .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))
             .is_some_and(|terminal| terminal.metadata_tokens.contains(AUTO_READ_METADATA_TOKEN))
+    }
+
+    /// Applies a newly reported `auto_read` token to a completion that already
+    /// happened: the completion is forgotten (clients stop projecting the pane
+    /// as done), an idle, unread pane becomes read, and a completion
+    /// notification still waiting out the toast delay is dropped. Working,
+    /// blocked and already-read panes are left alone. Returns whether anything
+    /// changed.
+    pub(crate) fn mark_auto_read_pane_seen_if_done(
+        &mut self,
+        ws_idx: usize,
+        pane_id: PaneId,
+    ) -> bool {
+        let Some(terminal_id) = self
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone())
+        else {
+            return false;
+        };
+        let Some(terminal) = self
+            .terminals
+            .get_mut(&terminal_id)
+            .filter(|terminal| terminal.state == AgentState::Idle)
+        else {
+            return false;
+        };
+        // Clients project "done" from the recorded completion, not from the seen
+        // flag, so the late token has to clear the record the completion left.
+        let completion_forgotten = terminal.last_agent_completion_seq.take().is_some();
+        let Some(pane) = self
+            .workspaces
+            .get_mut(ws_idx)
+            .and_then(|workspace| workspace.pane_state_mut(pane_id))
+        else {
+            return completion_forgotten;
+        };
+        let marked_seen = !pane.seen;
+        pane.seen = true;
+        if marked_seen
+            && self
+                .pending_agent_notifications
+                .get(&pane_id)
+                .is_some_and(|pending| pending.state == AgentState::Idle)
+        {
+            self.pending_agent_notifications.remove(&pane_id);
+        }
+        completion_forgotten || marked_seen
     }
 
     fn record_or_deliver_agent_notification(
