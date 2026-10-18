@@ -1767,6 +1767,42 @@ mod tests {
         (result, elapsed, server, client)
     }
 
+    // ONE request per connection: herdr answers the first request line and closes the
+    // connection; a second request written on it is never answered (the client reads end of
+    // stream). Clients depend on this shape: a client that sent two requests on one connection
+    // failed with EPIPE on every agent resumed after a restart (2026-10-18). Pinned so a
+    // change to it is a deliberate protocol change, never an accident.
+    #[test]
+    fn a_connection_answers_one_request_then_closes() {
+        let (mut client, server, _path) = local_stream_pair("api-one-request");
+        client
+            .write_all(
+                b"{\"id\":\"first\",\"method\":\"ping\",\"params\":{}}\n{\"id\":\"second\",\"method\":\"ping\",\"params\":{}}\n",
+            )
+            .unwrap();
+        client.flush().unwrap();
+
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let running = Arc::new(AtomicBool::new(true));
+        let event_hub = EventHub::default();
+        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+
+        let mut reader = BufReader::new(&mut client);
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(
+            first["id"], "first",
+            "positive control: the first request is answered"
+        );
+        let mut rest = String::new();
+        assert_eq!(
+            reader.read_line(&mut rest).unwrap(),
+            0,
+            "the second request on the same connection must get no reply: {rest:?}"
+        );
+    }
+
     // A request whose bytes come a moment after the server starts reading is answered at
     // once, not after a fixed 100 ms sleep (ledger #60).
     #[test]

@@ -267,9 +267,16 @@ fn extract_tab_agent_lifecycle_marker(display_agent: &str) -> Option<&str> {
 }
 
 /// The awaiting-user marker may carry a pending-ask count; the others are bare.
+/// Agent-driven may also lead ready-to-close, asked-to-stop or done as a pair
+/// (the reporter shows both at once); it is never paired with anything else.
 fn is_lifecycle_marker(s: &str) -> bool {
     if let Some(count) = s.strip_prefix('\u{2753}') {
         return count.is_empty() || count.bytes().all(|b| b.is_ascii_digit());
+    }
+    if let Some(second) = s.strip_prefix('\u{1F916}') {
+        if !second.is_empty() {
+            return matches!(second, "\u{1F4A4}" | "\u{270B}" | "\u{2705}");
+        }
     }
     matches!(s, "\u{1F4A4}" | "\u{270B}" | "\u{2705}" | "\u{1F916}")
 }
@@ -878,6 +885,27 @@ mod tests {
             ("\u{1F977}\u{1F916} 17%\u{B7}46223", Some("\u{1F916}")),
             ("\u{1F977}\u{2753} 17%\u{B7}46223", Some("\u{2753}")),
             ("\u{1F977}\u{2753}4 17%\u{B7}46223", Some("\u{2753}4")),
+            // agent-driven shown together with done / ready-to-close / asked-to-stop
+            (
+                "\u{1F977}\u{1F916}\u{2705} 17%\u{B7}46223",
+                Some("\u{1F916}\u{2705}"),
+            ),
+            (
+                "\u{1F977}\u{1F916}\u{1F4A4} 17%\u{B7}46223",
+                Some("\u{1F916}\u{1F4A4}"),
+            ),
+            (
+                "\u{1F977}\u{1F916}\u{270B} 17%\u{B7}46223",
+                Some("\u{1F916}\u{270B}"),
+            ),
+            // the pair is agent-driven FIRST, then exactly one of those three
+            ("\u{1F977}\u{2705}\u{1F916} 17%\u{B7}46223", None),
+            ("\u{1F977}\u{1F916}\u{1F916} 17%\u{B7}46223", None),
+            ("\u{1F977}\u{1F916}\u{2753} 17%\u{B7}46223", None),
+            ("\u{1F977}\u{1F916}\u{2753}4 17%\u{B7}46223", None),
+            ("\u{1F977}\u{1F916}\u{2705}\u{2705} 17%\u{B7}46223", None),
+            ("\u{1F977}\u{1F916}\u{1F680} 17%\u{B7}46223", None),
+            ("\u{1F977}\u{2705}\u{1F4A4} 17%\u{B7}46223", None),
             // absent marker -> None -> tab renders exactly as today
             ("\u{1F977} 17%\u{B7}46223", None),
             // no reporter icon -> None (guards against unrelated leading emoji)
@@ -947,6 +975,26 @@ mod tests {
                 Some("17%"),
                 Some("\u{2753}4"),
                 "pending-ask count",
+            ),
+            // Agent-driven together with done / ready-to-close / asked-to-stop:
+            // the robot first, then one of the three.
+            (
+                "\u{1F977}\u{1F916}\u{2705} 17%\u{B7}claude-opus-5:max\u{B7}46223",
+                Some("17%"),
+                Some("\u{1F916}\u{2705}"),
+                "agent-driven + done",
+            ),
+            (
+                "\u{1F977}\u{1F916}\u{1F4A4} 17%\u{B7}46223",
+                Some("17%"),
+                Some("\u{1F916}\u{1F4A4}"),
+                "agent-driven + ready-to-close",
+            ),
+            (
+                "\u{1F977}\u{1F916}\u{270B} 17%\u{B7}46223",
+                Some("17%"),
+                Some("\u{1F916}\u{270B}"),
+                "agent-driven + asked-to-stop",
             ),
             // Trailing tokens the reporter may append are IGNORED, not fatal.
             (
