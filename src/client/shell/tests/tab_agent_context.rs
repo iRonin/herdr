@@ -99,7 +99,13 @@ fn context_and_marker_compose_on_the_tab_with_exact_width() {
 /// before reading the separator and the name.
 #[test]
 fn tab_lifecycle_marker_has_a_separator_before_the_pane_name() {
-    for (display_agent, marker) in [("🥷✅ 52%·4242", "✅"), ("🥷❓3 52%·4242", "❓3")] {
+    for (display_agent, marker) in [
+        ("🥷✅ 52%·4242", "✅"),
+        ("🥷❓3 52%·4242", "❓3"),
+        // Two glyphs, both double-width: the separator follows the PAIR.
+        ("🥷🤖✅ 52%·4242", "🤖✅"),
+        ("🥷🤖💤 52%·4242", "🤖💤"),
+    ] {
         let (state, frame) = composed_state(tab_context_config(true), display_agent);
         let (rect, row) = composed_tab_row(&state, &frame);
 
