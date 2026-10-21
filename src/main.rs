@@ -453,6 +453,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Set false to run plain ssh against your ssh config unchanged — this does not
 # force keepalive or multiplexing off, it only stops herdr from adding its own.
 # manage_ssh_config = true
+# Extra ssh config files read before your own ssh config for remote connections,
+# for machines whose Host block lives outside ~/.ssh. `~/` expands to your home
+# directory; a missing file is skipped. Ignored when manage_ssh_config = false.
+# ssh_config_files = []
 
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.

@@ -1,10 +1,12 @@
 use std::io;
 use std::path::PathBuf;
 
-use super::attach::{find_installed_remote_herdr, RemoteSsh, SshStdioBridge};
+use super::attach::{find_installed_remote_herdr, ManagedSshConfig, RemoteSsh, SshStdioBridge};
 
 pub(crate) struct SavedSshBridge {
     _bridge: SshStdioBridge,
+    // Declared after the bridge so the bridge stops before its ssh config goes.
+    _ssh_config: Option<ManagedSshConfig>,
 }
 
 pub(crate) struct SavedSshStream {
@@ -17,7 +19,7 @@ pub(crate) fn connect_saved_ssh(
     target: &str,
     session: &str,
 ) -> io::Result<SavedSshStream> {
-    let ssh = validated_saved_ssh(profile_id, target, session)?;
+    let mut ssh = validated_saved_ssh(profile_id, target, session)?;
     let remote_herdr = find_installed_remote_herdr(&ssh)?;
     let path = saved_bridge_path(profile_id);
     let bridge = SshStdioBridge::start(
@@ -31,18 +33,23 @@ pub(crate) fn connect_saved_ssh(
     let stream = crate::ipc::connect_local_stream(&path)?;
     Ok(SavedSshStream {
         stream,
-        bridge: SavedSshBridge { _bridge: bridge },
+        bridge: SavedSshBridge {
+            _bridge: bridge,
+            _ssh_config: ssh.take_managed_config(),
+        },
     })
 }
 
 pub(crate) struct SavedSshApiBridge {
     path: PathBuf,
     bridge: SshStdioBridge,
+    // Declared after the bridge so the bridge stops before its ssh config goes.
+    _ssh_config: Option<ManagedSshConfig>,
 }
 
 impl SavedSshApiBridge {
     pub(crate) fn start(profile_id: &str, target: &str, session: &str) -> io::Result<Self> {
-        let ssh = validated_saved_ssh(profile_id, target, session)?;
+        let mut ssh = validated_saved_ssh(profile_id, target, session)?;
         let remote_herdr = super::attach::find_installed_remote_api_herdr(&ssh, session)?;
         let command = super::attach::remote_api_bridge_command(&remote_herdr, session, false);
         let path = crate::platform::remote_bridge_endpoint_path(
@@ -60,7 +67,11 @@ impl SavedSshApiBridge {
             ssh.options(),
             true,
         )?;
-        Ok(Self { path, bridge })
+        Ok(Self {
+            path,
+            bridge,
+            _ssh_config: ssh.take_managed_config(),
+        })
     }
 
     pub(crate) fn socket_path(&self) -> &std::path::Path {

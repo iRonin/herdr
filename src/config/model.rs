@@ -1280,12 +1280,18 @@ pub struct RemoteConfig {
     /// Add keepalive fallbacks and private connection reuse for `herdr --remote`.
     /// Set false to run plain ssh unchanged. Default: true.
     pub manage_ssh_config: bool,
+    /// Extra ssh config files that remote connections read before the user's own
+    /// ssh config, so a machine whose `Host` block lives outside `~/.ssh` can be
+    /// reached. `~/` expands to the home directory; missing files are skipped.
+    /// Ignored when `manage_ssh_config` is false. Default: [].
+    pub ssh_config_files: Vec<String>,
 }
 
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
             manage_ssh_config: true,
+            ssh_config_files: Vec::new(),
         }
     }
 }

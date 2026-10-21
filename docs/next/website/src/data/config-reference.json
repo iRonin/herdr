@@ -1527,6 +1527,12 @@
           "type": "boolean",
           "default": "true",
           "description": "Add keepalive fallbacks and private connection reuse for `herdr --remote`. Set false to run plain ssh unchanged."
+        },
+        {
+          "key": "remote.ssh_config_files",
+          "type": "list of strings",
+          "default": "[]",
+          "description": "Extra ssh config files that remote connections, including saved machines, read before your own ssh config, so a machine whose `Host` block lives outside `~/.ssh` can be reached. Paths must be absolute or start with `~/`; a missing file is skipped with a warning. Ignored when `manage_ssh_config` is false."
         }
       ]
     },

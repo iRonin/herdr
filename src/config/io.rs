@@ -939,6 +939,28 @@ pi_program = "custom-pi"
     }
 
     #[test]
+    fn load_live_config_parses_remote_ssh_config_files() {
+        let loaded = load_live_config_from_str(
+            r#"
+[remote]
+ssh_config_files = ["~/.config/my host/ssh_config", "/etc/extra_config"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            loaded.config.remote.ssh_config_files,
+            vec!["~/.config/my host/ssh_config", "/etc/extra_config"]
+        );
+        assert!(loaded.config.remote.manage_ssh_config);
+        assert!(loaded.diagnostics.is_empty());
+        assert!(loaded.invalid_sections.is_empty());
+
+        let default = load_live_config_from_str("").unwrap();
+        assert!(default.config.remote.ssh_config_files.is_empty());
+    }
+
+    #[test]
     fn startup_and_live_agent_config_default_blank_pi_program_to_pi() {
         let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let stamp = std::time::SystemTime::now()
