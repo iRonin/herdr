@@ -121,6 +121,15 @@ manage_ssh_config = true
 
 When enabled, `herdr --remote` writes a private temporary SSH config that includes your user and system SSH configs first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own keepalive settings win. Linux and macOS clients also use a private per-attach OpenSSH control socket to reuse the first authenticated connection; Windows OpenSSH does not. Set `manage_ssh_config = false` to run remote attach through plain `ssh` without Herdr's generated config or control socket.
 
+To reach a machine whose `Host` block lives outside `~/.ssh`, list extra SSH config files. Remote attach and saved machines read them before your own SSH config, so OpenSSH takes their values first:
+
+```toml
+[remote]
+ssh_config_files = ["~/.config/my-machine/ssh_config"]
+```
+
+Paths must be absolute or start with `~/`. A file that does not exist is skipped with a warning. The list is ignored when `manage_ssh_config = false`, and empty by default.
+
 ## Keybindings
 
 For a guided introduction to the prefix and a vetted prefix-free setup, see [Keyboard](/docs/keyboard/).
