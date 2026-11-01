@@ -17,7 +17,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use serde_json::Value;
 use support::{
     cleanup_test_base, client_shell_handshake, drain_messages, register_runtime_dir,
-    register_spawned_herdr_pid, send_detach, unregister_spawned_herdr_pid, wait_for_disconnect,
+    register_spawned_herdr_pid, send_detach, unregister_spawned_herdr_pid, wait_for_server_close,
     wait_for_socket, wait_until, CURRENT_ENDPOINT_PROTOCOL_GENERATION as CURRENT_PROTOCOL,
 };
 
@@ -330,7 +330,7 @@ fn explicit_detach_message_causes_clean_disconnect() {
     // After sending Detach, the server removes the client.
     // We may still receive a few queued frames before the connection closes.
     let got_eof =
-        wait_for_disconnect(&mut stream, Duration::from_secs(2)).expect("wait for disconnect");
+        wait_for_server_close(&mut stream, Duration::from_secs(10)).expect("wait for disconnect");
     assert!(
         got_eof,
         "client connection should be closed after explicit Detach message"
@@ -501,7 +501,7 @@ fn processes_survive_during_and_after_detach() {
     );
 
     assert!(
-        wait_for_disconnect(&mut stream, Duration::from_secs(2)).expect("wait for detach"),
+        wait_for_server_close(&mut stream, Duration::from_secs(10)).expect("wait for detach"),
         "detached client connection should close"
     );
 
@@ -653,8 +653,13 @@ fn pane_created_after_detach_uses_configured_headless_size() {
     assert_eq!(attached_size, (50, 160));
 
     send_detach(&mut stream).expect("send detach");
+    // The server closes the connection only after its main loop has removed the
+    // client and switched the tabs back to the headless size, and it handles the
+    // next API request only after that. Silence is not a sign of either: under
+    // load the detach can still be queued while the stream looks idle, and the
+    // next pane would then be created at the attached size.
     assert!(
-        wait_for_disconnect(&mut stream, Duration::from_secs(2)).expect("wait for detach"),
+        wait_for_server_close(&mut stream, Duration::from_secs(10)).expect("wait for detach"),
         "detached client connection should close"
     );
     drop(stream);
