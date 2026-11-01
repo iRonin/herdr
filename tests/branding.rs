@@ -508,3 +508,74 @@ fn remote_attach_stays_quiet_when_the_remote_version_check_fails() {
         "a failed version check must stay quiet; got: {stderr}"
     );
 }
+
+/// Finds one section of a thin 64-bit little-endian Mach-O file and returns its bytes.
+#[cfg(target_os = "macos")]
+fn macho_section<'a>(file: &'a [u8], segment: &str, section: &str) -> Option<&'a [u8]> {
+    fn u32_at(file: &[u8], at: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(file.get(at..at + 4)?.try_into().ok()?))
+    }
+    fn u64_at(file: &[u8], at: usize) -> Option<u64> {
+        Some(u64::from_le_bytes(file.get(at..at + 8)?.try_into().ok()?))
+    }
+    fn name_is(field: &[u8], name: &str) -> bool {
+        field.len() == 16
+            && field.starts_with(name.as_bytes())
+            && field[name.len()..].iter().all(|&byte| byte == 0)
+    }
+    const MH_MAGIC_64: u32 = 0xfeed_facf;
+    const LC_SEGMENT_64: u32 = 0x19;
+    if u32_at(file, 0)? != MH_MAGIC_64 {
+        return None;
+    }
+    let mut command = 32;
+    for _ in 0..u32_at(file, 16)? {
+        let kind = u32_at(file, command)?;
+        let size = u32_at(file, command + 4)? as usize;
+        if kind == LC_SEGMENT_64 {
+            for index in 0..u32_at(file, command + 64)? as usize {
+                let header = command + 72 + index * 80;
+                if name_is(file.get(header..header + 16)?, section)
+                    && name_is(file.get(header + 16..header + 32)?, segment)
+                {
+                    let length = u64_at(file, header + 40)? as usize;
+                    let offset = u32_at(file, header + 48)? as usize;
+                    return file.get(offset..offset.checked_add(length)?);
+                }
+            }
+        }
+        command += size;
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_binary_embeds_the_info_plist_that_gives_the_server_a_bundle_identity() {
+    // On macOS the server runs as its own launchd job, so macOS charges every privacy request of every
+    // program in a pane (Apple events from osascript, folder access, ...) to the herdr binary. A bare
+    // executable has no identity macOS can keep a grant for, and the request is refused without a prompt.
+    // build.rs embeds assets/macos/Info.plist to give it one; the release signing step
+    // (docs/rebase/tools/v0.9.1-macos-sign.sh) signs with the same identifier. If the plist is dropped
+    // from the build, grants stop working again with no error anywhere.
+    let binary = std::fs::read(env!("CARGO_BIN_EXE_herdr")).expect("read the herdr binary");
+
+    // Control: the walker can answer "absent" on this very file, so a present section means something.
+    assert!(
+        macho_section(&binary, "__TEXT", "__no_such_section").is_none(),
+        "section lookup must return nothing for a section the binary does not have"
+    );
+
+    let plist = macho_section(&binary, "__TEXT", "__info_plist")
+        .expect("the binary must carry __TEXT,__info_plist");
+    let plist = String::from_utf8_lossy(plist);
+    assert!(
+        plist.contains("<key>CFBundleIdentifier</key>")
+            && plist.contains("<string>dev.herdr.cli</string>"),
+        "the embedded plist must carry the stable bundle identifier; got: {plist}"
+    );
+    assert!(
+        plist.contains("<key>NSAppleEventsUsageDescription</key>"),
+        "macOS only prompts for Apple events when the plist explains why; got: {plist}"
+    );
+}
