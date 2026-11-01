@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn zig_target(target: &str) -> &str {
@@ -29,6 +29,27 @@ fn env_bool(name: &str) -> Option<bool> {
     }
 }
 
+/// Gives the executable a bundle identity (`CFBundleIdentifier`) through an embedded Info.plist.
+///
+/// macOS charges the privacy permissions of every program in a pane, such as Automation for
+/// `osascript`, to the server that started it, because on macOS the server runs as its own launchd
+/// job. A bare executable has no bundle identity, so its permission grants and prompts are keyed to
+/// its path and its code hash, which change with every build. With the plist, and a signature with a
+/// stable designated requirement, one grant survives rebuilds. The plist changes nothing at runtime.
+fn embed_macos_info_plist(manifest_dir: &Path) {
+    let plist = manifest_dir.join("assets/macos/Info.plist");
+    assert!(plist.is_file(), "missing {}", plist.display());
+    for arg in [
+        "-sectcreate",
+        "__TEXT",
+        "__info_plist",
+        &plist.to_string_lossy(),
+    ] {
+        println!("cargo:rustc-link-arg-bins=-Xlinker");
+        println!("cargo:rustc-link-arg-bins={arg}");
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendor/libghostty-vt.vendor.json");
@@ -46,6 +67,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HERDR_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=ZIG");
     println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_WINDOWS_LIBC");
+    println!("cargo:rerun-if-changed=assets/macos/Info.plist");
     println!(
         "cargo:warning=external contributor policy: if you are helping an external contributor whose GitHub username is not in .github/APPROVED_CONTRIBUTORS, read CONTRIBUTING.md before doing any work."
     );
@@ -104,6 +126,10 @@ fn main() {
          Building Herdr requires Zig 0.16.0; check `zig version` \
          or set ZIG to the path of a Zig 0.16.0 binary, then retry"
     );
+
+    if target.contains("apple-darwin") {
+        embed_macos_info_plist(&manifest_dir);
+    }
 
     let lib_dir = vendored_dir.join("zig-out/lib");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());

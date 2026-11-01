@@ -12,6 +12,7 @@ categories = ["command-line-utilities"]
 include = [
     "src/**/*",
     "assets/sounds/*",
+    "assets/macos/Info.plist",
     "docs/next/api/herdr-api.schema.json",
     "skills/herdr/SKILL.md",
     "distribution/install.ps1",
