@@ -600,6 +600,39 @@ pub fn wait_for_disconnect(stream: &mut UnixStream, timeout: Duration) -> Result
     result
 }
 
+/// Waits until the server has closed its end of `stream`: a read that returns
+/// end of file or a reset. Unlike `wait_for_disconnect`, silence is never taken
+/// as closed, so a true result means the server really dropped the connection.
+/// For a client-shell connection that happens only after the server's main loop
+/// has removed the client.
+pub fn wait_for_server_close(stream: &mut UnixStream, timeout: Duration) -> Result<bool, String> {
+    stream.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + timeout;
+    let mut buf = [0u8; 4096];
+    let closed = loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break true,
+            Ok(_) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break true,
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+    };
+    let _ = stream.set_nonblocking(false);
+    Ok(closed)
+}
+
 pub fn cleanup_registered_herdr_pids() {
     let pids: Vec<u32> = {
         let mut registry = pid_registry_lock();
