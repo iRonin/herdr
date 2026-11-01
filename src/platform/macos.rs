@@ -26,6 +26,9 @@ pub(crate) use super::unix_common::{
 mod bootstrap;
 pub(crate) use bootstrap::{configure_server_daemon_context, prepare_server_process};
 
+mod launchd_spawn;
+pub(crate) use launchd_spawn::{leave_launchd_job, spawn_launchd_job};
+
 #[cfg(test)]
 mod config_file_tests;
 
