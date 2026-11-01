@@ -612,7 +612,10 @@ Herdr resumes supported Agent conversations after a server restart by default:
 ```toml
 [session]
 resume_agents_on_restore = true
+startup_per_agent_delay_ms = 100
 ```
+
+Automatic restores start one agent at a time, 100 milliseconds apart by default, to reduce startup contention. The first eligible agent starts immediately. Set `startup_per_agent_delay_ms = 0` to disable spacing. Manual launches and explicit terminal attaches are unaffected. Restart the Herdr server to apply changes.
 
 Pi resumes substitute the current `agent.pi_program` value for a generated or saved native `pi` program when the deferred resume starts; a saved non-`pi` program is preserved.
 

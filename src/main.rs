@@ -438,6 +438,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Resume supported AI-agent panes into their native conversation sessions after
 # a Herdr server restart. Requires official integrations that report session refs.
 # resume_agents_on_restore = true
+# Milliseconds between automatic agent restores; 0 starts them without spacing.
+# startup_per_agent_delay_ms = 100
 
 # Maximum time in milliseconds for `herdr server stop` to wait for shutdown.
 # Zero uses the 15000ms default; values above 300000ms (5 minutes) are capped.

@@ -25,14 +25,19 @@ impl App {
     pub(crate) fn sync_pending_agent_resume_deadline(&mut self, now: Instant) {
         if !self.has_pending_agent_resumes() {
             self.pending_agent_resume_deadline = None;
+            self.next_agent_resume_at = None;
             return;
         }
         if self.pending_agent_resume_candidates().is_empty() {
             self.pending_agent_resume_deadline = None;
             return;
         }
-        self.pending_agent_resume_deadline
-            .get_or_insert(now + super::PENDING_AGENT_RESUME_THEME_WAIT);
+        if let Some(next) = self.next_agent_resume_at {
+            self.pending_agent_resume_deadline = Some(next);
+        } else {
+            self.pending_agent_resume_deadline
+                .get_or_insert(now + super::PENDING_AGENT_RESUME_THEME_WAIT);
+        }
     }
 
     pub(crate) fn pending_agent_resume_due(&self, now: Instant) -> bool {
@@ -40,7 +45,15 @@ impl App {
             .is_some_and(|deadline| now >= deadline)
     }
 
-    pub(crate) fn start_pending_agent_resumes(&mut self, allow_empty_theme: bool) -> bool {
+    pub(crate) fn start_pending_agent_resumes(
+        &mut self,
+        now: Instant,
+        allow_empty_theme: bool,
+    ) -> bool {
+        // Geometry/theme events can also enter here; they must not bypass spacing.
+        if self.next_agent_resume_at.is_some_and(|next| now < next) {
+            return false;
+        }
         let pending = self.pending_agent_resume_candidates();
         let mut changed = false;
         for PendingAgentResumeCandidate {
@@ -64,6 +77,11 @@ impl App {
                 cols,
                 allow_empty_theme,
             );
+            if changed && !self.startup_per_agent_delay.is_zero() {
+                self.next_agent_resume_at = Some(now + self.startup_per_agent_delay);
+                self.pending_agent_resume_deadline = self.next_agent_resume_at;
+                break;
+            }
         }
 
         if changed {
@@ -71,6 +89,9 @@ impl App {
         }
         if !self.has_pending_agent_resumes() || self.pending_agent_resume_candidates().is_empty() {
             self.pending_agent_resume_deadline = None;
+        }
+        if !self.has_pending_agent_resumes() {
+            self.next_agent_resume_at = None;
         }
         changed
     }
@@ -365,6 +386,73 @@ mod tests {
         )
     }
 
+    /// Upstream's version also counts failed restores through
+    /// `TerminalState::restore_error` (#4400), which this line does not have;
+    /// this port counts the runtimes that actually started.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_agent_resume_spacing_survives_events_and_failed_restores() {
+        for delay_ms in [100, 250, 0] {
+            let config: crate::config::Config = toml::from_str(&format!(
+                "[session]\nstartup_per_agent_delay_ms = {delay_ms}"
+            ))
+            .unwrap();
+            let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(
+                &config,
+                crate::app::AppPolicy::TEST,
+                None,
+                api_rx,
+                crate::api::EventHub::default(),
+            );
+            app.state.workspaces = (0..4)
+                .map(|_| crate::workspace::Workspace::test_new("restore"))
+                .collect();
+            app.state.active = Some(0);
+            app.state.view.terminal_area = Rect::new(0, 0, 100, 30);
+            app.state.ensure_test_terminals();
+            let cwd = std::env::current_dir().unwrap();
+            for terminal in app.state.terminals.values_mut() {
+                terminal.cwd = cwd.clone();
+                terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+                    agent: "codex".into(),
+                    argv: long_running_test_argv(),
+                    dedupe_key: terminal.id.to_string(),
+                });
+            }
+            let now = Instant::now();
+            app.sync_pending_agent_resume_deadline(now);
+            assert!(!app.start_pending_agent_resumes(now, false));
+            assert_eq!(app.terminal_runtimes.len(), 0);
+            assert!(app.start_pending_agent_resumes(now, true));
+            if delay_ms != 0 {
+                let next = now + std::time::Duration::from_millis(delay_ms);
+                assert_eq!(app.terminal_runtimes.len(), 1);
+                // Geometry changes clear the wakeup, but must preserve the launch gap.
+                app.pending_agent_resume_deadline = None;
+                app.sync_pending_agent_resume_deadline(now);
+                assert_eq!(app.pending_agent_resume_deadline, Some(next));
+                assert!(!app
+                    .start_pending_agent_resumes(next - std::time::Duration::from_millis(1), true));
+                assert_eq!(app.terminal_runtimes.len(), 1);
+                // A late wakeup must not release every overdue agent in a burst.
+                for processed in 2..=4 {
+                    let late = now + std::time::Duration::from_secs(processed * 10);
+                    assert!(app.start_pending_agent_resumes(late, true));
+                    assert_eq!(app.terminal_runtimes.len(), processed as usize);
+                }
+            }
+            assert!(!app.has_pending_agent_resumes());
+            assert!(app.pending_agent_resume_deadline.is_none());
+            assert!(app.next_agent_resume_at.is_none());
+            assert_eq!(app.terminal_runtimes.len(), 4);
+
+            for (_, runtime) in app.terminal_runtimes.drain() {
+                runtime.shutdown();
+            }
+        }
+    }
+
     #[cfg(unix)]
     fn long_running_test_argv() -> Vec<String> {
         vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()]
@@ -405,7 +493,7 @@ mod tests {
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
         });
 
-        assert!(!app.start_pending_agent_resumes(false));
+        assert!(!app.start_pending_agent_resumes(Instant::now(), false));
         assert!(app.terminal_runtimes.get(&terminal_id).is_none());
 
         app.state.host_terminal_theme = crate::terminal_theme::TerminalTheme {
@@ -422,7 +510,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(app.start_pending_agent_resumes(false));
+        assert!(app.start_pending_agent_resumes(Instant::now(), false));
         assert!(app.terminal_runtimes.get(&terminal_id).is_some());
         let terminal = app
             .state
@@ -484,8 +572,8 @@ mod tests {
         });
 
         app.sync_pending_agent_resume_deadline(std::time::Instant::now());
-        assert!(!app.start_pending_agent_resumes(false));
-        assert!(app.start_pending_agent_resumes(true));
+        assert!(!app.start_pending_agent_resumes(Instant::now(), false));
+        assert!(app.start_pending_agent_resumes(Instant::now(), true));
         assert!(app.terminal_runtimes.get(&terminal_id).is_some());
 
         for (_, runtime) in app.terminal_runtimes.drain() {
@@ -537,8 +625,14 @@ mod tests {
         app.pending_agent_resume_deadline =
             Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
 
-        assert!(app.start_pending_agent_resumes(false));
+        let now = Instant::now();
+        assert!(app.start_pending_agent_resumes(now, false));
         assert!(app.terminal_runtimes.get(&active_terminal).is_some());
+        assert!(app.terminal_runtimes.get(&hidden_terminal).is_none());
+        assert!(!app.start_pending_agent_resumes(now, true));
+        assert!(
+            app.start_pending_agent_resumes(now + std::time::Duration::from_millis(100), false,)
+        );
         assert!(app.terminal_runtimes.get(&hidden_terminal).is_some());
         assert!(
             app.pending_agent_resume_deadline.is_none(),
@@ -598,7 +692,7 @@ mod tests {
             dedupe_key: "herdr:codex\0codex\0Id\0inactive-tab-session".into(),
         });
 
-        assert!(app.start_pending_agent_resumes(false));
+        assert!(app.start_pending_agent_resumes(Instant::now(), false));
         assert!(app.terminal_runtimes.get(&inactive_terminal).is_some());
         assert!(
             app.state
@@ -659,7 +753,7 @@ mod tests {
             dedupe_key: "herdr:codex\0codex\0Id\0zoom-hidden-session".into(),
         });
 
-        assert!(app.start_pending_agent_resumes(false));
+        assert!(app.start_pending_agent_resumes(Instant::now(), false));
         assert!(app.terminal_runtimes.get(&hidden_terminal).is_some());
         assert!(
             app.state
@@ -719,7 +813,7 @@ mod tests {
 
         app.sync_pending_agent_resume_deadline(std::time::Instant::now());
         assert!(app.pending_agent_resume_deadline.is_some());
-        assert!(app.start_pending_agent_resumes(false));
+        assert!(app.start_pending_agent_resumes(Instant::now(), false));
         assert!(app.terminal_runtimes.get(&previous_terminal).is_some());
         assert!(
             app.state
@@ -778,7 +872,7 @@ mod tests {
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
         });
 
-        assert!(app.start_pending_agent_resumes(false));
+        assert!(app.start_pending_agent_resumes(Instant::now(), false));
         assert_eq!(
             app.terminal_runtimes
                 .get(&terminal_id)
