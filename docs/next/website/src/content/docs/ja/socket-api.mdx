@@ -189,9 +189,10 @@ idle かつ既読なら `idle` です。`working`、`blocked`、`unknown` には
 マークの区別には `seen` を使ってください。
 
 存在しないペインには `pane.get` と同じ `pane_not_found` を返します。古いサーバーは
-フラグを推測せず、この新しいメソッドを拒否します。これは一度限りのクエリで、
-購読ではありません。既存の状態イベントは `seen` のすべての変更を通知しません。
-最新の既読状態が必要なときは再度問い合わせてください。
+フラグを推測せず、この新しいメソッドを拒否します。既存の状態イベントは `seen` の
+すべての変更を通知しません。タブを表示すると blocked のペインは既読になりますが、
+その `agent_status` は `blocked` のままです。ポーリングせずに値を追うには、
+`pane.read_state_changed` を購読してください（イベント購読を参照）。
 
 ### ペイングラフィックス
 
@@ -704,7 +705,14 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
 
 ワークスペースのイベント購読には `workspace.created`、`workspace.updated`、`workspace.metadata_updated`、`workspace.renamed`、`workspace.moved`、`workspace.reordered`、`workspace.closed`、`workspace.focused` があります。`workspace.metadata_updated` はプラグインイベントフックを実行せずにトークン変更と TTL 失効を報告します。その他のワークスペースイベントは Herdr の UI/ランタイムのライフサイクルを記述します。ワークスペースが worktree グループに属している場合、`workspace.created` は任意の `workspace.worktree` 出自情報を含みます。`workspace.moved` は、移動した `workspace_id`、要求された `insert_index`、更新済みの順序付き `workspaces` リストを含みます。`workspace.reordered` は、アトミックに移動した `workspace_ids`、省略可能な `before_workspace_id`、サーバーが確定した順序付き `workspaces` リストを含みます。削除前に Herdr がまだ識別できる場合、`workspace.closed` は最終的な `workspace` スナップショットを含みます。
 タブのイベント購読には `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed`、`tab.moved` があります。`tab.moved` は、移動した `tab_id`、`workspace_id`、要求された `insert_index`、そのワークスペースの更新済みの順序付き `tabs` リストを含みます。
-ペインのイベント購読には `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed`、`pane.scroll_changed` があります。`pane.focused` は、このサーバーに接続した任意のクライアントでの手動ペイン選択も報告します。他のクライアントの表示は移動させず、ペイロードにクライアントの識別情報は含みません。選択済みのペインを再度選んでも発行しません。ターミナルタイトルの変更は `pane.updated` を発行することがありますが、生のタイトルでスピナーだけが変化し、`terminal_title_stripped` が変わらない場合は発行しません。`pane.scroll_changed` は 1 つの `pane_id` を対象とし、Herdr がスクロールスナップショットの変化を検出するたびに `pane_id`、`workspace_id`、現在の `scroll` 情報を発行します。
+ペインのイベント購読には `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed`、`pane.scroll_changed`、`pane.read_state_changed` があります。`pane.focused` は、このサーバーに接続した任意のクライアントでの手動ペイン選択も報告します。他のクライアントの表示は移動させず、ペイロードにクライアントの識別情報は含みません。選択済みのペインを再度選んでも発行しません。ターミナルタイトルの変更は `pane.updated` を発行することがありますが、生のタイトルでスピナーだけが変化し、`terminal_title_stripped` が変わらない場合は発行しません。`pane.scroll_changed` は 1 つの `pane_id` を対象とし、Herdr がスクロールスナップショットの変化を検出するたびに `pane_id`、`workspace_id`、現在の `scroll` 情報を発行します。`pane.read_state_changed` は 1 つの `pane_id` を対象とし、`pane.read_state` と同じ方法で解決します。存在しないペインでは購読が `pane_not_found` で失敗します。このペインの `pane.read_state` の値が変わるたびに、`result.read_state` と同じフィールドでその値を発行します。両方のフィールドが対象なので、blocked のペインを表示すると、`agent_status` が `blocked` のままでもイベントが発行されます。
+
+```json
+{"id":"sub_read","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.read_state_changed","pane_id":"w1:p1"}]}}
+{"event":"pane.read_state_changed","data":{"pane_id":"w1:p1","workspace_id":"w1","seen":true,"agent_status":"blocked"}}
+```
+
+この購読は現在の値のイベントを送りません。先に購読し、その後 `pane.read_state` を 1 回呼んで開始時の値を取得してください。イベントがその値を繰り返すことがあります。Herdr はサーバーのループ 1 回につき各ペインを 1 度比較するため、1 回のループ内の複数の変更は最終結果として届き、同じループ内で元に戻った変更は通知されません。変更を起こしたリクエストの後、1 秒未満でイベントが届きます。イベントにはペインの現在の公開 id が含まれるため、ペインが別のワークスペースへ移動した後は、新しい id で再度購読してください。古いサーバーはこの購読タイプを知らないため、リクエストの解析時に `pane.read_state_changed` を拒否します。何も届かない購読を開始することはありません。
 レイアウトのイベント購読には `layout.updated` があります。このイベントは 1 つのタブについて更新済みの `PaneLayoutSnapshot` を運びます。`session.snapshot` でキャッシュを管理するクライアントは、このイベントを契機にサーバーから対象のレイアウトを再取得してください。遅れて届いたペイロードは、最新のスナップショットより古い可能性があります。
 
 worktree のイベント購読には `worktree.created`、`worktree.opened`、`worktree.removed` があります。worktree イベントは Git チェックアウトのライフサイクルを記述します。`worktree.created` は開かれた `workspace` と作成された `worktree` を含みます。`worktree.opened` は対象の `workspace`、開かれた `worktree`、`already_open` を含みます。`worktree.removed` は `workspace_id`、削除された `worktree`、`forced` を含みます。

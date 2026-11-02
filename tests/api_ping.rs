@@ -2479,6 +2479,197 @@ fn events_subscribe_streams_output_and_agent_status_events() {
     cleanup_spawned_herdr(child, base);
 }
 
+/// The agent here is a real process, not a bare hook report: a hook-reported agent that no
+/// process backs falls back to Unknown at the first detection tick (about 0.8 s), on stock
+/// herdr too, which would be a second read-state change this test did not cause.
+#[test]
+fn events_subscribe_streams_pane_read_state_changes() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin_dir = base.join("bin");
+
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_pi = bin_dir.join("pi");
+    fs::write(&fake_pi, "#!/bin/sh\nsleep 120\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&fake_pi).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_pi, perms).unwrap();
+    }
+
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+    let path_override = format!("{}:{}", bin_dir.display(), inherited_path);
+    let child = spawn_herdr_with_path(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        Some(Path::new(&path_override)),
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"rs_1","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let tab = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"rs_2","method":"tab.create","params":{{"workspace_id":"{}","cwd":"{}","focus":false}}}}"#,
+            workspace_id,
+            base.display()
+        ),
+    );
+    let tab_id = tab["result"]["tab"]["tab_id"].as_str().unwrap().to_string();
+    let pane_id = tab["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Start the agent process in the background pane and wait until herdr detects it.
+    let started = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"rs_start","method":"pane.send_text","params":{{"pane_id":"{pane_id}","text":"pi"}}}}"#
+        ),
+    );
+    assert_eq!(started["result"]["type"], "ok", "{started}");
+    let entered = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"rs_enter","method":"pane.send_keys","params":{{"pane_id":"{pane_id}","keys":["Enter"]}}}}"#
+        ),
+    );
+    assert_eq!(entered["result"]["type"], "ok", "{entered}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pane = send_request(
+            &socket_path,
+            &format!(
+                r#"{{"id":"rs_detect","method":"pane.get","params":{{"pane_id":"{pane_id}"}}}}"#
+            ),
+        );
+        if pane["result"]["pane"]["agent"] == "pi" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pi agent was never detected: {pane}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let session_path = base.join("pi-session.jsonl");
+    let session = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"rs_session","method":"pane.report_agent_session","params":{{"pane_id":"{pane_id}","source":"herdr:pi","agent":"pi","agent_session_path":"{}","session_start_source":"startup","seq":1}}}}"#,
+            session_path.display()
+        ),
+    );
+    assert_eq!(session["result"]["type"], "ok", "{session}");
+
+    let report = |seq: u64, state: &str| {
+        let response = send_request(
+            &socket_path,
+            &format!(
+                r#"{{"id":"rs_report_{seq}","method":"pane.report_agent","params":{{"pane_id":"{pane_id}","source":"herdr:pi","agent":"pi","state":"{state}","agent_session_path":"{}","seq":{seq}}}}}"#,
+                session_path.display()
+            ),
+        );
+        assert_eq!(response["result"]["type"], "ok", "{response}");
+    };
+    let read_state = |id: &str| {
+        send_request(
+            &socket_path,
+            &format!(
+                r#"{{"id":"{id}","method":"pane.read_state","params":{{"pane_id":"{pane_id}"}}}}"#
+            ),
+        )["result"]["read_state"]
+            .clone()
+    };
+
+    // A pane in a background tab that is blocked and was never looked at.
+    report(2, "working");
+    report(3, "blocked");
+    let unread = read_state("rs_unread");
+    assert_eq!(unread["seen"], false, "{unread}");
+    assert_eq!(unread["agent_status"], "blocked");
+
+    // An unknown pane fails the subscription instead of starting one that stays silent.
+    let mut rejected = open_subscription(
+        &socket_path,
+        r#"{"id":"sub_missing","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.read_state_changed","pane_id":"missing"}]}}"#,
+    );
+    let rejection = rejected.read_json_line(Duration::from_secs(2));
+    assert_eq!(rejection["error"]["code"], "pane_not_found", "{rejection}");
+
+    let mut reader = open_subscription(
+        &socket_path,
+        &format!(
+            r#"{{"id":"sub_read","method":"events.subscribe","params":{{"subscriptions":[{{"type":"pane.read_state_changed","pane_id":"{pane_id}"}}]}}}}"#
+        ),
+    );
+    let ack = reader.read_json_line(Duration::from_secs(2));
+    assert_eq!(ack["id"], "sub_read");
+    assert_eq!(ack["result"]["type"], "subscription_started");
+
+    // A change that only the read flag shows: viewing the tab leaves the status blocked.
+    let focused = send_request(
+        &socket_path,
+        &format!(r#"{{"id":"rs_focus","method":"tab.focus","params":{{"tab_id":"{tab_id}"}}}}"#),
+    );
+    assert_eq!(focused["result"]["type"], "tab_info", "{focused}");
+    let viewed = reader.read_json_line(Duration::from_secs(5));
+    assert_eq!(viewed["event"], "pane.read_state_changed", "{viewed}");
+    assert_eq!(
+        viewed["data"],
+        serde_json::json!({
+            "pane_id": pane_id,
+            "workspace_id": workspace_id,
+            "seen": true,
+            "agent_status": "blocked",
+        })
+    );
+    assert_eq!(
+        viewed["data"],
+        read_state("rs_viewed"),
+        "the event body is what pane.read_state returns"
+    );
+
+    // A change that only the status shows.
+    report(4, "working");
+    let working = reader.read_json_line(Duration::from_secs(5));
+    assert_eq!(working["event"], "pane.read_state_changed", "{working}");
+    assert_eq!(working["data"]["seen"], true);
+    assert_eq!(working["data"]["agent_status"], "working");
+
+    // Nothing changed since: no further event, and a repeated view is not a change.
+    let focused = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"rs_focus_again","method":"tab.focus","params":{{"tab_id":"{tab_id}"}}}}"#
+        ),
+    );
+    assert_eq!(focused["result"]["type"], "tab_info", "{focused}");
+    assert!(
+        reader.try_read_json_line(Duration::from_secs(1)).is_none(),
+        "an unchanged read state must not produce an event"
+    );
+
+    cleanup_spawned_herdr(child, base);
+}
+
 #[test]
 fn pane_info_and_subscriptions_expose_done_agent_status() {
     let _lock = test_lock();

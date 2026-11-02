@@ -219,9 +219,10 @@ encode the flag. In particular, both read and unread blocked panes return
 `blocked`; callers must use `seen` to distinguish their marks.
 
 An unknown pane returns `pane_not_found`, just like `pane.get`. Older servers
-reject this new method rather than returning a guessed flag. This is a one-time
-query, not a subscription; existing status events do not report every change to
-`seen`. Query again when a fresh read state is needed.
+reject this new method rather than returning a guessed flag. Existing status
+events do not report every change to `seen`: viewing a tab marks a blocked pane
+read and leaves its `agent_status` at `blocked`. To follow the value without
+polling, subscribe to `pane.read_state_changed` (see Event subscriptions).
 
 ### Pane graphics
 
@@ -896,7 +897,8 @@ carries `previous_tab_id` and `previous_workspace_id`, linking the new identity
 to the one that disappeared from the source workspace.
 Pane event subscriptions include `pane.created`, `pane.updated`, `pane.closed`, `pane.focused`,
 `pane.moved`, `pane.exited`, `pane.agent_detected`,
-`pane.output_matched`, `pane.agent_status_changed`, and `pane.scroll_changed`.
+`pane.output_matched`, `pane.agent_status_changed`, `pane.scroll_changed`, and
+`pane.read_state_changed`.
 `pane.focused` also reports manual pane selection changes from any client attached
 to this server. It does not move other clients' views, and its payload does not
 identify the client. Selecting an already-selected pane does not emit it again.
@@ -904,6 +906,26 @@ Terminal-title changes can emit `pane.updated`, but spinner-only raw-title chang
 `pane.scroll_changed` is scoped to one `pane_id` and emits `pane_id`,
 `workspace_id`, and the current `scroll` metrics whenever Herdr observes a
 changed scroll snapshot.
+`pane.read_state_changed` is scoped to one `pane_id`, resolved like
+`pane.read_state`; an unknown pane fails the subscription with `pane_not_found`.
+It emits the pane's `pane.read_state` value, with the same fields as
+`result.read_state`, each time that value changes. Both fields count, so viewing
+a blocked pane emits an event even though its `agent_status` stays `blocked`.
+
+```json
+{"id":"sub_read","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.read_state_changed","pane_id":"w1:p1"}]}}
+{"event":"pane.read_state_changed","data":{"pane_id":"w1:p1","workspace_id":"w1","seen":true,"agent_status":"blocked"}}
+```
+
+The subscription sends no event for the current value. Subscribe first, then
+call `pane.read_state` once for the starting value; an event may repeat that
+value. Herdr compares every pane once per server loop turn, so several changes
+inside one turn arrive as their net result, and a change that reverts within a
+turn is not reported. An event follows the request that caused the change within
+a fraction of a second. Events carry the pane's current public id, so after a
+pane moves to another workspace subscribe again with its new id. Older servers
+reject `pane.read_state_changed` when they parse the request, because they do not
+know the subscription type; they never start a subscription that stays silent.
 Layout event subscriptions include `layout.updated`. The event carries the
 updated `PaneLayoutSnapshot` for one tab. Clients maintaining a cache with
 `session.snapshot` should use this event to refresh the affected layout through
