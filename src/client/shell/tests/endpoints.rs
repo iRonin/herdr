@@ -14,7 +14,96 @@ fn remote_profile() -> SavedSshEndpoint {
         target: "dev@build.example".into(),
         session: "agents".into(),
         enabled: true,
+        local_sessions: Vec::new(),
     }
+}
+
+/// What a client of local session `session` shows for this catalog file content: the frame text
+/// and the number of machine rows (zero in the normal, single-machine sidebar).
+fn sidebar_for_local_session(session: &str, catalog: serde_json::Value) -> (String, usize) {
+    let path = std::env::temp_dir()
+        .join(format!(
+            "herdr-scope-sidebar-{}-{session}-{}",
+            std::process::id(),
+            catalog["ssh"].as_array().map_or(0, Vec::len)
+        ))
+        .join("endpoints.json");
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, catalog.to_string()).unwrap();
+    let profiles =
+        crate::client::endpoint::EndpointCatalog::load_profiles_from_path_for_local_session(
+            &path, session,
+        )
+        .unwrap();
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_endpoint_catalog(&profiles);
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    let frame = state.compose(100, 28).expect("sidebar frame");
+    let text = frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (text, state.hits.machines.len())
+}
+
+fn scoped_machine(id: &str, label: &str, local_sessions: Option<&[&str]>) -> serde_json::Value {
+    let mut machine = serde_json::json!({
+        "id": id, "label": label, "target": "build.example", "session": "agents", "enabled": true,
+    });
+    if let Some(local_sessions) = local_sessions {
+        machine["local_sessions"] = serde_json::json!(local_sessions);
+    }
+    machine
+}
+
+#[test]
+fn legal_session_sidebar_never_lists_a_machine_scoped_to_the_default_session() {
+    let catalog = serde_json::json!({
+        "version": 1,
+        "ssh": [scoped_machine("0123456789abcdef0123456789abcdef", "Alpha", Some(&["default"]))],
+    });
+
+    let (legal, legal_machine_rows) = sidebar_for_local_session("legal", catalog.clone());
+    // Guard against a vacuous pass: the frame did render this client's own workspace.
+    assert!(legal.contains("client-shell"), "{legal}");
+    assert!(!legal.contains("Alpha"), "{legal}");
+    // Nor a dimmed row, and not the machines layout a second machine would switch on.
+    assert_eq!(legal_machine_rows, 0, "{legal}");
+
+    let (default, default_machine_rows) = sidebar_for_local_session("default", catalog);
+    assert!(default.contains("Alpha"), "{default}");
+    assert_eq!(default_machine_rows, 2, "Local and the machine: {default}");
+}
+
+#[test]
+fn unscoped_machine_shows_in_every_session_beside_the_scoped_ones() {
+    let catalog = serde_json::json!({
+        "version": 1,
+        "ssh": [
+            scoped_machine("0123456789abcdef0123456789abcdef", "Alpha", Some(&["default"])),
+            scoped_machine("11111111111111111111111111111111", "Bravo", None),
+        ],
+    });
+
+    let (legal, legal_machine_rows) = sidebar_for_local_session("legal", catalog.clone());
+    assert!(legal.contains("Bravo"), "{legal}");
+    assert!(!legal.contains("Alpha"), "{legal}");
+    assert_eq!(legal_machine_rows, 2, "Local and Bravo: {legal}");
+
+    let (default, default_machine_rows) = sidebar_for_local_session("default", catalog);
+    assert!(default.contains("Bravo"), "{default}");
+    assert!(default.contains("Alpha"), "{default}");
+    assert_eq!(default_machine_rows, 3, "{default}");
 }
 
 fn agent(

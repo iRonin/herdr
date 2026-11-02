@@ -466,6 +466,7 @@ fn dropping_on_another_machines_workspace_is_ignored() {
         target: "dev@build.example".into(),
         session: "agents".into(),
         enabled: true,
+        local_sessions: Vec::new(),
     };
     let remote_id = crate::client::endpoint::ClientEndpointId::Ssh(profile.id.clone());
     state.set_endpoint_catalog(&[profile]);

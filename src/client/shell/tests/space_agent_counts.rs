@@ -235,6 +235,7 @@ fn a_collapsed_group_on_a_saved_machine_sums_the_agent_counts_of_its_members() {
         target: "dev@build.example".into(),
         session: "agents".into(),
         enabled: true,
+        local_sessions: Vec::new(),
     };
     let endpoint_id = ClientEndpointId::Ssh(profile.id.clone());
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&space_count_config()));

@@ -11,8 +11,9 @@ const HELP: &str = "Usage:
   herdr machine list [--json]
   herdr machine status [<label-or-id>] [--json]
   herdr machine reconnect <label-or-id>
-  herdr machine add <ssh-target> [--label <label>] [--remote-session <name>]
+  herdr machine add <ssh-target> [--label <label>] [--remote-session <name>] [--local-session <name>]...
   herdr machine rename <profile-id> --label <label>
+  herdr machine scope <profile-id> (--local-session <name>... | --all-local-sessions)
   herdr machine remove <profile-id>
   herdr machine enable <profile-id>
   herdr machine disable <profile-id>
@@ -21,7 +22,12 @@ Add prepares the remote Herdr installation and starts its server before saving.
 Missing or incompatible installations require approval in an interactive terminal.
 Changes apply automatically to open local Herdr clients.
 Removing or disabling a machine leaves its remote sessions running.
-Saved machines contain only a label, SSH target, explicit Herdr session, and enabled state.
+Saved machines contain only a label, SSH target, explicit Herdr session, enabled state, and
+optionally the local sessions that show the machine.
+A machine appears in every local session's window unless it is limited: --local-session names the
+local sessions that show it (`herdr` is \"default\", `herdr --session legal` is \"legal\"; not the
+remote session), scope replaces that list later, and --all-local-sessions removes the limit.
+`herdr --machine` still reaches every saved machine.
 SSH credentials and key material remain owned by OpenSSH.";
 
 #[derive(Serialize)]
@@ -32,6 +38,8 @@ struct MachineListRow<'a> {
     session: &'a str,
     enabled: bool,
     selected: bool,
+    /// Local sessions that show the machine; empty means every local session.
+    local_sessions: &'a [String],
 }
 
 pub(super) fn run_machine_command(args: &[String]) -> std::io::Result<i32> {
@@ -41,6 +49,7 @@ pub(super) fn run_machine_command(args: &[String]) -> std::io::Result<i32> {
         Some("reconnect") => reconnect(&args[1..]),
         Some("add") => add(&args[1..]),
         Some("rename") => rename(&args[1..]),
+        Some("scope") => scope(&args[1..]),
         Some("remove") => remove(&args[1..]),
         Some("enable") => set_enabled(&args[1..], true),
         Some("disable") => set_enabled(&args[1..], false),
@@ -75,6 +84,7 @@ fn list(args: &[String]) -> std::io::Result<i32> {
             session: &profile.session,
             enabled: profile.enabled,
             selected: catalog.selected_profile.as_ref() == Some(&profile.id),
+            local_sessions: &profile.local_sessions,
         })
         .collect::<Vec<_>>();
     if json {
@@ -90,9 +100,15 @@ fn list(args: &[String]) -> std::io::Result<i32> {
     }
     for row in rows {
         let state = if row.enabled { "enabled" } else { "disabled" };
+        // A sixth column only for a limited machine keeps every other line as it always was.
+        let scope = if row.local_sessions.is_empty() {
+            String::new()
+        } else {
+            format!("\tlocal sessions: {}", row.local_sessions.join(","))
+        };
         println!(
-            "{}\t{}\t{}\t{}\t{}",
-            row.id, row.label, row.target, row.session, state
+            "{}\t{}\t{}\t{}\t{state}{scope}",
+            row.id, row.label, row.target, row.session
         );
     }
     Ok(0)
@@ -212,17 +228,19 @@ struct AddArgs {
     target: String,
     label: Option<String>,
     session: Option<String>,
+    local_sessions: Vec<String>,
 }
 
 fn parse_add_args(args: &[String]) -> Result<AddArgs, String> {
-    let args = super::expand_equals_args(args, &["--label", "--remote-session"]);
+    let args = super::expand_equals_args(args, &["--label", "--remote-session", "--local-session"]);
     let mut target = None;
     let mut label = None;
     let mut session = None;
+    let mut local_sessions = Vec::new();
     let mut index = 0;
     while index < args.len() {
         let (name, value) = match args[index].as_str() {
-            "--label" | "--remote-session" => {
+            "--label" | "--remote-session" | "--local-session" => {
                 let Some(value) = args.get(index + 1) else {
                     return Err(format!("missing value for {}", args[index]));
                 };
@@ -241,6 +259,7 @@ fn parse_add_args(args: &[String]) -> Result<AddArgs, String> {
         match name {
             "--label" if label.is_none() => label = Some(value),
             "--remote-session" if session.is_none() => session = Some(value),
+            "--local-session" => local_sessions.push(value),
             "--remote-session" => {
                 return Err("--remote-session can only be specified once".into());
             }
@@ -251,13 +270,14 @@ fn parse_add_args(args: &[String]) -> Result<AddArgs, String> {
         }
     }
     let target = target.ok_or_else(|| {
-        "usage: herdr machine add <ssh-target> [--label <label>] [--remote-session <name>]"
+        "usage: herdr machine add <ssh-target> [--label <label>] [--remote-session <name>] [--local-session <name>]..."
             .to_owned()
     })?;
     Ok(AddArgs {
         target,
         label,
         session,
+        local_sessions,
     })
 }
 
@@ -301,6 +321,7 @@ fn add(args: &[String]) -> std::io::Result<i32> {
         target,
         label,
         session,
+        local_sessions,
     } = match parse_add_args(args) {
         Ok(args) => args,
         Err(error) => {
@@ -338,7 +359,13 @@ fn add(args: &[String]) -> std::io::Result<i32> {
             return Ok(2);
         }
     }
-    match catalog.add_ssh(label.clone(), &target, session.clone()) {
+    // Checks every field, the local sessions included, before ssh is touched.
+    match catalog.add_ssh_scoped(
+        label.clone(),
+        &target,
+        session.clone(),
+        local_sessions.clone(),
+    ) {
         Ok(_) => {}
         Err(error) => {
             eprintln!("error: {error}");
@@ -369,7 +396,7 @@ fn add(args: &[String]) -> std::io::Result<i32> {
             return Ok(2);
         }
     }
-    let id = match catalog.add_ssh(label, &target, &session) {
+    let id = match catalog.add_ssh_scoped(label, &target, &session, local_sessions) {
         Ok(id) => id,
         Err(error) => {
             eprintln!("error: {error}");
@@ -465,6 +492,91 @@ fn render_remote_session_picker(
     execute!(output, terminal::Clear(terminal::ClearType::CurrentLine))?;
     write!(output, "↑/↓ select · Enter confirm · Esc cancel\r\n")?;
     output.flush()
+}
+
+const SCOPE_USAGE: &str =
+    "usage: herdr machine scope <profile-id> (--local-session <name>... | --all-local-sessions)";
+
+#[derive(Debug, PartialEq, Eq)]
+struct ScopeArgs {
+    id: String,
+    /// Empty: every local session.
+    local_sessions: Vec<String>,
+}
+
+fn parse_scope_args(args: &[String]) -> Result<ScopeArgs, String> {
+    let args = super::expand_equals_args(args, &["--local-session"]);
+    let mut id = None;
+    let mut local_sessions = Vec::new();
+    let mut all = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--local-session" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --local-session".into());
+                };
+                local_sessions.push(value.clone());
+                index += 2;
+            }
+            "--all-local-sessions" if !all => {
+                all = true;
+                index += 1;
+            }
+            positional if !positional.starts_with('-') && id.is_none() => {
+                id = Some(positional.to_owned());
+                index += 1;
+            }
+            _ => return Err(SCOPE_USAGE.into()),
+        }
+    }
+    // Exactly one of: a list of sessions, or all of them.
+    match (id, all, local_sessions.is_empty()) {
+        (Some(id), true, true) | (Some(id), false, false) => Ok(ScopeArgs { id, local_sessions }),
+        _ => Err(SCOPE_USAGE.into()),
+    }
+}
+
+fn scope(args: &[String]) -> std::io::Result<i32> {
+    let ScopeArgs {
+        id: raw_id,
+        local_sessions,
+    } = match parse_scope_args(args) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("{error}");
+            return Ok(2);
+        }
+    };
+    let id = match ProfileId::parse(raw_id) {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return Ok(2);
+        }
+    };
+    let mut catalog = load_catalog()?;
+    match catalog.set_local_sessions(&id, local_sessions.clone()) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("machine profile {id} was not found");
+            return Ok(1);
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            return Ok(2);
+        }
+    }
+    store_catalog(&catalog)?;
+    if local_sessions.is_empty() {
+        println!("SSH machine {id} now appears in every local session.");
+    } else {
+        println!(
+            "SSH machine {id} now appears only in local sessions: {}.",
+            local_sessions.join(", ")
+        );
+    }
+    Ok(0)
 }
 
 fn rename(args: &[String]) -> std::io::Result<i32> {
@@ -614,6 +726,7 @@ mod tests {
                     target: "workstation.coder".into(),
                     label: Some("coder".into()),
                     session: session.map(str::to_owned),
+                    local_sessions: Vec::new(),
                 },
                 "{args:?}"
             );
@@ -640,6 +753,69 @@ mod tests {
             ("ssh://dev@workbox:2222/", "agents", "workbox/agents"),
         ] {
             assert_eq!(default_label(target, session), label, "{target} {session}");
+        }
+    }
+
+    #[test]
+    fn add_parser_collects_repeatable_local_sessions_in_any_spelling_and_order() {
+        for args in [
+            vec![
+                "--local-session",
+                "default",
+                "--label",
+                "coder",
+                "--local-session=legal",
+                "workstation.coder",
+            ],
+            vec![
+                "workstation.coder",
+                "--label=coder",
+                "--local-session=default",
+                "--local-session",
+                "legal",
+            ],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let parsed = parse_add_args(&args).unwrap();
+            assert_eq!(parsed.local_sessions, ["default", "legal"], "{args:?}");
+            assert_eq!(parsed.session, None, "the remote session is not touched");
+        }
+        let args = ["workstation.coder", "--label", "coder", "--local-session"].map(str::to_owned);
+        assert!(parse_add_args(&args).is_err());
+    }
+
+    #[test]
+    fn scope_parser_wants_a_machine_and_exactly_a_list_or_all() {
+        let parse = |args: &[&str]| {
+            parse_scope_args(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            parse(&["abc", "--local-session", "default", "--local-session=legal"]).unwrap(),
+            ScopeArgs {
+                id: "abc".into(),
+                local_sessions: vec!["default".into(), "legal".into()],
+            }
+        );
+        // Flags before the machine, and the empty list meaning "every local session".
+        assert_eq!(
+            parse(&["--all-local-sessions", "abc"]).unwrap(),
+            ScopeArgs {
+                id: "abc".into(),
+                local_sessions: Vec::new(),
+            }
+        );
+        for bad in [
+            vec![],
+            vec!["abc"],
+            vec!["--local-session", "default"],
+            vec!["--all-local-sessions"],
+            vec!["abc", "--all-local-sessions", "--local-session", "default"],
+            vec!["abc", "def", "--local-session", "default"],
+            vec!["abc", "--local-session"],
+            vec!["abc", "--all-local-sessions", "--all-local-sessions"],
+            vec!["abc", "--local-sessions", "default"],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
         }
     }
 
@@ -697,9 +873,14 @@ mod tests {
             session: "agents",
             enabled: true,
             selected: false,
+            local_sessions: &["default".to_owned()],
         })
         .unwrap();
         assert!(!encoded.contains("password"));
         assert!(!encoded.contains("key"));
+        assert!(
+            encoded.contains(r#""local_sessions":["default"]"#),
+            "{encoded}"
+        );
     }
 }

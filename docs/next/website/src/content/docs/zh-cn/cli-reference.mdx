@@ -57,13 +57,17 @@ herdr machine rename <profile-id> --label "New name"
 herdr machine disable <profile-id>
 herdr machine enable <profile-id>
 herdr machine remove <profile-id>
+herdr machine scope <profile-id> --local-session default --local-session legal
+herdr machine scope <profile-id> --all-local-sessions
 ```
 
 在交互式终端中，`machine add` 会发现运行中的会话，并在有多个会话运行时让你选择。没有运行中的会话或未安装 Herdr 时使用 `default`；如果查询已安装的二进制文件失败，则需要明确选择。添加 `--remote-session <name>` 可跳过发现。非交互式命令会使用 `default`，除非提供该选项。`machine list` 支持可选的 `--json` 供脚本使用。完整流程见[连接机器](/zh-cn/docs/connecting-machines/)。
 
 `machine add` 会检查远程 Herdr 是否具备所需能力，仅在必要时征得批准后安装或更新，并在保存配置前启动指定会话的后台服务器。只要兼容，发行版本不必一致。需要批准安装或重启时，请在交互式终端中运行；设置失败或取消时不会保存配置。替换运行中的服务器需要明确批准，默认回答为 No；停止服务器会结束其窗格进程。`machine add` 不会隐式启用实验性实时交接。
 
-更改会自动应用到已打开的本地 Herdr 客户端，通常在一秒内生效。新增或启用的机器在后台连接；重命名不会重新连接。移除或禁用只会断开该机器，远程会话仍会继续运行。移除正在查看的机器会返回 Local；如果 Local 不可用，则显示不可用状态，直到重新连接。每份配置在客户端状态文件中保存一个不透明 ID、标签、SSH 目标、明确的远程会话名和启用状态。Herdr 不保存密码、私钥或其他 SSH 凭据。
+默认情况下，已保存的机器会出现在每个本地会话的窗口中。若只想在部分会话中显示，请用可重复的 `--local-session <name>` 指定这些本地会话：在 `machine add` 时指定，或之后用 `machine scope <profile-id> --local-session <name>...` 替换列表。`machine scope <profile-id> --all-local-sessions` 取消限制。本地会话是客户端所属的会话（`herdr` 是 `default`，`herdr --session legal` 是 `legal`），不同于 `--remote-session`。被限定在其他会话的机器完全不会出现在窗口中，没有其他机器的窗口会保持普通侧边栏。`--machine` 始终可以选择任何已保存的机器。`machine list --json` 为每台机器给出 `local_sessions` 列表（为空表示所有本地会话）；普通列表只为受限机器在末尾增加 `local sessions: ...` 列。旧版本无法读取包含限制的目录。
+
+更改会自动应用到已打开的本地 Herdr 客户端，通常在一秒内生效。新增或启用的机器在后台连接；重命名不会重新连接。移除或禁用只会断开该机器，远程会话仍会继续运行。移除正在查看的机器会返回 Local；如果 Local 不可用，则显示不可用状态，直到重新连接。每份配置在客户端状态文件中保存一个不透明 ID、标签、SSH 目标、明确的远程会话名、启用状态，以及（如果设置了）本地会话。Herdr 不保存密码、私钥或其他 SSH 凭据。
 
 `herdr machine status [<label-or-id>] [--json]` 可非交互式检查 SSH 和远程 Herdr。`reachable` 表示本次检查成功，不代表 TUI 当前已连接。在终端运行 `herdr machine reconnect <label-or-id>` 可认证并验证连接，不会安装或更新 Herdr。已打开的客户端会在 30 秒内重试。点击 `! auth` 或 `! error` 可查看最新错误和 CLI 命令；侧边栏折叠时显示 `!`。平台限制请参阅[恢复 SSH 认证](/zh-cn/docs/connecting-machines/#恢复-ssh-认证)。需要远程设置时使用 `herdr --remote workbox`，仅在命名会话时添加 `--session <name>`。
 

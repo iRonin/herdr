@@ -1,6 +1,6 @@
-use clap::{Arg, Command};
+use clap::{Arg, ArgGroup, Command};
 
-use super::{json_flag, option};
+use super::{flag, json_flag, option, repeatable_option};
 
 pub(super) fn command() -> Command {
     Command::new("machine")
@@ -37,13 +37,36 @@ pub(super) fn command() -> Command {
                 .arg(
                     option("remote-session", "NAME")
                         .help("Select a session explicitly (default without an interactive terminal)"),
-                ),
+                )
+                .arg(repeatable_option("local-session", "NAME").help(
+                    "Show the machine only in this local session (repeatable; default: every local session)",
+                )),
         )
         .subcommand(
             profile_command("rename", "Rename a saved SSH machine").arg(
                 option("label", "LABEL")
                     .required(true)
                     .help("Set the machine label shown in the sidebar"),
+            ),
+        )
+        .subcommand(
+            profile_command(
+                "scope",
+                "Limit a saved SSH machine to some local sessions, or to all of them",
+            )
+            .arg(
+                repeatable_option("local-session", "NAME")
+                    .help("Show the machine only in this local session (repeatable)"),
+            )
+            .arg(
+                flag("all-local-sessions")
+                    .help("Show the machine in every local session again")
+                    .conflicts_with("local-session"),
+            )
+            .group(
+                ArgGroup::new("scope")
+                    .args(["local-session", "all-local-sessions"])
+                    .required(true),
             ),
         )
         .subcommand(profile_command("remove", "Remove a saved SSH machine"))

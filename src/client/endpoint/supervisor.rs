@@ -390,6 +390,7 @@ mod tests {
             target: "build".into(),
             session: "agents".into(),
             enabled: true,
+            local_sessions: Vec::new(),
         }
     }
 
