@@ -222,10 +222,11 @@ fn run_client_with_mode(
     info!(path = %socket_path.display(), "{log_message}");
 
     let endpoint_catalog = if client_rendered_shell && !is_remote_client_process() {
-        endpoint::EndpointCatalog::load().unwrap_or_else(|error| {
-            warn!(%error, "saved SSH endpoint catalog is unavailable");
-            endpoint::EndpointCatalog::default()
-        })
+        endpoint::EndpointCatalog::load_for_local_session(&crate::session::active_name_or_default())
+            .unwrap_or_else(|error| {
+                warn!(%error, "saved SSH endpoint catalog is unavailable");
+                endpoint::EndpointCatalog::default()
+            })
     } else {
         endpoint::EndpointCatalog::default()
     };
@@ -609,7 +610,11 @@ async fn run_client_loop(
     let mut scheduled_activation = None;
     let mut pending_catalog: Option<Result<Vec<endpoint::SavedSshEndpoint>, String>> = None;
     if state.shell.is_some() && !is_remote_client && state.attach_escape.is_none() {
-        catalog_reload::watch_profiles(event_tx.clone(), should_quit.clone());
+        catalog_reload::watch_profiles(
+            event_tx.clone(),
+            should_quit.clone(),
+            crate::session::active_name_or_default(),
+        );
     }
 
     // This (foreground) client owns the prefix ASCII input-source switch

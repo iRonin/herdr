@@ -101,6 +101,11 @@ pub fn active_name() -> Option<String> {
         .filter(|name| validate_name(name).is_ok())
 }
 
+/// The local session this process works in, with the unnamed one spelled `default`.
+pub fn active_name_or_default() -> String {
+    active_name().unwrap_or_else(|| DEFAULT_SESSION_NAME.to_string())
+}
+
 pub fn local_attach_command() -> String {
     match active_name() {
         Some(name) => format!("herdr session attach {name}"),

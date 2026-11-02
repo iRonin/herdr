@@ -1123,6 +1123,171 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
     }
 }
 
+/// What a client's terminal shows right now: the captured bytes replayed through a terminal.
+fn screen_text(output: &SharedOutput) -> String {
+    let bytes = output
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .bytes
+        .clone();
+    terminal_screen::text(&bytes, 80, 24)
+}
+
+/// Replaces the saved-machine catalog the way `herdr machine` does (write, then rename), so a
+/// running client's once-a-second reload never reads half a file.
+fn write_scoped_catalog(catalog_dir: &std::path::Path, local_sessions: &[&str]) {
+    let catalog = serde_json::json!({
+        "version": 1,
+        "ssh": [{
+            "id": "0123456789abcdef0123456789abcdef", "label": "Scoped", "target": "test-only",
+            "session": "default", "enabled": true, "local_sessions": local_sessions,
+        }],
+    });
+    let temp = catalog_dir.join("endpoints.json.next");
+    fs::write(&temp, catalog.to_string()).unwrap();
+    fs::rename(&temp, catalog_dir.join("endpoints.json")).unwrap();
+}
+
+/// Text only the normal single-machine sidebar draws. Placeholder: set from a real run.
+const LEGAL_RENDERED_MARKERS: &[&str] = &["agents"];
+
+#[test]
+fn saved_machine_scope_follows_the_clients_local_session_at_startup_and_on_live_reload() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
+    fs::write(
+        config_home.join(app_dir_name()).join("config.toml"),
+        "onboarding = false\n",
+    )
+    .unwrap();
+    let catalog_dir = runtime_dir
+        .join("state")
+        .join(app_dir_name())
+        .join("client");
+    fs::create_dir_all(&catalog_dir).unwrap();
+    // The machine is limited to the default local session.
+    write_scoped_catalog(&catalog_dir, &["default"]);
+    let bin = base.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    // An unreachable host: the connection neither succeeds nor fails while the client is open.
+    fs::write(
+        bin.join("ssh"),
+        "#!/bin/sh\ni=0\nwhile [ $i -lt 300 ] && kill -0 $PPID 2>/dev/null; do i=$((i+1)); sleep 0.2; done\nexit 255\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let _server_guard = LocalServerGuard {
+        api_socket: api_socket.clone(),
+    };
+
+    // Two clients of one Local server, each in its own local session: HERDR_SESSION is what a
+    // client started from a `legal` pane inherits (the default session sets nothing).
+    let default_client = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &[],
+        &[("PATH", &path)],
+    );
+    let default_output = spawn_pty_drain(
+        default_client
+            ._master
+            .as_ref()
+            .unwrap()
+            .try_clone_reader()
+            .unwrap(),
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+            screen_text(&default_output).contains("Scoped")
+        }),
+        "the default session's client must list its machine: {}",
+        screen_text(&default_output)
+    );
+
+    let mut legal_client = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &[],
+        &[("PATH", &path), ("HERDR_SESSION", "legal")],
+    );
+    let legal_output = spawn_pty_drain(
+        legal_client
+            ._master
+            .as_ref()
+            .unwrap()
+            .try_clone_reader()
+            .unwrap(),
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+            LEGAL_RENDERED_MARKERS
+                .iter()
+                .any(|marker| screen_text(&legal_output).contains(marker))
+        }),
+        "the legal client never rendered: {}",
+        screen_text(&legal_output)
+    );
+    // The client reads the catalog at startup and again every second: wait out more than two reads.
+    thread::sleep(Duration::from_millis(2500));
+    let legal = screen_text(&legal_output);
+    assert!(
+        !legal.contains("Scoped"),
+        "legal lists a default-only machine:\n{legal}"
+    );
+    assert!(
+        !legal.contains("Local"),
+        "legal switched to the machines layout:\n{legal}"
+    );
+    // Not even for a moment: everything the legal client ever wrote to its terminal so far.
+    assert!(
+        !read_output(&legal_output).contains("Scoped"),
+        "legal drew a default-only machine at startup before the reload removed it"
+    );
+
+    // Live reload, widening: the machine appears in the legal client, no restart.
+    write_scoped_catalog(&catalog_dir, &["default", "legal"]);
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+            screen_text(&legal_output).contains("Scoped")
+        }),
+        "widening the scope never reached the running legal client:\n{}",
+        screen_text(&legal_output)
+    );
+
+    // Live reload, narrowing: it leaves again; the default client keeps it throughout.
+    write_scoped_catalog(&catalog_dir, &["default"]);
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+            !screen_text(&legal_output).contains("Scoped")
+        }),
+        "narrowing the scope never reached the running legal client:\n{}",
+        screen_text(&legal_output)
+    );
+    assert!(screen_text(&default_output).contains("Scoped"));
+    assert!(
+        legal_client.child.try_wait().unwrap().is_none(),
+        "the legal client must survive its reloads"
+    );
+
+    drop(legal_client);
+    drop(default_client);
+    cleanup_test_base(&base);
+}
+
 struct RecordedStartup {
     base: PathBuf,
     api_socket: PathBuf,

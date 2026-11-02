@@ -3,12 +3,16 @@ use super::*;
 pub(super) fn watch_profiles(
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
     should_quit: Arc<AtomicBool>,
+    local_session: String,
 ) {
     // One bounded read per second per client, independent of rendering and pane count.
     std::thread::spawn(move || {
         let mut previous = None;
         while !should_quit.load(Ordering::Acquire) {
-            let current = endpoint::EndpointCatalog::load_profiles();
+            // Only this local session's machines: a change to another session's machine is no
+            // reload here, and a machine moved into or out of this session is one.
+            let current =
+                endpoint::EndpointCatalog::load_profiles_for_local_session(&local_session);
             if previous.as_ref() != Some(&current) {
                 previous = Some(current.clone());
                 if event_tx
@@ -156,6 +160,130 @@ mod tests {
             );
         }
         assert_eq!(disconnected.load(Ordering::Relaxed), 0);
+    }
+
+    const SCOPED_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    fn write_scoped_catalog(path: &std::path::Path, local_sessions: &[&str]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            serde_json::json!({
+                "version": 1,
+                "ssh": [{
+                    "id": SCOPED_ID, "label": "Build", "target": "build", "session": "main",
+                    "enabled": true, "local_sessions": local_sessions,
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// One reload of a client of local session `legal`: the loader the watcher thread runs, then
+    /// the application of what it found.
+    fn reload_as_legal(
+        path: &std::path::Path,
+        state: &mut ClientState,
+        endpoints: &mut EndpointRegistry,
+        commands: &mut endpoint_commands::EndpointCommands,
+        supervisors: &mut EndpointSupervisors,
+        catalog: &mut EndpointCatalog,
+        now: Instant,
+    ) -> bool {
+        let profiles =
+            EndpointCatalog::load_profiles_from_path_for_local_session(path, "legal").unwrap();
+        apply_profiles(
+            state,
+            endpoints,
+            commands,
+            supervisors,
+            catalog,
+            profiles,
+            now,
+        )
+    }
+
+    #[test]
+    fn live_reload_applies_a_scope_change_in_both_directions_without_a_restart() {
+        let path = std::env::temp_dir()
+            .join(format!("herdr-scope-reload-{}", std::process::id()))
+            .join("endpoints.json");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let now = Instant::now();
+        let mut state = state();
+        let remote = ClientEndpointId::Ssh(endpoint::ProfileId::parse(SCOPED_ID).unwrap());
+        let disconnected = Arc::new(AtomicUsize::new(0));
+        let mut endpoints =
+            EndpointRegistry::new(Transport(disconnected.clone()), 1, Default::default());
+        let mut supervisors = EndpointSupervisors::new(&[], now);
+        let mut commands = endpoint_commands::EndpointCommands::default();
+        let mut catalog = EndpointCatalog::default();
+        let status = |state: &ClientState| state.shell.as_ref().unwrap().endpoint_status(&remote);
+
+        // Scoped to the default session: this legal client has no such machine.
+        write_scoped_catalog(&path, &["default"]);
+        assert!(!reload_as_legal(
+            &path,
+            &mut state,
+            &mut endpoints,
+            &mut commands,
+            &mut supervisors,
+            &mut catalog,
+            now
+        ));
+        assert!(catalog.ssh.is_empty());
+        assert_eq!(status(&state), None);
+
+        // Widened to include legal: the machine appears, Local stays connected and selected.
+        write_scoped_catalog(&path, &["default", "legal"]);
+        assert!(!reload_as_legal(
+            &path,
+            &mut state,
+            &mut endpoints,
+            &mut commands,
+            &mut supervisors,
+            &mut catalog,
+            now
+        ));
+        assert_eq!(catalog.ssh.len(), 1);
+        assert_eq!(
+            status(&state),
+            Some(endpoint::ClientEndpointStatus::Connecting)
+        );
+        assert_eq!(endpoints.active_id(), &ClientEndpointId::Local);
+        assert_eq!(disconnected.load(Ordering::Relaxed), 0);
+
+        // The machine is the active one, then the scope narrows back to the default session:
+        // it goes away at once and the client falls back to Local.
+        catalog.select_ssh(&endpoint::ProfileId::parse(SCOPED_ID).unwrap());
+        let remote_disconnects = Arc::new(AtomicUsize::new(0));
+        endpoints.insert(
+            remote.clone(),
+            Transport(remote_disconnects.clone()),
+            2,
+            Default::default(),
+            true,
+        );
+        endpoints.set_active(&remote);
+        endpoints.unfreeze_input();
+        write_scoped_catalog(&path, &["default"]);
+        assert!(reload_as_legal(
+            &path,
+            &mut state,
+            &mut endpoints,
+            &mut commands,
+            &mut supervisors,
+            &mut catalog,
+            now
+        ));
+        assert!(catalog.ssh.is_empty());
+        assert_eq!(catalog.selected_profile, None);
+        assert_eq!(status(&state), None);
+        assert_eq!(endpoints.active_id(), &ClientEndpointId::Local);
+        assert!(endpoints.connection(&remote).is_none());
+        assert_eq!(remote_disconnects.load(Ordering::Relaxed), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

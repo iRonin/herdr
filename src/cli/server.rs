@@ -67,7 +67,10 @@ fn server_restart(args: &[String]) -> std::io::Result<i32> {
             // (src/main.rs) rather than hardcoding false -- hardcoding would
             // make `server restart` fail hard in a session where a plain
             // launch would have succeeded.
-            let saved_federation = crate::client::endpoint::EndpointCatalog::load()
+            let saved_federation =
+                crate::client::endpoint::EndpointCatalog::load_for_local_session(
+                    &crate::session::active_name_or_default(),
+                )
                 .is_ok_and(|catalog| catalog.has_enabled_ssh());
             crate::server::autodetect::auto_detect_launch(saved_federation)
         },
