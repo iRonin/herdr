@@ -2,8 +2,8 @@ use regex::Regex;
 
 use crate::api::schema::{
     ErrorBody, ErrorResponse, EventKind, Method, PaneAgentStatusChangedEvent,
-    PaneOutputMatchedEvent, PaneScrollChangedEvent, PaneScrollInfo, Request, Subscription,
-    SubscriptionEventData, SubscriptionEventEnvelope, SubscriptionEventKind,
+    PaneOutputMatchedEvent, PaneReadState, PaneScrollChangedEvent, PaneScrollInfo, Request,
+    Subscription, SubscriptionEventData, SubscriptionEventEnvelope, SubscriptionEventKind,
 };
 use crate::api::server::{dispatch_to_app_with_timeout, APP_RESPONSE_TIMEOUT};
 use crate::api::{ApiRequestSender, EventHub};
@@ -62,6 +62,14 @@ pub(super) struct ActiveScrollChangedSubscription {
     request_prefix: String,
 }
 
+/// Relays the app's `pane.read_state_changed` hub events for one pane. The app
+/// diffs every pane's read state once per loop turn (`App::sync_read_state_events`),
+/// so this subscription only filters; it never polls the app.
+pub(super) struct ActiveReadStateChangedSubscription {
+    pane_id: String,
+    last_sequence: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PanePresentationSnapshot {
     title: Option<String>,
@@ -101,6 +109,7 @@ pub(super) enum ActiveSubscription {
     OutputMatched(ActiveOutputMatchedSubscription),
     AgentStatusChanged(Box<ActiveAgentStatusChangedSubscription>),
     ScrollChanged(ActiveScrollChangedSubscription),
+    ReadStateChanged(ActiveReadStateChangedSubscription),
 }
 
 impl ActiveSubscription {
@@ -243,6 +252,19 @@ impl ActiveSubscription {
                     request_prefix: format!("{request_id}:sub:{index}"),
                 }))
             }
+            Subscription::PaneReadStateChanged { pane_id } => {
+                // The probe resolves the id the way `pane.read_state` does and fails
+                // with `pane_not_found` for an unknown pane. It is not a baseline:
+                // events are taken from the start of the request, so a change that
+                // lands while the subscription is being set up is still delivered.
+                let probe =
+                    pane_read_state(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
+
+                Ok(Self::ReadStateChanged(ActiveReadStateChangedSubscription {
+                    pane_id: probe.pane_id,
+                    last_sequence: event_start_sequence,
+                }))
+            }
         }
     }
 
@@ -261,6 +283,9 @@ impl ActiveSubscription {
             }
             Self::ScrollChanged(subscription) => {
                 serde_json::to_value(subscription.poll(api_tx)?).ok()
+            }
+            Self::ReadStateChanged(subscription) => {
+                serde_json::to_value(subscription.poll(event_hub)?).ok()
             }
         }
     }
@@ -457,6 +482,26 @@ impl ActiveAgentStatusChangedSubscription {
     }
 }
 
+impl ActiveReadStateChangedSubscription {
+    fn poll(&mut self, event_hub: &EventHub) -> Option<SubscriptionEventEnvelope> {
+        for (sequence, event) in event_hub.events_after(self.last_sequence) {
+            self.last_sequence = sequence;
+            let crate::api::schema::EventData::PaneReadStateChanged { read_state } = event.data
+            else {
+                continue;
+            };
+            if read_state.pane_id != self.pane_id {
+                continue;
+            }
+            return Some(SubscriptionEventEnvelope {
+                event: SubscriptionEventKind::PaneReadStateChanged,
+                data: SubscriptionEventData::PaneReadStateChanged(read_state),
+            });
+        }
+        None
+    }
+}
+
 impl ActiveScrollChangedSubscription {
     fn poll(&mut self, api_tx: &ApiRequestSender) -> Option<SubscriptionEventEnvelope> {
         let pane = pane_get(
@@ -534,6 +579,48 @@ fn pane_read(
         error: ErrorBody {
             code: "internal_error".into(),
             message: "failed to decode pane read result".into(),
+        },
+    })
+}
+
+fn pane_read_state(
+    request_id: String,
+    pane_id: &str,
+    api_tx: &ApiRequestSender,
+) -> Result<PaneReadState, ErrorResponse> {
+    let response = dispatch_to_app_with_timeout(
+        Request {
+            id: request_id.clone(),
+            method: Method::PaneReadState(crate::api::schema::PaneTarget {
+                pane_id: pane_id.to_string(),
+            }),
+        },
+        api_tx,
+        Some(APP_RESPONSE_TIMEOUT),
+    );
+    let value: serde_json::Value = serde_json::from_str(&response).map_err(|_| ErrorResponse {
+        id: request_id.clone(),
+        error: ErrorBody {
+            code: "internal_error".into(),
+            message: "failed to decode pane read state response".into(),
+        },
+    })?;
+    if value.get("error").is_some() {
+        return Err(
+            serde_json::from_value::<ErrorResponse>(value).map_err(|_| ErrorResponse {
+                id: request_id,
+                error: ErrorBody {
+                    code: "internal_error".into(),
+                    message: "failed to decode pane read state error".into(),
+                },
+            })?,
+        );
+    }
+    serde_json::from_value(value["result"]["read_state"].clone()).map_err(|_| ErrorResponse {
+        id: request_id,
+        error: ErrorBody {
+            code: "internal_error".into(),
+            message: "failed to decode pane read state result".into(),
         },
     })
 }
@@ -838,5 +925,155 @@ mod tests {
         };
         assert_eq!(data.title.as_deref(), Some("short lived"));
         assert!(subscription.initial_event.is_none());
+    }
+
+    fn read_state_event(pane_id: &str, seen: bool, agent_status: AgentStatus) -> EventEnvelope {
+        EventEnvelope {
+            event: EventKind::PaneReadStateChanged,
+            data: EventData::PaneReadStateChanged {
+                read_state: PaneReadState {
+                    pane_id: pane_id.into(),
+                    workspace_id: "w1".into(),
+                    seen,
+                    agent_status,
+                },
+            },
+        }
+    }
+
+    /// Answers the one request a subscription probe sends, as the app would.
+    fn answer_one_request(
+        mut api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
+        response: serde_json::Value,
+    ) -> std::thread::JoinHandle<Request> {
+        std::thread::spawn(move || {
+            let message = api_rx.blocking_recv().expect("probe request");
+            message
+                .respond_to
+                .send(response.to_string())
+                .expect("probe response");
+            message.request
+        })
+    }
+
+    #[test]
+    fn read_state_subscription_relays_its_pane_with_the_exact_read_state_body() {
+        let event_hub = EventHub::default();
+        let mut subscription = ActiveReadStateChangedSubscription {
+            pane_id: "w1:p1".into(),
+            last_sequence: event_hub.current_sequence(),
+        };
+
+        event_hub.push(read_state_event("w1:p2", false, AgentStatus::Blocked));
+        event_hub.push(presentation_event(None));
+        event_hub.push(read_state_event("w1:p1", false, AgentStatus::Blocked));
+        event_hub.push(read_state_event("w1:p1", true, AgentStatus::Blocked));
+
+        let first = subscription.poll(&event_hub).expect("unread event");
+        assert_eq!(
+            serde_json::to_value(first).unwrap(),
+            serde_json::json!({
+                "event": "pane.read_state_changed",
+                "data": {
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                    "seen": false,
+                    "agent_status": "blocked",
+                }
+            }),
+            "the body must be the pane.read_state result"
+        );
+        let second = subscription.poll(&event_hub).expect("read event");
+        let SubscriptionEventData::PaneReadStateChanged(body) = second.data else {
+            panic!("wrong event data");
+        };
+        assert!(body.seen);
+        assert!(
+            subscription.poll(&event_hub).is_none(),
+            "other panes and other event kinds are not relayed"
+        );
+    }
+
+    #[test]
+    fn read_state_subscription_resolves_the_pane_and_skips_history() {
+        let event_hub = EventHub::default();
+        event_hub.push(read_state_event("w1:p1", false, AgentStatus::Blocked));
+        let event_start_sequence = event_hub.current_sequence();
+        event_hub.push(read_state_event("w1:p1", true, AgentStatus::Blocked));
+
+        let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let probe = answer_one_request(
+            api_rx,
+            serde_json::json!({
+                "id": "test:sub:0:probe",
+                "result": {
+                    "type": "pane_read_state",
+                    "read_state": {
+                        "pane_id": "w1:p1",
+                        "workspace_id": "w1",
+                        "seen": true,
+                        "agent_status": "blocked",
+                    }
+                }
+            }),
+        );
+        // The legacy id form resolves to the canonical id the events carry.
+        let mut subscription = ActiveSubscription::new(
+            Subscription::PaneReadStateChanged {
+                pane_id: "w1-1".into(),
+            },
+            "test",
+            0,
+            &api_tx,
+            &event_hub,
+            event_start_sequence,
+        )
+        .expect("read state subscription");
+
+        let request = probe.join().unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["method"],
+            "pane.read_state"
+        );
+        let setup_window_event = subscription
+            .poll(&api_tx, &event_hub)
+            .expect("an event after the request started is kept");
+        assert_eq!(setup_window_event["event"], "pane.read_state_changed");
+        assert!(
+            subscription.poll(&api_tx, &event_hub).is_none(),
+            "an event from before the request is history"
+        );
+        event_hub.push(read_state_event("w1:p1", false, AgentStatus::Blocked));
+        assert!(subscription.poll(&api_tx, &event_hub).is_some());
+    }
+
+    #[test]
+    fn read_state_subscription_for_an_unknown_pane_fails_loudly() {
+        let event_hub = EventHub::default();
+        let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let probe = answer_one_request(
+            api_rx,
+            serde_json::json!({
+                "id": "test:sub:0:probe",
+                "error": { "code": "pane_not_found", "message": "pane missing not found" }
+            }),
+        );
+
+        let result = ActiveSubscription::new(
+            Subscription::PaneReadStateChanged {
+                pane_id: "missing".into(),
+            },
+            "test",
+            0,
+            &api_tx,
+            &event_hub,
+            event_hub.current_sequence(),
+        );
+
+        probe.join().unwrap();
+        let Err(error) = result else {
+            panic!("an unknown pane must not start a subscription");
+        };
+        assert_eq!(error.error.code, "pane_not_found");
     }
 }

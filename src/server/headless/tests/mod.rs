@@ -5,6 +5,8 @@ use crate::test_support::TestTempPath;
 mod pane_graphics_tests;
 #[path = "pane_move.rs"]
 mod pane_move_tests;
+#[path = "read_state.rs"]
+mod read_state_tests;
 #[path = "surface_delta.rs"]
 mod surface_delta_tests;
 #[path = "surface_interest.rs"]
