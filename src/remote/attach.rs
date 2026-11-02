@@ -542,6 +542,10 @@ pub(super) struct RemoteSsh {
     target: String,
     session_name: String,
     managed_config: Option<ManagedSshConfig>,
+    /// The configured `[remote] ssh_config_files` that exist, empty when
+    /// `manage_ssh_config` is off. Every ssh herdr runs reads them, including
+    /// the endpoint probe, which builds its own config from this list.
+    extra_ssh_config_files: Vec<PathBuf>,
     noninteractive: bool,
 }
 
@@ -552,8 +556,13 @@ impl RemoteSsh {
         ssh_config_files: &[String],
         session_name: String,
     ) -> Self {
+        let extra_ssh_config_files = if manage_ssh_config {
+            existing_ssh_config_files(ssh_config_files)
+        } else {
+            Vec::new()
+        };
         let managed_config = if manage_ssh_config {
-            write_managed_ssh_config(&existing_ssh_config_files(ssh_config_files), false)
+            write_managed_ssh_config(&extra_ssh_config_files, false)
                 .inspect_err(|err| {
                     tracing::debug!(%err, "could not write managed ssh config; using plain ssh");
                 })
@@ -566,6 +575,7 @@ impl RemoteSsh {
             target,
             session_name,
             managed_config,
+            extra_ssh_config_files,
             noninteractive: false,
         }
     }
@@ -580,19 +590,12 @@ impl RemoteSsh {
         } else {
             Vec::new()
         };
-        let managed_config = if extra_files.is_empty() {
-            None
-        } else {
-            write_managed_ssh_config(&extra_files, true)
-                .inspect_err(|err| {
-                    tracing::debug!(%err, "could not write ssh config; using plain ssh");
-                })
-                .ok()
-        };
+        let managed_config = write_noninteractive_ssh_config(&extra_files);
         Self {
             target,
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config,
+            extra_ssh_config_files: extra_files,
             noninteractive: true,
         }
     }
@@ -2017,12 +2020,18 @@ fn probe_remote_endpoint(
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<crate::client::endpoint::EndpointNegotiation> {
     let path = local_forward_socket_path(ssh.target(), &ssh.session_name);
+    // The probe stands in for a saved-machine connection, so its ssh reads what a saved
+    // connection reads: the configured extra ssh config files and nothing else (no
+    // control socket, no keepalive block; the noninteractive options carry the
+    // keepalives). Without extra files it stays plain ssh. Declared before the bridge
+    // so the bridge stops before its config is removed.
+    let probe_config = write_noninteractive_ssh_config(&ssh.extra_ssh_config_files);
     let bridge = SshStdioBridge::start(
         ssh.target.clone(),
         remote_herdr.clone(),
         path.clone(),
         ssh.session_name.clone(),
-        None,
+        probe_config.as_ref().map(|config| &config.options),
         true,
     )?;
     let mut stream = crate::ipc::connect_local_stream(&path)?;
@@ -2925,6 +2934,20 @@ fn write_managed_ssh_config(
             control_path,
         },
     })
+}
+
+/// The temporary ssh config of a noninteractive connection (saved machines and
+/// the endpoint probe): includes only, or `None`, meaning plain ssh, when there
+/// are no extra files or the file cannot be written.
+fn write_noninteractive_ssh_config(extra_files: &[PathBuf]) -> Option<ManagedSshConfig> {
+    if extra_files.is_empty() {
+        return None;
+    }
+    write_managed_ssh_config(extra_files, true)
+        .inspect_err(|err| {
+            tracing::debug!(%err, "could not write ssh config; using plain ssh");
+        })
+        .ok()
 }
 
 struct BridgeUploadStop {
@@ -3990,6 +4013,32 @@ User svc-agents\n  IdentityFile /nonexistent/extra-key\n  IdentitiesOnly yes\n",
         assert!(!args.iter().any(|arg| arg == "-F"));
     }
 
+    /// The endpoint probe builds its ssh config from the extra files its `RemoteSsh`
+    /// recorded: includes only, plain ssh when there are none. (The end-to-end
+    /// check that the probe's ssh carries it is in `tests/machine_setup.rs`.)
+    #[cfg(unix)]
+    #[test]
+    fn probe_ssh_config_follows_the_recorded_extra_files() {
+        let sandbox = SshConfigSandbox::new("probe");
+        let extra = sandbox.file("extra_config", "Host probe-test\n  Port 2222\n");
+        let configured = [extra.to_string_lossy().into_owned()];
+
+        let mut ssh = RemoteSsh::new("probe-test".into(), true, &configured, "default".into());
+        assert_eq!(ssh.extra_ssh_config_files, vec![extra.clone()]);
+        let probe = write_noninteractive_ssh_config(&ssh.extra_ssh_config_files)
+            .expect("an extra file produces a probe config");
+        assert!(probe.options.control_path.is_none());
+        let contents = std::fs::read_to_string(&probe.options.config_path).unwrap();
+        assert!(contents.contains(&format!("Include {}", ssh_config_include_path(&extra))));
+        assert!(!contents.contains("Host *"), "{contents}");
+        // Drop the interactive config first: its owner would otherwise run `ssh -O exit`.
+        drop(ssh.take_managed_config());
+
+        let ssh = RemoteSsh::new("probe-test".into(), false, &configured, "default".into());
+        assert!(ssh.extra_ssh_config_files.is_empty());
+        assert!(write_noninteractive_ssh_config(&ssh.extra_ssh_config_files).is_none());
+    }
+
     #[test]
     fn ssh_config_quote_wraps_path_with_spaces() {
         assert_eq!(
@@ -4014,6 +4063,7 @@ User svc-agents\n  IdentityFile /nonexistent/extra-key\n  IdentitiesOnly yes\n",
             target: "example".to_string(),
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: Some(managed_config),
+            extra_ssh_config_files: Vec::new(),
             noninteractive: false,
         };
 
@@ -4083,6 +4133,7 @@ User svc-agents\n  IdentityFile /nonexistent/extra-key\n  IdentitiesOnly yes\n",
             target: "example".to_string(),
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: Some(managed_config),
+            extra_ssh_config_files: Vec::new(),
             noninteractive: false,
         };
         let args = ssh
@@ -4250,6 +4301,7 @@ User svc-agents\n  IdentityFile /nonexistent/extra-key\n  IdentitiesOnly yes\n",
             target: "example".to_string(),
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: None,
+            extra_ssh_config_files: Vec::new(),
             noninteractive: false,
         };
 

@@ -350,3 +350,239 @@ fn machine_setup_explicit_remote_handoff_remains_available_but_restart_fallback_
         result.output
     );
 }
+
+// `herdr machine add` runs ssh once more for the endpoint probe, with strict host-key checking. That
+// call must read the same extra ssh config files as every other call of the setup. `fake-host` is
+// defined only in `$FAKE_EXTRA_CONFIG`, so the fake resolves it only when the call's `-F` config
+// includes that file, and fails the way real ssh does when it cannot.
+const PROBE_SSH: &str = r#"#!/bin/sh
+{ printf 'ssh'; for arg do printf ' [%s]' "$arg"; done; printf '\n'; } >>"$FAKE_ROOT/ssh-calls"
+cfg=; prev=; probe=no
+for arg do
+    if [ "$prev" = -F ]; then cfg=$arg; fi
+    if [ "$arg" = 'StrictHostKeyChecking=yes' ]; then probe=yes; fi
+    if [ "$arg" = -O ]; then exit 0; fi
+    prev=$arg
+done
+if [ "$probe" = yes ]; then
+    printf '%s\n' "$@" >"$FAKE_ROOT/probe-argv"
+    if [ -n "$cfg" ]; then cat "$cfg" >"$FAKE_ROOT/probe-config"; fi
+    if [ -n "$cfg" ] && grep -qF "$FAKE_EXTRA_CONFIG" "$cfg"; then
+        echo 'ssh: probe reached fake-host through the extra config' >&2
+    else
+        echo 'ssh: Could not resolve hostname fake-host: Name or service not known' >&2
+    fi
+    exit 255
+fi
+exec "$FAKE_ROOT/bin/ssh-main" "$@"
+"#;
+
+struct ProbeRun {
+    output: String,
+    ssh_calls: String,
+    probe_argv: Vec<String>,
+    probe_config: Option<String>,
+    extra_config: std::path::PathBuf,
+}
+
+impl ProbeRun {
+    fn context(&self) -> String {
+        format!(
+            "output: {}\nssh calls:\n{}\nprobe config: {:?}",
+            self.output, self.ssh_calls, self.probe_config
+        )
+    }
+
+    fn probe_config_arg(&self) -> Option<&str> {
+        self.probe_argv
+            .windows(2)
+            .find(|pair| pair[0] == "-F")
+            .map(|pair| pair[1].as_str())
+    }
+}
+
+/// Runs `herdr machine add` against the fake ssh above, with the `[remote]` section `remote_toml`
+/// builds from the path of the extra ssh config file.
+fn machine_add_probe(tag: &str, remote_toml: impl Fn(&std::path::Path) -> String) -> ProbeRun {
+    use std::process::Stdio;
+
+    let root = std::path::PathBuf::from(format!(
+        "/var/tmp/herdr-sshprobe-{}-{tag}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let app = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    fs::create_dir_all(root.join("bin")).unwrap();
+    fs::create_dir_all(root.join("tmp")).unwrap();
+    fs::create_dir_all(root.join("config").join(app)).unwrap();
+    for (name, script) in [("ssh", PROBE_SSH), ("ssh-main", SSH)] {
+        fs::write(root.join("bin").join(name), script).unwrap();
+        fs::set_permissions(
+            root.join("bin").join(name),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+    let extra_config = root.join("extra_ssh_config");
+    fs::write(
+        &extra_config,
+        "Host fake-host\n  HostName extra.example.invalid\n  Port 2222\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("config").join(app).join("config.toml"),
+        format!("onboarding = false\n{}", remote_toml(&extra_config)),
+    )
+    .unwrap();
+
+    let mut status_command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    support::sanitize_herdr_env_command(&mut status_command);
+    let status = status_command
+        .args(["status", "client", "--json"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+
+    let log = fs::File::create(root.join("herdr-output")).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    support::sanitize_herdr_env_command(&mut command);
+    command
+        .args(["machine", "add", "fake-host", "--label", "VPS"])
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
+        .env("HOME", &root)
+        .env("TMPDIR", root.join("tmp"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_RUNTIME_DIR", &root)
+        .env("FAKE_ROOT", &root)
+        .env("FAKE_EXTRA_CONFIG", &extra_config)
+        .env("FAKE_INSTALLED", "new")
+        // Makes the fake server report the capabilities that make setup probe its endpoint.
+        .env("FAKE_STRICT_HOST_KEY_FAILURE", "yes")
+        .env(
+            "FAKE_CLIENT_STATUS",
+            String::from_utf8(status.stdout).unwrap(),
+        )
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log);
+    let mut child = command.spawn().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let _ = fs::remove_dir_all(&root);
+            panic!("machine add timed out");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let read = |name: &str| fs::read_to_string(root.join(name)).ok();
+    let run = ProbeRun {
+        output: read("herdr-output").unwrap_or_default(),
+        ssh_calls: read("ssh-calls").unwrap_or_default(),
+        probe_argv: read("probe-argv")
+            .map(|argv| argv.lines().map(str::to_owned).collect())
+            .unwrap_or_default(),
+        probe_config: read("probe-config"),
+        extra_config,
+    };
+    let saved = root
+        .join("state")
+        .join(app)
+        .join("client/endpoints.json")
+        .exists();
+    fs::remove_dir_all(&root).unwrap();
+    assert!(!status.success(), "the fake probe always fails");
+    assert!(
+        !saved,
+        "a failed probe saved the machine: {}",
+        run.context()
+    );
+    assert!(
+        run.probe_argv
+            .iter()
+            .any(|arg| arg == "StrictHostKeyChecking=yes"),
+        "setup never reached the endpoint probe: {}",
+        run.context()
+    );
+    run
+}
+
+#[test]
+fn machine_add_probe_ssh_reads_the_configured_extra_ssh_config() {
+    let run = machine_add_probe("extra", |extra| {
+        format!("[remote]\nssh_config_files = [\"{}\"]\n", extra.display())
+    });
+    let context = run.context();
+
+    let config_path = run
+        .probe_config_arg()
+        .unwrap_or_else(|| panic!("the probe's ssh has no -F: {:?}\n{context}", run.probe_argv));
+    assert!(
+        run.probe_config.as_deref().is_some_and(
+            |config| config.contains(&format!("Include \"{}\"", run.extra_config.display()))
+        ),
+        "probe config {config_path} does not include the extra file\n{context}"
+    );
+    // Config only: no connection-sharing socket for a short metadata attach, and no keepalive
+    // block, because the probe passes its own keepalive options.
+    assert!(
+        !run.probe_argv
+            .iter()
+            .any(|arg| arg == "-S" || arg.starts_with("ControlMaster")),
+        "the probe must not share a control socket: {:?}",
+        run.probe_argv
+    );
+    assert!(
+        !run.probe_config
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Host *"),
+        "{context}"
+    );
+    assert!(
+        !run.output.contains("Could not resolve hostname"),
+        "{context}"
+    );
+    assert!(
+        run.output
+            .contains("probe reached fake-host through the extra config"),
+        "{context}"
+    );
+}
+
+#[test]
+fn machine_add_probe_ssh_stays_plain_without_extra_ssh_config_files() {
+    // Default-preserving: no extra files, or extras switched off, leave the probe as stock.
+    let default = machine_add_probe("default", |_| "[remote]\n".to_owned());
+    assert_eq!(default.probe_config_arg(), None, "{}", default.context());
+    assert!(
+        default.output.contains("Could not resolve hostname"),
+        "{}",
+        default.context()
+    );
+
+    let unmanaged = machine_add_probe("unmanaged", |extra| {
+        format!(
+            "[remote]\nmanage_ssh_config = false\nssh_config_files = [\"{}\"]\n",
+            extra.display()
+        )
+    });
+    assert_eq!(
+        unmanaged.probe_config_arg(),
+        None,
+        "{}",
+        unmanaged.context()
+    );
+}
