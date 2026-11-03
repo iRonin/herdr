@@ -141,16 +141,46 @@ fn is_routine_api_method(method: &str) -> bool {
     )
 }
 
-/// A process, as a log field: its command line quoted and cut, or "unknown" when it cannot be read (the process may
-/// already be gone). Quoted so a command line with a newline cannot forge a log line.
+/// The longest a log line waits for a process's command line. Reading it takes the other process's memory-map lock on
+/// Linux and a kernel call on macOS; if that process is stuck in an uninterruptible wait while holding it, the read waits
+/// too. A stop or a signal must never wait on that.
+const COMMAND_LINE_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// A process, as a log field: its command line quoted and cut, "unknown" when it cannot be read (the process may
+/// already be gone), or "unavailable" when the read did not finish within `COMMAND_LINE_WAIT`. Quoted so a command line
+/// with a newline cannot forge a log line.
 pub(crate) fn describe_process_command(pid: u32) -> String {
+    describe_process_command_with(
+        pid,
+        COMMAND_LINE_WAIT,
+        crate::platform::process_command_line,
+    )
+}
+
+/// The read runs on a short-lived helper thread so that the caller can give up on it. A read that never finishes
+/// leaves that one thread behind; the caller carries on.
+fn describe_process_command_with(
+    pid: u32,
+    limit: std::time::Duration,
+    read: impl FnOnce(u32) -> Option<String> + Send + 'static,
+) -> String {
     const MAX_CHARS: usize = 300;
-    match crate::platform::process_command_line(pid) {
-        Some(command) => {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("herdr-cmdline".into())
+        .spawn(move || {
+            let _ = tx.send(read(pid));
+        });
+    if spawned.is_err() {
+        return "unavailable".to_string();
+    }
+    match rx.recv_timeout(limit) {
+        Ok(Some(command)) => {
             let cut: String = command.chars().take(MAX_CHARS).collect();
             format!("{cut:?}")
         }
-        None => "unknown".to_string(),
+        Ok(None) => "unknown".to_string(),
+        Err(_) => "unavailable".to_string(),
     }
 }
 
@@ -722,5 +752,34 @@ mod tests {
         assert!(!rotated_log_path(&path, 1).exists());
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A stop or a signal logs the sender's command line, and reading it can block for as long as the sender is stuck in
+    /// the kernel (the other process's memory-map lock on Linux). The caller must give up after the limit and say so,
+    /// instead of holding up the stop.
+    #[test]
+    fn a_command_line_read_that_does_not_finish_never_holds_up_the_log_line() {
+        let started = std::time::Instant::now();
+        let described =
+            describe_process_command_with(1, std::time::Duration::from_millis(100), |_| {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                Some("too late".to_string())
+            });
+        assert_eq!(described, "unavailable");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the log line waited {:?} for a read that was given 100 ms",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_command_line_that_is_read_in_time_is_quoted_and_a_missing_one_is_unknown() {
+        let limit = std::time::Duration::from_secs(10);
+        assert_eq!(
+            describe_process_command_with(1, limit, |_| Some("sleep \"30\"\nforged".to_string())),
+            "\"sleep \\\"30\\\"\\nforged\""
+        );
+        assert_eq!(describe_process_command_with(1, limit, |_| None), "unknown");
     }
 }
