@@ -704,3 +704,50 @@ fn sighup_to_the_server_is_logged_with_its_sender() {
 fn sigint_to_the_server_is_logged_with_its_sender() {
     assert_signal_is_logged_with_its_sender("INT", "SIGINT");
 }
+
+/// A signal queued with `sigqueue` carries the sender's own process id and user id: the kernel passes them through
+/// unchecked for a queued signal, so the sender can name any process. The log line must therefore say how the signal
+/// was sent (`cause="Sent(Queue)"`), so that a reader can tell such a line from an ordinary `kill`. macOS has no
+/// `sigqueue`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_queued_signal_is_logged_as_sent_by_queue() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    let server_pid = spawned.child.process_id().expect("server pid");
+
+    let value = libc::sigval {
+        sival_ptr: std::ptr::null_mut(),
+    };
+    let queued = unsafe { libc::sigqueue(server_pid as libc::pid_t, libc::SIGTERM, value) };
+    assert_eq!(queued, 0, "sigqueue to the server must succeed");
+
+    assert!(
+        wait_for_server_exit(&mut spawned, Duration::from_secs(10)),
+        "a queued SIGTERM must still stop the server"
+    );
+    let log = server_log(&config_home);
+    let line = log
+        .lines()
+        .find(|line| line.contains("server.signal.received"))
+        .unwrap_or_else(|| panic!("the server log has no line about the signal:\n{log}"));
+    assert!(
+        line.contains("signal=\"SIGTERM\""),
+        "the line must name the signal: {line}"
+    );
+    assert!(
+        line.contains("cause=\"Sent(Queue)\""),
+        "the line must say the signal was queued, not sent with kill: {line}"
+    );
+
+    drop(spawned);
+    cleanup_test_base(&base);
+}
