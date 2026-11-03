@@ -1592,6 +1592,22 @@ fn a_line_typed_only_before_the_first_snapshot_arrives_without_further_typing() 
     startup.finish();
 }
 
+/// A command the client test types into a pane shell until its output shows up. `format` holds one
+/// `%s` and no quote or backslash; the newline is added here and `arg` fills the `%s`.
+///
+/// The line holds no quote on purpose. The client drops the input it reads while it reconnects or
+/// switches machines, and its one-shot hold for a line typed across the first snapshot
+/// (`src/client/startup_input.rs`) is never re-armed for those; that comment records that such a
+/// line reaches the pane as a tail. On Linux one retry reached the shell without its first 9 or 14
+/// bytes. A tail must fail alone: with a quote pair in the line it leaves the shell waiting for the
+/// closing quote (the `> ` prompt) and swallows every later retry until the test times out, while
+/// without one it is a single unknown command and the next retry runs. The output marker is never
+/// in the typed text, because `%s` carries the word, so the echo of the command cannot satisfy a
+/// check for it.
+fn typed_printf(format: &str, arg: &str) -> Vec<u8> {
+    format!("printf {format}\\\\n {arg}\r").into_bytes()
+}
+
 #[test]
 fn federated_client_starts_without_local_and_survives_its_restart() {
     use std::os::unix::fs::PermissionsExt;
@@ -1712,11 +1728,12 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
                 if screen_text().contains(&format!("REMOTE_ALIVE_INPUT_{cycle}")) {
                     return true;
                 }
-                write!(
-                    input,
-                    "printf 'REMOTE_%s_INPUT_{cycle}\\n' \"$reconnect_survivor\"\r"
-                )
-                .unwrap();
+                input
+                    .write_all(&typed_printf(
+                        &format!("REMOTE_%s_INPUT_{cycle}"),
+                        "$reconnect_survivor",
+                    ))
+                    .unwrap();
                 false
             }),
             "remote reconnect {cycle} must restore visible input and preserve the shell"
@@ -1749,7 +1766,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
                 return true;
             }
             input
-                .write_all(b"printf 'REMOTE_%s\\n' SURVIVED\r")
+                .write_all(&typed_printf("REMOTE_%s", "SURVIVED"))
                 .unwrap();
             false
         }),
@@ -1776,7 +1793,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
         "Local must reconnect with fresh metadata"
     );
     input
-        .write_all(b"printf 'REMOTE_%s\\n' STILL_SELECTED\r")
+        .write_all(&typed_printf("REMOTE_%s", "STILL_SELECTED"))
         .unwrap();
     assert!(
         wait_until(Duration::from_secs(8), Duration::from_millis(20), || {
@@ -1822,7 +1839,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
                     return true;
                 }
                 input
-                    .write_all(b"printf 'LOCAL_%s\\n' INPUT_WHILE_REMOTE_STALLED\r")
+                    .write_all(&typed_printf("LOCAL_%s", "INPUT_WHILE_REMOTE_STALLED"))
                     .unwrap();
                 false
             }),
@@ -1857,7 +1874,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
                 return true;
             }
             input
-                .write_all(b"printf 'REMOTE_%s\\n' INPUT_BEFORE_LOSS\r")
+                .write_all(&typed_printf("REMOTE_%s", "INPUT_BEFORE_LOSS"))
                 .unwrap();
             false
         }),
@@ -1903,7 +1920,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
                 return true;
             }
             input
-                .write_all(b"printf 'LOCAL_%s\\n' INPUT_RECOVERED\r")
+                .write_all(&typed_printf("LOCAL_%s", "INPUT_RECOVERED"))
                 .unwrap();
             false
         }),
