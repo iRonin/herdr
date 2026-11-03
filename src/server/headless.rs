@@ -3762,6 +3762,9 @@ fn install_signal_origin_handler(
                 );
             }
         });
+    if let Err(err) = &spawned {
+        warn!(%err, "cannot start the signal thread; using the plain handler");
+    }
     spawned.is_ok()
 }
 
