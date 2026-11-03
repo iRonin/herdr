@@ -3702,14 +3702,65 @@ impl Drop for HeadlessServer {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Installs a Ctrl+C handler that sets the should_quit flag and wakes up
-/// the event loop by sending a QuitSignal on the server event channel.
+/// Installs the handler for SIGINT, SIGTERM and SIGHUP: it sets the should_quit flag and wakes up
+/// the event loop by sending a QuitSignal on the server event channel. These are the three signals the
+/// `ctrlc` crate's "termination" handling covers, and the server shuts down the same way for each.
+/// On Unix the handler first logs which signal arrived and who sent it; if that cannot be set up, the
+/// plain handler is installed instead, so a signal still stops the server.
 fn ctrlc_handler(should_quit: Arc<AtomicBool>, server_event_tx: mpsc::Sender<ServerEvent>) {
-    let _ = ctrlc::set_handler(move || {
-        should_quit.store(true, Ordering::Release);
-        // Wake up the event loop so the quit flag is checked promptly.
-        let _ = server_event_tx.try_send(ServerEvent::QuitSignal);
-    });
+    #[cfg(unix)]
+    if install_signal_origin_handler(should_quit.clone(), server_event_tx.clone()) {
+        return;
+    }
+    let _ = ctrlc::set_handler(move || request_quit(&should_quit, &server_event_tx));
+}
+
+fn request_quit(should_quit: &AtomicBool, server_event_tx: &mpsc::Sender<ServerEvent>) {
+    should_quit.store(true, Ordering::Release);
+    // Wake up the event loop so the quit flag is checked promptly.
+    let _ = server_event_tx.try_send(ServerEvent::QuitSignal);
+}
+
+/// Watches SIGINT, SIGTERM and SIGHUP with their origin (the sender's process id and user id, read from the
+/// kernel's signal information), logs each one at INFO before it asks the server to quit, then quits.
+/// Returns false, with nothing left watching, when the signals cannot be registered or the thread cannot start.
+#[cfg(unix)]
+fn install_signal_origin_handler(
+    should_quit: Arc<AtomicBool>,
+    server_event_tx: mpsc::Sender<ServerEvent>,
+) -> bool {
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+    use signal_hook::iterator::exfiltrator::origin::WithOrigin;
+    use signal_hook::iterator::SignalsInfo;
+
+    let mut signals = match SignalsInfo::<WithOrigin>::new([SIGINT, SIGTERM, SIGHUP]) {
+        Ok(signals) => signals,
+        Err(err) => {
+            warn!(%err, "cannot watch signals with their origin; using the plain handler");
+            return false;
+        }
+    };
+    let spawned = std::thread::Builder::new()
+        .name("herdr-signals".into())
+        .spawn(move || {
+            for origin in signals.forever() {
+                let name = signal_hook::low_level::signal_name(origin.signal)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("signal {}", origin.signal));
+                // Kernel-made signals (a hangup when the terminal closes) carry no sender; macOS fills in zeros.
+                let sender = origin
+                    .process
+                    .filter(|process| process.pid > 0)
+                    .map(|process| (process.pid as u32, process.uid));
+                crate::logging::server_signal_received(
+                    &name,
+                    sender,
+                    &format!("{:?}", origin.cause),
+                );
+                request_quit(&should_quit, &server_event_tx);
+            }
+        });
+    spawned.is_ok()
 }
 
 /// Sleep until a deadline, or return pending if none.

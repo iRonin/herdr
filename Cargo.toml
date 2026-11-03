@@ -53,6 +53,11 @@ schemars = { version = "1.2.1", features = ["derive"] }
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }
 
+[target.'cfg(unix)'.dependencies]
+# Which signal stopped the server and who sent it (SIGINT, SIGTERM, SIGHUP): the origin of a signal, with the
+# sender's process id and user id, which the `ctrlc` crate does not report. "extended-siginfo" compiles a small C helper.
+signal-hook = { version = "0.3", features = ["extended-siginfo"] }
+
 [target.'cfg(windows)'.dependencies]
 # UTF-16 SDDL input for interprocess security descriptors.
 widestring = "1.2"

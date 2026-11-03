@@ -179,6 +179,35 @@ pub(crate) fn server_stop_requested(requester: Option<crate::platform::PeerProce
     }
 }
 
+/// A signal that stops the server: its name, who sent it (process id and user id, with the sender's command line) and the
+/// kernel's reason for it. Logged at INFO before the server is asked to quit. `sender` is `None` for a signal the
+/// kernel made itself (the hangup of a closed terminal), which has no sending process.
+#[cfg(unix)]
+pub(crate) fn server_signal_received(signal: &str, sender: Option<(u32, u32)>, cause: &str) {
+    match sender {
+        Some((pid, uid)) => tracing::info!(
+            event = "server.signal.received",
+            subsystem = "server",
+            outcome = "quitting",
+            signal,
+            sender_pid = pid,
+            sender_uid = uid,
+            sender_cmd = %describe_process_command(pid),
+            cause,
+            "signal received; the server is shutting down"
+        ),
+        None => tracing::info!(
+            event = "server.signal.received",
+            subsystem = "server",
+            outcome = "quitting",
+            signal,
+            sender_pid = "none",
+            cause,
+            "signal received from no process (the kernel); the server is shutting down"
+        ),
+    }
+}
+
 pub(crate) fn api_request_failed(request_id: &str, method: &'static str, err: &str) {
     tracing::warn!(
         event = "api.request.fail",

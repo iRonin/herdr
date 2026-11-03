@@ -615,3 +615,84 @@ fn server_stop_over_the_api_logs_the_process_that_asked() {
     drop(spawned);
     cleanup_test_base(&base);
 }
+
+/// A signal that stops the server must be logged with its name and its sender, and must still stop the server.
+/// The sender is a shell this test starts, so its process id is known here; the shell stays alive for a moment
+/// after the signal so its command line can still be read. The line must come before the shutdown starts.
+fn assert_signal_is_logged_with_its_sender(signal: &str, name: &str) {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    let server_pid = spawned.child.process_id().expect("server pid");
+
+    let mut sender = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -{signal} {server_pid}; sleep 2"))
+        .spawn()
+        .expect("spawn the sending shell");
+    let sender_pid = sender.id();
+
+    assert!(
+        wait_for_server_exit(&mut spawned, Duration::from_secs(10)),
+        "{name} must still stop the server"
+    );
+    let _ = sender.kill();
+    let _ = sender.wait();
+
+    let log = server_log(&config_home);
+    let lines: Vec<&str> = log.lines().collect();
+    let signal_at = lines
+        .iter()
+        .position(|line| line.contains("server.signal.received"))
+        .unwrap_or_else(|| panic!("the server log has no line about the signal:\n{log}"));
+    let line = lines[signal_at];
+    assert!(
+        line.contains(&format!("signal=\"{name}\"")),
+        "the line must name the signal {name}: {line}"
+    );
+    assert!(
+        line.contains(&format!("sender_pid={sender_pid} ")),
+        "the line must name the process that sent it ({sender_pid}): {line}"
+    );
+    assert!(
+        line.contains(&format!("sender_uid={} ", unsafe { libc::getuid() })),
+        "the line must carry the sender's user id: {line}"
+    );
+    assert!(
+        line.contains(&format!("kill -{signal}")),
+        "the line must carry the sender's command line: {line}"
+    );
+    let shutdown_at = lines
+        .iter()
+        .position(|line| line.contains("server shutdown initiated"))
+        .unwrap_or_else(|| panic!("the server did not shut down gracefully:\n{log}"));
+    assert!(
+        signal_at < shutdown_at,
+        "the signal must be logged before the shutdown starts:\n{log}"
+    );
+
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn sigterm_to_the_server_is_logged_with_its_sender() {
+    assert_signal_is_logged_with_its_sender("TERM", "SIGTERM");
+}
+
+#[test]
+fn sighup_to_the_server_is_logged_with_its_sender() {
+    assert_signal_is_logged_with_its_sender("HUP", "SIGHUP");
+}
+
+#[test]
+fn sigint_to_the_server_is_logged_with_its_sender() {
+    assert_signal_is_logged_with_its_sender("INT", "SIGINT");
+}
