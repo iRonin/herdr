@@ -7,6 +7,8 @@ mod pane_graphics_tests;
 mod pane_move_tests;
 #[path = "read_state.rs"]
 mod read_state_tests;
+#[path = "signal_quit.rs"]
+mod signal_quit_tests;
 #[path = "surface_delta.rs"]
 mod surface_delta_tests;
 #[path = "surface_interest.rs"]

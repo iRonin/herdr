@@ -3744,23 +3744,57 @@ fn install_signal_origin_handler(
         .name("herdr-signals".into())
         .spawn(move || {
             for origin in signals.forever() {
-                let name = signal_hook::low_level::signal_name(origin.signal)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("signal {}", origin.signal));
                 // Kernel-made signals (a hangup when the terminal closes) carry no sender; macOS fills in zeros.
                 let sender = origin
                     .process
                     .filter(|process| process.pid > 0)
                     .map(|process| (process.pid as u32, process.uid));
-                crate::logging::server_signal_received(
-                    &name,
+                let origin = SignalOrigin {
+                    signal: origin.signal,
                     sender,
-                    &format!("{:?}", origin.cause),
+                    cause: format!("{:?}", origin.cause),
+                };
+                quit_after_logging_signal(
+                    &origin,
+                    log_signal_origin,
+                    &should_quit,
+                    &server_event_tx,
                 );
-                request_quit(&should_quit, &server_event_tx);
             }
         });
     spawned.is_ok()
+}
+
+/// A stop signal as the server reports it: its number, the sender (process id and user id) when a process sent it,
+/// and the kernel's reason for it.
+#[cfg(unix)]
+struct SignalOrigin {
+    signal: i32,
+    sender: Option<(u32, u32)>,
+    cause: String,
+}
+
+#[cfg(unix)]
+fn log_signal_origin(origin: &SignalOrigin) {
+    let name = signal_hook::low_level::signal_name(origin.signal)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("signal {}", origin.signal));
+    crate::logging::server_signal_received(&name, origin.sender, &origin.cause);
+}
+
+/// Logs a stop signal, then asks the server to quit, whatever the logging does. The quit is the point of the signal
+/// thread: if the logging panicked and took the thread with it, the three signals would be ignored for the rest of the
+/// server's life (the watcher unregisters on drop and the previous handler is never restored), and only SIGKILL could
+/// end the server, without its graceful save.
+#[cfg(unix)]
+fn quit_after_logging_signal(
+    origin: &SignalOrigin,
+    log: impl FnOnce(&SignalOrigin),
+    should_quit: &AtomicBool,
+    server_event_tx: &mpsc::Sender<ServerEvent>,
+) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log(origin)));
+    request_quit(should_quit, server_event_tx);
 }
 
 /// Sleep until a deadline, or return pending if none.
