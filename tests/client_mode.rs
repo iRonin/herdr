@@ -745,7 +745,13 @@ fn server_death_mid_attach_reports_the_pre_attach_phase_error() {
         thread::sleep(Duration::from_millis(20));
     }
     let status = thin_client.child.wait().expect("wait thin client status");
-    let text = output.lock().unwrap().text.clone();
+    // The client has exited, but the drain thread may not have read its last bytes yet, and the error line is
+    // the last thing the client prints (after the terminal restore): wait for it instead of reading the text at
+    // once, as the post-attach test above does. Read at once, a run was seen to find only the restore bytes.
+    wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+        read_output(&output).contains("lost connection to server: server closed connection")
+    });
+    let text = read_output(&output);
     assert!(
         !status.success(),
         "a client whose server died mid-attach must exit non-zero; output: {text:?}"
