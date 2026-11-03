@@ -375,6 +375,11 @@ pub(crate) fn process_parent_id(_pid: u32) -> Option<u32> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn process_command_line(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn process_group_exists(_process_group: u32) -> bool {
     true
 }

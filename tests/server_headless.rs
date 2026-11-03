@@ -143,6 +143,28 @@ fn spawn_server(
     }
 }
 
+/// The server's own log file: where it says why it stopped.
+fn server_log(config_home: &Path) -> String {
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    fs::read_to_string(config_home.join(app_dir).join("herdr-server.log")).unwrap_or_default()
+}
+
+/// Waits until the pty child (the server) has exited; false when it is still running at the deadline.
+fn wait_for_server_exit(spawned: &mut SpawnedHerdr, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if spawned.child.try_wait().ok().flatten().is_some() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    false
+}
+
 fn ping_socket(socket_path: &Path) -> String {
     let mut stream = UnixStream::connect(socket_path).expect("should connect to API socket");
 
@@ -538,4 +560,58 @@ fn no_hello_client_closed_within_five_seconds() {
     );
 
     cleanup_spawned_herdr(spawned, base);
+}
+
+/// Servers have "stopped with no request in the log". The generic request log records `server.stop` at DEBUG only, so
+/// an API stop left nothing at the default level. The server must now say who asked, and the sender is identified by the
+/// kernel (the peer credentials of the connection), not by anything the sender claims.
+#[test]
+fn server_stop_over_the_api_logs_the_process_that_asked() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+
+    // A process this test starts, so its id is known here: the stop command of the CLI.
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"));
+    support::sanitize_herdr_env_command(&mut command);
+    command
+        .args(["server", "stop"])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("HERDR_SOCKET_PATH", &api_socket)
+        .env_remove("HERDR_CLIENT_SOCKET_PATH")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut requester = command.spawn().expect("spawn the stop command");
+    let requester_pid = requester.id();
+    let _ = requester.wait();
+
+    assert!(
+        wait_for_server_exit(&mut spawned, Duration::from_secs(10)),
+        "the server must stop when asked"
+    );
+    let log = server_log(&config_home);
+    let line = log
+        .lines()
+        .find(|line| line.contains("server.stop.requested"))
+        .unwrap_or_else(|| panic!("the server log has no line about the stop request:\n{log}"));
+    assert!(
+        line.contains(&format!("requester_pid={requester_pid} ")),
+        "the stop line must name the process that asked ({requester_pid}): {line}"
+    );
+    assert!(
+        line.contains("server stop"),
+        "the stop line must carry the sender's command line: {line}"
+    );
+
+    drop(spawned);
+    cleanup_test_base(&base);
 }

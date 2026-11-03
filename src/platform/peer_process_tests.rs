@@ -2,7 +2,9 @@
 //! process group still has members, and a process's parent. Each test uses real
 //! processes, so a helper that answered from the wrong process fails here.
 
-use super::{local_peer_process, process_group_exists, process_parent_id, PeerProcess};
+use super::{
+    local_peer_process, process_command_line, process_group_exists, process_parent_id, PeerProcess,
+};
 use std::os::unix::process::CommandExt as _;
 
 fn spawn_group_leader() -> std::process::Child {
@@ -113,4 +115,29 @@ fn process_parent_id_names_the_spawning_process() {
     child.kill().unwrap();
     child.wait().unwrap();
     assert_eq!(parent, Some(std::process::id()));
+}
+
+#[test]
+fn process_command_line_names_another_process_by_its_arguments() {
+    // A different process with arguments only it has: a function that answered for the caller, or for a
+    // fixed name, would not return "sleep 30".
+    let mut child = spawn_group_leader();
+    // Right after spawn the child can still be inside exec: on Linux its argument area reads as empty until the new
+    // program's arguments are in place, so wait for the first answer instead of asking once. A process that never
+    // answers still fails the assertion below, after the deadline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut command_line = process_command_line(child.id());
+    while command_line.is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        command_line = process_command_line(child.id());
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(command_line.as_deref(), Some("sleep 30"));
+}
+
+#[test]
+fn process_command_line_is_none_for_a_process_that_does_not_exist() {
+    // Best effort by contract: a sender that is already gone must not fail the log line that asks about it.
+    assert_eq!(process_command_line(0x7fff_fffe), None);
 }

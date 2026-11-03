@@ -947,6 +947,12 @@ fn process_argv(pid: u32) -> Option<Vec<String>> {
     procargs2_argv(&buf)
 }
 
+/// The command line of `pid` (its arguments joined by spaces), for a log line.
+/// Best effort: `None` when the process is gone or its arguments cannot be read.
+pub(crate) fn process_command_line(pid: u32) -> Option<String> {
+    process_argv(pid).map(|argv| argv.join(" "))
+}
+
 /// Read a Herdr agent identity hint from a process environment.
 pub fn process_agent_hint(pid: u32) -> Option<crate::detect::Agent> {
     if pid == 0 {

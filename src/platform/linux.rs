@@ -698,6 +698,12 @@ fn process_argv(pid: u32) -> Option<Vec<String>> {
     (!parts.is_empty()).then_some(parts)
 }
 
+/// The command line of `pid` (its arguments joined by spaces), for a log line.
+/// Best effort: `None` when the process is gone or its arguments cannot be read.
+pub(crate) fn process_command_line(pid: u32) -> Option<String> {
+    process_argv(pid).map(|argv| argv.join(" "))
+}
+
 /// Get the current working directory of a process.
 /// Uses /proc/<pid>/cwd symlink.
 pub fn process_cwd(pid: u32) -> Option<PathBuf> {

@@ -141,6 +141,44 @@ fn is_routine_api_method(method: &str) -> bool {
     )
 }
 
+/// A process, as a log field: its command line quoted and cut, or "unknown" when it cannot be read (the process may
+/// already be gone). Quoted so a command line with a newline cannot forge a log line.
+pub(crate) fn describe_process_command(pid: u32) -> String {
+    const MAX_CHARS: usize = 300;
+    match crate::platform::process_command_line(pid) {
+        Some(command) => {
+            let cut: String = command.chars().take(MAX_CHARS).collect();
+            format!("{cut:?}")
+        }
+        None => "unknown".to_string(),
+    }
+}
+
+/// Who asked the server to stop. Logged at INFO BEFORE the stop flag is set, so the line is there even when the stop
+/// finishes the process at once. `server.stop` is not a UI-changing method, so the generic request log records it at DEBUG
+/// only: without this line a stop that came over the API leaves nothing at the default level, and a server that "stopped
+/// with no request in its log" cannot be told from one that was signalled. Best effort: an unknown sender never fails the stop.
+pub(crate) fn server_stop_requested(requester: Option<crate::platform::PeerProcess>) {
+    match requester {
+        Some(peer) => tracing::info!(
+            event = "server.stop.requested",
+            subsystem = "server",
+            outcome = "accepted",
+            requester_pid = peer.pid,
+            requester_pgid = peer.process_group,
+            requester_cmd = %describe_process_command(peer.pid),
+            "server stop requested over the api"
+        ),
+        None => tracing::info!(
+            event = "server.stop.requested",
+            subsystem = "server",
+            outcome = "accepted",
+            requester_pid = "unknown",
+            "server stop requested over the api; the sender could not be identified"
+        ),
+    }
+}
+
 pub(crate) fn api_request_failed(request_id: &str, method: &'static str, err: &str) {
     tracing::warn!(
         event = "api.request.fail",

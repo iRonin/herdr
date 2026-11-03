@@ -1047,6 +1047,7 @@ impl App {
 
         let response = match request.method {
             Method::ServerStop(_) => {
+                crate::logging::server_stop_requested(self.api_request_sender);
                 self.state.should_quit = true;
                 SuccessResponse {
                     id: request.id,

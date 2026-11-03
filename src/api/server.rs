@@ -394,6 +394,7 @@ fn handle_request(
 
     if matches!(&request.method, Method::ServerStop(_)) {
         if let Some(server_stop) = server_stop {
+            crate::logging::server_stop_requested(peer_process);
             server_stop.store(true, Ordering::Release);
             return serde_json::to_string(&SuccessResponse {
                 id: request.id,
