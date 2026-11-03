@@ -73,10 +73,15 @@ pub fn register_runtime_dir(path: &Path) {
     ensure_cleanup_hooks();
 
     let _ = fs::create_dir_all(path);
-    let _ = fs::write(
-        path.join(RUNTIME_OWNER_MARKER),
-        std::process::id().to_string(),
-    );
+    // The watchdog reads this marker every second while the dir's servers may already be running, and a missing,
+    // empty or unparseable marker reads as "the owner is gone": it kills them. `fs::write` truncates before it
+    // writes, and every client a test spawns registers its dir again, so rewriting an unchanged marker opened a
+    // window in which a scan killed a healthy server. Write the marker only when it does not already name us.
+    let owner = std::process::id().to_string();
+    let marker = path.join(RUNTIME_OWNER_MARKER);
+    if !fs::read_to_string(&marker).is_ok_and(|content| content.trim() == owner) {
+        let _ = fs::write(&marker, &owner);
+    }
 
     let mut runtime_dirs = runtime_dir_registry_lock();
     runtime_dirs.insert(path.to_path_buf());
@@ -1208,6 +1213,47 @@ mod tests {
         let should_terminate = should_terminate_runtime_dir(&runtime_dir, &registered_runtime_dirs);
         fs::remove_dir_all(runtime_dir).unwrap();
         assert!(!should_terminate, "a live test owner must remain protected");
+    }
+
+    /// The watchdog reads the owner marker of every registered runtime dir once a second and kills the servers of a
+    /// dir whose marker does not name a live process. Every client a test spawns registers its runtime dir again, and
+    /// the marker used to be rewritten each time: `fs::write` truncates the file before it writes, so a scan that
+    /// landed between the two read an empty marker and killed a healthy server that had just started (measured: the
+    /// server log named the test process as the sender of a SIGTERM about 10 ms before the next client started).
+    /// Re-registering must never let a reader see anything but the owner's pid.
+    #[test]
+    fn re_registering_a_runtime_dir_never_shows_a_reader_a_torn_owner_marker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let runtime_dir = unique_missing_runtime_dir("re-register");
+        register_runtime_dir(&runtime_dir);
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let runtime_dir = runtime_dir.clone();
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                let (mut reads, mut torn) = (0u64, 0u64);
+                while !done.load(Ordering::Relaxed) {
+                    reads += 1;
+                    if !runtime_dir_owner_alive(&runtime_dir) {
+                        torn += 1;
+                    }
+                }
+                (reads, torn)
+            })
+        };
+        for _ in 0..3000 {
+            register_runtime_dir(&runtime_dir);
+        }
+        done.store(true, Ordering::Relaxed);
+        let (reads, torn) = reader.join().unwrap();
+        unregister_runtime_dir(&runtime_dir);
+        let _ = fs::remove_dir_all(&runtime_dir);
+        assert_eq!(
+            torn, 0,
+            "{torn} of {reads} reads of the owner marker did not name the live owner while the dir was re-registered"
+        );
     }
 
     #[test]
