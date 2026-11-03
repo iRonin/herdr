@@ -622,6 +622,31 @@ fn client_error_display_connection_lost() {
     );
 }
 
+// Linux ends a stream whose peer closed with unread data with ECONNRESET, macOS with end of
+// stream. The user must read the same "server closed connection" for both, while any other
+// I/O error keeps its own text.
+#[test]
+fn a_reset_connection_reads_as_the_server_closing_it() {
+    use crate::protocol::FramingError;
+    let _guard = env_lock().lock().unwrap();
+    let _env = EnvVarsRemovedGuard::new(&[crate::remote::REATTACH_COMMAND_ENV_VAR]);
+    for framing in [
+        FramingError::UnexpectedEof,
+        FramingError::Io(io::Error::from(io::ErrorKind::ConnectionReset)),
+    ] {
+        assert_eq!(
+            ClientError::from(framing).to_string(),
+            "lost connection to server: server closed connection"
+        );
+    }
+    let other = FramingError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
+    assert_eq!(
+        ClientError::from(other).to_string(),
+        "lost connection to server: denied",
+        "only a reset is rewritten; other I/O errors keep their own text"
+    );
+}
+
 #[test]
 fn client_error_display_remote_connection_lost_has_reattach_hint() {
     let _guard = env_lock().lock().unwrap();
