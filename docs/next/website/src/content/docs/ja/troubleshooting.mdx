@@ -126,3 +126,5 @@ herdr-server.log
 ```
 
 詳細なログには `HERDR_LOG=herdr=debug` を設定します。問題を報告するときは現在のログとローテーション済みログを含めてください。[設定](/ja/docs/configuration/#logs)を参照してください。
+
+サーバーが停止したとき、`herdr-server.log` にその理由が記録されます。API 経由の停止要求(`herdr server stop`、`herdr session stop`、その他のクライアント)は `server.stop.requested` として、送信元のプロセス ID、プロセスグループ、コマンドラインとともに記録されます。SIGINT、SIGTERM、SIGHUP は `server.signal.received` として、シグナル名と、プロセスが送った場合はそのプロセスの ID、ユーザー ID、コマンドラインとともに記録されます。ターミナルが閉じられたときにシステムが送るハングアップには送信元のプロセスがありません。コマンドラインはベストエフォートで取得され、送信元がすでに終了している場合は `unknown` と表示されます。
