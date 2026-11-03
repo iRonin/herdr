@@ -102,6 +102,15 @@ impl From<protocol::FramingError> for ClientError {
                 io::ErrorKind::UnexpectedEof,
                 "server closed connection",
             )),
+            // A peer that closes a Unix socket while it still holds unread data ends the
+            // stream with end-of-file on macOS but with ECONNRESET on Linux. Both mean the
+            // server closed the connection, so both read the same to the user.
+            protocol::FramingError::Io(err) if err.kind() == io::ErrorKind::ConnectionReset => {
+                ClientError::ConnectionLost(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "server closed connection",
+                ))
+            }
             protocol::FramingError::Io(err) => ClientError::ConnectionLost(err),
             err => ClientError::Protocol(err),
         }
