@@ -127,4 +127,4 @@ herdr-server.log
 
 设置 `HERDR_LOG=herdr=debug` 可获得更多细节。报告问题时请附上当前日志和轮转后的日志。见[配置](/zh-cn/docs/configuration/#logs)。
 
-服务器停止时,`herdr-server.log` 会记录原因。通过 API 发出的停止请求(`herdr server stop`、`herdr session stop` 或其他客户端)会记为 `server.stop.requested`,并附上发送方的进程 ID、进程组和命令行。SIGINT、SIGTERM 或 SIGHUP 会记为 `server.signal.received`,并附上信号名称;如果信号由某个进程发送,还会附上该进程的 ID、用户 ID 和命令行。终端关闭时系统发出的挂断信号没有发送进程。命令行为尽力读取,发送方已退出时显示 `unknown`。
+服务器停止时,`herdr-server.log` 会记录原因:`server shutdown initiated` 行带有 `reason`。被 SIGKILL 杀死、崩溃或被内存不足终止的服务器不会留下这样的行,`HERDR_LOG` 设置过滤掉 INFO 时也看不到。通过 API 发出的停止请求(`herdr server stop`、`herdr session stop` 或任何其他客户端)会记录为 `server.stop.requested`,包含发送方的进程 ID、进程组和命令行,停止行的 `reason` 也指向同一个发送方。SIGINT 或 SIGTERM 会在关闭之前记录为 `server.signal.received`(`outcome="quitting"`),包含信号、`cause`(内核给出的原因:普通 kill 为 `Sent(User)`,用 `sigqueue` 排队发送的信号为 `Sent(Queue)`),以及在有进程发送时该进程的 ID、用户 ID 和命令行。SIGHUP 不会停止服务器:它以同样方式记录,`outcome="ignored"`。终端关闭时系统发出的挂断信号没有发送进程。发送方以内核报告为准,但排队信号(`Sent(Queue)`)除外:此时发送方自己提供进程 ID 和用户 ID。命令行是尽力读取的:发送方已退出时显示 `unknown`,200 ms 内未能读取时显示 `unavailable`。
