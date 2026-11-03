@@ -173,6 +173,16 @@ fn remote_attach_refuses_the_upstream_release_on_a_fork_build_and_fetches_nothin
     std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755))
         .expect("make fake curl executable");
 
+    // The refusal is for a remote whose platform is NOT this machine's: when both ends run the same
+    // platform, remote attach uploads this binary instead, and without a terminal to approve that
+    // it stops with a different error. So the fake remote must never be the platform the test runs
+    // on, or the test would reach the upload path (Linux x86_64 test machines did) and prove nothing
+    // about the refusal.
+    let (remote_os, remote_arch) = if cfg!(target_os = "linux") {
+        ("Darwin", "arm64")
+    } else {
+        ("Linux", "x86_64")
+    };
     let ssh_log = sandbox.join("ssh.log");
     let ssh = bin.join("ssh");
     std::fs::write(
@@ -183,7 +193,7 @@ printf '%s\n' "$*" >> {log}
 input=$(cat 2>/dev/null || true)
 case "$* $input" in
   *"uname -s"*)
-    printf '\nherdr-remote-output-ready:1\nLinux\nx86_64\n'
+    printf '\nherdr-remote-output-ready:1\n{remote_os}\n{remote_arch}\n'
     exit 0 ;;
   *"command -v herdr"*)
     exit 1 ;;
