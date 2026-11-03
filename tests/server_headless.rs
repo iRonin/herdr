@@ -607,8 +607,16 @@ fn server_stop_over_the_api_logs_the_process_that_asked() {
         line.contains(&format!("requester_pid={requester_pid} ")),
         "the stop line must name the process that asked ({requester_pid}): {line}"
     );
-    assert!(
-        line.contains("server stop"),
+    // The command line is the field's own value. A bare search for "server stop" in the line proves nothing: the
+    // event's message ("server stop requested over the api") contains it, so it passed with `requester_cmd=unknown`.
+    let requester_cmd = line
+        .split("requester_cmd=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or_else(|| panic!("the stop line must carry a quoted requester_cmd: {line}"));
+    assert_eq!(
+        requester_cmd,
+        format!("{} server stop", env!("CARGO_BIN_EXE_herdr")),
         "the stop line must carry the sender's command line: {line}"
     );
 
