@@ -1796,10 +1796,18 @@ mod tests {
             "positive control: the first request is answered"
         );
         let mut rest = String::new();
-        assert_eq!(
-            reader.read_line(&mut rest).unwrap(),
-            0,
-            "the second request on the same connection must get no reply: {rest:?}"
+        // The server closed the connection with the second request still unread. The client
+        // then sees end of stream on macOS and ECONNRESET on Linux (which delivers the queued
+        // first reply before the reset). Either way the second request got no reply.
+        let second = reader.read_line(&mut rest);
+        assert!(
+            matches!(&second, Ok(0))
+                || matches!(&second, Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset),
+            "the second request on the same connection must get no reply (end of stream, or a reset): {second:?} {rest:?}"
+        );
+        assert!(
+            rest.is_empty(),
+            "no bytes may follow the first reply: {rest:?}"
         );
     }
 
