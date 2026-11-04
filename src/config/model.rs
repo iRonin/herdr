@@ -1721,6 +1721,9 @@ stop_timeout_ms = 5000
             ("-1", 0),
             ("11", 10),
             ("[1, 2]", 0),
+            // A datetime and an inline table reach the type as a map, not as a scalar.
+            ("1979-05-27", 0),
+            ("{ files = 3 }", 0),
         ] {
             let toml = format!("[session]\nlog_retained_files = {value}\nstop_timeout_ms = 5000\n");
             let config: Config = toml::from_str(&toml)

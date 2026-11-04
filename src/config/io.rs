@@ -245,7 +245,9 @@ pub fn config_diagnostic_summary(diagnostics: &[String]) -> Option<String> {
 /// The `[session] log_retained_files` setting, read straight from the config file for the logger. Logging starts before
 /// `Config::load` runs (and its first write can already rotate a log), so the loaded config arrives too late. A missing or
 /// unreadable file, a file that does not parse, or a missing key all give the default (0, upstream's behaviour); a bad
-/// value gets the same reading as in the loaded config, whose diagnostics report it.
+/// value gets the same reading as in the loaded config, whose diagnostics report it. A file that is valid TOML but
+/// fails another key's type check still gives the configured value here, although `Config::load` then uses the
+/// defaults for every setting: the logs matter most when the config is broken.
 pub fn startup_log_retained_files() -> usize {
     let Ok(Some(content)) = read_optional_config(&config_path()) else {
         return crate::logging::LogRetention::default().files();
@@ -1011,6 +1013,15 @@ ssh_config_files = ["~/.config/my host/ssh_config", "/etc/extra_config"]
         }
     }
 
+    /// An unreadable config path (here a directory) is not an error for the logger: it logs with the default.
+    #[test]
+    fn startup_log_retained_files_is_zero_when_the_config_path_is_a_directory() {
+        with_config_file(None, || {
+            std::fs::create_dir_all(config_path()).unwrap();
+            assert_eq!(startup_log_retained_files(), 0);
+        });
+    }
+
     /// A bad `log_retained_files` is reported for that key alone. Any other wrong type makes the startup load fall back
     /// to the defaults for EVERY setting (a parse error).
     #[test]
@@ -1032,6 +1043,23 @@ ssh_config_files = ["~/.config/my host/ssh_config", "/etc/extra_config"]
             let live = load_live_config().unwrap();
             assert_eq!(live.diagnostics, startup.diagnostics);
             assert!(live.invalid_sections.is_empty());
+        });
+
+        // A TOML date reaches the value type through the key capture `Config::load` runs for unknown-key reports, as a
+        // one-key map. It must come out as a bad value of this key alone, not as a parse error for the whole file.
+        let content = "[session]\nlog_retained_files = 1979-05-27\nstop_timeout_ms = 5000\n";
+        with_config_file(Some(content), || {
+            let startup = Config::load();
+            assert_eq!(startup.config.session.stop_timeout_ms, 5000);
+            assert_eq!(startup.config.session.log_retained_files.files(), 0);
+            assert_eq!(startup.diagnostics.len(), 1, "{:?}", startup.diagnostics);
+            assert!(
+                startup.diagnostics[0].starts_with(
+                    "session.log_retained_files must be an integer between 0 and 10 (got "
+                ),
+                "{:?}",
+                startup.diagnostics
+            );
         });
 
         with_config_file(Some("[session]\nlog_retained_files = 3\n"), || {

@@ -840,6 +840,13 @@ fn server_starts_and_keeps_no_copies_when_log_retained_files_is_bad() {
         !log_dir.join("herdr-server.log.1").exists(),
         "a bad value keeps no rotated copy"
     );
+    // The logger is installed before the config is loaded, and a parse failure is logged into this very file. A bad
+    // value of this one key must not turn into a whole-config parse error (every setting back to its default,
+    // including the program name the Pi agent is detected by).
+    assert!(
+        !current.contains("config parse error"),
+        "a bad log_retained_files must not make the server fall back to the defaults for every setting"
+    );
 
     cleanup_test_base(&base);
 }
