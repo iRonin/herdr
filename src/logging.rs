@@ -626,10 +626,14 @@ impl RotatingFileState {
                 rotated_log_path(&self.path, index - 1)
             };
             let target = rotated_log_path(&self.path, index);
-            if !source.exists() {
-                continue;
+            // No check for the source first: another process rotating the same file (every client shares
+            // `herdr-client.log`) can move it between a check and the rename. A source that is not there is
+            // already moved, and an error here would switch this process's logging off for good.
+            match fs::rename(source, target) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
             }
-            fs::rename(source, target)?;
         }
 
         self.current_size = 0;
@@ -753,6 +757,49 @@ mod tests {
             "older"
         );
         assert!(!path.exists());
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Another process rotating the same file (every client shares `herdr-client.log`) can move a generation away
+    /// just before this process renames it. A generation that is missing must be skipped, never turn into an error that
+    /// switches this process's logging off for good. (The race itself cannot be forced here; a rename that finds the
+    /// file gone is the same case as the gaps below, which this test pins.)
+    #[test]
+    fn rotate_files_survives_missing_generations() {
+        let path = temp_log_path("rotate-gap");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // `.1` is missing, `.2` is there, `.3` is missing: every rename in the chain meets a different case.
+        fs::write(&path, "current").unwrap();
+        fs::write(rotated_log_path(&path, 2), "two").unwrap();
+
+        let mut state = RotatingFileState {
+            path: path.clone(),
+            max_bytes: 128,
+            retained_files: 4,
+            file: None,
+            current_size: 0,
+            disabled: false,
+        };
+        state.rotate_files().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(rotated_log_path(&path, 1)).unwrap(),
+            "current"
+        );
+        assert!(!rotated_log_path(&path, 2).exists());
+        assert_eq!(
+            fs::read_to_string(rotated_log_path(&path, 3)).unwrap(),
+            "two"
+        );
+        assert!(!path.exists());
+
+        // Nothing at all to move (the current log is gone too): still no error.
+        state.rotate_files().unwrap();
+        assert_eq!(
+            fs::read_to_string(rotated_log_path(&path, 4)).unwrap(),
+            "two"
+        );
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
