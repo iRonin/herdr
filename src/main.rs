@@ -444,6 +444,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Zero uses the 15000ms default; values above 300000ms (5 minutes) are capped.
 # stop_timeout_ms = 15000
 
+# Rotated copies of herdr-server.log and herdr-client.log to keep (herdr-server.log.1,
+# .2, ...) when a log reaches its 5 MB limit. 0 keeps none: the full log is deleted.
+# The maximum is 10. Read when each herdr process starts.
+# log_retained_files = 0
+
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.
 # When true (default), herdr runs remote ssh through a generated config that

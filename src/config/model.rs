@@ -397,6 +397,9 @@ pub struct SessionConfig {
     /// The server-stop command treats zero as the default and caps larger values at 300000ms.
     #[serde(default = "default_stop_timeout_ms")]
     pub stop_timeout_ms: u64,
+    /// Rotated copies to keep beside herdr-server.log and herdr-client.log. Default: 0 (none, as upstream).
+    /// Read when each herdr process starts; a bad value is reported by `herdr config check` and keeps the other settings.
+    pub log_retained_files: crate::logging::LogRetention,
 }
 
 fn default_stop_timeout_ms() -> u64 {
@@ -409,6 +412,7 @@ impl Default for SessionConfig {
             resume_agents_on_restore: true,
             startup_per_agent_delay_ms: 100,
             stop_timeout_ms: default_stop_timeout_ms(),
+            log_retained_files: crate::logging::LogRetention::default(),
         }
     }
 }
@@ -1694,6 +1698,52 @@ stop_timeout_ms = 5000
         )
         .unwrap();
         assert_eq!(config.session.stop_timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn log_retained_files_defaults_to_none_as_upstream_and_parses() {
+        let default_config: Config = toml::from_str("").unwrap();
+        assert_eq!(default_config.session.log_retained_files.files(), 0);
+        assert_eq!(default_config.session.log_retained_files.problem(), None);
+        assert_eq!(Config::default().session.log_retained_files.files(), 0);
+
+        let config: Config = toml::from_str("[session]\nlog_retained_files = 3\n").unwrap();
+        assert_eq!(config.session.log_retained_files.files(), 3);
+        assert!(config.collect_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn a_bad_log_retained_files_value_parses_and_is_reported_as_a_diagnostic() {
+        for (value, kept) in [
+            ("\"many\"", 0),
+            ("true", 0),
+            ("2.5", 0),
+            ("-1", 0),
+            ("11", 10),
+            ("[1, 2]", 0),
+        ] {
+            let toml = format!("[session]\nlog_retained_files = {value}\nstop_timeout_ms = 5000\n");
+            let config: Config = toml::from_str(&toml)
+                .unwrap_or_else(|err| panic!("{value} must not fail the whole config: {err}"));
+            assert_eq!(config.session.log_retained_files.files(), kept, "{value}");
+            assert_eq!(config.session.stop_timeout_ms, 5000, "{value}");
+            let diagnostics = config.collect_diagnostics();
+            assert_eq!(diagnostics.len(), 1, "{value}: {diagnostics:?}");
+            assert!(
+                diagnostics[0].contains("session.log_retained_files"),
+                "{diagnostics:?}"
+            );
+            // `config_diagnostic_summary` words its notice from these phrases: a bad value for this one key must not
+            // claim that the defaults are in use.
+            assert!(
+                !diagnostics[0].contains("using defaults"),
+                "{diagnostics:?}"
+            );
+            assert!(
+                !diagnostics[0].contains("keeping current config"),
+                "{diagnostics:?}"
+            );
+        }
     }
 
     #[test]
