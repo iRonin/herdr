@@ -8,13 +8,83 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const DEFAULT_RETAINED_LOG_FILES: usize = 0;
+/// The most rotated copies `[session] log_retained_files` may keep beside each log file.
+pub(crate) const MAX_RETAINED_LOG_FILES: usize = 10;
+
+/// The `[session] log_retained_files` setting: how many rotated copies (`herdr-server.log.1`, `.2`, ...) to keep beside
+/// each of `herdr-server.log` and `herdr-client.log`. The default, 0, is upstream's behaviour: a log that reaches its
+/// size limit is deleted. Any value in the file deserializes: a bad one becomes a per-key problem (see `problem`) instead
+/// of a parse error, which would reset every setting in the file to its default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogRetention {
+    files: usize,
+    problem: Option<String>,
+}
+
+impl Default for LogRetention {
+    fn default() -> Self {
+        Self {
+            files: DEFAULT_RETAINED_LOG_FILES,
+            problem: None,
+        }
+    }
+}
+
+impl LogRetention {
+    /// The number of rotated copies to keep.
+    pub fn files(&self) -> usize {
+        self.files
+    }
+
+    /// What is wrong with the configured value, when something is. The value in use is named in the text.
+    pub fn problem(&self) -> Option<&str> {
+        self.problem.as_deref()
+    }
+
+    pub(crate) fn from_value(value: &toml::Value) -> Self {
+        let max = MAX_RETAINED_LOG_FILES;
+        match value {
+            toml::Value::Integer(count) if (0..=max as i64).contains(count) => Self {
+                files: *count as usize,
+                problem: None,
+            },
+            toml::Value::Integer(count) if *count > max as i64 => Self {
+                files: max,
+                problem: Some(format!(
+                    "session.log_retained_files = {count} is above the maximum of {max}; keeping {max} rotated copies"
+                )),
+            },
+            toml::Value::Integer(count) => Self {
+                files: DEFAULT_RETAINED_LOG_FILES,
+                problem: Some(format!(
+                    "session.log_retained_files = {count} must be between 0 and {max}; keeping no rotated copies"
+                )),
+            },
+            other => Self {
+                files: DEFAULT_RETAINED_LOG_FILES,
+                problem: Some(format!(
+                    "session.log_retained_files must be an integer between 0 and {max} (got {}); keeping no rotated copies",
+                    other.type_str()
+                )),
+            },
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for LogRetention {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        toml::Value::deserialize(deserializer).map(|value| Self::from_value(&value))
+    }
+}
 
 pub(crate) fn init_file_logging(file_name: &str) {
+    // Logging starts before `Config::load` runs, and a first write can already rotate the file, so the setting is read
+    // here from the config file itself rather than waiting for the loaded config.
     let Ok(make_writer) = RotatingFileMakeWriter::new(
         crate::session::data_dir(),
         file_name,
         DEFAULT_MAX_LOG_BYTES,
-        DEFAULT_RETAINED_LOG_FILES,
+        crate::config::startup_log_retained_files(),
     ) else {
         return;
     };
@@ -693,6 +763,57 @@ mod tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique).join("herdr.log")
+    }
+
+    fn retention_of(toml_value: &str) -> LogRetention {
+        let table: toml::Table = format!("value = {toml_value}").parse().unwrap();
+        LogRetention::from_value(&table["value"])
+    }
+
+    #[test]
+    fn log_retention_defaults_to_upstream_and_reads_zero_to_the_maximum() {
+        assert_eq!(LogRetention::default().files(), DEFAULT_RETAINED_LOG_FILES);
+        assert_eq!(DEFAULT_RETAINED_LOG_FILES, 0);
+        assert_eq!(LogRetention::default().problem(), None);
+        for count in 0..=MAX_RETAINED_LOG_FILES {
+            let retention = retention_of(&count.to_string());
+            assert_eq!(retention.files(), count);
+            assert_eq!(retention.problem(), None);
+        }
+    }
+
+    #[test]
+    fn log_retention_turns_a_bad_value_into_a_problem_naming_what_is_kept() {
+        let above = retention_of("11");
+        assert_eq!(above.files(), MAX_RETAINED_LOG_FILES);
+        assert_eq!(
+            above.problem(),
+            Some("session.log_retained_files = 11 is above the maximum of 10; keeping 10 rotated copies")
+        );
+
+        let negative = retention_of("-4");
+        assert_eq!(negative.files(), 0);
+        assert_eq!(
+            negative.problem(),
+            Some("session.log_retained_files = -4 must be between 0 and 10; keeping no rotated copies")
+        );
+
+        for (value, kind) in [
+            ("\"3\"", "string"),
+            ("true", "boolean"),
+            ("1.5", "float"),
+            ("[1]", "array"),
+        ] {
+            let bad = retention_of(value);
+            assert_eq!(bad.files(), 0, "{value}");
+            assert_eq!(
+                bad.problem().map(str::to_string),
+                Some(format!(
+                    "session.log_retained_files must be an integer between 0 and 10 (got {kind}); keeping no rotated copies"
+                )),
+                "{value}"
+            );
+        }
     }
 
     #[test]

@@ -573,6 +573,69 @@ new_tabb = "ctrl+t"
     cleanup_test_base(&base);
 }
 
+/// `[session] log_retained_files` keeps rotated copies of the logs. A bad value there must be reported for that key alone:
+/// a parse error would make herdr fall back to the defaults for every setting in the file, and one of them can be the
+/// program name herdr detects the Pi agent by.
+#[test]
+fn config_check_accepts_log_retained_files_and_reports_a_bad_value_for_that_key_alone() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let config_dir = config_home.join(app_dir_name());
+    fs::create_dir_all(&config_dir).unwrap();
+    let check = |config: &str| {
+        fs::write(config_dir.join("config.toml"), config).unwrap();
+        let output = run_named_cli(&config_home, &runtime_dir, &["config", "check"]);
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    };
+
+    for good in ["0", "3", "10"] {
+        let (code, stdout) = check(&format!("[session]\nlog_retained_files = {good}\n"));
+        assert_eq!(code, Some(0), "log_retained_files = {good}: {stdout}");
+        assert!(stdout.contains("config: ok"), "{stdout}");
+    }
+
+    for (bad, expected) in [
+        (
+            "\"many\"",
+            "session.log_retained_files must be an integer between 0 and 10 (got string)",
+        ),
+        (
+            "2.5",
+            "session.log_retained_files must be an integer between 0 and 10 (got float)",
+        ),
+        (
+            "-1",
+            "session.log_retained_files = -1 must be between 0 and 10",
+        ),
+        (
+            "50",
+            "session.log_retained_files = 50 is above the maximum of 10",
+        ),
+    ] {
+        let (code, stdout) = check(&format!(
+            "[session]\nlog_retained_files = {bad}\nstop_timeout_ms = 5000\n[agent]\npi_program = \"custom-pi\"\n"
+        ));
+        assert_eq!(code, Some(1), "log_retained_files = {bad}: {stdout}");
+        assert!(stdout.contains(expected), "{bad}: {stdout}");
+        // A known key with a bad value is a diagnostic of its own, not an unknown key and not a failed parse that
+        // resets every other setting.
+        assert!(!stdout.contains("unknown config key"), "{bad}: {stdout}");
+        assert!(!stdout.contains("using defaults"), "{bad}: {stdout}");
+        assert!(!stdout.contains("parse error"), "{bad}: {stdout}");
+        assert_eq!(
+            stdout.lines().count(),
+            2,
+            "one issue and nothing else: {stdout}"
+        );
+    }
+
+    cleanup_test_base(&base);
+}
+
 #[test]
 fn config_check_reports_unknown_theme_names() {
     let base = unique_test_dir();

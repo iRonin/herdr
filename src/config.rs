@@ -13,8 +13,8 @@ mod write;
 pub use self::{
     io::{
         config_diagnostic_summary, config_dir, config_path, load_live_config,
-        remove_keybinding_config_sections, remove_section_key, state_dir, upsert_section_bool,
-        upsert_section_value,
+        remove_keybinding_config_sections, remove_section_key, startup_log_retained_files,
+        state_dir, upsert_section_bool, upsert_section_value,
     },
     keybinds::{
         format_key_combo, normalize_key_combo, terminal_key_matches_combo, ActionKeybinds,
@@ -125,6 +125,12 @@ impl Config {
             .chain(window_title_diagnostics(&self.ui.window_title))
             .chain(self.invalid_sidebar_bounds_diagnostic())
             .chain(self.invalid_headless_size_diagnostic())
+            .chain(
+                self.session
+                    .log_retained_files
+                    .problem()
+                    .map(str::to_string),
+            )
             .collect()
     }
 
