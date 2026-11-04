@@ -305,13 +305,33 @@ pub(crate) fn ignore_server_hangup() {
 }
 
 /// Routes SIGINT and SIGTERM to `on_quit`, and logs SIGHUP without stopping.
+///
+/// The signals are watched with their origin when that works (see `signal_origin`): each one is logged with the process
+/// that sent it before `on_quit` runs. When the origin watcher cannot start, tokio's signal streams do the same routing
+/// without the sender. Either way the server logs `server.signal.handler.installed` once the signals are caught: before
+/// that a signal takes the default action and ends the server without a log line, so a client that must not race the setup
+/// (the signal tests) waits for it.
 pub(crate) fn spawn_server_signal_monitor(
     on_quit: impl Fn(super::ServerQuitSignal) + Send + Sync + 'static,
+) {
+    let on_quit: std::sync::Arc<dyn Fn(super::ServerQuitSignal) + Send + Sync> =
+        std::sync::Arc::new(on_quit);
+    if !super::signal_origin::spawn(on_quit.clone()) {
+        spawn_tokio_signal_streams(on_quit);
+    }
+    tracing::info!(
+        event = "server.signal.handler.installed",
+        subsystem = "server",
+        "stop signals are caught and logged"
+    );
+}
+
+fn spawn_tokio_signal_streams(
+    on_quit: std::sync::Arc<dyn Fn(super::ServerQuitSignal) + Send + Sync>,
 ) {
     use tokio::signal::unix::{signal, SignalKind};
     use tracing::{info, warn};
 
-    let on_quit = std::sync::Arc::new(on_quit);
     for (kind, quit_signal) in [
         (SignalKind::interrupt(), super::ServerQuitSignal::Interrupt),
         (SignalKind::terminate(), super::ServerQuitSignal::Terminate),

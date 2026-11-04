@@ -463,6 +463,8 @@ mod remote_bridge;
 #[cfg(all(test, unix))]
 mod remote_bridge_tests;
 #[cfg(unix)]
+mod signal_origin;
+#[cfg(unix)]
 mod unix_common;
 /// Other Unix platforms keep their existing input admission policy.
 /// Their _PC_MAX_CANON values need not describe the actual queue capacity.

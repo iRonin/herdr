@@ -63,6 +63,11 @@ portable-pty = { path = "vendor/portable-pty" }
 zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+[target.'cfg(unix)'.dependencies]
+# Which signal reached the server and who sent it (SIGINT, SIGTERM, SIGHUP): the origin of a signal, with the sender's
+# process id and user id. "extended-siginfo" compiles a small C helper.
+signal-hook = { version = "0.3", features = ["extended-siginfo"] }
+
 [target.'cfg(windows)'.dependencies]
 # UTF-16 SDDL input for interprocess security descriptors.
 widestring = "1.2"

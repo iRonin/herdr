@@ -617,6 +617,13 @@ fn server_survives_hangup_and_logs_why_it_stops() {
     let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
     let pid = spawned.child.process_id().expect("server pid") as libc::pid_t;
+    // The API socket accepts connections before the server catches its stop signals. A signal sent in between takes the
+    // default action and ends the server with no log line, so wait for the line the server writes once they are caught.
+    wait_for_log_line(
+        &server_log_path(&config_home),
+        "server.signal.handler.installed",
+        Duration::from_secs(20),
+    );
 
     assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
     // Closing the terminal hangs up the server's whole session too.
@@ -925,6 +932,182 @@ fn server_stop_over_the_api_logs_the_process_that_asked() {
             && shutdown.contains("process group")
             && shutdown.contains(&expected_cmd),
         "the shutdown line must name the process that asked, its group and its command line: {shutdown}"
+    );
+
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+/// Waits until the server log holds a line with `needle`; panics with the log when it does not within the timeout.
+fn wait_for_server_log_line(config_home: &Path, needle: &str, timeout: Duration) {
+    wait_for_log_line(&server_log_path(config_home), needle, timeout);
+}
+
+/// A signal that reaches the server must be logged with its name and its sender. SIGINT and SIGTERM still stop the
+/// server; SIGHUP is ignored and the server keeps running. The sender is a shell this test starts, so its process id is
+/// known here; the shell stays alive for a moment after the signal so its command line can still be read. The line must
+/// come before the shutdown starts.
+fn assert_signal_is_logged_with_its_sender(signal: &str, name: &str, stops_the_server: bool) {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    let server_pid = spawned.child.process_id().expect("server pid");
+    // The sockets accept connections before the server catches its stop signals (that happens when the event loop
+    // starts). A signal sent in between takes the default action and kills the server with no log line, so wait for the
+    // line the server writes once the signals are caught.
+    wait_for_server_log_line(
+        &config_home,
+        "server.signal.handler.installed",
+        Duration::from_secs(20),
+    );
+
+    let mut sender = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -{signal} {server_pid}; sleep 2"))
+        .spawn()
+        .expect("spawn the sending shell");
+    let sender_pid = sender.id();
+
+    if stops_the_server {
+        assert!(
+            wait_for_server_exit(&mut spawned, Duration::from_secs(10)),
+            "{name} must still stop the server"
+        );
+    } else {
+        wait_for_server_log_line(
+            &config_home,
+            "server.signal.received",
+            Duration::from_secs(10),
+        );
+        assert!(
+            !wait_for_server_exit(&mut spawned, Duration::from_millis(500)),
+            "{name} must not stop the server"
+        );
+        assert!(ping_socket(&api_socket).contains("pong"));
+    }
+    let _ = sender.kill();
+    let _ = sender.wait();
+
+    let log = server_log(&config_home);
+    let lines: Vec<&str> = log.lines().collect();
+    let signal_at = lines
+        .iter()
+        .position(|line| line.contains("server.signal.received"))
+        .unwrap_or_else(|| panic!("the server log has no line about the signal:\n{log}"));
+    let line = lines[signal_at];
+    assert!(
+        line.contains(&format!("signal=\"{name}\"")),
+        "the line must name the signal {name}: {line}"
+    );
+    assert!(
+        line.contains(&format!("sender_pid={sender_pid} ")),
+        "the line must name the process that sent it ({sender_pid}): {line}"
+    );
+    assert!(
+        line.contains(&format!("sender_uid={} ", unsafe { libc::getuid() })),
+        "the line must carry the sender's user id: {line}"
+    );
+    assert!(
+        line.contains(&format!("kill -{signal}")),
+        "the line must carry the sender's command line: {line}"
+    );
+    assert!(
+        line.contains(if stops_the_server {
+            "outcome=\"quitting\""
+        } else {
+            "outcome=\"ignored\""
+        }),
+        "the line must say what the server does with the signal: {line}"
+    );
+    if stops_the_server {
+        let shutdown_at = lines
+            .iter()
+            .position(|line| line.contains("server shutdown initiated"))
+            .unwrap_or_else(|| panic!("the server did not shut down gracefully:\n{log}"));
+        assert!(
+            signal_at < shutdown_at,
+            "the signal must be logged before the shutdown starts:\n{log}"
+        );
+        assert!(
+            lines[shutdown_at].contains(&format!("reason={name}")),
+            "the shutdown line must name the signal: {}",
+            lines[shutdown_at]
+        );
+    }
+
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn sigterm_to_the_server_is_logged_with_its_sender() {
+    assert_signal_is_logged_with_its_sender("TERM", "SIGTERM", true);
+}
+
+#[test]
+fn sigint_to_the_server_is_logged_with_its_sender() {
+    assert_signal_is_logged_with_its_sender("INT", "SIGINT", true);
+}
+
+/// SIGHUP is ignored (the server outlives its terminal), and it is logged with its sender like the stop signals.
+#[test]
+fn sighup_to_the_server_is_logged_with_its_sender_and_the_server_keeps_running() {
+    assert_signal_is_logged_with_its_sender("HUP", "SIGHUP", false);
+}
+
+/// A signal queued with `sigqueue` carries the sender's own process id and user id: the kernel passes them through
+/// unchecked for a queued signal, so the sender can name any process. The log line must therefore say how the signal
+/// was sent (`cause="Sent(Queue)"`), so that a reader can tell such a line from an ordinary `kill`. macOS has no
+/// `sigqueue`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_queued_signal_is_logged_as_sent_by_queue() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    wait_for_server_log_line(
+        &config_home,
+        "server.signal.handler.installed",
+        Duration::from_secs(20),
+    );
+    let server_pid = spawned.child.process_id().expect("server pid");
+
+    let value = libc::sigval {
+        sival_ptr: std::ptr::null_mut(),
+    };
+    let queued = unsafe { libc::sigqueue(server_pid as libc::pid_t, libc::SIGTERM, value) };
+    assert_eq!(queued, 0, "sigqueue to the server must succeed");
+
+    assert!(
+        wait_for_server_exit(&mut spawned, Duration::from_secs(10)),
+        "a queued SIGTERM must still stop the server"
+    );
+    let log = server_log(&config_home);
+    let line = log
+        .lines()
+        .find(|line| line.contains("server.signal.received"))
+        .unwrap_or_else(|| panic!("the server log has no line about the signal:\n{log}"));
+    assert!(
+        line.contains("signal=\"SIGTERM\""),
+        "the line must name the signal: {line}"
+    );
+    assert!(
+        line.contains("cause=\"Sent(Queue)\""),
+        "the line must say the signal was queued, not sent with kill: {line}"
     );
 
     drop(spawned);

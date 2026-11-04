@@ -319,6 +319,62 @@ pub(crate) fn server_stop_requested(requester: Option<&StopRequester>) {
     }
 }
 
+/// A signal that reached the server: its name, whether it makes the server quit (SIGINT and SIGTERM do, SIGHUP is
+/// ignored), who sent it (process id and user id, with the sender's command line) and the kernel's reason for it. Logged
+/// at INFO before the server is asked to quit. `sender` is `None` for a signal the kernel made itself (the hangup of a
+/// closed terminal), which has no sending process.
+#[cfg(unix)]
+pub(crate) fn server_signal_received(
+    signal: &str,
+    quitting: bool,
+    sender: Option<(u32, u32)>,
+    cause: &str,
+) {
+    let outcome = if quitting { "quitting" } else { "ignored" };
+    match (sender, quitting) {
+        (Some((pid, uid)), true) => tracing::info!(
+            event = "server.signal.received",
+            subsystem = "server",
+            outcome,
+            signal,
+            sender_pid = pid,
+            sender_uid = uid,
+            sender_cmd = %describe_process_command(pid),
+            cause,
+            "signal received; the server is shutting down"
+        ),
+        (Some((pid, uid)), false) => tracing::info!(
+            event = "server.signal.received",
+            subsystem = "server",
+            outcome,
+            signal,
+            sender_pid = pid,
+            sender_uid = uid,
+            sender_cmd = %describe_process_command(pid),
+            cause,
+            "signal received; the server keeps running"
+        ),
+        (None, true) => tracing::info!(
+            event = "server.signal.received",
+            subsystem = "server",
+            outcome,
+            signal,
+            sender_pid = "none",
+            cause,
+            "signal received from no process (the kernel); the server is shutting down"
+        ),
+        (None, false) => tracing::info!(
+            event = "server.signal.received",
+            subsystem = "server",
+            outcome,
+            signal,
+            sender_pid = "none",
+            cause,
+            "signal received from no process (the kernel); the server keeps running"
+        ),
+    }
+}
+
 pub(crate) fn api_request_failed(request_id: &str, method: &'static str, err: &str) {
     tracing::warn!(
         event = "api.request.fail",
