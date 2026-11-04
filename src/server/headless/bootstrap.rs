@@ -10,6 +10,14 @@ pub fn run_server() -> io::Result<()> {
     if let Some(warning) = launcher_warning {
         warn!("{warning}");
     }
+    if let Some(keeper_pid) = crate::platform::launcher_keeper_pid() {
+        info!(
+            event = "server.launchd.keeper",
+            subsystem = "server",
+            keeper_pid,
+            "the launchd job process stays while this server runs"
+        );
+    }
     match process_context {
         Ok(true) => info!("server using persistent user service context"),
         Ok(false) => {}
