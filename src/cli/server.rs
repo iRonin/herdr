@@ -59,6 +59,14 @@ fn server_restart(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     }
 
+    // The restart stops the server first and attaches last, and the attach refuses without a usable
+    // terminal (#4395). Check for one before the stop, so a run without a terminal leaves the server
+    // running instead of stopped.
+    if let Err(message) = restart_terminal_check(crate::platform::terminal_grid_size()) {
+        eprintln!("{message}");
+        return Ok(1);
+    }
+
     let config = crate::config::Config::load().config;
     match restart_server_with(
         &config,
@@ -86,6 +94,14 @@ fn server_restart(args: &[String]) -> std::io::Result<i32> {
             Ok(1)
         }
     }
+}
+
+fn restart_terminal_check(grid: std::io::Result<(u16, u16)>) -> Result<(), String> {
+    grid.map(|_| ()).map_err(|err| {
+        format!(
+            "server restart aborted: cannot attach without a usable terminal: {err}; run it inside a terminal.\nThe server was not restarted."
+        )
+    })
 }
 
 fn restart_server_with(
@@ -402,6 +418,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(*events.borrow(), ["stop", "start-and-attach"]);
+    }
+
+    #[test]
+    fn server_restart_without_a_terminal_is_refused_before_the_stop() {
+        // The stop closure of `restart_server_with` is never reached on this path: the check runs in
+        // `server_restart` before it. What this pins is the message and that an unusable terminal is
+        // an error at all, so the restart cannot stop a server it can no longer start and attach.
+        let refused = restart_terminal_check(Err(std::io::Error::other("not a tty"))).unwrap_err();
+        assert!(
+            refused.contains("cannot attach without a usable terminal"),
+            "{refused}"
+        );
+        assert!(refused.contains("not a tty"), "{refused}");
+        assert!(
+            refused.contains("The server was not restarted."),
+            "{refused}"
+        );
+        assert!(restart_terminal_check(Ok((80, 24))).is_ok());
     }
 
     #[test]
