@@ -210,6 +210,115 @@ fn is_routine_api_method(method: &str) -> bool {
     )
 }
 
+/// The longest a log line waits for a process's command line. Reading it takes the other process's memory-map lock on
+/// Linux and a kernel call on macOS; if that process is stuck in an uninterruptible wait while holding it, the read waits
+/// too. A stop or a signal must never wait on that.
+const COMMAND_LINE_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// A process, as a log field: its command line quoted and cut, "unknown" when it cannot be read (the process may
+/// already be gone), or "unavailable" when the read did not finish within `COMMAND_LINE_WAIT`. Quoted so a command line
+/// with a newline cannot forge a log line.
+pub(crate) fn describe_process_command(pid: u32) -> String {
+    describe_process_command_with(
+        pid,
+        COMMAND_LINE_WAIT,
+        crate::platform::process_command_line,
+    )
+}
+
+/// The read runs on a short-lived helper thread so that the caller can give up on it. A read that never finishes
+/// leaves that one thread behind; the caller carries on.
+fn describe_process_command_with(
+    pid: u32,
+    limit: std::time::Duration,
+    read: impl FnOnce(u32) -> Option<String> + Send + 'static,
+) -> String {
+    const MAX_CHARS: usize = 300;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("herdr-cmdline".into())
+        .spawn(move || {
+            let _ = tx.send(read(pid));
+        });
+    if spawned.is_err() {
+        return "unavailable".to_string();
+    }
+    match rx.recv_timeout(limit) {
+        Ok(Some(command)) => {
+            let cut: String = command.chars().take(MAX_CHARS).collect();
+            format!("{cut:?}")
+        }
+        Ok(None) => "unknown".to_string(),
+        Err(_) => "unavailable".to_string(),
+    }
+}
+
+/// The process on the other end of a `server.stop` request, as the kernel reports it for the connection (not anything
+/// the sender claims): its id, process group and command line. Every part is best effort.
+pub(crate) struct StopRequester {
+    pid: u32,
+    process_group: Option<u32>,
+    command: String,
+}
+
+impl StopRequester {
+    pub(crate) fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            process_group: process_group_of(pid),
+            command: describe_process_command(pid),
+        }
+    }
+
+    /// The stop reason the server logs when shutdown begins: the platform's description of the sender (its name and
+    /// parent), when it has one, followed by the process group and the command line.
+    pub(crate) fn describe(&self, platform_description: Option<String>) -> String {
+        let who = platform_description.unwrap_or_else(|| format!("pid {}", self.pid));
+        match self.process_group {
+            Some(group) => format!("{who}, process group {group}, command {}", self.command),
+            None => format!("{who}, command {}", self.command),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_group_of(pid: u32) -> Option<u32> {
+    let group = unsafe { libc::getpgid(pid as libc::pid_t) };
+    (group > 0).then_some(group as u32)
+}
+
+#[cfg(not(unix))]
+fn process_group_of(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// Who asked the server to stop. Logged at INFO when the request arrives, BEFORE the stop flag is set, so the line is
+/// there even when the stop finishes the process at once. `server.stop` is not a UI-changing method, so the generic
+/// request log records it at DEBUG only, and the shutdown line names the reason only once shutdown begins. Best effort: an
+/// unknown sender never fails the stop.
+pub(crate) fn server_stop_requested(requester: Option<&StopRequester>) {
+    match requester {
+        Some(requester) => tracing::info!(
+            event = "server.stop.requested",
+            subsystem = "server",
+            outcome = "accepted",
+            requester_pid = requester.pid,
+            requester_pgid = requester
+                .process_group
+                .map_or_else(|| "unknown".to_string(), |group| group.to_string()),
+            requester_cmd = %requester.command,
+            "server stop requested over the api"
+        ),
+        None => tracing::info!(
+            event = "server.stop.requested",
+            subsystem = "server",
+            outcome = "accepted",
+            requester_pid = "unknown",
+            "server stop requested over the api; the sender could not be identified"
+        ),
+    }
+}
+
 pub(crate) fn api_request_failed(request_id: &str, method: &'static str, err: &str) {
     tracing::warn!(
         event = "api.request.fail",
@@ -720,6 +829,54 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    /// A stop or a signal logs the sender's command line, and reading it can block for as long as the sender is stuck in
+    /// the kernel (the other process's memory-map lock on Linux). The caller must give up after the limit and say so,
+    /// instead of holding up the stop.
+    #[test]
+    fn a_command_line_read_that_does_not_finish_never_holds_up_the_log_line() {
+        let started = std::time::Instant::now();
+        let described =
+            describe_process_command_with(1, std::time::Duration::from_millis(100), |_| {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                Some("too late".to_string())
+            });
+        assert_eq!(described, "unavailable");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the log line waited {:?} for a read that was given 100 ms",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_command_line_that_is_read_in_time_is_quoted_and_a_missing_one_is_unknown() {
+        let limit = std::time::Duration::from_secs(10);
+        assert_eq!(
+            describe_process_command_with(1, limit, |_| Some("sleep \"30\"\nforged".to_string())),
+            "\"sleep \\\"30\\\"\\nforged\""
+        );
+        assert_eq!(describe_process_command_with(1, limit, |_| None), "unknown");
+    }
+
+    #[test]
+    fn a_stop_reason_names_the_platform_description_then_group_and_command() {
+        let requester = StopRequester {
+            pid: 42,
+            process_group: Some(40),
+            command: "\"herdr status\"".into(),
+        };
+        assert_eq!(
+            requester.describe(Some("pid 42 (herdr), parent pid 7 (zsh)".into())),
+            "pid 42 (herdr), parent pid 7 (zsh), process group 40, command \"herdr status\""
+        );
+        let unknown_group = StopRequester {
+            pid: 42,
+            process_group: None,
+            command: "unknown".into(),
+        };
+        assert_eq!(unknown_group.describe(None), "pid 42, command unknown");
     }
 
     #[test]

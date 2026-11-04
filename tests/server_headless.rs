@@ -850,3 +850,83 @@ fn server_starts_and_keeps_no_copies_when_log_retained_files_is_bad() {
 
     cleanup_test_base(&base);
 }
+
+/// The server's own log, read whole: where it says why it stopped.
+fn server_log(config_home: &Path) -> String {
+    fs::read_to_string(server_log_path(config_home)).unwrap_or_default()
+}
+
+/// Servers have "stopped with no request in the log". The generic request log records `server.stop` at DEBUG only, so
+/// an API stop left nothing at the default level. The server must say who asked when the request arrives, and the sender
+/// is identified by the kernel (the peer credentials of the connection), not by anything the sender claims. The line that
+/// begins the shutdown carries the same sender.
+#[test]
+fn server_stop_over_the_api_logs_the_process_that_asked() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+
+    // A process this test starts, so its id is known here: the stop command of the CLI.
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"));
+    support::sanitize_herdr_env_command(&mut command);
+    command
+        .args(["server", "stop"])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("HERDR_SOCKET_PATH", &api_socket)
+        .env_remove("HERDR_CLIENT_SOCKET_PATH")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut requester = command.spawn().expect("spawn the stop command");
+    let requester_pid = requester.id();
+    let _ = requester.wait();
+
+    assert!(
+        wait_for_server_exit(&mut spawned, Duration::from_secs(10)),
+        "the server must stop when asked"
+    );
+    let log = server_log(&config_home);
+    let line = log
+        .lines()
+        .find(|line| line.contains("server.stop.requested"))
+        .unwrap_or_else(|| panic!("the server log has no line about the stop request:\n{log}"));
+    assert!(
+        line.contains(&format!("requester_pid={requester_pid} ")),
+        "the stop line must name the process that asked ({requester_pid}): {line}"
+    );
+    // The command line is the field's own value. A bare search for "server stop" in the line proves nothing: the
+    // event's message ("server stop requested over the api") contains it, so it passed with `requester_cmd=unknown`.
+    let requester_cmd = line
+        .split("requester_cmd=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or_else(|| panic!("the stop line must carry a quoted requester_cmd: {line}"));
+    let expected_cmd = format!("{} server stop", env!("CARGO_BIN_EXE_herdr"));
+    assert_eq!(
+        requester_cmd, expected_cmd,
+        "the stop line must carry the sender's command line: {line}"
+    );
+
+    // The line that begins the shutdown names the same sender: its id, process group and command line.
+    let shutdown = log
+        .lines()
+        .find(|line| line.contains("server shutdown initiated"))
+        .unwrap_or_else(|| panic!("the server log has no shutdown line:\n{log}"));
+    assert!(
+        shutdown.contains(&format!("pid {requester_pid}"))
+            && shutdown.contains("process group")
+            && shutdown.contains(&expected_cmd),
+        "the shutdown line must name the process that asked, its group and its command line: {shutdown}"
+    );
+
+    drop(spawned);
+    cleanup_test_base(&base);
+}

@@ -139,6 +139,17 @@ pub(crate) fn local_stream_peer_description(_stream: &crate::ipc::LocalStream) -
     None
 }
 
+#[cfg(not(unix))]
+pub(crate) fn local_stream_peer_pid(_stream: &crate::ipc::LocalStream) -> Option<u32> {
+    None
+}
+
+/// The command line of `pid`, for a log line. Only Linux and macOS can read another process's arguments.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn process_command_line(_pid: u32) -> Option<String> {
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,
@@ -445,6 +456,8 @@ pub(crate) struct RemoteSshConfigPaths {
 pub(crate) const REMOTE_BRIDGE_IDLE_TIMEOUT_SUPPORTED: bool =
     cfg!(any(target_os = "linux", target_os = "macos"));
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod command_line_tests;
 #[cfg(unix)]
 mod remote_bridge;
 #[cfg(all(test, unix))]
@@ -472,7 +485,8 @@ pub(crate) mod unix_image_files;
 #[cfg(unix)]
 pub(crate) use unix_common::{
     begin_cli_output, end_cli_output, forward_remote_bridge_stdio, ignore_server_hangup,
-    local_stream_peer_description, spawn_server_signal_monitor, RemoteBridgeWake,
+    local_stream_peer_description, local_stream_peer_pid, spawn_server_signal_monitor,
+    RemoteBridgeWake,
 };
 
 mod client_state;

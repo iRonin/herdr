@@ -488,9 +488,17 @@ fn handle_connection_with_stop(
         }
         method_body => {
             let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
-            let stop_caller = matches!(method_body, Method::ServerStop(_))
-                .then(|| crate::platform::local_stream_peer_description(&stream))
-                .flatten();
+            // Who asked is read from the connection's kernel credentials, and logged here, when the request
+            // arrives: the shutdown line names the reason only once shutdown begins.
+            let stop_caller = matches!(method_body, Method::ServerStop(_)).then(|| {
+                let requester = crate::platform::local_stream_peer_pid(&stream)
+                    .map(crate::logging::StopRequester::new);
+                crate::logging::server_stop_requested(requester.as_ref());
+                requester.map(|requester| {
+                    requester.describe(crate::platform::local_stream_peer_description(&stream))
+                })
+            });
+            let stop_caller = stop_caller.flatten();
             let response = handle_request(
                 Request {
                     id: request_id.clone(),
