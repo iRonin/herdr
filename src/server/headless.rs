@@ -3764,6 +3764,14 @@ fn install_signal_origin_handler(
         });
     if let Err(err) = &spawned {
         warn!(%err, "cannot start the signal thread; using the plain handler");
+    } else {
+        // From here a stop signal is caught, not fatal. Until it exists a signal gets the default action and kills the
+        // server with no log line, so a client that must not race the setup (the signal tests) waits for this line.
+        info!(
+            event = "server.signal.handler.installed",
+            subsystem = "server",
+            "stop signals are watched and logged with their sender"
+        );
     }
     spawned.is_ok()
 }

@@ -172,6 +172,21 @@ fn server_log(config_home: &Path) -> String {
     fs::read_to_string(config_home.join(app_dir).join("herdr-server.log")).unwrap_or_default()
 }
 
+/// Waits until the server log holds a line with `needle`; panics with the log when it does not within the timeout.
+fn wait_for_server_log_line(config_home: &Path, needle: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if server_log(config_home).contains(needle) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "the server log has no line with {needle:?} after {timeout:?}:\n{}",
+        server_log(config_home)
+    );
+}
+
 /// Waits until the pty child (the server) has exited; false when it is still running at the deadline.
 fn wait_for_server_exit(spawned: &mut SpawnedHerdr, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
@@ -658,6 +673,14 @@ fn assert_signal_is_logged_with_its_sender(signal: &str, name: &str) {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_file(&client_socket, Duration::from_secs(10));
     let server_pid = spawned.child.process_id().expect("server pid");
+    // The client socket accepts connections before the server's signal watcher exists (the watcher is set up when the
+    // event loop starts). A signal sent in between takes the default action and kills the server with no log line, so
+    // wait for the line the server writes once the watcher is registered.
+    wait_for_server_log_line(
+        &config_home,
+        "server.signal.handler.installed",
+        Duration::from_secs(20),
+    );
 
     let mut sender = std::process::Command::new("sh")
         .arg("-c")
