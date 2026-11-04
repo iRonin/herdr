@@ -7,6 +7,16 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// A shell inside a herdr pane exports HERDR_* variables, and HERDR_SOCKET_PATH names the developer's live
+/// server: strip every inherited one, then set the few a test means to pass.
+fn sanitize_herdr_env(command: &mut Command) {
+    for (key, _) in std::env::vars() {
+        if key.starts_with("HERDR_") {
+            command.env_remove(&key);
+        }
+    }
+}
+
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -124,21 +134,16 @@ async fn host_shutdown_saves_layout_before_releasing_delay_lock() {
     let socket = base.join("herdr-dev/sessions/shutdown/herdr.sock");
     let config = base.join("config.toml");
     std::fs::write(&config, "onboarding = false\n[experimental]\nallow_nested = true\n[terminal]\ndefault_shell = \"/bin/sh\"\n").unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    sanitize_herdr_env(&mut command);
     let mut server = ChildGuard(
-        Command::new(env!("CARGO_BIN_EXE_herdr"))
+        command
             .args(["--session", "shutdown", "server"])
             .env("XDG_CONFIG_HOME", &base)
             .env("XDG_STATE_HOME", &base)
             .env("XDG_RUNTIME_DIR", &base)
             .env("HERDR_CONFIG_PATH", &config)
-            .env_remove("HERDR_SOCKET_PATH")
             .env("DBUS_SYSTEM_BUS_ADDRESS", address.trim())
-            .env_remove("HERDR_CLIENT_SOCKET_PATH")
-            .env_remove("HERDR_STARTUP_CWD")
-            .env_remove("HERDR_SESSION")
-            .env_remove("HERDR_WORKSPACE_ID")
-            .env_remove("HERDR_TAB_ID")
-            .env_remove("HERDR_PANE_ID")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .spawn()
