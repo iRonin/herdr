@@ -25,6 +25,8 @@ pub(crate) fn configure_server_daemon_context(command: &mut Command) {
     // Older replacements also cannot consume this marker and would leak it.
     if command.get_args().any(|arg| arg == "--handoff-import") {
         command.env_remove(SERVER_CONTEXT_ENV);
+        // The replacement must keep this server's launchd keeper alive.
+        super::launchd_spawn::pass_keeper_to_handoff(command);
     } else {
         command.env(SERVER_CONTEXT_ENV, USER_CONTEXT);
     }

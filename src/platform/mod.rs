@@ -331,6 +331,17 @@ pub(crate) fn leave_launcher_job() -> Option<String> {
     None
 }
 
+/// The launchd job process kept alive while this server runs (macOS), if any.
+#[cfg(target_os = "macos")]
+pub(crate) fn launcher_keeper_pid() -> Option<u32> {
+    macos::launcher_keeper_pid()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn launcher_keeper_pid() -> Option<u32> {
+    None
+}
+
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn prepare_server_process(_handoff_import: bool) -> std::io::Result<bool> {
     Ok(false)
