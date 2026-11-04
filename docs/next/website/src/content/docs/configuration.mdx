@@ -672,3 +672,12 @@ Common log files:
 ```
 
 Logs rotate automatically. Include the current log and rotated siblings when reporting issues.
+
+A log rotates when it reaches 5 MB. By default the full log is deleted and no old copy is kept, so a busy server's log may reach back only about a day. To keep older lines, set how many rotated copies of `herdr-server.log` and `herdr-client.log` to keep:
+
+```toml
+[session]
+log_retained_files = 3
+```
+
+The copies sit beside the log as `herdr-server.log.1` (the newest), `herdr-server.log.2`, and so on. The default is `0`, which keeps none and changes nothing. The maximum is `10`, and larger values are capped, so the logs of one session can take up to 11 times 5 MB per file. A value that is not an integer from 0 to 10 is reported by `herdr config check`, keeps no copies, and leaves your other settings alone. The setting is read when each herdr process starts, so restart the server to apply it; clients pick it up the next time they start. Rotated copies hold whatever the log recorded, for as long as they are kept.
