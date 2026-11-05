@@ -542,6 +542,10 @@ impl HeadlessServer {
             self.stream_host_mouse_capture_mode();
             self.stream_direct_terminal_keyboard_mode();
 
+            // Every source of a pane read-state change for this turn has run (internal
+            // events, API requests, client input, scheduled tasks); report the net result.
+            self.app.sync_read_state_events();
+
             // 7. Render virtually and stream frames. Hidden-only PTY work keeps a
             // bounded classification cadence without delaying presentation work
             // that joins the same coalesced request.
@@ -3180,6 +3184,12 @@ impl HeadlessServer {
         };
 
         self.sync_foreground_client_state();
+        if matches!(&msg.request.method, api::schema::Method::PaneReadState(_)) {
+            // A change made earlier in this turn has not been reported yet. Report it
+            // before answering, so the value this request returns has already been
+            // announced and a subscriber that starts from it cannot miss a later change.
+            self.app.sync_read_state_events();
+        }
         if let Some(error) = self.agent_read_not_idle_error(&msg.request) {
             let response = serde_json::to_string(&api::schema::ErrorResponse {
                 id: msg.request.id.clone(),

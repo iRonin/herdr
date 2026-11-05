@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::common::{AgentStatus, ReadSource};
-use super::panes::{PaneInfo, PaneReadResult, PaneScrollInfo};
+use super::panes::{PaneInfo, PaneReadResult, PaneReadState, PaneScrollInfo};
 use super::tabs::TabInfo;
 use super::workspaces::WorkspaceInfo;
 use super::worktrees::WorktreeInfo;
@@ -80,6 +80,9 @@ pub enum Subscription {
     },
     #[serde(rename = "pane.scroll_changed")]
     PaneScrollChanged { pane_id: String },
+    /// Pushes the pane's `pane.read_state` value each time it changes.
+    #[serde(rename = "pane.read_state_changed")]
+    PaneReadStateChanged { pane_id: String },
     #[serde(rename = "layout.updated")]
     LayoutUpdated {},
 }
@@ -217,6 +220,7 @@ pub enum EventKind {
     PaneExited,
     PaneAgentDetected,
     PaneAgentStatusChanged,
+    PaneReadStateChanged,
     LayoutUpdated,
 }
 
@@ -248,6 +252,7 @@ impl EventKind {
             EventKind::PaneExited => "pane.exited",
             EventKind::PaneAgentDetected => "pane.agent_detected",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
+            EventKind::PaneReadStateChanged => "pane.read_state_changed",
             EventKind::LayoutUpdated => "layout.updated",
         }
     }
@@ -280,6 +285,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneExited,
     EventKind::PaneAgentDetected,
     EventKind::PaneAgentStatusChanged,
+    EventKind::PaneReadStateChanged,
     EventKind::LayoutUpdated,
 ];
 
@@ -354,6 +360,7 @@ mod known_event_name_tests {
         assert!(!names.contains(&"layout.updated"));
         assert!(!names.contains(&"workspace.metadata_updated"));
         assert!(!names.contains(&"pane.updated"));
+        assert!(!names.contains(&"pane.read_state_changed"));
         assert!(names.contains(&"pane.moved"));
     }
 }
@@ -370,6 +377,8 @@ pub enum SubscriptionEventKind {
     PaneOutputMatched,
     #[serde(rename = "pane.agent_status_changed")]
     PaneAgentStatusChanged,
+    #[serde(rename = "pane.read_state_changed")]
+    PaneReadStateChanged,
     #[serde(rename = "pane.scroll_changed")]
     ScrollChanged,
 }
@@ -384,6 +393,10 @@ pub struct SubscriptionEventEnvelope {
 #[serde(untagged)]
 pub enum SubscriptionEventData {
     PaneOutputMatched(PaneOutputMatchedEvent),
+    // Untagged variants are tried in order when decoding. A read-state body
+    // carries every field `PaneAgentStatusChangedEvent` requires, so it must be
+    // tried first: its `seen` field is what tells the two apart.
+    PaneReadStateChanged(PaneReadState),
     PaneAgentStatusChanged(PaneAgentStatusChangedEvent),
     ScrollChanged(PaneScrollChangedEvent),
 }
@@ -549,6 +562,11 @@ pub enum EventData {
         display_agent: Option<String>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         state_labels: HashMap<String, String>,
+    },
+    /// A pane's `pane.read_state` value changed. Delivered to subscribers as
+    /// `pane.read_state_changed`; it does not invoke plugin event hooks.
+    PaneReadStateChanged {
+        read_state: PaneReadState,
     },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,

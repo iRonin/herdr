@@ -4,6 +4,8 @@ mod event_fairness;
 mod native_graphics;
 #[path = "pane_move.rs"]
 mod pane_move_tests;
+#[path = "read_state.rs"]
+mod read_state_tests;
 #[path = "pane_graphics.rs"]
 mod retained_graphics_tests;
 #[path = "surface_delta.rs"]

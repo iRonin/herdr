@@ -709,6 +709,23 @@
               "type": "object"
             },
             {
+              "description": "A pane's `pane.read_state` value changed. Delivered to subscribers as\n`pane.read_state_changed`; it does not invoke plugin event hooks.",
+              "properties": {
+                "read_state": {
+                  "$ref": "#/schemas/event/$defs/PaneReadState"
+                },
+                "type": {
+                  "const": "pane_read_state_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "read_state"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "layout": {
                   "$ref": "#/schemas/event/$defs/PaneLayoutSnapshot"
@@ -753,6 +770,7 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "pane_read_state_changed",
             "layout_updated"
           ],
           "type": "string"
@@ -1000,6 +1018,30 @@
             "direction",
             "ratio",
             "rect"
+          ],
+          "type": "object"
+        },
+        "PaneReadState": {
+          "description": "A pane's read flag and displayed agent status from one server-side observation.",
+          "properties": {
+            "agent_status": {
+              "$ref": "#/schemas/event/$defs/AgentStatus"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "seen": {
+              "type": "boolean"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "workspace_id",
+            "seen",
+            "agent_status"
           ],
           "type": "object"
         },
@@ -4257,6 +4299,23 @@
               "type": "object"
             },
             {
+              "description": "Pushes the pane's `pane.read_state` value each time it changes.",
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane.read_state_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "type": {
                   "const": "layout.updated",
@@ -6456,6 +6515,30 @@
           ],
           "type": "object"
         },
+        "PaneReadState": {
+          "description": "A pane's read flag and displayed agent status from one server-side observation.",
+          "properties": {
+            "agent_status": {
+              "$ref": "#/schemas/subscription_event/$defs/AgentStatus"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "seen": {
+              "type": "boolean"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "workspace_id",
+            "seen",
+            "agent_status"
+          ],
+          "type": "object"
+        },
         "PaneScrollChangedEvent": {
           "properties": {
             "pane_id": {
@@ -6522,6 +6605,9 @@
               "$ref": "#/schemas/subscription_event/$defs/PaneOutputMatchedEvent"
             },
             {
+              "$ref": "#/schemas/subscription_event/$defs/PaneReadState"
+            },
+            {
               "$ref": "#/schemas/subscription_event/$defs/PaneAgentStatusChangedEvent"
             },
             {
@@ -6533,6 +6619,7 @@
           "enum": [
             "pane.output_matched",
             "pane.agent_status_changed",
+            "pane.read_state_changed",
             "pane.scroll_changed"
           ],
           "type": "string"
@@ -7438,6 +7525,23 @@
               "type": "object"
             },
             {
+              "description": "A pane's `pane.read_state` value changed. Delivered to subscribers as\n`pane.read_state_changed`; it does not invoke plugin event hooks.",
+              "properties": {
+                "read_state": {
+                  "$ref": "#/schemas/success_response/$defs/PaneReadState"
+                },
+                "type": {
+                  "const": "pane_read_state_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "read_state"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "layout": {
                   "$ref": "#/schemas/success_response/$defs/PaneLayoutSnapshot"
@@ -7497,6 +7601,7 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "pane_read_state_changed",
             "layout_updated"
           ],
           "type": "string"

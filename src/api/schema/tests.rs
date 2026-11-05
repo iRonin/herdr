@@ -567,6 +567,17 @@ fn event_envelope_round_trips() {
             },
         },
         EventEnvelope {
+            event: EventKind::PaneReadStateChanged,
+            data: EventData::PaneReadStateChanged {
+                read_state: PaneReadState {
+                    pane_id: "w_1-1".into(),
+                    workspace_id: "w_1".into(),
+                    seen: false,
+                    agent_status: AgentStatus::Blocked,
+                },
+            },
+        },
+        EventEnvelope {
             event: EventKind::LayoutUpdated,
             data: EventData::LayoutUpdated {
                 layout: PaneLayoutSnapshot {
@@ -705,6 +716,80 @@ fn scroll_changed_subscription_event_round_trips() {
     assert!(json.contains("\"event\":\"pane.scroll_changed\""));
     let restored: SubscriptionEventEnvelope = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, event);
+}
+
+#[test]
+fn read_state_subscription_parses_and_its_event_body_is_the_read_state_result() {
+    let request: Request = serde_json::from_str(
+        r#"{"id":"sub","method":"events.subscribe","params":{"subscriptions":[
+            {"type":"pane.read_state_changed","pane_id":"p_1_1"}]}}"#,
+    )
+    .unwrap();
+    let Method::EventsSubscribe(params) = request.method else {
+        panic!("wrong method parsed");
+    };
+    assert_eq!(
+        params.subscriptions,
+        vec![Subscription::PaneReadStateChanged {
+            pane_id: "p_1_1".into()
+        }]
+    );
+
+    let read_state = PaneReadState {
+        pane_id: "w_1-1".into(),
+        workspace_id: "w_1".into(),
+        seen: true,
+        agent_status: AgentStatus::Blocked,
+    };
+    let event = SubscriptionEventEnvelope {
+        event: SubscriptionEventKind::PaneReadStateChanged,
+        data: SubscriptionEventData::PaneReadStateChanged(read_state.clone()),
+    };
+    let json = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["event"], "pane.read_state_changed");
+    assert_eq!(
+        json["data"],
+        serde_json::to_value(&read_state).unwrap(),
+        "the event body is exactly the `pane.read_state` result"
+    );
+    let restored: SubscriptionEventEnvelope = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        restored, event,
+        "a read-state body must not decode as an agent-status body"
+    );
+
+    let status_event = SubscriptionEventEnvelope {
+        event: SubscriptionEventKind::PaneAgentStatusChanged,
+        data: SubscriptionEventData::PaneAgentStatusChanged(PaneAgentStatusChangedEvent {
+            pane_id: "w_1-1".into(),
+            workspace_id: "w_1".into(),
+            agent_status: AgentStatus::Blocked,
+            agent: None,
+            title: None,
+            display_agent: None,
+            state_labels: HashMap::new(),
+        }),
+    };
+    let restored: SubscriptionEventEnvelope =
+        serde_json::from_value(serde_json::to_value(&status_event).unwrap()).unwrap();
+    assert_eq!(restored, status_event);
+}
+
+#[test]
+fn unknown_subscription_types_are_refused_when_the_request_is_parsed() {
+    // A server without `pane.read_state_changed` parses subscriptions with this same
+    // strict, tagged enum, so it answers the new type with an error instead of
+    // starting a subscription that never delivers.
+    let err = serde_json::from_str::<Request>(
+        r#"{"id":"sub","method":"events.subscribe","params":{"subscriptions":[
+            {"type":"pane.not_a_subscription_type","pane_id":"p_1_1"}]}}"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("unknown variant `pane.not_a_subscription_type`"),
+        "{err}"
+    );
 }
 
 #[test]

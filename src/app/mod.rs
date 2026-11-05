@@ -20,6 +20,7 @@ mod custom_commands;
 mod git_refresh;
 mod ids;
 mod popup;
+mod read_state_events;
 mod runtime;
 mod session;
 pub mod state;
@@ -111,6 +112,9 @@ pub struct App {
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
     pub(crate) event_hub: crate::api::EventHub,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
+    /// Each pane's read state as last compared by `sync_read_state_events`.
+    pub(crate) read_state_observed:
+        HashMap<crate::layout::PaneId, read_state_events::ObservedReadState>,
     pub(crate) policy: AppPolicy,
     pub(crate) config_diagnostic_deadline: Option<Instant>,
     pub(crate) toast_deadline: Option<Instant>,
@@ -671,6 +675,7 @@ impl App {
             api_rx,
             event_hub,
             last_focus,
+            read_state_observed: HashMap::new(),
             policy,
             render_notify,
             render_dirty,
