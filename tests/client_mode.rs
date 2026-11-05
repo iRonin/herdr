@@ -1332,9 +1332,10 @@ fn saved_machine_scope_follows_the_clients_local_session_at_startup_and_on_live_
     let _server_guard = LocalServerGuard {
         api_socket: api_socket.clone(),
     };
-    // A client that is stopped while its saved machine is still connecting leaves the managed
-    // ssh config directory it made (herdr-ssh-<pid>-0) in its temp dir. Keep it inside this
-    // test's base, which cleanup_test_base removes, instead of in the shared temp dir.
+    // A client killed while its saved machine is still connecting can leave the managed ssh
+    // config directory it made (herdr-ssh-<pid>-0) in its temp dir; one that is stopped removes
+    // it at exit. Keep it inside this test's base, which cleanup_test_base removes, instead of
+    // in the shared temp dir.
     let tmp = base.display().to_string();
 
     // Two clients of one Local server, each in its own local session: HERDR_SESSION is what a
@@ -1438,6 +1439,168 @@ fn saved_machine_scope_follows_the_clients_local_session_at_startup_and_on_live_
     cleanup_test_base(&base);
 }
 
+/// A client with one saved SSH machine whose ssh never answers, stopped while that connect is in flight. The client's temp dir
+/// is `tmp`, inside this test's base, so whatever it leaves there is this test's alone.
+struct HangingMachineClient {
+    base: PathBuf,
+    tmp: PathBuf,
+    client: SpawnedHerdr,
+    output: SharedOutput,
+    _server_guard: LocalServerGuard,
+}
+
+impl HangingMachineClient {
+    /// Starts the client and returns once the connect is really in flight: the stand-in ssh is running and the client has made its
+    /// managed ssh config directory.
+    fn start() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = unique_test_dir();
+        let config_home = base.join("config");
+        let runtime_dir = base.join("runtime");
+        let api_socket = runtime_dir.join("herdr.sock");
+        let tmp = base.join("tmp");
+        fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
+        fs::write(
+            config_home.join(app_dir_name()).join("config.toml"),
+            "onboarding = false\n",
+        )
+        .unwrap();
+        let catalog_dir = runtime_dir
+            .join("state")
+            .join(app_dir_name())
+            .join("client");
+        fs::create_dir_all(&catalog_dir).unwrap();
+        fs::create_dir_all(&tmp).unwrap();
+        let profile = "0123456789abcdef0123456789abcdef";
+        fs::write(catalog_dir.join("endpoints.json"), serde_json::json!({
+            "version": 1, "selected_profile": serde_json::Value::Null,
+            "ssh": [{"id": profile, "label": "Unreachable remote", "target": "test-only", "session": "default", "enabled": true}],
+        }).to_string()).unwrap();
+        let bin = base.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        // An unreachable host: it records that it started, then neither succeeds nor fails while the client lives (60 s at most).
+        let started = base.join("ssh-started");
+        fs::write(
+            bin.join("ssh"),
+            format!(
+                "#!/bin/sh\n: > '{}'\ni=0\nwhile [ $i -lt 300 ] && kill -0 $PPID 2>/dev/null; do i=$((i+1)); sleep 0.2; done\nexit 255\n",
+                started.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(bin.join("ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let tmp_env = tmp.display().to_string();
+        let server_guard = LocalServerGuard {
+            api_socket: api_socket.clone(),
+        };
+        let client = spawn_client_process_with_args_and_env(
+            &config_home,
+            &runtime_dir,
+            &api_socket,
+            &[],
+            &[("PATH", &path), ("TMPDIR", &tmp_env)],
+        );
+        let output = spawn_pty_drain(client._master.as_ref().unwrap().try_clone_reader().unwrap());
+        let this = Self {
+            base,
+            tmp,
+            client,
+            output,
+            _server_guard: server_guard,
+        };
+        assert!(
+            wait_until(Duration::from_secs(20), Duration::from_millis(50), || {
+                started.exists() && !this.leftover_ssh_config_dirs().is_empty()
+            }),
+            "the saved machine's connect never got going (ssh started: {}, ssh config dirs: {:?}):\n{}",
+            started.exists(),
+            this.leftover_ssh_config_dirs(),
+            read_output(&this.output)
+        );
+        this
+    }
+
+    /// The managed ssh config directories in the client's temp dir (the control sockets beside them are not directories).
+    fn leftover_ssh_config_dirs(&self) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(&self.tmp)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.path().is_dir())
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.starts_with("herdr-ssh-"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Sends `signal` to the client and waits for it to exit.
+    fn stop_with(&mut self, signal: libc::c_int) {
+        let pid = self.client.child.process_id().expect("client pid");
+        unsafe {
+            libc::kill(pid as libc::pid_t, signal);
+        }
+        assert!(
+            wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+                self.client.child.try_wait().unwrap().is_some()
+            }),
+            "the client did not exit after signal {signal}:\n{}",
+            read_output(&self.output)
+        );
+    }
+
+    fn finish(self) {
+        let base = self.base.clone();
+        drop(self);
+        cleanup_test_base(&base);
+    }
+}
+
+/// A client stopped while a saved machine is still connecting exits at once (SIGTERM, SIGHUP and SIGINT all end the client loop
+/// cleanly), but the connect worker still held the managed ssh config directory, so its last-owner removal never ran and the
+/// directory stayed in the temp dir. The client removes the directories it made when it exits.
+#[test]
+fn a_client_stopped_while_a_saved_machine_connects_removes_its_ssh_config_dir() {
+    let _lock = test_lock();
+    for (name, signal) in [
+        ("SIGTERM", libc::SIGTERM),
+        ("SIGHUP", libc::SIGHUP),
+        ("SIGINT", libc::SIGINT),
+    ] {
+        let mut client = HangingMachineClient::start();
+        client.stop_with(signal);
+        assert_eq!(
+            client.leftover_ssh_config_dirs(),
+            Vec::<String>::new(),
+            "a client stopped by {name} while its saved machine was connecting left its ssh config dir behind"
+        );
+        client.finish();
+    }
+}
+
+/// The control for the test above: a client that is killed cannot clean up after itself, and the same check sees the directory it
+/// leaves. Without this the test above could pass because the check never looks in the right place.
+#[test]
+fn a_killed_client_leaves_its_ssh_config_dir_where_the_check_looks() {
+    let _lock = test_lock();
+    let mut client = HangingMachineClient::start();
+    client.stop_with(libc::SIGKILL);
+    assert_eq!(
+        client.leftover_ssh_config_dirs().len(),
+        1,
+        "a killed client must leave exactly its own ssh config dir for the check to find"
+    );
+    client.finish();
+}
+
 struct RecordedStartup {
     base: PathBuf,
     api_socket: PathBuf,
@@ -1510,9 +1673,9 @@ impl RecordedStartup {
         let server_guard = LocalServerGuard {
             api_socket: api_socket.clone(),
         };
-        // A client stopped while its saved machine is still connecting leaves the managed ssh
-        // config directory it made in its temp dir: keep that inside this test's base, which
-        // `finish` removes, instead of in the shared temp dir.
+        // A client killed while its saved machine is still connecting can leave the managed ssh
+        // config directory it made in its temp dir (one that is stopped removes it at exit): keep
+        // that inside this test's base, which `finish` removes, instead of in the shared temp dir.
         let tmp = base.display().to_string();
         let client = spawn_client_process_with_args_and_env(
             &config_home,

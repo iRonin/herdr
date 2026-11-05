@@ -693,10 +693,81 @@ struct ManagedSshConfig {
 
 struct ManagedSshConfigDirectory(PathBuf);
 
+impl ManagedSshConfigDirectory {
+    /// Takes over a directory this process just made. The last owner's drop removes it; if a worker thread still holds
+    /// it when the process exits, the exit hook removes it (`remove_owned_managed_ssh_dirs`).
+    fn adopt(dir: PathBuf) -> Self {
+        register_owned_managed_ssh_dir(&dir);
+        Self(dir)
+    }
+}
+
 impl Drop for ManagedSshConfigDirectory {
     fn drop(&mut self) {
+        // Remove first, then unregister: an exit between the two steps still finds the directory listed.
         let _ = fs::remove_dir_all(&self.0);
+        unregister_owned_managed_ssh_dir(&self.0);
     }
+}
+
+/// Managed ssh config directories this process made and has not removed yet, each with the pid that made it.
+///
+/// A client that is stopped while a saved machine is still connecting (SIGTERM, SIGHUP and SIGINT all end its loop and
+/// return from `main`) exits with a connect worker still holding the directory's `Arc`, so the last-owner drop never
+/// runs and the directory stayed in the temp dir. Only directories this process made are removed, by path from this
+/// list, never by pattern: another herdr process's directory, or anything else in the temp dir, is never touched. An
+/// ssh child that outlives the client has already read its `-F` config at start, so removing the directory does not
+/// affect it.
+static OWNED_MANAGED_SSH_DIRS: std::sync::Mutex<Vec<(u32, PathBuf)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn register_owned_managed_ssh_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        static EXIT_HOOK: std::sync::Once = std::sync::Once::new();
+        EXIT_HOOK.call_once(|| {
+            // SAFETY: hands the C runtime a plain function that runs after `main` returns or `std::process::exit`.
+            unsafe {
+                libc::atexit(remove_owned_managed_ssh_dirs_at_exit);
+            }
+        });
+    }
+    OWNED_MANAGED_SSH_DIRS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push((std::process::id(), dir.to_path_buf()));
+}
+
+fn unregister_owned_managed_ssh_dir(dir: &Path) {
+    OWNED_MANAGED_SSH_DIRS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|(_, path)| path != dir);
+}
+
+/// Removes the directories in `registry` that `pid` made and returns how many it tried. Never waits: if another thread
+/// holds the list, that thread is registering or removing its own directory and nothing is removed here. A directory
+/// that is already gone is not an error.
+#[cfg(any(unix, test))]
+fn remove_dirs_owned_by(registry: &std::sync::Mutex<Vec<(u32, PathBuf)>>, pid: u32) -> usize {
+    let owned = match registry.try_lock() {
+        Ok(owned) => owned,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return 0,
+    };
+    let mut tried = 0;
+    for (owner, dir) in owned.iter() {
+        if *owner == pid {
+            let _ = fs::remove_dir_all(dir);
+            tried += 1;
+        }
+    }
+    tried
+}
+
+#[cfg(unix)]
+extern "C" fn remove_owned_managed_ssh_dirs_at_exit() {
+    remove_dirs_owned_by(&OWNED_MANAGED_SSH_DIRS, std::process::id());
 }
 
 /// Classify only SSH authentication diagnostics, not transport failures or
@@ -3205,6 +3276,7 @@ fn write_managed_ssh_config(target: &str, extra_files: &[PathBuf]) -> io::Result
 
     let dir = crate::platform::create_remote_ssh_config_dir(SSH_CONTROL_SOCKET_NAME)?;
     let path = dir.join("config");
+    let directory = ManagedSshConfigDirectory::adopt(dir);
     let contents = managed_ssh_config_contents(
         extra_files,
         paths.user_config.as_deref(),
@@ -3215,15 +3287,13 @@ fn write_managed_ssh_config(target: &str, extra_files: &[PathBuf]) -> io::Result
         let mut file = crate::platform::create_remote_ssh_config_file(&path)?;
         file.write_all(contents.as_bytes())
     })();
-    if let Err(err) = write_result {
-        let _ = fs::remove_dir_all(&dir);
-        return Err(err);
-    }
+    // On an error `directory` is dropped here, which removes the directory again.
+    write_result?;
     Ok(ManagedSshConfig {
         options: ManagedSshOptions {
             config_path: path,
             control_path,
-            _directory: Arc::new(ManagedSshConfigDirectory(dir)),
+            _directory: Arc::new(directory),
         },
     })
 }
@@ -4121,6 +4191,174 @@ mod tests {
         );
 
         drop(managed_config);
+    }
+
+    /// A scratch directory standing in for a managed ssh config directory, in the temp dir.
+    fn scratch_ssh_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-ssh-unit-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config"), "Host *\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn exit_removal_takes_only_the_directories_this_process_made() {
+        let pid = std::process::id();
+        let mine = scratch_ssh_dir("mine");
+        let other_process = scratch_ssh_dir("other-process");
+        let unlisted = scratch_ssh_dir("unlisted");
+        let registry = std::sync::Mutex::new(vec![
+            (pid, mine.clone()),
+            (pid.wrapping_add(1), other_process.clone()),
+        ]);
+
+        assert_eq!(remove_dirs_owned_by(&registry, pid), 1);
+        assert!(!mine.exists(), "a directory this process made is removed");
+        assert!(
+            other_process.exists(),
+            "a directory another process made is left alone"
+        );
+        assert!(
+            unlisted.exists(),
+            "a directory that is not in the list is never matched by its name"
+        );
+
+        // Already gone: no error, nothing else touched.
+        assert_eq!(remove_dirs_owned_by(&registry, pid), 1);
+        assert!(other_process.exists() && unlisted.exists());
+
+        std::fs::remove_dir_all(&other_process).unwrap();
+        std::fs::remove_dir_all(&unlisted).unwrap();
+    }
+
+    #[test]
+    fn exit_removal_never_waits_for_a_thread_that_holds_the_list() {
+        let pid = std::process::id();
+        let dir = scratch_ssh_dir("busy");
+        let registry = std::sync::Mutex::new(vec![(pid, dir.clone())]);
+
+        let held = registry.lock().unwrap();
+        let started = Instant::now();
+        assert_eq!(remove_dirs_owned_by(&registry, pid), 0);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(held);
+        assert!(dir.exists(), "nothing is removed while the list is held");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_managed_ssh_config_dir_is_listed_while_it_exists_and_not_after_its_last_owner_drops() {
+        let managed = write_managed_ssh_config("example", &[]).expect("write managed config");
+        let dir = managed.options.config_path.parent().unwrap().to_path_buf();
+        let listed = |dir: &Path| {
+            OWNED_MANAGED_SSH_DIRS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|(owner, path)| *owner == std::process::id() && path == dir)
+        };
+        assert!(listed(&dir), "a directory this process made is listed");
+
+        // A connect worker holds a copy of the options; the directory outlives the helper's own copy.
+        let worker_copy = managed.options.clone();
+        drop(managed);
+        assert!(dir.is_dir() && listed(&dir));
+        drop(worker_copy);
+        assert!(!dir.exists() && !listed(&dir), "the last owner removes it");
+    }
+
+    /// A child forked from this process inherits the exit hook and a copy of the list, but it is not the process that made the
+    /// directories: its exit must leave them alone, and it must not wait for a list that another thread of the parent held at
+    /// the moment of the fork (that thread does not exist in the child, so nothing would ever release it).
+    #[cfg(unix)]
+    #[test]
+    fn a_forked_child_that_exits_leaves_its_parents_dirs_alone_and_never_waits_on_the_list() {
+        fn exited_within_ten_seconds(child: libc::pid_t) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let mut status = 0;
+                let reaped = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+                if reaped == child {
+                    return libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+                }
+                if reaped < 0 || Instant::now() >= deadline {
+                    unsafe {
+                        libc::kill(child, libc::SIGKILL);
+                        libc::waitpid(child, &mut status, 0);
+                    }
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let managed = write_managed_ssh_config("example", &[]).expect("write managed config");
+        let dir = managed.options.config_path.parent().unwrap().to_path_buf();
+        let parent_pid = std::process::id();
+
+        // The child leaves through `exit`, which runs the exit hook, with the list free.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe { libc::exit(0) }
+        }
+        assert!(child > 0, "fork failed");
+        assert!(exited_within_ten_seconds(child), "the child did not exit");
+        assert!(
+            dir.is_dir(),
+            "a forked child's exit removed its parent's directory"
+        );
+
+        // The same, while another thread of the parent holds the list at the moment of the fork.
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = thread::spawn(move || {
+            let held = OWNED_MANAGED_SSH_DIRS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(held);
+        });
+        held_rx.recv().unwrap();
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe { libc::exit(0) }
+        }
+        assert!(child > 0, "fork failed");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(
+            exited_within_ten_seconds(child),
+            "a child forked while the list was held waited on it when it exited"
+        );
+        assert!(
+            dir.is_dir(),
+            "a forked child's exit removed its parent's directory"
+        );
+
+        // Control: a child that does claim the parent's pid removes the directory, and this check sees it. Without this the
+        // two assertions above could hold because nothing a child does reaches the directory at all.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            remove_dirs_owned_by(&OWNED_MANAGED_SSH_DIRS, parent_pid);
+            unsafe { libc::_exit(0) }
+        }
+        assert!(child > 0, "fork failed");
+        assert!(
+            exited_within_ten_seconds(child),
+            "the control child did not exit"
+        );
+        assert!(
+            !dir.exists(),
+            "the control child claimed the parent's pid and must have removed the directory"
+        );
+        drop(managed);
     }
 
     #[cfg(unix)]
