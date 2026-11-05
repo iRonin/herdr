@@ -238,6 +238,32 @@ fn project_aggregate_status(snapshot: &mut ClientShellSnapshot) {
     }
 }
 
+/// What a client shows for each agent after it has received a snapshot and the completions the server sent with it, worked out by the
+/// real `EndpointAgentPresentation` (the type itself stays private to the client shell). It exists only for tests of other modules
+/// that must prove what a window shows, such as the server's headless tests; it is compiled out of every non-test build.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ClientProjectionProbe(EndpointAgentPresentation);
+
+#[cfg(test)]
+impl ClientProjectionProbe {
+    /// Feeds one snapshot and its completions, as the client does for a pair that arrives together, and returns the status the
+    /// client would show for each agent, by public pane id.
+    pub(crate) fn project(
+        &mut self,
+        mut snapshot: ClientShellSnapshot,
+        completions: crate::protocol::endpoint::EndpointAgentCompletions,
+    ) -> HashMap<String, AgentStatus> {
+        self.0.receive_completions(None, completions);
+        self.0.project_snapshot(&mut snapshot);
+        snapshot
+            .agents
+            .into_iter()
+            .map(|agent| (agent.pane_id, agent.agent_status))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

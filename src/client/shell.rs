@@ -11,6 +11,8 @@ mod config;
 mod context_menu;
 mod copy_mode;
 mod endpoint_agent_state;
+#[cfg(test)]
+pub(crate) use endpoint_agent_state::ClientProjectionProbe;
 mod endpoint_agents;
 mod endpoint_navigation;
 mod endpoint_notices;

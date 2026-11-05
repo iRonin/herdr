@@ -32,6 +32,8 @@ mod input;
 mod loop_config;
 mod notifications;
 mod shell;
+#[cfg(test)]
+pub(crate) use shell::ClientProjectionProbe;
 mod shell_runtime;
 mod startup;
 #[cfg(unix)]

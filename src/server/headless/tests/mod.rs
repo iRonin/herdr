@@ -815,6 +815,196 @@ async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
     }
 }
 
+/// The read state a herdr window shows is the CLIENT's projection of a snapshot plus the completions the server sends with it, not the
+/// server's own `seen` flag. The two halves of the `auto_read` rule (the server records no completion for a token pane, the client projects
+/// Done only from a recorded completion) each have unit tests; this drives both over the messages the wire carries.
+struct AutoReadWire {
+    server: HeadlessServer,
+    pane_id: crate::layout::PaneId,
+    control_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    client: crate::client::ClientProjectionProbe,
+}
+
+/// What the client showed for the pane after one message pair, and the completion that pair carried for it.
+struct AutoReadShown {
+    status: Option<api::schema::AgentStatus>,
+    completion: Option<u64>,
+}
+
+impl AutoReadWire {
+    fn connect(auto_read: bool) -> Self {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("auto-read-wire");
+        let pane_id = workspace.tabs[0].root_pane;
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        if auto_read {
+            let terminal_id = server.app.state.workspaces[0]
+                .pane_state(pane_id)
+                .unwrap()
+                .attached_terminal_id
+                .clone();
+            server
+                .app
+                .state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .metadata_tokens
+                .patch(
+                    std::collections::HashMap::from([(
+                        "auto_read".to_string(),
+                        Some("1".to_string()),
+                    )]),
+                    None,
+                    Instant::now(),
+                );
+        }
+        let (writer, control_rx, _render_rx) = test_client_writer();
+        server.handle_server_event(ServerEvent::ClientShellConnected {
+            client_id: 79,
+            surface_cols: 80,
+            surface_rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_mouse: false,
+            direct_graphics: false,
+            endpoint_keybindings: false,
+            mouse_capture: false,
+            surface_active: false,
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
+            writer,
+        });
+        let mut wire = Self {
+            server,
+            pane_id,
+            control_rx,
+            client: Default::default(),
+        };
+        // The first pair, sent when the client attaches, sets up the client's projection.
+        assert_eq!(wire.receive().completion, None);
+        wire
+    }
+
+    /// Reads the next completions-and-snapshot pair the server sent the client and feeds it to the client's projection.
+    fn receive(&mut self) -> AutoReadShown {
+        let (snapshot, completions) = client_shell_projection(&self.control_rx);
+        let pane = snapshot.agents.first().map(|agent| agent.pane_id.clone());
+        let completion = pane
+            .as_ref()
+            .and_then(|pane| completions.completions.get(pane).copied());
+        let mut shown = self.client.project(*snapshot, completions);
+        AutoReadShown {
+            status: pane.and_then(|pane| shown.remove(&pane)),
+            completion,
+        }
+    }
+
+    fn change_state(&mut self, state: crate::detect::AgentState) -> AutoReadShown {
+        self.server
+            .app
+            .state
+            .handle_app_event(AppEvent::StateChanged {
+                pane_id: self.pane_id,
+                agent: Some(crate::detect::Agent::Pi),
+                state,
+                visible_blocker: state == crate::detect::AgentState::Blocked,
+                visible_working: state == crate::detect::AgentState::Working,
+                process_exited: false,
+                observed_at: Instant::now(),
+            });
+        self.server.render_and_stream();
+        self.receive()
+    }
+
+    /// A work cycle: Working, then Idle. Returns what the client showed after the Idle.
+    fn work_and_finish(&mut self) -> AutoReadShown {
+        let working = self.change_state(crate::detect::AgentState::Working);
+        assert_eq!(working.status, Some(api::schema::AgentStatus::Working));
+        self.change_state(crate::detect::AgentState::Idle)
+    }
+}
+
+#[tokio::test]
+async fn auto_read_pane_is_shown_read_by_the_client_it_is_sent_to() {
+    use api::schema::AgentStatus;
+
+    // The pane carries the token: no completion crosses the wire, so the client shows it read.
+    let mut wire = AutoReadWire::connect(true);
+    let shown = wire.work_and_finish();
+    assert_eq!(
+        shown.completion, None,
+        "a completion on an auto_read pane must not be sent to clients"
+    );
+    assert_eq!(
+        shown.status,
+        Some(AgentStatus::Idle),
+        "a finished auto_read pane must be shown read (Idle), not Done"
+    );
+
+    // Control: the same pane without the token. If this showed Idle too, the test could not tell the token from its absence.
+    let mut wire = AutoReadWire::connect(false);
+    let shown = wire.work_and_finish();
+    assert!(
+        shown.completion.is_some(),
+        "the pane without the token must have its completion sent"
+    );
+    assert_eq!(
+        shown.status,
+        Some(AgentStatus::Done),
+        "a finished pane without the token must be shown Done (unread)"
+    );
+
+    // The token arrives late, after the pane finished: the next completions message no longer names it, and it is shown read.
+    let public_pane_id = wire.server.app.public_pane_id(0, wire.pane_id).unwrap();
+    completion_guard_api_report(
+        &mut wire.server,
+        api::schema::Method::PaneReportMetadata(api::schema::PaneReportMetadataParams {
+            pane_id: public_pane_id,
+            source: "user:metadata.test-1".into(),
+            agent: None,
+            applies_to_source: None,
+            title: None,
+            display_agent: None,
+            state_labels: std::collections::HashMap::new(),
+            tokens: std::collections::HashMap::from([(
+                "auto_read".to_string(),
+                Some("1".to_string()),
+            )]),
+            clear_title: false,
+            clear_display_agent: false,
+            clear_state_labels: false,
+            seq: None,
+            ttl_ms: None,
+        }),
+    );
+    wire.server.render_and_stream();
+    let shown = wire.receive();
+    assert_eq!(
+        shown.completion, None,
+        "a late auto_read token must remove the pane from the next completions message"
+    );
+    assert_eq!(
+        shown.status,
+        Some(AgentStatus::Idle),
+        "a pane whose auto_read token arrived late must be shown read"
+    );
+
+    // Blocked on a token pane still asks for attention: the token silences completions only.
+    let mut wire = AutoReadWire::connect(true);
+    let working = wire.change_state(crate::detect::AgentState::Working);
+    assert_eq!(working.status, Some(AgentStatus::Working));
+    let shown = wire.change_state(crate::detect::AgentState::Blocked);
+    assert_eq!(
+        shown.status,
+        Some(AgentStatus::Blocked),
+        "a blocked auto_read pane must still be shown Blocked"
+    );
+}
+
 #[tokio::test]
 async fn first_full_app_client_receives_startup_banner_notification() {
     // The first attaching client shell receives one-shot fork branding. The
