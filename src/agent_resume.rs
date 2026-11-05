@@ -25,6 +25,8 @@ pub struct AgentResumePlan {
     pub agent: String,
     pub argv: Vec<String>,
     pub dedupe_key: String,
+    /// The command was reported by the agent itself (`resume_argv`), not rebuilt by the server from a session.
+    pub reported: bool,
 }
 
 /// A resume command reported by the agent itself, run in the restored pane.
@@ -49,6 +51,7 @@ impl ReportedAgentResume {
                 cwd.display(),
                 self.argv.join("\u{0}")
             ),
+            reported: true,
         }
     }
 }
@@ -86,6 +89,22 @@ pub fn validate_resume_argv(argv: &[String]) -> Result<(), String> {
         return Err("resume_argv must start with a plain command name, not a path".into());
     }
     Ok(())
+}
+
+impl AgentResumePlan {
+    /// Launches the configured Pi executable instead of `pi` for a plan the server rebuilt itself. A command the
+    /// agent reported (`reported`) is run exactly as given: the agent named its own executable.
+    pub fn with_pi_program(mut self, program: &str) -> Self {
+        if !self.reported
+            && self.agent == "pi"
+            && self.argv.first().map(String::as_str) == Some("pi")
+        {
+            if let Some(first) = self.argv.first_mut() {
+                *first = program.to_string();
+            }
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,6 +334,7 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
         agent: agent.to_string(),
         argv,
         dedupe_key: dedupe_key(source, agent, session_ref),
+        reported: false,
     })
 }
 
@@ -359,6 +379,7 @@ pub fn plan_replaying_launch_argv(
         agent: base.agent,
         argv,
         dedupe_key: base.dedupe_key,
+        reported: false,
     })
 }
 
@@ -1077,6 +1098,143 @@ mod tests {
             &AgentSessionRef::path(&agy_session).unwrap()
         )
         .is_none());
+    }
+
+    #[test]
+    fn pi_program_override_rewrites_only_the_native_pi_program() {
+        let session_path = absolute_test_path("pi-program-override.jsonl");
+        let original = plan(
+            "herdr:pi",
+            "pi",
+            &AgentSessionRef::path(&session_path).unwrap(),
+        )
+        .unwrap();
+
+        let overridden = original.clone().with_pi_program("custom-pi");
+
+        assert_eq!(
+            overridden.argv,
+            argv(&["custom-pi", "--session", &session_path])
+        );
+        assert_eq!(overridden.argv[1..], original.argv[1..]);
+    }
+
+    /// A command the agent reported itself is run as given. The configured Pi name applies to what the server rebuilds
+    /// from a session, never to a command the agent chose: rewriting it would change an explicit instruction.
+    #[test]
+    fn pi_program_override_leaves_a_command_the_agent_reported_alone() {
+        let reported = ReportedAgentResume {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            argv: argv(&["pi", "--continue"]),
+        }
+        .plan(Path::new("/work"));
+
+        assert!(reported.reported);
+        assert_eq!(reported.clone().with_pi_program("custom-pi"), reported);
+
+        let native = plan_replaying_launch_argv(
+            "herdr:pi",
+            "pi",
+            &AgentSessionRef::path(absolute_test_path("pi-program-native-control.jsonl")).unwrap(),
+            Some(&argv(&["pi", "--model", "opus"])),
+        )
+        .unwrap();
+        assert!(!native.reported);
+        assert_eq!(native.with_pi_program("custom-pi").argv[0], "custom-pi");
+    }
+
+    #[test]
+    fn pi_program_override_rewrites_replayed_native_pi_program() {
+        let session_path = absolute_test_path("pi-program-replayed-native.jsonl");
+        let launch = argv(&["pi", "--model", "opus"]);
+        let plan = plan_replaying_launch_argv(
+            "herdr:pi",
+            "pi",
+            &AgentSessionRef::path(&session_path).unwrap(),
+            Some(&launch),
+        )
+        .unwrap()
+        .with_pi_program("custom-pi");
+
+        assert_eq!(
+            plan.argv,
+            argv(&["custom-pi", "--model", "opus", "--session", &session_path])
+        );
+    }
+
+    #[test]
+    fn default_pi_program_keeps_native_pi_plan_unchanged() {
+        let session_path = absolute_test_path("pi-program-default.jsonl");
+        let original = plan(
+            "herdr:pi",
+            "pi",
+            &AgentSessionRef::path(&session_path).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(original.clone().with_pi_program("pi"), original);
+    }
+
+    #[test]
+    fn pi_program_override_does_not_rewrite_non_pi_agents() {
+        for (source, agent) in [
+            ("herdr:claude", "claude"),
+            ("herdr:codex", "codex"),
+            ("herdr:copilot", "copilot"),
+            ("herdr:devin", "devin"),
+            ("herdr:droid", "droid"),
+            ("herdr:kimi", "kimi"),
+            ("herdr:mastracode", "mastracode"),
+            ("herdr:omp", "omp"),
+            ("herdr:hermes", "hermes"),
+            ("herdr:opencode", "opencode"),
+            ("herdr:qodercli", "qodercli"),
+            ("herdr:kilo", "kilo"),
+            ("herdr:cursor", "cursor"),
+        ] {
+            let original = plan(
+                source,
+                agent,
+                &AgentSessionRef::id(format!("{agent}-session")).unwrap(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                original.clone().with_pi_program("custom-pi"),
+                original,
+                "configured Pi program must not change {agent}"
+            );
+        }
+    }
+
+    #[test]
+    fn pi_program_override_leaves_replayed_fork_program_untouched() {
+        let session_path = absolute_test_path("pi-program-replay.jsonl");
+        let launch = argv(&["custom-pi", "--model", "opus"]);
+        let original = plan_replaying_launch_argv(
+            "herdr:pi",
+            "pi",
+            &AgentSessionRef::path(&session_path).unwrap(),
+            Some(&launch),
+        )
+        .unwrap();
+
+        let overridden = original.clone().with_pi_program("configured-pi");
+
+        assert_eq!(overridden, original);
+        assert_eq!(
+            overridden.argv,
+            argv(&["custom-pi", "--model", "opus", "--session", &session_path])
+        );
+        assert_eq!(
+            overridden
+                .argv
+                .iter()
+                .filter(|arg| *arg == "custom-pi")
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -548,6 +548,26 @@ The legacy `experimental.kitty_graphics` setting remains accepted for existing c
 
 Changing this setting requires restarting the affected Herdr server or reattaching the client. In remote sessions, the server's setting controls Kitty graphics parsing, while the local client's setting controls output to the outer terminal.
 
+## Pi executable name
+
+Herdr recognizes a Pi Agent by the name of the program running in the pane. If you run Pi through a differently named executable, such as a Pi-compatible fork or a wrapper on your `PATH`, name it here:
+
+```toml
+[agent]
+pi_program = "custom-pi"
+```
+
+Herdr uses that name to start and detect Pi, and to replace the native `pi` executable in a Pi resume plan:
+
+- **Starting** a Pi Agent, including `agent.start`, launches `custom-pi`.
+- **Detecting** a pane running `custom-pi` reports it as a Pi Agent, in status, the agents panel, and session restore.
+- **Resuming or relaunching** a Pi session uses `custom-pi` when its generated or saved launch command starts with `pi`; a saved command using another program keeps that program.
+
+For detection the name is matched the same way as the built-in Agent names: case-insensitively, ignoring a `.exe`, `.cmd`, `.bat`, `.ps1`, or `.js` extension, and using the final path component if you give a full path. Starting an Agent uses the configured value after trimming surrounding whitespace, so a full path launches that path.
+
+The default is `"pi"`, which changes nothing. Blank or whitespace-only values also fall back to `"pi"`. A name that already belongs to another Agent, such as `claude`, keeps that Agent, and other Agents always launch under their own executables. Reloading the config applies the new name immediately to detection and newly started Agents. A pending Pi resume reads the current setting when it starts, but substitutes it only for a launch command whose program is `pi`.
+
+
 ## Agent session restore
 
 Herdr resumes supported Agent conversations after a server restart by default:
@@ -559,6 +579,8 @@ startup_per_agent_delay_ms = 100
 ```
 
 Automatic restores start one agent at a time, 100 milliseconds apart by default, to reduce startup contention. The first eligible agent starts immediately. Set `startup_per_agent_delay_ms = 0` to disable spacing. Manual launches and explicit terminal attaches are unaffected. Restart the Herdr server to apply changes.
+
+Pi resumes substitute the current `agent.pi_program` value for a generated or saved native `pi` program when the deferred resume starts; a saved non-`pi` program is preserved.
 
 Only panes with a valid native session reference from an official integration can resume; other panes restore as normal shells. See [Session state and restore](/docs/session-state/) for supported Agents and persistence behavior.
 
