@@ -108,6 +108,8 @@ pub fn run_server() -> io::Result<()> {
     });
 
     rt.shutdown_timeout(Duration::from_millis(100));
+    // The server's panes were hung up as it shut down; let their escalation finish before the process ends.
+    crate::pane::finish_pane_shutdowns_before_exit();
     crate::logging::shutdown("server");
     result
 }
@@ -220,6 +222,8 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     });
 
     rt.shutdown_timeout(Duration::from_millis(100));
+    // The server's panes were hung up as it shut down; let their escalation finish before the process ends.
+    crate::pane::finish_pane_shutdowns_before_exit();
     crate::logging::shutdown("server");
     result
 }

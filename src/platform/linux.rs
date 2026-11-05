@@ -826,6 +826,38 @@ pub fn session_processes(child_pid: u32) -> Vec<u32> {
     pids
 }
 
+/// The pid and session id of every process, from one pass over `/proc`. A session keeps its id (its leader's pid)
+/// for as long as any process is in it, so this finds the members of a session whose leader has exited and been
+/// reaped, which asking the leader itself cannot.
+pub fn process_sessions() -> Vec<(u32, u32)> {
+    let mut processes = Vec::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if let Some(session) =
+            process_session_id(pid).and_then(|session| u32::try_from(session).ok())
+        {
+            if session > 0 {
+                processes.push((pid, session));
+            }
+        }
+    }
+    processes
+}
+
+/// Whether `pid` has exited but not been reaped by its parent yet.
+pub fn process_is_zombie(pid: u32) -> bool {
+    matches!(
+        process_pgrp_comm_and_state(pid),
+        Some((_, _, 'Z' | 'X' | 'x'))
+    )
+}
+
 pub fn signal_processes(pids: &[u32], signal: Signal) {
     let sig = match signal {
         Signal::Hangup => libc::SIGHUP,

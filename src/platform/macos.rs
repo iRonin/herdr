@@ -1143,6 +1143,39 @@ pub fn session_processes(child_pid: u32) -> Vec<u32> {
         .collect()
 }
 
+/// The pid and session id of every process, from one pass over the process table. A session keeps its id (its
+/// leader's pid) for as long as any process is in it, so this finds the members of a session whose leader has
+/// exited and been reaped, which asking the leader itself cannot.
+pub fn process_sessions() -> Vec<(u32, u32)> {
+    all_pids()
+        .into_iter()
+        .filter_map(|pid| {
+            let session = unsafe { libc::getsid(pid as libc::pid_t) };
+            (session > 0).then_some((pid, session as u32))
+        })
+        .collect()
+}
+
+/// Whether `pid` has exited but not been reaped by its parent yet. A zombie still answers `kill(pid, 0)`, but
+/// `proc_pidinfo` no longer finds it (ESRCH); a process we may not inspect fails with EPERM instead.
+pub fn process_is_zombie(pid: u32) -> bool {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if ret == size {
+        return info.pbi_status == libc::SZOMB;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) && process_exists(pid)
+}
+
 fn all_pids() -> Vec<u32> {
     let initial_count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
     let mut capacity = if initial_count > 0 {

@@ -30,6 +30,8 @@ mod cursor;
 mod input;
 mod kitty_keyboard;
 mod osc;
+#[cfg(unix)]
+mod shutdown;
 #[cfg(all(test, unix))]
 mod shutdown_tests;
 mod state;
@@ -37,6 +39,14 @@ mod terminal;
 #[cfg(test)]
 pub(crate) use terminal::test_on_core_locked;
 mod xtgettcap;
+
+#[cfg(unix)]
+pub(crate) use self::shutdown::finish_before_exit as finish_pane_shutdowns_before_exit;
+
+/// Lets the background ending of the processes of every pane shut down so far finish before the server exits.
+/// Only Unix ends them in the background.
+#[cfg(not(unix))]
+pub(crate) fn finish_pane_shutdowns_before_exit() {}
 
 use self::agent_detection::{
     codex_prompt_ready, decide_detection_screen_read, decide_screen_detection_publish,
@@ -1512,6 +1522,9 @@ pub struct PaneRuntime {
     io: PaneRuntimeIo,
     current_size: Cell<(u16, u16, u32, u32)>,
     child_pid: Arc<AtomicU32>,
+    /// The shell's start time (see `platform::process_start_token`) when the runtime took it over; 0 if not known.
+    /// It tells the shell from a later process that was given its pid.
+    child_start_token: u64,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
     persistence_cwd: Mutex<Option<std::path::PathBuf>>,
     cwd_process_exited: Arc<AtomicBool>,
@@ -1721,7 +1734,8 @@ impl Drop for PaneRuntime {
             shutdown_pane_processes(
                 self.pane_id,
                 self.child_pid.load(Ordering::Acquire),
-                self.child_wait_completed.as_deref(),
+                self.child_start_token,
+                self.child_wait_completed.as_ref(),
             );
         }
     }
@@ -1739,6 +1753,7 @@ fn process_alive_for_shutdown(
     process_exists(pid)
 }
 
+#[cfg(not(unix))]
 fn wait_for_processes_to_exit(
     pids: &[u32],
     child_pid: u32,
@@ -1766,7 +1781,34 @@ fn wait_for_processes_to_exit(
     }
 }
 
+/// Starts ending the processes of a pane that is going away. On Unix this only queues the pane: the steps and their
+/// grace periods run on a background thread (see `shutdown`), so the caller is never held up.
 fn shutdown_pane_processes(
+    pane_id: PaneId,
+    child_pid: u32,
+    child_start_token: u64,
+    child_wait_completed: Option<&Arc<AtomicBool>>,
+) {
+    #[cfg(unix)]
+    shutdown::begin(
+        pane_id,
+        child_pid,
+        child_start_token,
+        child_wait_completed.cloned(),
+    );
+    #[cfg(not(unix))]
+    {
+        let _ = child_start_token;
+        shutdown_pane_processes_blocking(
+            pane_id,
+            child_pid,
+            child_wait_completed.map(|flag| &**flag),
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn shutdown_pane_processes_blocking(
     pane_id: PaneId,
     child_pid: u32,
     child_wait_completed: Option<&AtomicBool>,
@@ -2249,7 +2291,8 @@ impl PaneRuntime {
         shutdown_pane_processes(
             self.pane_id,
             self.child_pid.load(Ordering::Acquire),
-            self.child_wait_completed.as_deref(),
+            self.child_start_token,
+            self.child_wait_completed.as_ref(),
         );
         self.preserve_processes_on_drop = true;
     }
@@ -2565,6 +2608,9 @@ impl PaneRuntime {
         }
         let terminal = Arc::new(PaneTerminal::new(pane_terminal));
         let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
+        // Recorded while the imported shell is alive, so a process given its pid later can be told from it.
+        let imported_child_start_token =
+            crate::platform::process_start_token(child_pid).unwrap_or(0);
         let child_pid = Arc::new(AtomicU32::new(child_pid));
         let reported_cwd = Arc::new(Mutex::new(None));
         let cwd_process_exited = Arc::new(AtomicBool::new(false));
@@ -2673,6 +2719,7 @@ impl PaneRuntime {
             io,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
+            child_start_token: imported_child_start_token,
             reported_cwd,
             persistence_cwd: Mutex::new(None),
             cwd_process_exited,
@@ -2739,6 +2786,7 @@ impl PaneRuntime {
         let child_pid = Arc::new(AtomicU32::new(0));
         let reported_cwd = Arc::new(Mutex::new(None));
         let child_wait_completed = Arc::new(AtomicBool::new(false));
+        let mut child_start_token = 0;
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
@@ -2751,6 +2799,8 @@ impl PaneRuntime {
             let mut child = spawned.child;
             if let Some(pid) = child.process_id() {
                 child_pid.store(pid, Ordering::Release);
+                // Read before the child can be waited for, so its pid cannot belong to anyone else yet.
+                child_start_token = crate::platform::process_start_token(pid).unwrap_or(0);
                 crate::logging::pane_spawned(pane_id.raw(), pid);
             }
             tokio::task::spawn_blocking(move || {
@@ -3286,6 +3336,7 @@ impl PaneRuntime {
             io,
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
+            child_start_token,
             reported_cwd,
             persistence_cwd: Mutex::new(None),
             cwd_process_exited: child_wait_completed.clone(),
@@ -4088,6 +4139,7 @@ impl PaneRuntime {
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
+                child_start_token: 0,
                 reported_cwd: Arc::new(Mutex::new(None)),
                 persistence_cwd: Mutex::new(None),
                 cwd_process_exited: Arc::new(AtomicBool::new(false)),
@@ -5443,6 +5495,7 @@ mod tests {
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
+            child_start_token: 0,
             reported_cwd: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
@@ -5483,6 +5536,7 @@ mod tests {
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
+            child_start_token: 0,
             reported_cwd: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),

@@ -106,7 +106,10 @@ fn wait_until_gone(pids: &[u32], timeout: Duration) -> bool {
 }
 
 fn survivors(pids: &[u32]) -> Vec<u32> {
-    pids.iter().copied().filter(|pid| pid_running(*pid)).collect()
+    pids.iter()
+        .copied()
+        .filter(|pid| pid_running(*pid))
+        .collect()
 }
 
 /// Starts a pane whose shell runs the probe script. `mode` is `stay` (the shell stays up) or `exit` (it exits as
@@ -147,7 +150,8 @@ async fn spawn_probe(mode: &str) -> (PaneRuntime, Probe, mpsc::Receiver<AppEvent
     let mut ready = None;
     assert!(
         wait_until(READY_TIMEOUT, || {
-            let pids = ["shell", "same", "own"].map(|name| read_pid(&dir.join(format!("{name}.pid"))));
+            let pids =
+                ["shell", "same", "own"].map(|name| read_pid(&dir.join(format!("{name}.pid"))));
             if let [Some(shell), Some(same), Some(own)] = pids {
                 ready = Some((shell, same, own));
                 true
@@ -168,10 +172,26 @@ async fn spawn_probe(mode: &str) -> (PaneRuntime, Probe, mpsc::Receiver<AppEvent
     // The stand-in must be faithful, or the tests below could pass for want of what they are about.
     let session = |pid: u32| unsafe { libc::getsid(pid as libc::pid_t) };
     let group = |pid: u32| unsafe { libc::getpgid(pid as libc::pid_t) };
-    assert_eq!(runtime.child_pid(), Some(probe.shell), "pane child is the probe shell");
-    assert_eq!(session(probe.same), probe.shell as libc::pid_t, "worker `same` is in the shell's session");
-    assert_eq!(group(probe.same), probe.shell as libc::pid_t, "worker `same` is in the shell's group");
-    assert_eq!(session(probe.own), probe.shell as libc::pid_t, "worker `own` is in the shell's session");
+    assert_eq!(
+        runtime.child_pid(),
+        Some(probe.shell),
+        "pane child is the probe shell"
+    );
+    assert_eq!(
+        session(probe.same),
+        probe.shell as libc::pid_t,
+        "worker `same` is in the shell's session"
+    );
+    assert_eq!(
+        group(probe.same),
+        probe.shell as libc::pid_t,
+        "worker `same` is in the shell's group"
+    );
+    assert_eq!(
+        session(probe.own),
+        probe.shell as libc::pid_t,
+        "worker `own` is in the shell's session"
+    );
     assert_ne!(
         group(probe.own),
         probe.shell as libc::pid_t,
@@ -320,7 +340,9 @@ async fn a_live_handoff_does_not_end_the_pane_processes() {
     runtime
         .pause_handoff_reader(Duration::from_secs(2))
         .expect("pause the PTY reader");
-    let duplicate = runtime.duplicate_handoff_fd().expect("duplicate the PTY master");
+    let duplicate = runtime
+        .duplicate_handoff_fd()
+        .expect("duplicate the PTY master");
     let _new_server_master = unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) };
 
     runtime.preserve_for_handoff();
@@ -332,4 +354,51 @@ async fn a_live_handoff_does_not_end_the_pane_processes() {
         probe.pids().to_vec(),
         "the shell and workers must outlive the old server's runtime after a handoff"
     );
+}
+
+/// A server that exits right after shutting its panes down must not leave the escalation unfinished: once the exit
+/// wait returns, the workers that only SIGKILL ends are gone, with no further waiting.
+#[tokio::test]
+async fn the_server_exit_wait_returns_only_after_the_whole_session_is_gone() {
+    let (runtime, probe, _rx) = spawn_probe("stay").await;
+    runtime.shutdown();
+
+    finish_pane_shutdowns_before_exit();
+
+    assert_eq!(
+        survivors(&probe.pids()),
+        Vec::<u32>::new(),
+        "the exit wait returned while these were still running"
+    );
+}
+
+/// The exit wait is bounded: asked for a short wait while a worker holds the pane for half a second, it returns on
+/// time and names the pane that is still being ended, instead of holding the exit open.
+#[tokio::test]
+async fn waiting_for_the_escalation_is_bounded_and_names_what_is_still_ending() {
+    for attempt in 1..=3 {
+        let (runtime, probe, _rx) = spawn_probe("stay").await;
+        runtime.shutdown();
+        let started = Instant::now();
+        let still_ending = super::shutdown::wait_for_all(Duration::from_millis(50));
+        let waited = started.elapsed();
+        finish_pane_shutdowns_before_exit();
+        if !still_ending.is_empty() {
+            assert!(
+                waited < Duration::from_millis(400),
+                "a 50 ms wait took {waited:?}"
+            );
+            assert!(
+                still_ending.contains(&(42, probe.shell)),
+                "pane 42 and shell {} should be named, got {still_ending:?}",
+                probe.shell
+            );
+            return;
+        }
+        // Only a stall of this thread past the kill step (an overloaded machine) earns another try.
+        assert!(
+            waited >= Duration::from_millis(450) && attempt < 3,
+            "the wait returned in {waited:?} with nothing left, but the worker lives until the kill step"
+        );
+    }
 }
