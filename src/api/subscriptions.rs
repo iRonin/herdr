@@ -493,10 +493,17 @@ impl ActiveAgentStatusChangedSubscription {
     }
 
     /// An event about this pane that is not a `pane.agent_status_changed` (the pane closed,
-    /// exited or moved, an agent was detected or released, or the pane was updated) can change
-    /// what `pane.get` answers, or end it with `pane_not_found`. The status events themselves are
-    /// consumed from the history directly, so a title, display-agent or state-label change needs
-    /// no snapshot; these need one, and at once rather than at the next interval.
+    /// exited or moved, an agent was detected or released, the pane was updated, or its read flag
+    /// changed) can change what `pane.get` answers, or end it with `pane_not_found`. The status
+    /// events themselves are consumed from the history directly, so a title, display-agent or
+    /// state-label change needs no snapshot; these need one, and at once rather than at the next
+    /// interval.
+    ///
+    /// A read-flag change is the only record of a done pane that was viewed (or got the
+    /// `auto_read` token late): the projected status goes from done to idle with no status event.
+    /// A tab or workspace that closes, or a tab that moves to another workspace, emits no
+    /// `pane.closed` for the panes inside it and renames their ids; those events carry no pane
+    /// list, so any of them requests the snapshot (they are rare).
     fn note_pane_event(&mut self, event: &crate::api::schema::EventEnvelope) {
         use crate::api::schema::EventData;
         let concerns_pane = match &event.data {
@@ -507,6 +514,10 @@ impl ActiveAgentStatusChangedSubscription {
                 previous_pane_id, ..
             } => *previous_pane_id == self.pane_id,
             EventData::PaneUpdated { pane } => pane.pane_id == self.pane_id,
+            EventData::PaneReadStateChanged { read_state } => read_state.pane_id == self.pane_id,
+            EventData::TabClosed { .. }
+            | EventData::WorkspaceClosed { .. }
+            | EventData::TabMoved { .. } => true,
             _ => false,
         };
         if concerns_pane {

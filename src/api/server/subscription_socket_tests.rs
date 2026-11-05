@@ -1,7 +1,7 @@
 use super::*;
 use crate::api::schema::{
-    AgentStatus, EventData, EventEnvelope, EventKind, PaneInfo, PaneReadResult, ReadFormat,
-    ReadSource,
+    AgentStatus, EventData, EventEnvelope, EventKind, PaneInfo, PaneReadResult, PaneReadState,
+    ReadFormat, ReadSource,
 };
 use crate::ipc::{poll_local_stream_read_count, LocalStreamReadCount};
 use interprocess::local_socket::traits::Listener as _;
@@ -229,6 +229,10 @@ fn reply(request: ApiRequestMessage, result: ResponseResult) {
 }
 
 fn reply_to_probe(request: ApiRequestMessage) {
+    reply_to_probe_with_status(request, AgentStatus::Working);
+}
+
+fn reply_to_probe_with_status(request: ApiRequestMessage, agent_status: AgentStatus) {
     let result = match request.request.method {
         Method::PaneGet(_) => ResponseResult::PaneInfo {
             pane: PaneInfo {
@@ -246,7 +250,7 @@ fn reply_to_probe(request: ApiRequestMessage) {
                 terminal_title: None,
                 terminal_title_stripped: None,
                 display_agent: None,
-                agent_status: AgentStatus::Working,
+                agent_status,
                 state_labels: Default::default(),
                 tokens: Default::default(),
                 agent_session: None,
@@ -392,6 +396,15 @@ fn agent_status_event(title: Option<&str>) -> EventEnvelope {
 /// Answers every app request that arrives during `window` with the probe reply and returns how
 /// many `pane.get` requests there were.
 fn answer_pane_gets_for(test: &mut SocketTest, window: Duration) -> usize {
+    answer_pane_gets_with_status_for(test, window, AgentStatus::Working)
+}
+
+/// `answer_pane_gets_for`, answering every `pane.get` with `agent_status`.
+fn answer_pane_gets_with_status_for(
+    test: &mut SocketTest,
+    window: Duration,
+    agent_status: AgentStatus,
+) -> usize {
     let end = Instant::now() + window;
     let mut pane_gets = 0;
     while Instant::now() < end {
@@ -400,7 +413,7 @@ fn answer_pane_gets_for(test: &mut SocketTest, window: Duration) -> usize {
                 if matches!(request.request.method, Method::PaneGet(_)) {
                     pane_gets += 1;
                 }
-                reply_to_probe(request);
+                reply_to_probe_with_status(request, agent_status);
             }
             Err(mpsc::error::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
             Err(error) => panic!("app request channel closed: {error}"),
@@ -594,4 +607,123 @@ fn a_pane_event_takes_a_snapshot_at_once_but_only_for_the_subscribed_pane() {
         request.request.id
     );
     reply_to_probe(request);
+}
+
+fn read_state_changed(pane_id: &str) -> EventEnvelope {
+    EventEnvelope {
+        event: EventKind::PaneReadStateChanged,
+        data: EventData::PaneReadStateChanged {
+            read_state: PaneReadState {
+                pane_id: pane_id.into(),
+                workspace_id: "workspace_1".into(),
+                seen: true,
+                agent_status: AgentStatus::Idle,
+            },
+        },
+    }
+}
+
+#[test]
+fn a_viewed_done_pane_reaches_an_agent_status_subscriber_at_once() {
+    // Viewing a done pane (or giving it the `auto_read` token late) turns done into idle with no
+    // `pane.agent_status_changed`; the app says so with `pane.read_state_changed`. Both intervals
+    // are 30 s, so only that event can make the subscription look at the pane within 5 s.
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let mut client = test.connect();
+    client.subscribe("read", idle_agent_status_subscription());
+    let probe = test.app_request();
+    assert!(probe.request.id.ends_with(":probe"));
+    reply_to_probe_with_status(probe, AgentStatus::Done);
+    client.assert_started("read");
+    // The first pass takes its snapshot (done); then the connection blocks on the hub.
+    assert_eq!(
+        answer_pane_gets_with_status_for(&mut test, Duration::from_millis(400), AgentStatus::Done),
+        1
+    );
+
+    // A read-state change of another pane is no concern of this subscription.
+    test.hub.push(read_state_changed("pane_2"));
+    assert_eq!(
+        answer_pane_gets_with_status_for(&mut test, Duration::from_millis(400), AgentStatus::Idle),
+        0
+    );
+    // The subscribed pane was viewed: its snapshot now says idle, and the subscriber is told.
+    test.hub.push(read_state_changed("pane_1"));
+    let request = test.app_request();
+    assert!(matches!(request.request.method, Method::PaneGet(_)));
+    reply_to_probe_with_status(request, AgentStatus::Idle);
+    let delivered = client
+        .next_line(Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(delivered["event"], "pane.agent_status_changed");
+    assert_eq!(delivered["data"]["agent_status"], "idle");
+}
+
+#[test]
+fn removing_a_tab_or_workspace_takes_a_snapshot_at_once() {
+    // `tab.close`, `workspace.close` and `tab.move_to_workspace` emit no `pane.closed` or
+    // `pane.moved` for the panes inside, yet `pane.get` answers `pane_not_found` (or another id)
+    // afterwards. Both intervals are 30 s, so a `pane.get` within the test answers one of them.
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let mut client = test.connect();
+    client.subscribe("removed", idle_agent_status_subscription());
+    let probe = test.app_request();
+    assert!(probe.request.id.ends_with(":probe"));
+    reply_to_probe(probe);
+    client.assert_started("removed");
+    assert_eq!(
+        answer_pane_gets_for(&mut test, Duration::from_millis(400)),
+        1
+    );
+
+    // Control: an event that cannot change the pane takes no snapshot.
+    test.hub.push(EventEnvelope {
+        event: EventKind::WorkspaceRenamed,
+        data: EventData::WorkspaceRenamed {
+            workspace_id: "workspace_1".into(),
+            label: "renamed".into(),
+        },
+    });
+    assert_eq!(
+        answer_pane_gets_for(&mut test, Duration::from_millis(400)),
+        0
+    );
+
+    let removals = [
+        EventEnvelope {
+            event: EventKind::TabClosed,
+            data: EventData::TabClosed {
+                tab_id: "tab_1".into(),
+                workspace_id: "workspace_1".into(),
+            },
+        },
+        EventEnvelope {
+            event: EventKind::WorkspaceClosed,
+            data: EventData::WorkspaceClosed {
+                workspace_id: "workspace_1".into(),
+                workspace: None,
+            },
+        },
+        EventEnvelope {
+            event: EventKind::TabMoved,
+            data: EventData::TabMoved {
+                tab_id: "tab_3".into(),
+                workspace_id: "workspace_2".into(),
+                insert_index: 0,
+                tabs: Vec::new(),
+                previous_tab_id: Some("tab_1".into()),
+                previous_workspace_id: Some("workspace_1".into()),
+            },
+        },
+    ];
+    for removal in removals {
+        let name = format!("{:?}", removal.event);
+        test.hub.push(removal);
+        let request = test.app_request();
+        assert!(
+            matches!(request.request.method, Method::PaneGet(_)),
+            "{name} must take a snapshot"
+        );
+        reply_to_probe(request);
+    }
 }
