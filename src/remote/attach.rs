@@ -52,16 +52,14 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.keybindings,
         remote.live_handoff,
     );
-    let manage_ssh_config = crate::config::Config::load()
-        .config
-        .remote
-        .manage_ssh_config;
+    let remote_config = crate::config::Config::load().config.remote;
     let require_surface_interest = crate::client::endpoint::EndpointCatalog::load()
         .map(|catalog| catalog.contains_enabled_target_session(&remote.target, &session_name))
         .unwrap_or(false);
     let remote_ssh = RemoteSsh::new(
         remote.target.clone(),
-        manage_ssh_config,
+        remote_config.manage_ssh_config,
+        &remote_config.ssh_config_files,
         session_name.clone(),
     );
     let prepared_remote =
@@ -135,13 +133,11 @@ impl SavedSshSetup {
     pub(crate) fn connect(target: &str) -> io::Result<Self> {
         super::validate_remote_target(target)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let manage = crate::config::Config::load()
-            .config
-            .remote
-            .manage_ssh_config;
+        let remote_config = crate::config::Config::load().config.remote;
         let ssh = RemoteSsh::new(
             target.to_owned(),
-            manage,
+            remote_config.manage_ssh_config,
+            &remote_config.ssh_config_files,
             crate::session::DEFAULT_SESSION_NAME.to_owned(),
         );
         let remote_herdr =
@@ -737,17 +733,17 @@ pub(crate) fn ssh_authentication_command(target: &str) -> io::Result<SshAuthenti
     if !crate::platform::remote_ssh_config_paths().multiplexing {
         return Err(io::Error::new(io::ErrorKind::Unsupported, "interactive SSH recovery requires Unix OpenSSH multiplexing; authenticate outside Herdr on this platform"));
     }
-    if !crate::config::Config::load()
-        .config
-        .remote
-        .manage_ssh_config
-    {
+    let remote_config = crate::config::Config::load().config.remote;
+    if !remote_config.manage_ssh_config {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "interactive SSH recovery requires remote.manage_ssh_config=true",
         ));
     }
-    let config = write_managed_ssh_config(target)?;
+    let config = write_managed_ssh_config(
+        target,
+        &existing_ssh_config_files(&remote_config.ssh_config_files),
+    )?;
     Ok(authentication_command_with_config(target, config))
 }
 
@@ -783,9 +779,14 @@ pub(super) struct RemoteSsh {
 }
 
 impl RemoteSsh {
-    fn new(target: String, manage_ssh_config: bool, session_name: String) -> Self {
+    fn new(
+        target: String,
+        manage_ssh_config: bool,
+        ssh_config_files: &[String],
+        session_name: String,
+    ) -> Self {
         let managed_config = if manage_ssh_config {
-            write_managed_ssh_config(&target)
+            write_managed_ssh_config(&target, &existing_ssh_config_files(ssh_config_files))
                 .inspect_err(|err| {
                     tracing::debug!(%err, "could not write managed ssh config; using plain ssh");
                 })
@@ -803,12 +804,15 @@ impl RemoteSsh {
     }
 
     pub(super) fn new_noninteractive(target: String) -> Self {
-        let manage = crate::platform::remote_ssh_config_paths().multiplexing
-            && crate::config::Config::load()
-                .config
-                .remote
-                .manage_ssh_config;
-        let mut ssh = Self::new(target, manage, crate::session::DEFAULT_SESSION_NAME.into());
+        let remote = crate::config::Config::load().config.remote;
+        let manage =
+            crate::platform::remote_ssh_config_paths().multiplexing && remote.manage_ssh_config;
+        let mut ssh = Self::new(
+            target,
+            manage,
+            &remote.ssh_config_files,
+            crate::session::DEFAULT_SESSION_NAME.into(),
+        );
         ssh.noninteractive = true;
         ssh
     }
@@ -2935,9 +2939,69 @@ fn ssh_user_config_include(path: Option<&Path>) -> Option<String> {
         .map(ssh_config_include_path)
 }
 
+/// Resolves the configured `[remote].ssh_config_files` to absolute paths of
+/// files that exist. `~/` expands against the home directory. A relative path
+/// is skipped because OpenSSH would resolve it against `~/.ssh`, not the
+/// working directory; a missing file is skipped like a missing user config.
+fn existing_ssh_config_files(configured: &[String]) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for raw in configured {
+        let Some(path) = expand_ssh_config_path(raw) else {
+            tracing::warn!(
+                path = %raw,
+                "skipping remote.ssh_config_files entry: not an absolute path or ~/ path"
+            );
+            continue;
+        };
+        if !path.is_file() {
+            tracing::warn!(
+                path = %path.display(),
+                "skipping remote.ssh_config_files entry: file does not exist"
+            );
+            continue;
+        }
+        files.push(path);
+    }
+    files
+}
+
+fn expand_ssh_config_path(raw: &str) -> Option<PathBuf> {
+    let path = crate::worktree::expand_tilde_path(raw.trim());
+    path.is_absolute().then_some(path)
+}
+
+/// The text of the temporary ssh config. Every file is `Include`d before herdr's
+/// own fallbacks, and the extra files before the default ssh config, so OpenSSH's
+/// first-value-wins rule lets a dedicated file's `Host` block apply while the
+/// user's explicit settings still beat the keepalive fallbacks.
+fn managed_ssh_config_contents(
+    extra_files: &[PathBuf],
+    user_config: Option<&Path>,
+    system_config: Option<&Path>,
+) -> String {
+    let mut contents = String::new();
+    for file in extra_files {
+        contents.push_str(&format!("Include {}\n", ssh_config_include_path(file)));
+    }
+    if let Some(include) = ssh_user_config_include(user_config) {
+        contents.push_str(&format!("Include {include}\n"));
+    }
+    if let Some(system_config) = system_config.filter(|path| path.is_file()) {
+        contents.push_str(&format!(
+            "Include {}\n",
+            ssh_config_include_path(system_config)
+        ));
+    }
+    contents.push_str("Host *\n");
+    contents.push_str("  ServerAliveInterval 15\n");
+    contents.push_str("  ServerAliveCountMax 4\n");
+    contents
+}
+
 /// Builds a temporary ssh config that includes the user's settings first, so
-/// OpenSSH's first-value-wins behavior preserves explicit user keepalives.
-fn write_managed_ssh_config(target: &str) -> io::Result<ManagedSshConfig> {
+/// OpenSSH's first-value-wins behavior preserves explicit user keepalives. The
+/// extra files from `remote.ssh_config_files` come before the default ssh config.
+fn write_managed_ssh_config(target: &str, extra_files: &[PathBuf]) -> io::Result<ManagedSshConfig> {
     let paths = crate::platform::remote_ssh_config_paths();
     let control_path = if paths.multiplexing {
         Some(crate::platform::shared_ssh_control_path(
@@ -2950,19 +3014,11 @@ fn write_managed_ssh_config(target: &str) -> io::Result<ManagedSshConfig> {
 
     let dir = crate::platform::create_remote_ssh_config_dir(SSH_CONTROL_SOCKET_NAME)?;
     let path = dir.join("config");
-    let mut contents = String::new();
-    if let Some(include) = ssh_user_config_include(paths.user_config.as_deref()) {
-        contents.push_str(&format!("Include {include}\n"));
-    }
-    if let Some(system_config) = paths.system_config.filter(|path| path.is_file()) {
-        contents.push_str(&format!(
-            "Include {}\n",
-            ssh_config_include_path(&system_config)
-        ));
-    }
-    contents.push_str("Host *\n");
-    contents.push_str("  ServerAliveInterval 15\n");
-    contents.push_str("  ServerAliveCountMax 4\n");
+    let contents = managed_ssh_config_contents(
+        extra_files,
+        paths.user_config.as_deref(),
+        paths.system_config.as_deref(),
+    );
 
     let write_result = (|| {
         let mut file = crate::platform::create_remote_ssh_config_file(&path)?;
@@ -3815,7 +3871,8 @@ mod tests {
     fn managed_ssh_config_includes_user_config_then_fallback() {
         use std::os::unix::fs::PermissionsExt;
 
-        let managed_config = write_managed_ssh_config("example").expect("write managed config");
+        let managed_config =
+            write_managed_ssh_config("example", &[]).expect("write managed config");
         let path = managed_config.options.config_path.clone();
         let control_path = managed_config
             .options
@@ -3878,8 +3935,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shared_ssh_transport_survives_helper_config_drop() {
-        let first = write_managed_ssh_config("example").unwrap();
-        let second = write_managed_ssh_config("example").unwrap();
+        let first = write_managed_ssh_config("example", &[]).unwrap();
+        let second = write_managed_ssh_config("example", &[]).unwrap();
         let socket = first.options.control_path.clone().unwrap();
         assert_eq!(Some(&socket), second.options.control_path.as_ref());
         assert_ne!(socket.parent(), first.options.config_path.parent());
@@ -3913,7 +3970,7 @@ mod tests {
 
     #[test]
     fn bridge_options_keep_temporary_config_alive_after_helper_drop() {
-        let config = write_managed_ssh_config("example").unwrap();
+        let config = write_managed_ssh_config("example", &[]).unwrap();
         let path = config.options.config_path.clone();
         let worker_options = config.options.clone();
         drop(config);
@@ -3925,8 +3982,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn authentication_command_uses_shared_transport_without_askpass_or_host_key_relaxation() {
-        let config = write_managed_ssh_config("example").unwrap();
-        let setup = RemoteSsh::new("example".into(), true, "other-session".into());
+        let config = write_managed_ssh_config("example", &[]).unwrap();
+        let setup = RemoteSsh::new("example".into(), true, &[], "other-session".into());
         assert_eq!(
             config.options.control_path,
             setup.options().unwrap().control_path
@@ -3970,9 +4027,219 @@ mod tests {
 
     #[test]
     fn unmanaged_ssh_setup_preserves_plain_transport() {
-        let ssh = RemoteSsh::new("example".into(), false, "main".into());
+        let ssh = RemoteSsh::new("example".into(), false, &[], "main".into());
         assert!(ssh.options().is_none());
         assert!(!ssh.command().get_args().any(|arg| arg == "-F"));
+    }
+
+    #[cfg(unix)]
+    struct SshConfigSandbox {
+        dir: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl SshConfigSandbox {
+        fn new(tag: &str) -> Self {
+            // A space in the path proves the Include value is quoted.
+            let dir =
+                std::env::temp_dir().join(format!("herdr ssh cfg {tag} {}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create sandbox dir");
+            Self { dir }
+        }
+
+        fn file(&self, name: &str, contents: &str) -> PathBuf {
+            let path = self.dir.join(name);
+            std::fs::write(&path, contents).expect("write sandbox file");
+            path
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SshConfigSandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[cfg(unix)]
+    const FALLBACK_BLOCK: &str = "Host *\n  ServerAliveInterval 15\n  ServerAliveCountMax 4\n";
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_ssh_config_without_extra_files_is_unchanged() {
+        let sandbox = SshConfigSandbox::new("default");
+        let user = sandbox.file("user_config", "Host a\n");
+        let system = sandbox.file("system_config", "Host b\n");
+
+        let contents = managed_ssh_config_contents(&[], Some(&user), Some(&system));
+
+        assert_eq!(
+            contents,
+            format!(
+                "Include \"{}\"\nInclude \"{}\"\n{FALLBACK_BLOCK}",
+                user.display(),
+                system.display()
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_ssh_config_includes_extra_files_before_user_config() {
+        let sandbox = SshConfigSandbox::new("extra");
+        let user = sandbox.file("user_config", "Host a\n");
+        let system = sandbox.file("system_config", "Host b\n");
+        let first = sandbox.file("first config", "Host c\n");
+        let second = sandbox.file("second config", "Host d\n");
+
+        let contents = managed_ssh_config_contents(
+            &[first.clone(), second.clone()],
+            Some(&user),
+            Some(&system),
+        );
+
+        // OpenSSH takes the first value it finds, so the dedicated files must
+        // come before the default ssh config, in the order they were listed, and
+        // the herdr fallbacks must stay last.
+        assert_eq!(
+            contents,
+            format!(
+                "Include \"{}\"\nInclude \"{}\"\nInclude \"{}\"\nInclude \"{}\"\n{FALLBACK_BLOCK}",
+                first.display(),
+                second.display(),
+                user.display(),
+                system.display()
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_ssh_config_files_skip_missing_and_relative_paths() {
+        let sandbox = SshConfigSandbox::new("skip");
+        let present = sandbox.file("present config", "Host c\n");
+        let missing = sandbox.dir.join("missing config");
+
+        let files = existing_ssh_config_files(&[
+            missing.to_string_lossy().into_owned(),
+            present.to_string_lossy().into_owned(),
+            "relative/config".to_string(),
+            String::new(),
+        ]);
+
+        assert_eq!(files, vec![present]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_ssh_config_paths_expand_the_home_directory() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+
+        assert_eq!(
+            expand_ssh_config_path("~/.config/my host/ssh_config"),
+            Some(home.join(".config/my host/ssh_config"))
+        );
+        assert_eq!(
+            expand_ssh_config_path("/etc/herdr/ssh_config"),
+            Some(PathBuf::from("/etc/herdr/ssh_config"))
+        );
+        assert_eq!(expand_ssh_config_path("relative/ssh_config"), None);
+    }
+
+    /// `ssh -G` only evaluates the configuration, so this runs the real
+    /// OpenSSH without connecting anywhere.
+    #[cfg(unix)]
+    #[test]
+    fn real_ssh_resolves_a_host_that_only_the_extra_file_defines() {
+        let sandbox = SshConfigSandbox::new("ssh-g");
+        let extra = sandbox.file(
+            "extra config",
+            "Host herdr-extra-test-host\n  HostName extra.example.invalid\n  Port 2222\n  \
+User svc-agents\n  IdentityFile /nonexistent/extra-key\n  IdentitiesOnly yes\n",
+        );
+
+        let managed = write_managed_ssh_config("herdr-extra-test-host", &[extra])
+            .expect("write managed config");
+        let output = match Command::new("ssh")
+            .arg("-G")
+            .arg("-F")
+            .arg(&managed.options.config_path)
+            .arg("herdr-extra-test-host")
+            .output()
+        {
+            Ok(output) => output,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+            Err(err) => panic!("run ssh -G: {err}"),
+        };
+        let resolved = String::from_utf8_lossy(&output.stdout);
+        println!("{resolved}");
+
+        assert!(output.status.success(), "ssh -G failed: {output:?}");
+        assert!(resolved.contains("\nhostname extra.example.invalid\n"));
+        assert!(resolved.contains("\nport 2222\n"));
+        assert!(resolved.contains("\nuser svc-agents\n"));
+        assert!(resolved.contains("\nidentityfile /nonexistent/extra-key\n"));
+        assert!(resolved.contains("\nidentitiesonly yes\n"));
+    }
+
+    /// Saved machines (`herdr machine add`) connect through `new_noninteractive`. Since the managed
+    /// config is shared with them, it must carry the configured extra files, and only existing ones,
+    /// and nothing at all when `manage_ssh_config` is false.
+    #[cfg(unix)]
+    #[test]
+    fn saved_machine_ssh_uses_configured_extra_config_files() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let sandbox = SshConfigSandbox::new("saved");
+        let extra = sandbox.file("extra_config", "Host saved-test\n  Port 2222\n");
+        let load_with = |toml: String| {
+            let config = sandbox.file("herdr.toml", &toml);
+            std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &config);
+            let ssh = RemoteSsh::new_noninteractive("saved-test".to_string());
+            std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+            let args: Vec<String> = ssh
+                .command()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            let contents = ssh
+                .options()
+                .map(|options| std::fs::read_to_string(&options.config_path).unwrap());
+            (args, contents)
+        };
+        let include = format!("Include {}", ssh_config_include_path(&extra));
+
+        // Configured and present: -F points at a config that includes the file.
+        let (args, contents) = load_with(format!(
+            "[remote]\nssh_config_files = [\"{}\"]\n",
+            extra.display()
+        ));
+        let contents = contents.expect("a managed config is in use");
+        assert!(args.iter().any(|arg| arg == "-F"));
+        assert!(contents.contains(&include), "{contents}");
+
+        // Default (empty list): the managed config is the same one without the extra include.
+        let (_, contents) = load_with("[remote]\n".to_string());
+        assert!(!contents
+            .expect("a managed config is in use")
+            .contains(&include));
+
+        // A listed file that does not exist is skipped.
+        let (_, contents) =
+            load_with("[remote]\nssh_config_files = [\"/nonexistent/herdr-extra\"]\n".to_string());
+        assert!(!contents
+            .expect("a managed config is in use")
+            .contains("/nonexistent/herdr-extra"));
+
+        // manage_ssh_config = false suppresses the extras and the managed config.
+        let (args, contents) = load_with(format!(
+            "[remote]\nmanage_ssh_config = false\nssh_config_files = [\"{}\"]\n",
+            extra.display()
+        ));
+        assert!(contents.is_none());
+        assert!(!args.iter().any(|arg| arg == "-F"));
     }
 
     #[test]
@@ -3986,7 +4253,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn remote_ssh_command_uses_managed_config_when_present() {
-        let managed_config = write_managed_ssh_config("example").expect("write managed config");
+        let managed_config =
+            write_managed_ssh_config("example", &[]).expect("write managed config");
         let config_path = managed_config.options.config_path.clone();
         let control_path = managed_config.options.control_path.clone().unwrap();
         let ssh = RemoteSsh {
@@ -4043,7 +4311,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_managed_ssh_config_uses_keepalives_without_control_socket() {
-        let managed_config = write_managed_ssh_config("example").expect("write managed config");
+        let managed_config =
+            write_managed_ssh_config("example", &[]).expect("write managed config");
         let config_path = managed_config.options.config_path.clone();
         assert!(managed_config.options.control_path.is_none());
         let contents = std::fs::read_to_string(&config_path).expect("read managed config");
@@ -4123,7 +4392,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn endpoint_probe_preserves_setup_ssh_options() {
-        let managed_config = write_managed_ssh_config("example").expect("write managed config");
+        let managed_config =
+            write_managed_ssh_config("example", &[]).expect("write managed config");
         let marker = managed_config
             .options
             .config_path
