@@ -30,7 +30,7 @@ mod shutdown;
 pub(crate) use shutdown::monitor_host_shutdown;
 
 mod launchd_spawn;
-pub(crate) use launchd_spawn::{leave_launchd_job, spawn_launchd_job};
+pub(crate) use launchd_spawn::{launcher_keeper_pid, leave_launchd_job, spawn_launchd_job};
 
 #[cfg(test)]
 mod config_file_tests;
