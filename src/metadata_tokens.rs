@@ -88,6 +88,13 @@ impl MetadataTokens {
             .collect()
     }
 
+    /// Presence check for a single token key (cheap — no map clone, unlike
+    /// `values`). Control-plane tokens (e.g. `auto_read`) are keyed on
+    /// PRESENCE; their value is a placeholder.
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
     pub(crate) fn next_expiry(&self) -> Option<Instant> {
         self.entries
             .values()
@@ -175,6 +182,21 @@ mod tests {
             tokens.values(),
             HashMap::from([("persistent".into(), "two".into())])
         );
+    }
+
+    #[test]
+    fn contains_reports_presence_without_cloning() {
+        let now = Instant::now();
+        let mut tokens = MetadataTokens::default();
+        assert!(!tokens.contains("auto_read"));
+
+        tokens.patch(patch(&[("auto_read", Some("1"))]), None, now);
+        assert!(tokens.contains("auto_read"));
+        assert!(!tokens.contains("other"));
+
+        // A null patch (clear) removes presence — the control-plane contract.
+        tokens.patch(patch(&[("auto_read", None)]), None, now);
+        assert!(!tokens.contains("auto_read"));
     }
 
     #[test]
