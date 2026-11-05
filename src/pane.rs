@@ -30,6 +30,8 @@ mod cursor;
 mod input;
 mod kitty_keyboard;
 mod osc;
+#[cfg(all(test, unix))]
+mod shutdown_tests;
 mod state;
 mod terminal;
 #[cfg(test)]
