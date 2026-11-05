@@ -780,12 +780,21 @@ fn server_death_mid_attach_reports_the_pre_attach_phase_error() {
             // waits for the client's hello first: since the client probes its terminal before it
             // connects (and this pty never answers), a fixed delay closed the connection before
             // the hello was written, and the client then failed on the write, not on the read.
+            // The server reads the WHOLE hello frame (the 4-byte length, then the payload) before it
+            // closes: the client sends the two with separate writes (`write_message`), and a close
+            // after the first byte lets a client that is descheduled between them hit EPIPE on the
+            // second write ("failed to connect to server: ... Broken pipe"), not the read this test
+            // is about. Seen once in 14 falkenstein runs, and made certain by a pause between the
+            // client's two writes.
             std::thread::spawn(move || {
                 use std::io::Read;
                 let mut connection = connection;
                 let _ = connection.set_read_timeout(Some(Duration::from_secs(10)));
-                let mut hello = [0_u8; 1];
-                let _ = connection.read(&mut hello);
+                let mut len = [0_u8; 4];
+                if connection.read_exact(&mut len).is_ok() {
+                    let mut payload = vec![0_u8; (u32::from_le_bytes(len) as usize).min(1 << 20)];
+                    let _ = connection.read_exact(&mut payload);
+                }
                 drop(connection);
             });
         }
