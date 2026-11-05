@@ -19,6 +19,21 @@ use crate::ipc::LocalStream;
 
 const AGENT_PROMPT_EFFECT_TIMEOUT_MS: u64 = 5_000;
 
+/// How long a wait loop may block on the event hub before it must look again: the hub's liveness
+/// interval, or less when its own deadline or a sampling subscription's next sample comes first.
+fn hub_wait_timeout(
+    liveness: std::time::Duration,
+    deadline: Option<std::time::Instant>,
+    sample_due: Option<std::time::Instant>,
+) -> std::time::Duration {
+    let now = std::time::Instant::now();
+    [deadline, sample_due]
+        .into_iter()
+        .flatten()
+        .map(|at| at.saturating_duration_since(now))
+        .fold(liveness, std::time::Duration::min)
+}
+
 pub(super) fn wait_for_output(
     request_id: String,
     params: crate::api::schema::PaneWaitForOutputParams,
@@ -384,6 +399,8 @@ fn wait_for_resolved_agent(
     let mut last_event_sequence = wait.last_event_sequence;
 
     loop {
+        // Take the cursor BEFORE the stop check and the history read (see `EventHub::wait_cursor`).
+        let cursor = event_hub.wait_cursor();
         if should_stop_connection(stream, running)? {
             return Ok(None);
         }
@@ -509,7 +526,11 @@ fn wait_for_resolved_agent(
                 .map(AgentWaitOutcome::Response)
                 .map(Some);
         }
-        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+        // This wait probes only after a relevant event (and at its deadline), so it blocks on the hub.
+        event_hub.wait_for_event_after(
+            cursor,
+            hub_wait_timeout(event_hub.timing().liveness, deadline, None),
+        );
     }
 }
 
@@ -722,12 +743,26 @@ pub(super) fn wait_for_event(
         Err(response) => return Ok(Some(serde_json::to_string(&response).unwrap())),
     };
 
+    let timing = event_hub.timing();
+    let sample_interval = active.sample_interval(&timing);
+    // The first pass samples (the initial snapshot of an agent-status wait is delivered then).
+    let mut sample_due_at = std::time::Instant::now();
     loop {
+        // Take the cursor BEFORE the stop check and the history read (see `EventHub::wait_cursor`).
+        let cursor = event_hub.wait_cursor();
         if should_stop_connection(stream, running)? {
             return Ok(None);
         }
 
-        match active.poll_for_wait(api_tx, event_hub) {
+        let now = std::time::Instant::now();
+        let sample_due = match sample_interval {
+            Some(interval) if now >= sample_due_at => {
+                sample_due_at = now + interval;
+                true
+            }
+            _ => false,
+        };
+        match active.poll_for_wait(api_tx, event_hub, sample_due) {
             Ok(Some(event)) => return Ok(Some(wait_matched_response(&request_id, event))),
             Ok(None) => {}
             Err(mut response) if response.error.code == "pane_not_found" => {
@@ -752,7 +787,14 @@ pub(super) fn wait_for_event(
             ));
         }
 
-        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+        event_hub.wait_for_event_after(
+            cursor,
+            hub_wait_timeout(
+                timing.liveness,
+                deadline,
+                sample_interval.map(|_| sample_due_at),
+            ),
+        );
     }
 }
 

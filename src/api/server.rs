@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 #[cfg(all(test, unix))]
 use std::fs;
 
+use crate::api::event_hub::WaitTiming;
 use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, Request, ResponseResult, ServerCapabilities, SuccessResponse,
 };
@@ -39,11 +40,14 @@ pub struct ServerHandle {
     path: PathBuf,
     identity: SocketFileIdentity,
     running: Arc<AtomicBool>,
+    event_hub: EventHub,
 }
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        // Connection threads blocked on the hub notice the flag now, not after their liveness interval.
+        self.event_hub.wake_waiters();
 
         if let Err(err) = self.remove_socket_file_if_owned() {
             if err.kind() != std::io::ErrorKind::NotFound {
@@ -119,6 +123,7 @@ fn start_server_inner(
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
+    let handle_event_hub = event_hub.clone();
     let spawned = crate::thread_spawn::spawn_named("herdr-api-accept", move || {
         run_accept_loop(
             listener.incoming(),
@@ -164,6 +169,7 @@ fn start_server_inner(
         path,
         identity,
         running,
+        event_hub: handle_event_hub,
     })
 }
 
@@ -1018,13 +1024,33 @@ fn stream_subscriptions(
         return Err(err);
     }
 
+    // The history is the only thing that wakes an idle connection; sampling subscriptions also come
+    // due on their own interval, and the liveness interval bounds every wait (see `EventHub`).
+    let timing = event_hub.timing();
+    let intervals: Vec<Option<Duration>> = subscriptions
+        .iter()
+        .map(|subscription| subscription.sample_interval(&timing))
+        .collect();
+    // The first pass samples every sampling subscription (the initial snapshot is delivered then).
+    let mut due = vec![Instant::now(); subscriptions.len()];
     loop {
+        // Take the cursor BEFORE the stop check and the history read: an event, or the server's
+        // stop wake-up, arriving at any point after this makes the wait below return at once.
+        let cursor = event_hub.wait_cursor();
         if should_stop_connection(&mut stream, running)? {
             return Ok(());
         }
 
-        for subscription in &mut subscriptions {
-            let events = match subscription.poll_batch(api_tx, event_hub) {
+        let now = Instant::now();
+        for (index, subscription) in subscriptions.iter_mut().enumerate() {
+            let sample_due = match intervals[index] {
+                Some(interval) if now >= due[index] => {
+                    due[index] = now + interval;
+                    true
+                }
+                _ => false,
+            };
+            let events = match subscription.poll_batch(api_tx, event_hub, sample_due) {
                 Ok(events) => events,
                 Err(error) => {
                     write_json_line_allow_disconnect(
@@ -1049,8 +1075,27 @@ fn stream_subscriptions(
                 }
             }
         }
-        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+        event_hub.wait_for_event_after(
+            cursor,
+            next_wake_timeout(&timing, &intervals, &due, Instant::now()),
+        );
     }
+}
+
+/// How long a connection thread may block before it must look again: its liveness interval, or
+/// less when a sampling subscription comes due sooner.
+fn next_wake_timeout(
+    timing: &WaitTiming,
+    intervals: &[Option<Duration>],
+    due: &[Instant],
+    now: Instant,
+) -> Duration {
+    intervals
+        .iter()
+        .zip(due)
+        .filter(|(interval, _)| interval.is_some())
+        .map(|(_, due)| due.saturating_duration_since(now))
+        .fold(timing.liveness, Duration::min)
 }
 
 fn write_text_line(stream: &mut LocalStream, value: &str) -> std::io::Result<()> {

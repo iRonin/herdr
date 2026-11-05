@@ -1,12 +1,17 @@
+use std::time::Duration;
+
 use regex::Regex;
 
 use crate::api::event_hub::EventHistoryError;
+use crate::api::event_hub::WaitTiming;
 use crate::api::schema::{
     ErrorBody, ErrorResponse, EventKind, Method, PaneAgentStatusChangedEvent,
     PaneOutputMatchedEvent, PaneReadState, PaneScrollChangedEvent, PaneScrollInfo, Request,
     Subscription, SubscriptionEventData, SubscriptionEventEnvelope, SubscriptionEventKind,
 };
-use crate::api::server::{dispatch_to_app_with_timeout, APP_RESPONSE_TIMEOUT};
+use crate::api::server::{
+    dispatch_to_app_with_timeout, APP_RESPONSE_TIMEOUT, CONNECTION_POLL_INTERVAL,
+};
 use crate::api::{ApiRequestSender, EventHub};
 
 pub(super) fn output_match_read_source(
@@ -54,6 +59,9 @@ pub(super) struct ActiveAgentStatusChangedSubscription {
     last_presentation: Option<PanePresentationSnapshot>,
     last_sequence: u64,
     initial_event: Option<PaneAgentStatusChangedEvent>,
+    /// Set when the history held an event about this pane that is not a status change (see
+    /// `note_pane_event`); the next pass takes a snapshot at once. Cleared when one has run.
+    snapshot_requested: bool,
     request_prefix: String,
 }
 
@@ -240,6 +248,7 @@ impl ActiveSubscription {
                         last_presentation: Some(last_presentation),
                         last_sequence,
                         initial_event,
+                        snapshot_requested: false,
                         request_prefix: format!("{request_id}:sub:{index}"),
                     },
                 )))
@@ -291,15 +300,31 @@ impl ActiveSubscription {
         }
     }
 
+    /// How often this subscription must sample live state while no event wakes it, or `None` when
+    /// the retained event history is all it reads (such a subscription can sleep until the hub
+    /// wakes it). Output and scroll subscriptions keep their original 100 ms cadence: terminal
+    /// output and scroll position are never published as events.
+    pub(super) fn sample_interval(&self, timing: &WaitTiming) -> Option<Duration> {
+        match self {
+            Self::Event(_) | Self::ReadStateChanged(_) => None,
+            Self::AgentStatusChanged(_) => Some(timing.agent_status_snapshot),
+            Self::OutputMatched(_) | Self::ScrollChanged(_) => Some(CONNECTION_POLL_INTERVAL),
+        }
+    }
+
+    /// `sample_due` says whether this pass may sample live state (see `sample_interval`); a pass
+    /// that an event woke early reads the history only.
     pub(super) fn poll_for_wait(
         &mut self,
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
+        sample_due: bool,
     ) -> Result<Option<serde_json::Value>, ErrorResponse> {
         match self {
             Self::AgentStatusChanged(subscription) => Ok(subscription
-                .poll_result(api_tx, event_hub)?
+                .poll_result(api_tx, event_hub, sample_due)?
                 .and_then(|event| serde_json::to_value(event).ok())),
+            Self::OutputMatched(_) | Self::ScrollChanged(_) if !sample_due => Ok(None),
             _ => Ok(self.poll(api_tx, event_hub)),
         }
     }
@@ -308,6 +333,7 @@ impl ActiveSubscription {
         &mut self,
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
+        sample_due: bool,
     ) -> Result<Vec<serde_json::Value>, ErrorBody> {
         match self {
             Self::Event(subscription) => {
@@ -330,7 +356,7 @@ impl ActiveSubscription {
                         matching.push(serde_json::to_value(event).map_err(event_encoding_error)?);
                     }
                 }
-                if matching.is_empty() {
+                if matching.is_empty() && (sample_due || subscription.snapshot_requested) {
                     if let Some(event) =
                         subscription.poll_snapshot(api_tx, event_hub).ok().flatten()
                     {
@@ -351,9 +377,14 @@ impl ActiveSubscription {
                 Ok(matching)
             }
             // These subscriptions sample current state, not retained event history.
-            // Keep their existing cadence even when a lifecycle batch was nonempty.
+            // Keep their existing cadence even when a lifecycle batch was nonempty: they
+            // sample when `sample_due`, not every time an unrelated event wakes the connection.
             Self::OutputMatched(_) | Self::ScrollChanged(_) => {
-                Ok(self.poll(api_tx, event_hub).into_iter().collect())
+                if sample_due {
+                    Ok(self.poll(api_tx, event_hub).into_iter().collect())
+                } else {
+                    Ok(Vec::new())
+                }
             }
         }
     }
@@ -436,13 +467,16 @@ impl ActiveAgentStatusChangedSubscription {
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
     ) -> Option<SubscriptionEventEnvelope> {
-        self.poll_result(api_tx, event_hub).ok().flatten()
+        self.poll_result(api_tx, event_hub, true).ok().flatten()
     }
 
+    /// `snapshot` false reads the retained history only; true also asks the app for the pane
+    /// when the history had nothing for this subscription.
     fn poll_result(
         &mut self,
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
+        snapshot: bool,
     ) -> Result<Option<SubscriptionEventEnvelope>, ErrorResponse> {
         for (sequence, event) in event_hub.events_after(self.last_sequence) {
             self.last_sequence = sequence;
@@ -451,13 +485,40 @@ impl ActiveAgentStatusChangedSubscription {
             }
         }
 
-        self.poll_snapshot(api_tx, event_hub)
+        if snapshot || self.snapshot_requested {
+            self.poll_snapshot(api_tx, event_hub)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// An event about this pane that is not a `pane.agent_status_changed` (the pane closed,
+    /// exited or moved, an agent was detected or released, or the pane was updated) can change
+    /// what `pane.get` answers, or end it with `pane_not_found`. The status events themselves are
+    /// consumed from the history directly, so a title, display-agent or state-label change needs
+    /// no snapshot; these need one, and at once rather than at the next interval.
+    fn note_pane_event(&mut self, event: &crate::api::schema::EventEnvelope) {
+        use crate::api::schema::EventData;
+        let concerns_pane = match &event.data {
+            EventData::PaneClosed { pane_id, .. }
+            | EventData::PaneExited { pane_id, .. }
+            | EventData::PaneAgentDetected { pane_id, .. } => *pane_id == self.pane_id,
+            EventData::PaneMoved {
+                previous_pane_id, ..
+            } => *previous_pane_id == self.pane_id,
+            EventData::PaneUpdated { pane } => pane.pane_id == self.pane_id,
+            _ => false,
+        };
+        if concerns_pane {
+            self.snapshot_requested = true;
+        }
     }
 
     fn event_from_history(
         &mut self,
         event: crate::api::schema::EventEnvelope,
     ) -> Option<SubscriptionEventEnvelope> {
+        self.note_pane_event(&event);
         if event.event != EventKind::PaneAgentStatusChanged {
             return None;
         }
@@ -528,6 +589,8 @@ impl ActiveAgentStatusChangedSubscription {
         if after_snapshot_sequence != before_snapshot_sequence {
             return Ok(None);
         }
+        // A snapshot ran against an unchanged history: a pending request is served.
+        self.snapshot_requested = false;
         let pane = pane?;
 
         let event = self.event_from_snapshot(pane);
@@ -895,12 +958,12 @@ mod tests {
         .unwrap();
         event_hub.push(presentation_event(None));
         event_hub.push(workspace_focused_event("live"));
-        let events = subscription.poll_batch(&api_tx, &event_hub).unwrap();
+        let events = subscription.poll_batch(&api_tx, &event_hub, true).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["data"]["workspace_id"], "setup");
         assert_eq!(events[1]["data"]["workspace_id"], "live");
         assert!(subscription
-            .poll_batch(&api_tx, &event_hub)
+            .poll_batch(&api_tx, &event_hub, true)
             .unwrap()
             .is_empty());
         let ActiveSubscription::Event(subscription) = subscription else {
@@ -937,7 +1000,7 @@ mod tests {
         // One batch carries both of the pane's changes, in order; the other pane's change
         // and the unrelated event are skipped, so a client sees a block read after it
         // was first reported unread.
-        let events = subscription.poll_batch(&api_tx, &event_hub).unwrap();
+        let events = subscription.poll_batch(&api_tx, &event_hub, true).unwrap();
         let seen = events
             .iter()
             .map(|event| event["data"]["seen"].as_bool().unwrap())
@@ -947,7 +1010,7 @@ mod tests {
             .iter()
             .all(|event| event["event"] == "pane.read_state_changed"));
         assert!(subscription
-            .poll_batch(&api_tx, &event_hub)
+            .poll_batch(&api_tx, &event_hub, true)
             .unwrap()
             .is_empty());
         let ActiveSubscription::ReadStateChanged(subscription) = subscription else {
@@ -962,6 +1025,7 @@ mod tests {
             let event_hub = EventHub::default();
             let mut subscription = ActiveSubscription::AgentStatusChanged(Box::new(
                 ActiveAgentStatusChangedSubscription {
+                    snapshot_requested: false,
                     pane_id: "pane_1".into(),
                     status_filter: filtered.then_some(AgentStatus::Working),
                     last_status: Some(AgentStatus::Working),
@@ -993,7 +1057,7 @@ mod tests {
                 event_hub.push(event);
             }
             let (api_tx, _api_rx) = tokio::sync::mpsc::unbounded_channel();
-            let events = subscription.poll_batch(&api_tx, &event_hub).unwrap();
+            let events = subscription.poll_batch(&api_tx, &event_hub, true).unwrap();
             let titles = events
                 .iter()
                 .map(|event| event["data"]["title"].as_str().unwrap())
@@ -1062,6 +1126,7 @@ mod tests {
             }),
             last_sequence: event_hub.current_sequence(),
             initial_event: None,
+            snapshot_requested: false,
             request_prefix: "test".into(),
         };
 
@@ -1089,6 +1154,7 @@ mod tests {
     fn agent_status_subscription_prefers_setup_window_events_over_initial_snapshot() {
         let event_hub = EventHub::default();
         let mut subscription = ActiveAgentStatusChangedSubscription {
+            snapshot_requested: false,
             pane_id: "pane_1".into(),
             status_filter: Some(AgentStatus::Working),
             last_status: Some(AgentStatus::Working),
@@ -1134,6 +1200,7 @@ mod tests {
     fn agent_status_subscription_emits_setup_window_event_already_reflected_by_probe() {
         let event_hub = EventHub::default();
         let mut subscription = ActiveAgentStatusChangedSubscription {
+            snapshot_requested: false,
             pane_id: "pane_1".into(),
             status_filter: Some(AgentStatus::Working),
             last_status: Some(AgentStatus::Working),
