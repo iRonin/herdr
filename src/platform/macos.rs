@@ -1127,22 +1127,6 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     Some(PathBuf::from(OsStr::from_bytes(&vip_path[..nul])))
 }
 
-pub fn session_processes(child_pid: u32) -> Vec<u32> {
-    if child_pid == 0 {
-        return Vec::new();
-    }
-
-    let target_session = unsafe { libc::getsid(child_pid as libc::c_int) };
-    if target_session <= 0 {
-        return Vec::new();
-    }
-
-    all_pids()
-        .into_iter()
-        .filter(|pid| unsafe { libc::getsid(*pid as libc::pid_t) } == target_session)
-        .collect()
-}
-
 /// The pid and session id of every process, from one pass over the process table. A session keeps its id (its
 /// leader's pid) for as long as any process is in it, so this finds the members of a session whose leader has
 /// exited and been reaped, which asking the leader itself cannot.

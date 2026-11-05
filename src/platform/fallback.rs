@@ -222,7 +222,8 @@ pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
     None
 }
 
-/// Unsupported platform stub.
+/// Unsupported platform stub. Only the non-unix shutdown path asks for a session this way.
+#[cfg_attr(unix, allow(dead_code))]
 pub fn session_processes(_child_pid: u32) -> Vec<u32> {
     Vec::new()
 }

@@ -801,31 +801,6 @@ pub fn process_agent_hint(pid: u32) -> Option<crate::detect::Agent> {
     super::parse_agent_env_hint(&environ)
 }
 
-pub fn session_processes(child_pid: u32) -> Vec<u32> {
-    let Some(session_id) = process_session_id(child_pid) else {
-        return Vec::new();
-    };
-
-    let mut pids = Vec::new();
-    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
-        let file_name = entry.file_name();
-        let Some(pid_str) = file_name.to_str() else {
-            continue;
-        };
-        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-
-        let Ok(pid) = pid_str.parse::<u32>() else {
-            continue;
-        };
-        if process_session_id(pid) == Some(session_id) {
-            pids.push(pid);
-        }
-    }
-    pids
-}
-
 /// The pid and session id of every process, from one pass over `/proc`. A session keeps its id (its leader's pid)
 /// for as long as any process is in it, so this finds the members of a session whose leader has exited and been
 /// reaped, which asking the leader itself cannot.
