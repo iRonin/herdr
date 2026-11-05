@@ -509,11 +509,12 @@ fn stopping_the_server_releases_a_connection_blocked_on_the_hub() {
     client.subscribe("stop", json!([{"type": "workspace.renamed"}]));
     client.assert_started("stop");
     std::thread::sleep(Duration::from_millis(300));
-    // What `ServerHandle::drop` does.
+    // What `ServerHandle::drop` does, once: a single wake-up must be enough (it is not repeated here, which would hide a
+    // lost one); `dropping_the_server_handle_releases_a_held_subscription` pins the real `ServerHandle::drop`.
     test.running.store(false, Ordering::Relaxed);
+    test.hub.wake_waiters();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !test.workers[0].is_finished() && Instant::now() < deadline {
-        test.hub.wake_waiters();
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(

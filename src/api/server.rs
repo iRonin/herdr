@@ -2206,6 +2206,54 @@ mod tests {
         assert!(result.is_ok());
         server_thread.join().unwrap();
     }
+
+    #[test]
+    fn dropping_the_server_handle_releases_a_held_subscription() {
+        // Both intervals are 30 s, so only the wake-up in `ServerHandle::drop` can end a connection
+        // that is blocked on the event hub within the deadline below.
+        let _guard = env_lock().lock().unwrap();
+        let dir = unique_test_path("api-handle-drop");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("herdr.sock");
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &path);
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let event_hub = EventHub::with_timing(WaitTiming {
+            liveness: Duration::from_secs(30),
+            agent_status_snapshot: Duration::from_secs(30),
+        });
+        let handle = start_server_inner(api_tx, event_hub, None, None);
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        let handle = handle.unwrap();
+
+        let mut client = crate::ipc::connect_local_stream(&path).unwrap();
+        client
+            .write_all(
+                br#"{"id":"held","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.created"}]}}"#,
+            )
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+        let ack: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(ack["result"]["type"], "subscription_started");
+        // Let the connection thread finish its first pass and block on the hub.
+        std::thread::sleep(Duration::from_millis(300));
+
+        drop(handle);
+        // The connection thread returning closes its end, which the client sees as the end of its stream.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut rest = String::new();
+            let _ = client.read_to_string(&mut rest);
+            let _ = done_tx.send(());
+        });
+        let released = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            released,
+            "a subscription blocked on the hub was not released when the server handle was dropped"
+        );
+    }
+
     /// Starts reading a request line on the server side of a fresh connection, then writes
     /// `first` at once and `rest` after `delay`. Returns what the reader returned, how long it
     /// took from the moment it started, and the server stream for further checks.
