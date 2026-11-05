@@ -375,6 +375,46 @@ async fn the_server_exit_wait_returns_only_after_the_whole_session_is_gone() {
     );
 }
 
+/// A panic in the server unwinds past the call that waits for the pane shutdowns. The guard the server runners hold
+/// makes the wait happen anyway, so processes that ignore SIGHUP are not left behind by a crashing server.
+#[tokio::test]
+async fn a_panicking_server_still_waits_for_the_pane_shutdowns() {
+    let (runtime, probe, _rx) = spawn_probe("stay").await;
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _exit_wait = PaneExitWait::new();
+        runtime.shutdown();
+        panic!("the server panics before it reaches its exit wait");
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(
+        survivors(&probe.pids()),
+        Vec::<u32>::new(),
+        "the unwinding server left these running"
+    );
+}
+
+/// A server that reaches its exit wait normally does not wait a second time when the guard is dropped.
+#[tokio::test]
+async fn a_finished_exit_wait_does_not_wait_again() {
+    let (runtime, probe, _rx) = spawn_probe("stay").await;
+    runtime.shutdown();
+    let mut exit_wait = PaneExitWait::new();
+    exit_wait.finish();
+    assert_eq!(survivors(&probe.pids()), Vec::<u32>::new());
+    // Panes queued after the wait are not waited for by the drop.
+    let (late, late_probe, _late_rx) = spawn_probe("stay").await;
+    late.shutdown();
+    let started = Instant::now();
+    drop(exit_wait);
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "dropping a finished guard waited {:?}",
+        started.elapsed()
+    );
+    finish_pane_shutdowns_before_exit();
+    assert_eq!(survivors(&late_probe.pids()), Vec::<u32>::new());
+}
+
 /// The exit wait is bounded: asked for a short wait while a worker holds the pane for half a second, it returns on
 /// time and names the pane that is still being ended, instead of holding the exit open.
 #[tokio::test]

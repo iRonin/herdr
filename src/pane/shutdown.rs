@@ -23,9 +23,13 @@ use tracing::{info, warn};
 use crate::layout::PaneId;
 use crate::platform::Signal;
 
-const TERMINATE_AFTER: Duration = Duration::from_millis(250);
-const KILL_AFTER: Duration = Duration::from_millis(500);
-const GIVE_UP_AFTER: Duration = Duration::from_millis(750);
+/// Each step is due this long after the signal before it was actually sent, not after the first one, so a pass of the
+/// background thread that runs late does not shorten what the processes get between two signals.
+const TERMINATE_AFTER_HANGUP: Duration = Duration::from_millis(250);
+const KILL_AFTER_TERMINATE: Duration = Duration::from_millis(250);
+const GIVE_UP_AFTER_KILL: Duration = Duration::from_millis(250);
+/// The length of the whole escalation when the thread is on time.
+const ESCALATION_LENGTH: Duration = Duration::from_millis(750);
 /// What the exiting server allows beyond the escalation itself, for a busy machine.
 const EXIT_MARGIN: Duration = Duration::from_millis(1500);
 /// How often the panes being ended are looked at again, so a session that is already gone is released at once
@@ -49,7 +53,8 @@ struct Pending {
     child_start_token: u64,
     child_wait_completed: Option<Arc<AtomicBool>>,
     pids: Vec<u32>,
-    hung_up_at: Instant,
+    /// When the last signal was sent; the next step is due a fixed time after it.
+    last_signal_at: Instant,
     step: Step,
     last_signal: Option<Signal>,
 }
@@ -174,7 +179,7 @@ pub(super) fn begin(
         child_start_token,
         child_wait_completed,
         pids: Vec::new(),
-        hung_up_at: Instant::now(),
+        last_signal_at: Instant::now(),
         step: Step::Hangup,
         last_signal: None,
     };
@@ -219,7 +224,7 @@ pub(crate) fn wait_for_all(timeout: Duration) -> Vec<(u32, u32)> {
 /// For a server that is about to exit: lets the escalation of every pane shut down so far finish, for at most its own
 /// length plus a margin, and logs the panes that are still being ended at that bound.
 pub(crate) fn finish_before_exit() {
-    let left = wait_for_all(GIVE_UP_AFTER + EXIT_MARGIN);
+    let left = wait_for_all(ESCALATION_LENGTH + EXIT_MARGIN);
     if !left.is_empty() {
         warn!(
             panes = ?left,
@@ -279,6 +284,12 @@ impl Reaper {
     }
 }
 
+/// When a signal sent in the pass that looked at `now` went out: the clock now, which is later than `now` by however
+/// long the pass took to get there, so a slow process-table read counts as time the processes had.
+fn signalled_at(now: Instant) -> Instant {
+    Instant::now().max(now)
+}
+
 impl Pending {
     /// Takes the pane one step further. `None` when its session is gone, was left alone, or the last step is done.
     fn advance(mut self, now: Instant, processes: &mut Processes) -> Option<Self> {
@@ -293,19 +304,19 @@ impl Pending {
                 return None;
             }
             crate::platform::signal_processes(&self.pids, Signal::Hangup);
-            self.hung_up_at = Instant::now();
+            self.last_signal_at = signalled_at(now);
             self.last_signal = Some(Signal::Hangup);
             self.step = Step::Terminate;
             return Some(self);
         }
 
-        let waited = now.saturating_duration_since(self.hung_up_at);
+        let waited = now.saturating_duration_since(self.last_signal_at);
         let due = match self.step {
-            Step::Terminate => (waited >= TERMINATE_AFTER).then_some(Signal::Terminate),
-            Step::Kill => (waited >= KILL_AFTER).then_some(Signal::Kill),
+            Step::Terminate => (waited >= TERMINATE_AFTER_HANGUP).then_some(Signal::Terminate),
+            Step::Kill => (waited >= KILL_AFTER_TERMINATE).then_some(Signal::Kill),
             Step::GiveUp | Step::Hangup => None,
         };
-        let give_up = self.step == Step::GiveUp && waited >= GIVE_UP_AFTER;
+        let give_up = self.step == Step::GiveUp && waited >= GIVE_UP_AFTER_KILL;
         let mut known = std::mem::take(&mut self.pids);
         known.retain(|pid| self.is_running(*pid));
         self.pids = known;
@@ -334,6 +345,7 @@ impl Pending {
         }
         if let Some(signal) = due {
             crate::platform::signal_processes(&self.pids, signal);
+            self.last_signal_at = signalled_at(now);
             self.last_signal = Some(signal);
             self.step = if signal == Signal::Terminate {
                 Step::Kill
@@ -400,7 +412,7 @@ mod tests {
             child_start_token: 0,
             child_wait_completed: Some(Arc::new(AtomicBool::new(reaped))),
             pids: Vec::new(),
-            hung_up_at: Instant::now(),
+            last_signal_at: Instant::now(),
             step: Step::Hangup,
             last_signal: None,
         }
@@ -545,6 +557,79 @@ mod tests {
         assert!(crate::platform::process_exists(pid));
         assert!(!pending(pid, false).is_running(pid));
         child.wait().unwrap();
+    }
+
+    /// A session leader that ignores HUP and TERM, in a session of its own like a pane's shell. Returns it once it
+    /// has installed the signal handling, so no signal can reach it before that.
+    fn stubborn_session_leader() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let ready = std::env::temp_dir().join(format!(
+            "herdr-stubborn-leader-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("trap '' HUP TERM; : > \"$0\"; exec /bin/sleep 3600")
+            .arg(&ready);
+        // SAFETY: setsid is async-signal-safe and touches nothing of the parent.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "the leader never got ready");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::remove_file(&ready).unwrap();
+        child
+    }
+
+    #[test]
+    fn a_late_terminate_step_still_leaves_the_processes_the_time_before_kill() {
+        // The pass that was due to send TERM at 250 ms ran at 480 ms. SIGKILL must then follow 250 ms after that
+        // TERM, not at the next pass 20 ms later, which would give the processes 20 ms between the two signals.
+        let mut leader = stubborn_session_leader();
+        let mut pane = pending(leader.id(), false);
+        let processes = Processes::default;
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+
+        pane = pane.advance(t0, &mut processes()).expect("hangup step");
+        assert_eq!(pane.last_signal, Some(Signal::Hangup));
+        pane = pane
+            .advance(t0 + ms(480), &mut processes())
+            .expect("terminate step");
+        assert_eq!(pane.last_signal, Some(Signal::Terminate));
+
+        pane = pane
+            .advance(t0 + ms(500), &mut processes())
+            .expect("20 ms later");
+        assert_eq!(
+            pane.last_signal,
+            Some(Signal::Terminate),
+            "KILL was sent 20 ms after TERM because it was timed from the hangup"
+        );
+        pane = pane
+            .advance(t0 + ms(729), &mut processes())
+            .expect("249 ms after TERM");
+        assert_eq!(pane.last_signal, Some(Signal::Terminate));
+
+        pane = pane
+            .advance(t0 + ms(730), &mut processes())
+            .expect("250 ms after TERM");
+        assert_eq!(pane.last_signal, Some(Signal::Kill));
+
+        let _ = leader.kill();
+        let _ = leader.wait();
     }
 
     #[test]

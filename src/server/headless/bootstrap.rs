@@ -63,6 +63,9 @@ pub fn run_server() -> io::Result<()> {
         Err(err) => return Err(err),
     };
 
+    // Declared before the runtime so that a panic in the server, which drops the runtime and with it every pane,
+    // still waits for the pane shutdowns afterwards.
+    let mut pane_exit_wait = crate::pane::PaneExitWait::new();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -109,7 +112,7 @@ pub fn run_server() -> io::Result<()> {
 
     rt.shutdown_timeout(Duration::from_millis(100));
     // The server's panes were hung up as it shut down; let their escalation finish before the process ends.
-    crate::pane::finish_pane_shutdowns_before_exit();
+    pane_exit_wait.finish();
     crate::logging::shutdown("server");
     result
 }
@@ -166,6 +169,9 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         );
     }
 
+    // Declared before the runtime so that a panic in the server, which drops the runtime and with it every pane,
+    // still waits for the pane shutdowns afterwards.
+    let mut pane_exit_wait = crate::pane::PaneExitWait::new();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -223,7 +229,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
 
     rt.shutdown_timeout(Duration::from_millis(100));
     // The server's panes were hung up as it shut down; let their escalation finish before the process ends.
-    crate::pane::finish_pane_shutdowns_before_exit();
+    pane_exit_wait.finish();
     crate::logging::shutdown("server");
     result
 }

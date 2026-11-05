@@ -48,6 +48,32 @@ pub(crate) use self::shutdown::finish_before_exit as finish_pane_shutdowns_befor
 #[cfg(not(unix))]
 pub(crate) fn finish_pane_shutdowns_before_exit() {}
 
+/// Makes the server's exit wait for the pane shutdowns even when the server panics. Create it before the runtime the
+/// server runs in, so that on an unwind it is dropped after the runtime, which has queued every pane by then; on a
+/// normal exit call [`PaneExitWait::finish`] at the point where the wait belongs, and the drop then does nothing.
+pub(crate) struct PaneExitWait {
+    finished: bool,
+}
+
+impl PaneExitWait {
+    pub(crate) fn new() -> Self {
+        Self { finished: false }
+    }
+
+    pub(crate) fn finish(&mut self) {
+        self.finished = true;
+        finish_pane_shutdowns_before_exit();
+    }
+}
+
+impl Drop for PaneExitWait {
+    fn drop(&mut self) {
+        if !self.finished {
+            finish_pane_shutdowns_before_exit();
+        }
+    }
+}
+
 use self::agent_detection::{
     codex_prompt_ready, decide_detection_screen_read, decide_screen_detection_publish,
     detection_update_for_publish_with_osc, mark_detection_content_changed,

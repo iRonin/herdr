@@ -7012,8 +7012,18 @@ async fn headless_scheduled_tasks_start_pending_agent_resume_without_foreground_
         .pending_agent_resume_deadline
         .expect("clientless resume should wait briefly for a host theme");
 
-    assert!(server.handle_scheduled_tasks_headless(deadline, false));
-    assert!(server.app.terminal_runtimes.get(&terminal_id).is_some());
+    // Said when this fails (it has failed once in about 70 runs, never explained): why the resume did not start.
+    let started = server.handle_scheduled_tasks_headless(deadline, false);
+    assert!(
+        started,
+        "the pending resume did not start at its deadline: {}",
+        server.app.pending_agent_resume_diagnostics(deadline)
+    );
+    assert!(
+        server.app.terminal_runtimes.get(&terminal_id).is_some(),
+        "the resume reported a start but made no runtime: {}",
+        server.app.pending_agent_resume_diagnostics(deadline)
+    );
     assert!(server
         .app
         .state

@@ -40,6 +40,29 @@ impl App {
         }
     }
 
+    /// Everything that decides whether a pending resume starts, for the message of a test that expected it to.
+    #[cfg(test)]
+    pub(crate) fn pending_agent_resume_diagnostics(&self, now: Instant) -> String {
+        let candidates = self.pending_agent_resume_candidates();
+        format!(
+            "now={now:?} deadline={:?} next_agent_resume_at={:?} startup_per_agent_delay={:?} \
+             host_theme_empty={} terminal_area={:?} has_pending_resumes={} candidates={} \
+             candidate_cwds_are_dirs={:?} runtimes={}",
+            self.pending_agent_resume_deadline,
+            self.next_agent_resume_at,
+            self.startup_per_agent_delay,
+            self.state.host_terminal_theme.is_empty(),
+            self.state.view.terminal_area,
+            self.has_pending_agent_resumes(),
+            candidates.len(),
+            candidates
+                .iter()
+                .map(|c| c.cwd.is_dir())
+                .collect::<Vec<_>>(),
+            self.terminal_runtimes.len(),
+        )
+    }
+
     pub(crate) fn pending_agent_resume_due(&self, now: Instant) -> bool {
         self.pending_agent_resume_deadline
             .is_some_and(|deadline| now >= deadline)
