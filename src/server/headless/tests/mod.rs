@@ -828,14 +828,22 @@ struct AutoReadWire {
 /// What the client showed for the pane after one message pair, and the completion that pair carried for it.
 struct AutoReadShown {
     status: Option<api::schema::AgentStatus>,
+    /// Whether a blocked pane is shown as a READ block (one the user has seen) rather than one that still needs them.
+    blocked_read: bool,
     completion: Option<u64>,
 }
 
 impl AutoReadWire {
-    fn connect(auto_read: bool) -> Self {
+    /// `watched`: the pane sits in the tab the user is looking at. Unwatched, another tab is the active one, as when the agent works
+    /// in the background: a finished or blocked pane then needs the user's attention unless the `auto_read` token says otherwise.
+    fn connect(auto_read: bool, watched: bool) -> Self {
         let mut server = test_headless_server();
-        let workspace = crate::workspace::Workspace::test_new("auto-read-wire");
+        let mut workspace = crate::workspace::Workspace::test_new("auto-read-wire");
         let pane_id = workspace.tabs[0].root_pane;
+        if !watched {
+            let other_tab = workspace.test_add_tab(Some("elsewhere"));
+            workspace.switch_tab(other_tab);
+        }
         server.app.state.workspaces = vec![workspace];
         server.app.state.ensure_test_terminals();
         server.app.state.active = Some(0);
@@ -889,18 +897,42 @@ impl AutoReadWire {
         wire
     }
 
-    /// Reads the next completions-and-snapshot pair the server sent the client and feeds it to the client's projection.
+    /// Reads the completions-and-snapshot pairs the server sent the client since the last call, feeds each to the client's projection
+    /// in order, and returns what the last one shows. Other messages (a toast for a pane that finished out of sight) are skipped.
     fn receive(&mut self) -> AutoReadShown {
-        let (snapshot, completions) = client_shell_projection(&self.control_rx);
-        let pane = snapshot.agents.first().map(|agent| agent.pane_id.clone());
-        let completion = pane
-            .as_ref()
-            .and_then(|pane| completions.completions.get(pane).copied());
-        let mut shown = self.client.project(*snapshot, completions);
-        AutoReadShown {
-            status: pane.and_then(|pane| shown.remove(&pane)),
-            completion,
+        let mut last = None;
+        let mut completions = None;
+        let mut wait = Duration::from_secs(1);
+        while let Ok(bytes) = self.control_rx.recv_timeout(wait) {
+            // Whatever the server sent right behind a pair is already on its way.
+            wait = Duration::from_millis(100);
+            let ServerMessage::EndpointControl { kind, data } = read_server_message(bytes) else {
+                continue;
+            };
+            if kind == protocol::endpoint::AGENT_COMPLETIONS_KIND {
+                completions = Some(serde_json::from_str(&data).unwrap());
+            } else if kind == protocol::endpoint::ENDPOINT_SNAPSHOT_KIND {
+                let completions: protocol::endpoint::EndpointAgentCompletions =
+                    completions.take().expect("the completions come first");
+                let snapshot: Box<protocol::ClientShellSnapshot> =
+                    serde_json::from_str(&data).unwrap();
+                assert_eq!(completions.boot_id, snapshot.boot_id);
+                let pane = snapshot.agents.first().map(|agent| agent.pane_id.clone());
+                let completion = pane
+                    .as_ref()
+                    .and_then(|pane| completions.completions.get(pane).copied());
+                let mut shown = self.client.project(*snapshot, completions);
+                let (status, blocked_read) = pane
+                    .and_then(|pane| shown.remove(&pane))
+                    .map_or((None, false), |(status, read)| (Some(status), read));
+                last = Some(AutoReadShown {
+                    status,
+                    blocked_read,
+                    completion,
+                });
+            }
         }
+        last.expect("a completions-and-snapshot pair from the server")
     }
 
     fn change_state(&mut self, state: crate::detect::AgentState) -> AutoReadShown {
@@ -932,8 +964,9 @@ impl AutoReadWire {
 async fn auto_read_pane_is_shown_read_by_the_client_it_is_sent_to() {
     use api::schema::AgentStatus;
 
+    // Every pane below sits in a tab nobody is looking at, so only the token, never a viewer, can make it read.
     // The pane carries the token: no completion crosses the wire, so the client shows it read.
-    let mut wire = AutoReadWire::connect(true);
+    let mut wire = AutoReadWire::connect(true, false);
     let shown = wire.work_and_finish();
     assert_eq!(
         shown.completion, None,
@@ -946,7 +979,7 @@ async fn auto_read_pane_is_shown_read_by_the_client_it_is_sent_to() {
     );
 
     // Control: the same pane without the token. If this showed Idle too, the test could not tell the token from its absence.
-    let mut wire = AutoReadWire::connect(false);
+    let mut wire = AutoReadWire::connect(false, false);
     let shown = wire.work_and_finish();
     assert!(
         shown.completion.is_some(),
@@ -993,8 +1026,9 @@ async fn auto_read_pane_is_shown_read_by_the_client_it_is_sent_to() {
         "a pane whose auto_read token arrived late must be shown read"
     );
 
-    // Blocked on a token pane still asks for attention: the token silences completions only.
-    let mut wire = AutoReadWire::connect(true);
+    // Blocked on a token pane still asks for attention: the token silences completions only. A block nobody has seen is UNREAD:
+    // the window tells it from a read block by the blocked-read mark, which the server sets from the pane's seen flag.
+    let mut wire = AutoReadWire::connect(true, false);
     let working = wire.change_state(crate::detect::AgentState::Working);
     assert_eq!(working.status, Some(AgentStatus::Working));
     let shown = wire.change_state(crate::detect::AgentState::Blocked);
@@ -1002,6 +1036,21 @@ async fn auto_read_pane_is_shown_read_by_the_client_it_is_sent_to() {
         shown.status,
         Some(AgentStatus::Blocked),
         "a blocked auto_read pane must still be shown Blocked"
+    );
+    assert!(
+        !shown.blocked_read,
+        "a blocked auto_read pane nobody has seen must be shown as an unread block, not a read one"
+    );
+
+    // Control for the assertion above: the probe does report a READ block when the user is looking at the pane. Without this the
+    // line above could not fail, whatever the server did.
+    let mut wire = AutoReadWire::connect(false, true);
+    wire.change_state(crate::detect::AgentState::Working);
+    let shown = wire.change_state(crate::detect::AgentState::Blocked);
+    assert_eq!(shown.status, Some(AgentStatus::Blocked));
+    assert!(
+        shown.blocked_read,
+        "a pane that blocks while the user is looking at it must be shown as a read block"
     );
 }
 

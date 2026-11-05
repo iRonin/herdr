@@ -247,19 +247,23 @@ pub(crate) struct ClientProjectionProbe(EndpointAgentPresentation);
 
 #[cfg(test)]
 impl ClientProjectionProbe {
-    /// Feeds one snapshot and its completions, as the client does for a pair that arrives together, and returns the status the
-    /// client would show for each agent, by public pane id.
+    /// Feeds one snapshot and its completions, as the client does for a pair that arrives together, and returns what the client
+    /// would show for each agent, by public pane id: its status, and whether a blocked agent is shown as a READ block
+    /// (`agent_is_blocked_read`, the mark that tells a block the user has seen from one that still needs them).
     pub(crate) fn project(
         &mut self,
         mut snapshot: ClientShellSnapshot,
         completions: crate::protocol::endpoint::EndpointAgentCompletions,
-    ) -> HashMap<String, AgentStatus> {
+    ) -> HashMap<String, (AgentStatus, bool)> {
         self.0.receive_completions(None, completions);
         self.0.project_snapshot(&mut snapshot);
         snapshot
             .agents
             .into_iter()
-            .map(|agent| (agent.pane_id, agent.agent_status))
+            .map(|agent| {
+                let blocked_read = super::agent_is_blocked_read(&agent);
+                (agent.pane_id, (agent.agent_status, blocked_read))
+            })
             .collect()
     }
 }
