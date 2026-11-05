@@ -563,3 +563,305 @@ fn machine_setup_explicit_remote_handoff_remains_available_but_restart_fallback_
         result.output
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Saved machines limited to local sessions: `machine add --local-session`, `machine scope`,
+// `machine list`. No ssh and no server: they only read and write the catalog in a sandbox.
+// ---------------------------------------------------------------------------------------------
+
+const ALPHA: &str = "0123456789abcdef0123456789abcdef";
+const BETA: &str = "11111111111111111111111111111111";
+
+// The bytes the catalog writer produces for two machines nobody limited to a local session.
+const SEEDED_UNSCOPED_CATALOG: &str = r#"{
+  "version": 1,
+  "ssh": [
+    {
+      "id": "0123456789abcdef0123456789abcdef",
+      "label": "Alpha",
+      "target": "alpha.example",
+      "session": "agents",
+      "enabled": true
+    },
+    {
+      "id": "11111111111111111111111111111111",
+      "label": "Beta",
+      "target": "beta.example",
+      "session": "main",
+      "enabled": false
+    }
+  ]
+}"#;
+
+struct MachineSandbox {
+    root: std::path::PathBuf,
+    catalog: std::path::PathBuf,
+}
+
+impl MachineSandbox {
+    fn new(tag: &str) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-machine-scope-{}-{tag}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let app = if cfg!(debug_assertions) {
+            "herdr-dev"
+        } else {
+            "herdr"
+        };
+        let catalog = root.join("state").join(app).join("client/endpoints.json");
+        fs::create_dir_all(catalog.parent().unwrap()).unwrap();
+        fs::create_dir_all(root.join("config").join(app)).unwrap();
+        fs::write(
+            root.join("config").join(app).join("config.toml"),
+            "onboarding = false\n[remote]\nmanage_ssh_config = false\n",
+        )
+        .unwrap();
+        fs::write(&catalog, SEEDED_UNSCOPED_CATALOG).unwrap();
+        Self { root, catalog }
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+        command
+            .args(args)
+            // Reaching ssh would fail with exit 1 and "machine was not saved", not these codes.
+            .env("PATH", self.root.join("no-executables"))
+            .env("HOME", &self.root)
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("XDG_STATE_HOME", self.root.join("state"))
+            .env("XDG_RUNTIME_DIR", &self.root)
+            .stdin(std::process::Stdio::null());
+        for name in [
+            "HERDR_ENV",
+            "HERDR_SESSION",
+            "HERDR_SOCKET_PATH",
+            "HERDR_CLIENT_SOCKET_PATH",
+            "HERDR_REMOTE_BINARY",
+            "HERDR_CONFIG_PATH",
+        ] {
+            command.env_remove(name);
+        }
+        command.output().unwrap()
+    }
+
+    fn list_json(&self) -> serde_json::Value {
+        let output = self.run(&["machine", "list", "--json"]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+}
+
+impl Drop for MachineSandbox {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn stdout(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn stderr(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn machine_scope_limits_a_machine_to_local_sessions_and_list_shows_it() {
+    let sandbox = MachineSandbox::new("scope");
+
+    // Before: nothing is limited, and the listing says so.
+    let before = sandbox.list_json();
+    assert_eq!(
+        before[0]["local_sessions"],
+        serde_json::json!([]),
+        "{before}"
+    );
+    assert_eq!(
+        before[1]["local_sessions"],
+        serde_json::json!([]),
+        "{before}"
+    );
+
+    let output = sandbox.run(&[
+        "machine",
+        "scope",
+        ALPHA,
+        "--local-session",
+        "default",
+        "--local-session=legal",
+        "--local-session",
+        "default",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let after = sandbox.list_json();
+    assert_eq!(after[0]["id"], ALPHA);
+    assert_eq!(
+        after[0]["local_sessions"],
+        serde_json::json!(["default", "legal"]),
+        "{after}"
+    );
+    assert_eq!(after[1]["local_sessions"], serde_json::json!([]), "{after}");
+    // Only the scoped machine's entry changed in the file.
+    let stored = fs::read_to_string(&sandbox.catalog).unwrap();
+    assert_eq!(stored.matches("local_sessions").count(), 1, "{stored}");
+
+    // The plain listing keeps its five columns for an unscoped machine and adds a sixth only
+    // for the scoped one.
+    let listing = stdout(&sandbox.run(&["machine", "list"]));
+    let lines = listing.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines[0],
+        format!("{ALPHA}\tAlpha\talpha.example\tagents\tenabled\tlocal sessions: default,legal")
+    );
+    assert_eq!(
+        lines[1],
+        format!("{BETA}\tBeta\tbeta.example\tmain\tdisabled")
+    );
+
+    // Back to every local session: the file is byte-identical to the one nobody scoped.
+    let output = sandbox.run(&["machine", "scope", ALPHA, "--all-local-sessions"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&sandbox.catalog).unwrap(),
+        SEEDED_UNSCOPED_CATALOG
+    );
+    assert_eq!(sandbox.list_json(), before);
+}
+
+#[test]
+fn machine_scope_refuses_bad_input_and_leaves_the_catalog_alone() {
+    let sandbox = MachineSandbox::new("scope-refusals");
+    for (args, code, needle) in [
+        // An invalid session name, as the rest of the CLI judges names.
+        (
+            vec!["machine", "scope", ALPHA, "--local-session", "bad/name"],
+            2,
+            "invalid local session",
+        ),
+        // A machine that does not exist.
+        (
+            vec![
+                "machine",
+                "scope",
+                "fedcba9876543210fedcba9876543210",
+                "--local-session",
+                "legal",
+            ],
+            1,
+            "was not found",
+        ),
+        // Neither a scope nor --all-local-sessions, or both at once.
+        (
+            vec!["machine", "scope", ALPHA],
+            2,
+            "usage: herdr machine scope",
+        ),
+        (
+            vec![
+                "machine",
+                "scope",
+                ALPHA,
+                "--all-local-sessions",
+                "--local-session",
+                "legal",
+            ],
+            2,
+            "usage: herdr machine scope",
+        ),
+        // A target is not a profile id.
+        (
+            vec![
+                "machine",
+                "scope",
+                "alpha.example",
+                "--local-session",
+                "legal",
+            ],
+            2,
+            "error:",
+        ),
+    ] {
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(code), "{args:?}: {output:?}");
+        assert!(stderr(&output).contains(needle), "{args:?}: {output:?}");
+        assert_eq!(
+            fs::read_to_string(&sandbox.catalog).unwrap(),
+            SEEDED_UNSCOPED_CATALOG,
+            "{args:?} changed the catalog"
+        );
+    }
+}
+
+#[test]
+fn machine_add_checks_local_sessions_before_it_connects_to_anything() {
+    let sandbox = MachineSandbox::new("add-scope");
+    // A bad name stops the command with a usage-class exit; ssh is never reached.
+    let output = sandbox.run(&[
+        "machine",
+        "add",
+        "fake-host",
+        "--label",
+        "Scoped",
+        "--local-session",
+        "bad/name",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        stderr(&output).contains("invalid local session"),
+        "{output:?}"
+    );
+
+    // A good one, in either spelling and any order, gets as far as ssh, which this sandbox
+    // does not have: "machine was not saved" (exit 1), and nothing is written.
+    for args in [
+        vec![
+            "machine",
+            "add",
+            "fake-host",
+            "--label",
+            "Scoped",
+            "--local-session",
+            "default",
+        ],
+        vec![
+            "machine",
+            "add",
+            "--local-session=default",
+            "--local-session",
+            "legal",
+            "fake-host",
+            "--label",
+            "Scoped",
+        ],
+    ] {
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+        assert!(
+            stderr(&output).contains("machine was not saved"),
+            "{output:?}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(&sandbox.catalog).unwrap(),
+        SEEDED_UNSCOPED_CATALOG
+    );
+}
+
+#[test]
+fn machine_help_documents_the_local_session_options() {
+    let sandbox = MachineSandbox::new("help");
+    let help = stdout(&sandbox.run(&["machine", "help"]));
+    for needle in [
+        "--local-session",
+        "herdr machine scope",
+        "--all-local-sessions",
+    ] {
+        assert!(help.contains(needle), "help lacks {needle}: {help}");
+    }
+}

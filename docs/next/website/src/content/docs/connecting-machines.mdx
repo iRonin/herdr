@@ -53,6 +53,20 @@ Herdr checks both the installed binary and the running server. It starts the req
 
 Run `herdr` to open the UI. If a local client is already open, added and enabled machines normally appear within a second and connect in the background without changing your selection. An in-progress machine switch finishes before profile changes are applied. The remote server keeps running after setup exits.
 
+## Show a machine in some local sessions only
+
+Every local Herdr session reads the same saved machines, so by default each machine appears in all of them. To keep a machine out of the others, limit it to the local sessions that should show it. A local session is the one a client belongs to: plain `herdr` is `default`, and `herdr --session legal` is `legal`. It is not the remote session that `--remote-session` selects.
+
+```bash
+herdr machine add workbox --label "Build machine" --local-session default
+herdr machine scope <profile-id> --local-session default --local-session legal
+herdr machine scope <profile-id> --all-local-sessions
+```
+
+`--local-session` can be repeated. `machine scope` replaces the whole list, and `--all-local-sessions` removes the limit again. A machine limited to other sessions does not appear in this session's window at all: no row, not even a dimmed one. When it was the last saved machine there, the sidebar goes back to the normal single-machine layout. If it was the machine you were viewing, the client returns to Local. Like any other machine change, a new limit reaches open clients within a second.
+
+The limit only decides what each client window shows. `herdr --machine <label-or-id>` still reaches every saved machine from any shell. `machine list` shows the limit: `--json` gives each machine a `local_sessions` list (empty means every local session), and the plain listing adds a trailing `local sessions: ...` column only for limited machines. A Herdr without this feature cannot read a catalog that holds a limit. An open client keeps its current connections and shows a notice. A client started while the limit is stored shows no saved machines until it is updated.
+
 ## Switch between machines
 
 Choose a machine or one of its workspaces in the sidebar. The selected machine receives your pane input and terminal size, and supplies the visible terminal content and graphics. Other connected machines keep updating their workspace information, agent states, and notifications without streaming their pane screens.
@@ -117,7 +131,7 @@ Workspace, tab, pane IDs, and agent names are scoped to one server. Two machines
 
 ## Updates and saved data
 
-Saved profiles contain only an opaque ID, label, SSH target, explicit remote session, and enabled state. Herdr does not store passwords, private keys, agent tickets, or SSH control sockets in the catalog. Authentication stays with OpenSSH.
+Saved profiles contain only an opaque ID, label, SSH target, explicit remote session, enabled state, and, if you set one, the local sessions that show the machine. Herdr does not store passwords, private keys, agent tickets, or SSH control sockets in the catalog. Authentication stays with OpenSSH.
 
 Herdr separately remembers each machine's remote OS and resolved executable path so repeated `--machine` commands can skip discovery. Existing profiles learn missing information on first use. This cache is optional: missing, invalid, or unwritable cache files do not prevent commands from working. Commands still check live server compatibility. If a cached executable is missing or no longer supports API forwarding, Herdr rediscovers it during the initial read-only check; it never automatically repeats a command that may already have changed remote state.
 
