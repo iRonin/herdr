@@ -14,12 +14,15 @@ use std::time::{Duration, Instant};
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 const PROBE_SCRIPT: &str = r#"D="$1"; MODE="$2"
-( trap '' HUP TERM; exec /bin/sleep 3600 ) &
+( trap '' HUP TERM; : > "$D/same.ready"; exec /bin/sleep 3600 ) &
 echo $! > "$D/same.pid.tmp"; mv "$D/same.pid.tmp" "$D/same.pid"
 set -m
-( trap '' HUP TERM; exec /bin/sleep 3601 ) &
+( trap '' HUP TERM; : > "$D/own.ready"; exec /bin/sleep 3601 ) &
 echo $! > "$D/own.pid.tmp"; mv "$D/own.pid.tmp" "$D/own.pid"
 set +m
+# A worker must ignore SIGHUP before the shell can exit, or the hangup the kernel sends when a session leader exits
+# would end it.
+while [ ! -e "$D/same.ready" ] || [ ! -e "$D/own.ready" ]; do /bin/sleep 0.05; done
 echo $$ > "$D/shell.pid.tmp"; mv "$D/shell.pid.tmp" "$D/shell.pid"
 case "$MODE" in
   exit) exit 0 ;;
