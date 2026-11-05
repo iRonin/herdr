@@ -58,6 +58,23 @@ fn current_workspace_view() -> crate::api::schema::AgentViewSetParams {
     }
 }
 
+/// The view `seen == false`: what a client lists as "still needs a look".
+fn unseen_agents_view() -> crate::api::schema::AgentViewSetParams {
+    use crate::api::schema::{
+        AgentViewBuiltinField, AgentViewField, AgentViewFilter, AgentViewValue,
+    };
+
+    crate::api::schema::AgentViewSetParams {
+        source: "example.views".into(),
+        label: Some("unseen".into()),
+        filter: Some(AgentViewFilter::Eq {
+            field: AgentViewField::Builtin(AgentViewBuiltinField::Seen),
+            value: AgentViewValue::Bool(false),
+        }),
+        sort: Vec::new(),
+    }
+}
+
 fn state_with_remote() -> (ClientShellState, ClientEndpointId) {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     let profile = remote_profile();
@@ -1321,6 +1338,76 @@ fn aggregate_agents_use_configured_rows_machine_token_and_status_colors() {
         .any(|cell| cell.symbol() == "×" && cell.fg == state.config.palette.red));
 }
 
+/// Upstream's `seen()` is true for every blocked agent (a block has no completion to acknowledge), so
+/// a client-side view on `seen == false` dropped unread blocked agents and listed none. A blocked
+/// agent is read only when the server marks it (the `herdr.blocked_read` token) or this client
+/// acknowledged it; the server's own evaluator reads the pane's flag, which means the same
+/// (`app::agent_view::tests::seen_filter_lists_an_unread_block_and_not_a_read_one`).
+#[test]
+fn seen_agent_view_lists_an_unread_blocked_agent_and_not_a_read_one() {
+    use crate::api::schema::AgentStatus;
+    use crate::config::AgentSidebarToken;
+
+    let mut config = Config::default();
+    config.ui.sidebar.agents.rows =
+        vec![vec![AgentSidebarToken::Machine, AgentSidebarToken::Agent]];
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    let profile = remote_profile();
+    let endpoint_id = ClientEndpointId::Ssh(profile.id.clone());
+    state.set_endpoint_catalog(&[profile]);
+    state.set_endpoint_status(&endpoint_id, ClientEndpointStatus::Online);
+
+    // The names are short on purpose: the sidebar is 26 columns wide and cuts a longer row with an
+    // ellipsis, which would hide the name the assertions look for.
+    // Neither pane is the one this client shows (`pane_1`): showing a blocked pane acknowledges
+    // it, which would make the "unread" one read for a reason other than the one under test.
+    let mut unread_block = agent("alpha", AgentStatus::Blocked, 2);
+    unread_block.pane_id = "pane_2".into();
+    unread_block.focused = false;
+    let mut read_block = agent("beta", AgentStatus::Blocked, 3);
+    read_block.pane_id = "pane_3".into();
+    read_block.focused = false;
+    read_block.tokens = vec![(
+        crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.to_string(),
+        "1".to_string(),
+    )];
+    let mut local = snapshot();
+    local.agent_view_label = Some("unseen".into());
+    local.agent_order = vec!["pane_2".into(), "pane_3".into()];
+    local.agents = vec![unread_block, read_block];
+    state.set_snapshot(Box::new(local));
+    state.set_pane_surface(surface());
+
+    let mut remote = snapshot();
+    remote.boot_id = "remote-boot".into();
+    remote.agent_view_label = Some("unseen".into());
+    remote.agents = Vec::new();
+    state.set_endpoint_snapshot(&endpoint_id, Box::new(remote));
+    let view = unseen_agents_view();
+    state.set_test_endpoint_agent_view(&ClientEndpointId::Local, Some(view.clone()));
+    state.set_test_endpoint_agent_view(&endpoint_id, Some(view));
+
+    let frame = state.compose(100, 28).expect("combined endpoint frame");
+    let text = frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("Local · alpha"),
+        "an unread block is still unseen and belongs in the view: {text}"
+    );
+    assert!(
+        !text.contains("Local · beta"),
+        "a read block is seen and must not be listed: {text}"
+    );
+}
+
 #[test]
 fn current_workspace_agent_view_excludes_same_workspace_id_on_other_machine() {
     use crate::api::schema::AgentStatus;
@@ -2246,13 +2333,24 @@ fn disconnected_active_endpoint_freezes_surface_and_marks_cached_ui_stale() {
     );
     assert!(state.hits.panes.is_empty());
     assert!(frame.cursor.is_none());
-    let buffer = frame.to_ratatui_buffer().expect("frame should reconstruct");
-    let stale_icon = buffer
-        .content()
+    let agent_row = frame
+        .cells
+        .chunks(frame.width as usize)
+        .find(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+                .contains("remote agent")
+        })
+        .expect("stale agent row");
+    let stale_icon = agent_row
         .iter()
-        .find(|cell| cell.symbol() == "×")
-        .expect("stale blocked icon");
-    assert_eq!(stale_icon.fg, state.config.palette.overlay0);
+        .find(|cell| cell.symbol == "○")
+        .expect("stale acknowledged-blocked icon");
+    assert_eq!(
+        stale_icon.fg,
+        crate::protocol::color_to_u32(state.config.palette.overlay0)
+    );
 }
 
 #[cfg(unix)]
@@ -2745,10 +2843,68 @@ fn workspace_drag_rejects_foreign_endpoint_slots() {
 }
 
 #[test]
-fn collapsed_aggregate_workspace_status_uses_its_status_color() {
+fn workspace_aggregate_mark_uses_read_aware_concrete_agent_priority() {
     use crate::api::schema::AgentStatus;
+    use crate::config::StatusIndicatorStyle;
 
     let (mut state, endpoint_id) = state_with_remote();
+    state.config.status_indicators = StatusIndicatorStyle::Symbols;
+    let snapshot = state
+        .endpoints
+        .iter_mut()
+        .find(|endpoint| endpoint.endpoint_id == endpoint_id)
+        .expect("remote endpoint")
+        .snapshot
+        .as_mut()
+        .expect("remote snapshot");
+    snapshot.workspaces[0].agent_status = AgentStatus::Blocked;
+    assert_eq!(
+        status_icon(
+            snapshot.workspaces[0].agent_status,
+            StatusIndicatorStyle::Symbols
+        ),
+        "×",
+        "the raw aggregate path must remain a discriminating negative control"
+    );
+    let mut read_blocked = agent("read-blocked", AgentStatus::Blocked, 2);
+    read_blocked.tokens.push((
+        crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
+        "1".into(),
+    ));
+    snapshot.agents = vec![read_blocked];
+    state.sidebar_collapsed = true;
+
+    let mark = |state: &mut ClientShellState| {
+        let frame = state.compose(100, 28).expect("collapsed aggregate sidebar");
+        let workspace = state
+            .hits
+            .workspaces
+            .iter()
+            .find(|hit| hit.endpoint_id == endpoint_id)
+            .expect("remote workspace")
+            .rect;
+        let buffer = frame.to_ratatui_buffer().expect("frame buffer");
+        let cell = &buffer[(workspace.x.saturating_add(2), workspace.y)];
+        (cell.symbol().to_owned(), cell.fg)
+    };
+
+    let read = mark(&mut state);
+    assert_eq!(read, ("○".into(), state.config.palette.red));
+
+    let snapshot = state
+        .endpoints
+        .iter_mut()
+        .find(|endpoint| endpoint.endpoint_id == endpoint_id)
+        .expect("remote endpoint")
+        .snapshot
+        .as_mut()
+        .expect("remote snapshot");
+    let mut working = agent("working", AgentStatus::Working, 3);
+    working.pane_id = "pane_2".into();
+    snapshot.agents.push(working);
+    let working = mark(&mut state);
+    assert_eq!(working, ("◐".into(), state.config.palette.yellow));
+
     state
         .endpoints
         .iter_mut()
@@ -2757,23 +2913,11 @@ fn collapsed_aggregate_workspace_status_uses_its_status_color() {
         .snapshot
         .as_mut()
         .expect("remote snapshot")
-        .workspaces[0]
-        .agent_status = AgentStatus::Blocked;
-    state.sidebar_collapsed = true;
-
-    let frame = state.compose(100, 28).expect("collapsed aggregate sidebar");
-    let workspace = state
-        .hits
-        .workspaces
-        .iter()
-        .find(|hit| hit.endpoint_id == endpoint_id)
-        .expect("remote workspace")
-        .rect;
-    let buffer = frame.to_ratatui_buffer().expect("frame buffer");
-    assert_eq!(
-        buffer[(workspace.x.saturating_add(2), workspace.y)].fg,
-        state.config.palette.red
-    );
+        .agents[0]
+        .tokens
+        .clear();
+    let unread = mark(&mut state);
+    assert_eq!(unread, ("×".into(), state.config.palette.red));
 }
 
 #[test]

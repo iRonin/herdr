@@ -1,17 +1,45 @@
 pub(super) fn tab_attention_priority(state: crate::detect::AgentState, seen: bool) -> u8 {
     match (state, seen) {
-        (crate::detect::AgentState::Blocked, _) => 4,
+        (crate::detect::AgentState::Blocked, false) => 4,
         (crate::detect::AgentState::Idle, false) => 3,
         (crate::detect::AgentState::Working, _) => 2,
-        (crate::detect::AgentState::Idle, true) => 1,
+        (crate::detect::AgentState::Blocked, true) | (crate::detect::AgentState::Idle, true) => 1,
         (crate::detect::AgentState::Unknown, _) => 0,
     }
 }
 
-fn parse_api_key(key: &str) -> Option<crossterm::event::KeyEvent> {
+#[cfg(test)]
+mod attention_priority_tests {
+    use super::tab_attention_priority;
+    use crate::detect::AgentState;
+
+    #[test]
+    fn acknowledged_blocked_sinks_below_unread_done_and_working() {
+        assert!(
+            tab_attention_priority(AgentState::Blocked, false)
+                > tab_attention_priority(AgentState::Idle, false)
+        );
+        assert!(
+            tab_attention_priority(AgentState::Blocked, true)
+                < tab_attention_priority(AgentState::Working, true)
+        );
+        assert!(
+            tab_attention_priority(AgentState::Blocked, true)
+                < tab_attention_priority(AgentState::Idle, false)
+        );
+    }
+}
+
+fn parse_api_key(key: &str) -> Option<crate::input::TerminalKey> {
     let normalized = normalize_api_key_alias(key.trim());
     let (code, modifiers) = crate::config::parse_key_combo(normalized)?;
-    Some(crossterm::event::KeyEvent::new(code, modifiers))
+    Some(crate::input::TerminalKey::new(code, modifiers))
+}
+
+pub(super) fn parse_api_keys(keys: &[String]) -> Result<Vec<crate::input::TerminalKey>, String> {
+    keys.iter()
+        .map(|key| parse_api_key(key).ok_or_else(|| key.clone()))
+        .collect()
 }
 
 fn normalize_api_key_alias(key: &str) -> &str {
@@ -22,27 +50,36 @@ fn normalize_api_key_alias(key: &str) -> &str {
     }
 }
 
-pub(super) fn encode_api_text(runtime: &crate::terminal::TerminalRuntime, text: &str) -> Vec<u8> {
+struct EncodedApiText {
+    bytes: Vec<u8>,
+    bracketed: bool,
+}
+
+fn encode_api_text_with_mode(
+    runtime: &crate::terminal::TerminalRuntime,
+    text: &str,
+) -> EncodedApiText {
     let bracketed = runtime.bracketed_paste_enabled();
-    if bracketed {
+    let bytes = if bracketed {
         format!("\x1b[200~{text}\x1b[201~").into_bytes()
     } else {
         text.as_bytes().to_vec()
-    }
+    };
+    EncodedApiText { bytes, bracketed }
 }
 
-pub(super) fn encode_api_keys(
+pub(super) fn encode_api_text(runtime: &crate::terminal::TerminalRuntime, text: &str) -> Vec<u8> {
+    encode_api_text_with_mode(runtime, text).bytes
+}
+
+pub(super) fn encode_terminal_keys(
     runtime: &crate::terminal::TerminalRuntime,
-    keys: &[String],
-) -> Result<Vec<Vec<u8>>, String> {
-    let mut encoded_keys = Vec::with_capacity(keys.len());
-    for key in keys {
-        let Some(key_event) = parse_api_key(key) else {
-            return Err(key.clone());
-        };
-        encoded_keys.push(runtime.encode_terminal_key(key_event.into()));
-    }
-    Ok(encoded_keys)
+    keys: &[crate::input::TerminalKey],
+) -> Vec<Vec<u8>> {
+    keys.iter()
+        .cloned()
+        .map(|key| runtime.encode_terminal_key(key))
+        .collect()
 }
 
 pub(super) fn encode_api_submission_parts(
@@ -66,20 +103,47 @@ pub(super) fn encode_api_submission(
     text
 }
 
+pub(super) struct EncodedTerminalKey {
+    pub(super) key: crate::input::TerminalKey,
+    pub(super) bytes: Vec<u8>,
+}
+
+pub(super) struct EncodedApiInput {
+    pub(super) bytes: Vec<u8>,
+    pub(super) text_bracketed: bool,
+    pub(super) keys: Vec<EncodedTerminalKey>,
+}
+
 pub(super) fn encode_api_input(
     runtime: &crate::terminal::TerminalRuntime,
     text: &str,
     keys: &[String],
-) -> Result<Vec<u8>, String> {
-    let mut bytes = if text.is_empty() {
-        Vec::new()
+) -> Result<EncodedApiInput, String> {
+    let encoded_text = if text.is_empty() {
+        EncodedApiText {
+            bytes: Vec::new(),
+            bracketed: false,
+        }
     } else {
-        encode_api_text(runtime, text)
+        encode_api_text_with_mode(runtime, text)
     };
-    for encoded in encode_api_keys(runtime, keys)? {
-        bytes.extend_from_slice(&encoded);
-    }
-    Ok(bytes)
+    let mut bytes = encoded_text.bytes;
+    let encoded_keys = parse_api_keys(keys)?
+        .into_iter()
+        .map(|key| {
+            let encoded = runtime.encode_terminal_key(key.clone());
+            bytes.extend_from_slice(&encoded);
+            EncodedTerminalKey {
+                key,
+                bytes: encoded,
+            }
+        })
+        .collect();
+    Ok(EncodedApiInput {
+        bytes,
+        text_bracketed: encoded_text.bracketed,
+        keys: encoded_keys,
+    })
 }
 
 pub(super) fn detect_state_from_api(

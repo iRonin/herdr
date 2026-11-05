@@ -13,6 +13,7 @@ use super::*;
 pub(super) struct AgentRow {
     pub(super) pane_id: String,
     pub(super) status: crate::api::schema::AgentStatus,
+    pub(super) status_icon: &'static str,
     pub(super) focused: bool,
     pub(super) rows: Vec<Vec<crate::ui::ResolvedToken>>,
 }
@@ -38,7 +39,7 @@ pub(super) fn ordered_agent_pane_ids(
     if sort == crate::config::AgentPanelSortConfig::Priority {
         agents.sort_by_key(|agent| {
             (
-                std::cmp::Reverse(status_priority(agent.agent_status)),
+                std::cmp::Reverse(agent_status_priority(agent)),
                 std::cmp::Reverse(agent.state_change_seq),
             )
         });
@@ -313,6 +314,7 @@ pub(super) fn agent_row(
     Some(AgentRow {
         pane_id: agent.pane_id.clone(),
         status: agent.agent_status,
+        status_icon: agent_status_icon(agent, config.status_indicators),
         focused: agent.focused,
         rows,
     })
@@ -342,7 +344,7 @@ pub(super) fn render_agent_row(
     let status_style = Style::default().fg(status_color(row.status, palette));
     let secondary = Style::default().fg(palette.overlay0);
     let icon = (
-        status_icon(row.status, config.status_indicators),
+        row.status_icon,
         Style::default().fg(status_color(row.status, palette)),
     );
     let rows = if row.rows.is_empty() {

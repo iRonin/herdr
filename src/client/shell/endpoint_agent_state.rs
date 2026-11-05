@@ -54,6 +54,10 @@ impl EndpointAgentPresentation {
                 snapshot
                     .agents
                     .iter()
+                    .filter(|agent| {
+                        agent.agent_status != AgentStatus::Blocked
+                            || super::agent_is_blocked_read(agent)
+                    })
                     .map(|agent| (agent.pane_id.clone(), agent.state_change_seq)),
             );
         }
@@ -68,6 +72,18 @@ impl EndpointAgentPresentation {
             .retain(|pane_id, _| pane_ids.contains(pane_id.as_str()));
         self.working
             .retain(|pane_id| pane_ids.contains(pane_id.as_str()));
+        // The server's own read flag is the truth for a blocked agent: a read block raises the acknowledgement,
+        // so the client and the server agree that someone has looked at it.
+        for agent in snapshot
+            .agents
+            .iter()
+            .filter(|agent| super::agent_is_blocked_read(agent))
+        {
+            self.acknowledged
+                .entry(agent.pane_id.clone())
+                .and_modify(|seq| *seq = (*seq).max(agent.state_change_seq))
+                .or_insert(agent.state_change_seq);
+        }
         let completions = self
             .pending_completions
             .take()
@@ -110,7 +126,7 @@ impl EndpointAgentPresentation {
                     self.completed.remove(&agent.pane_id);
                 }
             }
-            agent.agent_status = self.projected_status(agent);
+            self.project_agent(agent);
         }
         project_aggregate_status(snapshot);
     }
@@ -146,7 +162,7 @@ impl EndpointAgentPresentation {
         }
         if changed {
             for agent in &mut snapshot.agents {
-                agent.agent_status = self.projected_status(agent);
+                self.project_agent(agent);
             }
             project_aggregate_status(snapshot);
         }
@@ -173,29 +189,51 @@ impl EndpointAgentPresentation {
             status => status,
         }
     }
+
+    /// Whether this client has acknowledged the agent's current state (it showed the pane after the state began).
+    /// Not `seen()`: that answers for completions and is true for every blocked agent, which has none.
+    fn blocked_acknowledged(&self, agent: &ClientShellAgent) -> bool {
+        self.acknowledged
+            .get(&agent.pane_id)
+            .is_some_and(|sequence| *sequence >= agent.state_change_seq)
+    }
+
+    fn project_agent(&self, agent: &mut ClientShellAgent) {
+        let blocked_read = agent.agent_status == AgentStatus::Blocked
+            && (super::agent_is_blocked_read(agent) || self.blocked_acknowledged(agent));
+        agent.agent_status = self.projected_status(agent);
+        agent
+            .tokens
+            .retain(|(key, _)| key != crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN);
+        if blocked_read {
+            agent.tokens.push((
+                crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
+                "1".into(),
+            ));
+            agent.tokens.sort_by(|left, right| left.0.cmp(&right.0));
+        }
+    }
 }
 
 fn project_aggregate_status(snapshot: &mut ClientShellSnapshot) {
     for tab in &mut snapshot.tabs {
-        if let Some(status) = snapshot
+        if let Some(agent) = snapshot
             .agents
             .iter()
             .filter(|agent| agent.tab_id == tab.tab_id)
-            .map(|agent| agent.agent_status)
-            .max_by_key(|status| super::status_priority(*status))
+            .max_by_key(|agent| super::agent_status_priority(agent))
         {
-            tab.agent_status = status;
+            tab.agent_status = agent.agent_status;
         }
     }
     for workspace in &mut snapshot.workspaces {
-        if let Some(status) = snapshot
+        if let Some(agent) = snapshot
             .agents
             .iter()
             .filter(|agent| agent.workspace_id == workspace.workspace_id)
-            .map(|agent| agent.agent_status)
-            .max_by_key(|status| super::status_priority(*status))
+            .max_by_key(|agent| super::agent_status_priority(agent))
         {
-            workspace.agent_status = status;
+            workspace.agent_status = agent.agent_status;
         }
     }
 }
@@ -271,6 +309,98 @@ mod tests {
             popup: None,
             graphics: Default::default(),
         }
+    }
+
+    #[test]
+    fn first_snapshot_does_not_acknowledge_unread_blocked() {
+        let mut presentation = EndpointAgentPresentation::default();
+        let mut snapshot = snapshot(AgentStatus::Blocked, 4, 1);
+
+        presentation.project_snapshot(&mut snapshot);
+
+        assert!(!presentation.blocked_acknowledged(&snapshot.agents[0]));
+        assert!(!super::super::agent_is_blocked_read(&snapshot.agents[0]));
+    }
+
+    /// `seen()` answers for completions: a blocked agent has none, so it is true for every blocked agent. A blocked
+    /// agent must therefore be judged by its own acknowledgement, never by `seen()`: an unread block would read as
+    /// read on every client.
+    #[test]
+    fn an_unread_blocked_agent_is_not_read_although_seen_is_true_for_it() {
+        let mut presentation = EndpointAgentPresentation::default();
+        let mut snapshot = snapshot(AgentStatus::Blocked, 4, 1);
+
+        presentation.project_snapshot(&mut snapshot);
+
+        assert!(
+            presentation.seen(&snapshot.agents[0]),
+            "upstream's seen() is true for a blocked agent: this is the trap"
+        );
+        assert!(
+            !super::super::agent_is_blocked_read(&snapshot.agents[0]),
+            "an unread blocked agent must stay unread until someone looks at it"
+        );
+        assert_eq!(
+            super::super::agent_status_icon(
+                &snapshot.agents[0],
+                crate::config::StatusIndicatorStyle::Dots,
+            ),
+            "●"
+        );
+    }
+
+    #[test]
+    fn server_blocked_read_marker_updates_client_acknowledgment_state() {
+        let mut presentation = EndpointAgentPresentation::default();
+        let mut unread = snapshot(AgentStatus::Blocked, 4, 1);
+        presentation.project_snapshot(&mut unread);
+        assert!(!presentation.blocked_acknowledged(&unread.agents[0]));
+
+        let mut read = snapshot(AgentStatus::Blocked, 4, 2);
+        read.agents[0].tokens.push((
+            crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
+            "1".into(),
+        ));
+        presentation.project_snapshot(&mut read);
+
+        assert!(presentation.blocked_acknowledged(&read.agents[0]));
+        assert!(super::super::agent_is_blocked_read(&read.agents[0]));
+    }
+
+    #[test]
+    fn coherent_surface_acknowledges_blocked_without_changing_wire_status() {
+        let mut presentation = EndpointAgentPresentation::default();
+        let mut snapshot = snapshot(AgentStatus::Blocked, 4, 1);
+        presentation.project_snapshot(&mut snapshot);
+
+        assert!(presentation.acknowledge_surface(&mut snapshot, &surface(1), Some(true)));
+        assert_eq!(snapshot.agents[0].agent_status, AgentStatus::Blocked);
+        assert!(super::super::agent_is_blocked_read(&snapshot.agents[0]));
+    }
+
+    #[test]
+    fn projected_aggregates_rank_working_over_read_blocked_but_not_unread_blocked() {
+        let mut snapshot = snapshot(AgentStatus::Blocked, 4, 1);
+        snapshot.tabs[0].tab_id = "tab".into();
+        snapshot.workspaces[0].workspace_id = "workspace".into();
+        snapshot.agents[0].tokens.push((
+            crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
+            "1".into(),
+        ));
+        let mut working = agent(AgentStatus::Working, 5);
+        working.pane_id = "working-pane".into();
+        snapshot.agents.push(working);
+
+        project_aggregate_status(&mut snapshot);
+
+        assert_eq!(snapshot.tabs[0].agent_status, AgentStatus::Working);
+        assert_eq!(snapshot.workspaces[0].agent_status, AgentStatus::Working);
+
+        snapshot.agents[0].tokens.clear();
+        project_aggregate_status(&mut snapshot);
+
+        assert_eq!(snapshot.tabs[0].agent_status, AgentStatus::Blocked);
+        assert_eq!(snapshot.workspaces[0].agent_status, AgentStatus::Blocked);
     }
 
     #[test]

@@ -37,7 +37,7 @@ impl Tab {
                     pane_id: *id,
                     tab_idx,
                     agent_kind_label,
-                    state: terminal.state,
+                    state: terminal.display_state(),
                     seen: pane.seen,
                     last_agent_state_change_seq: terminal.last_agent_state_change_seq,
                     tokens: terminal.metadata_tokens.values(),
@@ -49,10 +49,10 @@ impl Tab {
 
 fn pane_attention_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
-        (AgentState::Blocked, _) => 4,
+        (AgentState::Blocked, false) => 4,
         (AgentState::Idle, false) => 3,
         (AgentState::Working, _) => 2,
-        (AgentState::Idle, true) => 1,
+        (AgentState::Blocked, true) | (AgentState::Idle, true) => 1,
         (AgentState::Unknown, _) => 0,
     }
 }
@@ -68,7 +68,7 @@ impl Workspace {
             .filter_map(|pane| {
                 terminals
                     .get(&pane.attached_terminal_id)
-                    .map(|terminal| (terminal.state, pane.seen))
+                    .map(|terminal| (terminal.display_state(), pane.seen))
             })
             .max_by_key(|(state, seen)| pane_attention_priority(*state, *seen))
             .unwrap_or((AgentState::Unknown, true))
@@ -95,6 +95,22 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_blocked_sinks_below_unread_done_and_working() {
+        assert!(
+            pane_attention_priority(AgentState::Blocked, false)
+                > pane_attention_priority(AgentState::Idle, false)
+        );
+        assert!(
+            pane_attention_priority(AgentState::Blocked, true)
+                < pane_attention_priority(AgentState::Working, true)
+        );
+        assert!(
+            pane_attention_priority(AgentState::Blocked, true)
+                < pane_attention_priority(AgentState::Idle, false)
+        );
+    }
+
+    #[test]
     fn aggregate_state_all_unknown() {
         let ws = Workspace::test_new("test");
         let mut terminals = HashMap::new();
@@ -104,6 +120,35 @@ mod tests {
         let (state, seen) = ws.aggregate_state(&terminals);
         assert_eq!(state, AgentState::Unknown);
         assert!(seen);
+    }
+
+    #[test]
+    fn aggregate_state_uses_compact_display_overlay_without_mutating_raw_state() {
+        let ws = Workspace::test_new("test");
+        let root = ws.tabs[0].root_pane;
+        let mut terminal = terminal_for_pane(&ws, root);
+        terminal.set_agent_name("worker".into());
+        terminal.state = AgentState::Idle;
+        let now = std::time::Instant::now();
+        assert!(terminal.note_forwarded_input_at(b"/compact\r", now));
+        assert_eq!(terminal.state, AgentState::Idle);
+        let mut terminals = HashMap::from([(terminal.id.clone(), terminal)]);
+
+        assert_eq!(ws.aggregate_state(&terminals), (AgentState::Working, true));
+        assert_eq!(ws.pane_details(&terminals)[0].state, AgentState::Working);
+
+        let deadline = terminals
+            .values()
+            .next()
+            .unwrap()
+            .optimistic_working_deadline()
+            .unwrap();
+        terminals
+            .values_mut()
+            .next()
+            .unwrap()
+            .expire_optimistic_working_at(deadline);
+        assert_eq!(ws.aggregate_state(&terminals), (AgentState::Idle, true));
     }
 
     #[test]

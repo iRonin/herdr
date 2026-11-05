@@ -206,6 +206,7 @@ fn mobile_header_and_switcher_render_released_sections_and_stable_targets() {
     });
     projected.workspaces[0].agent_status = AgentStatus::Blocked;
     state.set_snapshot(Box::new(projected));
+    state.outer_focused = Some(false);
     let mut projected_surface = surface();
     for cell in &mut projected_surface.frame.cells {
         cell.symbol = "X".to_owned();
@@ -343,6 +344,53 @@ fn mobile_header_and_switcher_render_released_sections_and_stable_targets() {
                     if params.tab_id == "tab_1"
             )
     )));
+}
+
+#[test]
+fn mobile_excludes_acknowledged_blocked_from_attention_summary_and_uses_hollow_red_mark() {
+    let mut projected = snapshot();
+    let mut agent = test_agent(
+        AgentStatus::Blocked,
+        vec![(
+            crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
+            "1".into(),
+        )],
+    );
+    agent.name = Some("reviewer".into());
+    projected.agents = vec![agent];
+    projected.workspaces[0].agent_status = AgentStatus::Blocked;
+    let mut config = Config::default();
+    config.ui.status_indicators = crate::config::StatusIndicatorStyle::Symbols;
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+
+    let header = state.compose(44, 20).expect("read-blocked mobile header");
+    let header_text = frame_rows(&header).join("\n");
+    assert!(header_text.contains("no agents"), "header: {header_text}");
+
+    state.mode = ClientShellMode::Navigate;
+    let switcher = state.compose(44, 20).expect("read-blocked switcher");
+    let switcher_rows = frame_rows(&switcher);
+    let switcher_text = switcher_rows.join("\n");
+    let detail_y = switcher_rows
+        .iter()
+        .position(|row| row.contains("reviewer"))
+        .unwrap_or_else(|| panic!("agent detail missing from switcher: {switcher_text}"));
+    let mark_y = detail_y.checked_sub(1).expect("agent mark row");
+    assert!(
+        switcher_rows[mark_y].contains('○'),
+        "switcher: {switcher_text}"
+    );
+    let marker = switcher.cells
+        [mark_y * usize::from(switcher.width)..(mark_y + 1) * usize::from(switcher.width)]
+        .iter()
+        .find(|cell| cell.symbol == "○")
+        .expect("hollow blocked marker");
+    assert_eq!(
+        marker.fg,
+        crate::protocol::color_to_u32(state.config.palette.red)
+    );
 }
 
 #[test]
