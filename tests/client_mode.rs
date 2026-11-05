@@ -283,6 +283,66 @@ fn client_connects_and_receives_pane_surface() {
 }
 
 #[test]
+fn client_keeps_the_configured_number_of_rotated_log_copies() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let log_dir = config_home.join(app_dir_name());
+
+    // herdr-client.log is already at its 5 MB limit, so the client's first log line rotates it, before the client
+    // has loaded its config.
+    fs::create_dir_all(&log_dir).unwrap();
+    let mut full_log = b"CURRENT-CLIENT-LOG".to_vec();
+    full_log.resize(5 * 1024 * 1024, b'.');
+    fs::write(log_dir.join("herdr-client.log"), &full_log).unwrap();
+    fs::write(log_dir.join("herdr-client.log.1"), "OLD-ONE").unwrap();
+
+    let spawned_server = spawn_server_with_config(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+        "onboarding = false\n[session]\nlog_retained_files = 2\n",
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+    let spawned_client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+
+    let (one, two) = (
+        log_dir.join("herdr-client.log.1"),
+        log_dir.join("herdr-client.log.2"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(two.exists()
+        && fs::metadata(&one).is_ok_and(|meta| meta.len() == full_log.len() as u64))
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let kept_one = fs::read(&one).unwrap_or_default();
+    let kept_two = fs::read(&two).unwrap_or_default();
+    drop(spawned_client);
+
+    assert_eq!(
+        kept_two, b"OLD-ONE",
+        "the old .1 of the client log must become .2"
+    );
+    assert!(
+        kept_one.starts_with(b"CURRENT-CLIENT-LOG") && kept_one.len() == full_log.len(),
+        "the full client log must be kept whole as .1"
+    );
+    assert!(
+        !log_dir.join("herdr-client.log.3").exists(),
+        "only 2 copies are to be kept"
+    );
+
+    cleanup_spawned_herdr(spawned_server, base);
+}
+
+#[test]
 fn direct_attach_initial_mouse_capture_follows_config() {
     let _lock = test_lock();
     let base = unique_test_dir();

@@ -242,6 +242,29 @@ pub fn config_diagnostic_summary(diagnostics: &[String]) -> Option<String> {
     Some(format!("{target}{impact}; herdr config check"))
 }
 
+/// The `[session] log_retained_files` setting, read straight from the config file for the logger. Logging starts before
+/// `Config::load` runs (and its first write can already rotate a log), so the loaded config arrives too late. A missing or
+/// unreadable file, a file that does not parse, or a missing key all give the default (0, upstream's behaviour); a bad
+/// value gets the same reading as in the loaded config, whose diagnostics report it. A file that is valid TOML but
+/// fails another key's type check still gives the configured value here, although `Config::load` then uses the
+/// defaults for every setting: the logs matter most when the config is broken.
+pub fn startup_log_retained_files() -> usize {
+    let Ok(Some(content)) = read_optional_config(&config_path()) else {
+        return crate::logging::LogRetention::default().files();
+    };
+    content
+        .parse::<toml::Value>()
+        .ok()
+        .and_then(|value| {
+            value
+                .get("session")?
+                .get("log_retained_files")
+                .map(crate::logging::LogRetention::from_value)
+        })
+        .unwrap_or_default()
+        .files()
+}
+
 pub fn load_live_config() -> Result<LoadedConfig, Vec<String>> {
     let path = config_path();
     let content = match read_optional_config(&path) {
@@ -377,6 +400,13 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
     );
 
     diagnostics.extend(config.theme.diagnostics());
+    diagnostics.extend(
+        config
+            .session
+            .log_retained_files
+            .problem()
+            .map(str::to_string),
+    );
 
     Ok(LoadedConfig {
         config,
@@ -912,6 +942,111 @@ name = "catppucin"
 
         assert_eq!(loaded.diagnostics.len(), 1);
         assert!(loaded.diagnostics[0].contains("theme.name = \"catppucin\""));
+    }
+
+    /// Runs `check` with HERDR_CONFIG_PATH pointing at a config file with `content` (or at no file when None).
+    fn with_config_file(content: Option<&str>, check: impl FnOnce()) {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-config-log-retention-{}-{stamp}",
+            std::process::id()
+        ));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(content) = content {
+            std::fs::write(&path, content).unwrap();
+        }
+        std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+        check();
+        std::env::remove_var(CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The logger starts before `Config::load` runs, so it reads the setting from the file itself. Whatever is in the
+    /// file, it must come out as a usable number of copies: the default 0 for anything it cannot use.
+    #[test]
+    fn startup_log_retained_files_reads_the_key_and_falls_back_to_none() {
+        let cases: [(Option<&str>, usize); 8] = [
+            (None, 0),
+            (Some(""), 0),
+            (Some("[session]\nlog_retained_files = 3\n"), 3),
+            (Some("[session]\nlog_retained_files = 10\n"), 10),
+            (Some("[session]\nlog_retained_files = 50\n"), 10),
+            (Some("[session]\nlog_retained_files = \"many\"\n"), 0),
+            (Some("[session\nlog_retained_files = 3\n"), 0),
+            (Some("\u{feff}[session]\nlog_retained_files = 2\n"), 2),
+        ];
+        for (content, expected) in cases {
+            with_config_file(content, || {
+                assert_eq!(
+                    startup_log_retained_files(),
+                    expected,
+                    "config file {content:?}"
+                );
+            });
+        }
+    }
+
+    /// An unreadable config path (here a directory) is not an error for the logger: it logs with the default.
+    #[test]
+    fn startup_log_retained_files_is_zero_when_the_config_path_is_a_directory() {
+        with_config_file(None, || {
+            std::fs::create_dir_all(config_path()).unwrap();
+            assert_eq!(startup_log_retained_files(), 0);
+        });
+    }
+
+    /// A bad `log_retained_files` is reported for that key alone. Any other wrong type makes the startup load fall back
+    /// to the defaults for EVERY setting (a parse error).
+    #[test]
+    fn a_bad_log_retained_files_value_is_reported_without_resetting_other_settings() {
+        let content =
+            "[session]\nlog_retained_files = \"many\"\nstartup_per_agent_delay_ms = 5000\n";
+        with_config_file(Some(content), || {
+            let startup = Config::load();
+            assert_eq!(startup.config.session.startup_per_agent_delay_ms, 5000);
+            assert_eq!(startup.config.session.log_retained_files.files(), 0);
+            assert_eq!(startup.diagnostics.len(), 1, "{:?}", startup.diagnostics);
+            assert!(
+                startup.diagnostics[0].starts_with(
+                    "session.log_retained_files must be an integer between 0 and 10 (got string)"
+                ),
+                "{:?}",
+                startup.diagnostics
+            );
+
+            let live = load_live_config().unwrap();
+            assert_eq!(live.diagnostics, startup.diagnostics);
+            assert!(live.invalid_sections.is_empty());
+        });
+
+        // A TOML date reaches the value type through the key capture `Config::load` runs for unknown-key reports, as a
+        // one-key map. It must come out as a bad value of this key alone, not as a parse error for the whole file.
+        let content =
+            "[session]\nlog_retained_files = 1979-05-27\nstartup_per_agent_delay_ms = 5000\n";
+        with_config_file(Some(content), || {
+            let startup = Config::load();
+            assert_eq!(startup.config.session.startup_per_agent_delay_ms, 5000);
+            assert_eq!(startup.config.session.log_retained_files.files(), 0);
+            assert_eq!(startup.diagnostics.len(), 1, "{:?}", startup.diagnostics);
+            assert!(
+                startup.diagnostics[0].starts_with(
+                    "session.log_retained_files must be an integer between 0 and 10 (got "
+                ),
+                "{:?}",
+                startup.diagnostics
+            );
+        });
+
+        with_config_file(Some("[session]\nlog_retained_files = 3\n"), || {
+            let startup = Config::load();
+            assert_eq!(startup.config.session.log_retained_files.files(), 3);
+            assert!(startup.diagnostics.is_empty(), "{:?}", startup.diagnostics);
+        });
     }
 
     #[test]

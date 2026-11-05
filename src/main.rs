@@ -401,6 +401,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Milliseconds between automatic agent restores; 0 starts them without spacing.
 # startup_per_agent_delay_ms = 100
 
+# Rotated copies of herdr-server.log and herdr-client.log to keep (herdr-server.log.1,
+# .2, ...) when a log reaches its 5 MB limit. 0 keeps none: the full log is deleted.
+# The maximum is 10. Read when each herdr process starts.
+# log_retained_files = 0
+
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.
 # When true (default), herdr runs remote ssh through a generated config that

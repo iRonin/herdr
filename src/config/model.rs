@@ -270,6 +270,9 @@ pub struct SessionConfig {
     pub resume_agents_on_restore: bool,
     /// Milliseconds between automatic agent restores. Zero disables spacing.
     pub startup_per_agent_delay_ms: u32,
+    /// Rotated copies to keep beside herdr-server.log and herdr-client.log. Default: 0 (none, as upstream).
+    /// Read when each herdr process starts; a bad value is reported by `herdr config check` and keeps the other settings.
+    pub log_retained_files: crate::logging::LogRetention,
 }
 
 impl Default for SessionConfig {
@@ -277,6 +280,7 @@ impl Default for SessionConfig {
         Self {
             resume_agents_on_restore: true,
             startup_per_agent_delay_ms: 100,
+            log_retained_files: crate::logging::LogRetention::default(),
         }
     }
 }
@@ -1444,6 +1448,57 @@ startup_per_agent_delay_ms = 0
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.session.resume_agents_on_restore);
         assert_eq!(config.session.startup_per_agent_delay_ms, 0);
+    }
+
+    #[test]
+    fn log_retained_files_defaults_to_none_as_upstream_and_parses() {
+        let default_config: Config = toml::from_str("").unwrap();
+        assert_eq!(default_config.session.log_retained_files.files(), 0);
+        assert_eq!(default_config.session.log_retained_files.problem(), None);
+        assert_eq!(Config::default().session.log_retained_files.files(), 0);
+
+        let config: Config = toml::from_str("[session]\nlog_retained_files = 3\n").unwrap();
+        assert_eq!(config.session.log_retained_files.files(), 3);
+        assert!(config.collect_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn a_bad_log_retained_files_value_parses_and_is_reported_as_a_diagnostic() {
+        for (value, kept) in [
+            ("\"many\"", 0),
+            ("true", 0),
+            ("2.5", 0),
+            ("-1", 0),
+            ("11", 10),
+            ("[1, 2]", 0),
+            // A datetime and an inline table reach the type as a map, not as a scalar.
+            ("1979-05-27", 0),
+            ("{ files = 3 }", 0),
+        ] {
+            let toml = format!(
+                "[session]\nlog_retained_files = {value}\nstartup_per_agent_delay_ms = 5000\n"
+            );
+            let config: Config = toml::from_str(&toml)
+                .unwrap_or_else(|err| panic!("{value} must not fail the whole config: {err}"));
+            assert_eq!(config.session.log_retained_files.files(), kept, "{value}");
+            assert_eq!(config.session.startup_per_agent_delay_ms, 5000, "{value}");
+            let diagnostics = config.collect_diagnostics();
+            assert_eq!(diagnostics.len(), 1, "{value}: {diagnostics:?}");
+            assert!(
+                diagnostics[0].contains("session.log_retained_files"),
+                "{diagnostics:?}"
+            );
+            // `config_diagnostic_summary` words its notice from these phrases: a bad value for this one key must not
+            // claim that the defaults are in use.
+            assert!(
+                !diagnostics[0].contains("using defaults"),
+                "{diagnostics:?}"
+            );
+            assert!(
+                !diagnostics[0].contains("keeping current config"),
+                "{diagnostics:?}"
+            );
+        }
     }
 
     #[test]

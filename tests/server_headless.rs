@@ -102,7 +102,23 @@ fn spawn_server(
     config_home: &Path,
     runtime_dir: &Path,
     api_socket_path: &Path,
+    client_socket_path: &Path,
+) -> SpawnedHerdr {
+    spawn_server_with_env(
+        config_home,
+        runtime_dir,
+        api_socket_path,
+        client_socket_path,
+        &[],
+    )
+}
+
+fn spawn_server_with_env(
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket_path: &Path,
     _client_socket_path: &Path,
+    extra_env: &[(&str, &Path)],
 ) -> SpawnedHerdr {
     fs::create_dir_all(config_home.join("herdr")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
@@ -131,6 +147,9 @@ fn spawn_server(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -558,6 +577,18 @@ fn wait_for_exit(child: &mut Box<dyn Child + Send + Sync>, timeout: Duration) ->
     false
 }
 
+/// Waits until the pty child (the server) has exited; false when it is still running at the deadline.
+fn wait_for_server_exit(spawned: &mut SpawnedHerdr, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if spawned.child.try_wait().ok().flatten().is_some() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    false
+}
+
 fn wait_for_log_line(path: &Path, needle: &str, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -647,4 +678,174 @@ fn server_stop_request_logs_its_caller() {
     assert!(line.contains(&expected), "{line}");
 
     cleanup_spawned_herdr(spawned, base);
+}
+
+/// The log file's size limit: a log that already has this many bytes rotates on its first write.
+const LOG_SIZE_LIMIT_BYTES: usize = 5 * 1024 * 1024;
+
+fn server_app_dir(config_home: &Path) -> PathBuf {
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    config_home.join(app_dir)
+}
+
+/// A log of exactly the size limit that starts with `marker`, so the server's first log line rotates it.
+fn write_full_log(path: &Path, marker: &str) {
+    let mut content = marker.as_bytes().to_vec();
+    content.resize(LOG_SIZE_LIMIT_BYTES, b'.');
+    fs::write(path, content).unwrap();
+}
+
+/// Starts a server whose log is already full, with `session_config` (the text under `[session]`, possibly empty) in a
+/// config file the server is pointed at, waits for it to be ready, shuts it down over the API, and returns the log
+/// directory.
+fn run_server_with_full_log(
+    base: &Path,
+    session_config: &str,
+    old_generations: &[(&str, &str)],
+) -> PathBuf {
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let log_dir = server_app_dir(&config_home);
+    fs::create_dir_all(&log_dir).unwrap();
+    write_full_log(&log_dir.join("herdr-server.log"), "CURRENT-LOG");
+    for (suffix, marker) in old_generations {
+        fs::write(log_dir.join(format!("herdr-server.log.{suffix}")), marker).unwrap();
+    }
+    let config_file = base.join("config-under-test.toml");
+    fs::write(
+        &config_file,
+        format!("onboarding = false\n[session]\n{session_config}"),
+    )
+    .unwrap();
+
+    let mut spawned = spawn_server_with_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+        &[("HERDR_CONFIG_PATH", config_file.as_path())],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"));
+    command
+        .args(["server", "stop"])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("HERDR_SOCKET_PATH", &api_socket)
+        .env_remove("HERDR_CLIENT_SOCKET_PATH")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let _ = command.spawn().expect("spawn the shutdown command").wait();
+    assert!(
+        wait_for_server_exit(&mut spawned, Duration::from_secs(10)),
+        "the server must stop when asked"
+    );
+    drop(spawned);
+    log_dir
+}
+
+/// herdr's log rotates at 5 MB and, by upstream's default, keeps no old copy: a busy server's log reaches back about a
+/// day, so an event from before that cannot be read. With `[session] log_retained_files = 2` the full log must become
+/// `.1`, the old `.1` must become `.2`, and the oldest copy beyond that must go. The very first rotation happens on the
+/// server's first log line, before the config is loaded, so it must already use the setting.
+#[test]
+fn server_keeps_the_configured_number_of_rotated_log_copies() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+
+    let log_dir = run_server_with_full_log(
+        &base,
+        "log_retained_files = 2\n",
+        &[("1", "OLD-ONE"), ("2", "OLD-TWO")],
+    );
+
+    let one =
+        fs::read(log_dir.join("herdr-server.log.1")).expect("the full log must be kept as .1");
+    assert!(
+        one.starts_with(b"CURRENT-LOG"),
+        "herdr-server.log.1 must be the log that was full"
+    );
+    assert_eq!(
+        one.len(),
+        LOG_SIZE_LIMIT_BYTES,
+        "the kept copy must be whole"
+    );
+    assert_eq!(
+        fs::read(log_dir.join("herdr-server.log.2")).expect("the old .1 must become .2"),
+        b"OLD-ONE"
+    );
+    assert!(
+        !log_dir.join("herdr-server.log.3").exists(),
+        "only 2 copies are to be kept: the old .2 must be gone and nothing may become .3"
+    );
+    let current = fs::read_to_string(log_dir.join("herdr-server.log")).unwrap();
+    assert!(
+        current.contains("app.startup") && !current.contains("CURRENT-LOG"),
+        "the new log must start fresh with this run's lines"
+    );
+
+    cleanup_test_base(&base);
+}
+
+/// Default preservation: without the setting a full log is deleted when it rotates, exactly as upstream does, and no
+/// numbered copy is shifted or created.
+#[test]
+fn server_keeps_no_rotated_log_copy_by_default() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+
+    let log_dir = run_server_with_full_log(&base, "", &[("1", "OLD-ONE")]);
+
+    let current = fs::read_to_string(log_dir.join("herdr-server.log")).unwrap();
+    assert!(
+        current.contains("app.startup") && !current.contains("CURRENT-LOG"),
+        "the full log must be replaced by a fresh one"
+    );
+    assert!(
+        fs::read(log_dir.join("herdr-server.log.1")).is_ok_and(|content| content == b"OLD-ONE"),
+        "with no copies to keep, rotation must leave a numbered file that is already there alone"
+    );
+    assert!(
+        !log_dir.join("herdr-server.log.2").exists(),
+        "nothing may be shifted without the setting"
+    );
+
+    cleanup_test_base(&base);
+}
+
+/// A bad value must not stop the server or change how it logs: it keeps no copies.
+#[test]
+fn server_starts_and_keeps_no_copies_when_log_retained_files_is_bad() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+
+    let log_dir = run_server_with_full_log(&base, "log_retained_files = \"many\"\n", &[]);
+
+    let current = fs::read_to_string(log_dir.join("herdr-server.log")).unwrap();
+    assert!(
+        current.contains("app.startup"),
+        "the server must have started and logged"
+    );
+    assert!(
+        !log_dir.join("herdr-server.log.1").exists(),
+        "a bad value keeps no rotated copy"
+    );
+    // The logger is installed before the config is loaded, and a parse failure is logged into this very file. A bad
+    // value of this one key must not turn into a whole-config parse error (every setting back to its default,
+    // including the program name the Pi agent is detected by).
+    assert!(
+        !current.contains("config parse error"),
+        "a bad log_retained_files must not make the server fall back to the defaults for every setting"
+    );
+
+    cleanup_test_base(&base);
 }

@@ -1441,6 +1441,12 @@
           "type": "integer",
           "default": "100",
           "description": "Milliseconds between automatic agent restores after a server restart. The first agent starts without this delay; 0 disables spacing. Does not delay manual launches or explicit terminal attaches. Restart the server to apply."
+        },
+        {
+          "key": "session.log_retained_files",
+          "type": "integer",
+          "default": "0",
+          "description": "Rotated copies to keep beside herdr-server.log and herdr-client.log when a log reaches its 5 MB size limit (herdr-server.log.1, .2, and so on). 0 keeps none: the full log is deleted, as before. The maximum is 10: a value above 10 keeps 10 copies; any other value that is not a whole number of 0 or more keeps none. herdr config check reports both, and other settings are not affected. Lowering the number does not delete the higher-numbered copies. Read when each herdr process starts: restart the server to apply."
         }
       ]
     },
