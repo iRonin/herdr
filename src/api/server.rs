@@ -1921,6 +1921,113 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_wait_ends_at_once_when_an_event_about_its_pane_arrives() {
+        // WHY: an agent wait blocks on the event hub and only events about its own pane can end it
+        // or make it probe. With a 30 s liveness interval only the hub wake can end it within 5 s,
+        // and an event about another pane must not wake it at all (a history read would show it).
+        use crate::api::schema::{AgentStatus, EventData, EventEnvelope, EventKind};
+
+        let event_hub = EventHub::with_timing(WaitTiming {
+            liveness: Duration::from_secs(30),
+            agent_status_snapshot: Duration::from_secs(30),
+        });
+        let status_event = |pane_id: &str, agent_status| EventEnvelope {
+            event: EventKind::PaneAgentStatusChanged,
+            data: EventData::PaneAgentStatusChanged {
+                pane_id: pane_id.into(),
+                workspace_id: "ws_1".into(),
+                agent_status,
+                agent: Some("pi".into()),
+                title: None,
+                display_agent: None,
+                state_labels: HashMap::new(),
+            },
+        };
+        let (first_get_tx, first_get_rx) = std::sync::mpsc::channel();
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let mut gets = 0;
+            while let Some(msg) = api_rx.blocking_recv() {
+                assert!(matches!(msg.request.method, Method::AgentGet(_)));
+                gets += 1;
+                let status = if gets == 1 {
+                    AgentStatus::Working
+                } else {
+                    AgentStatus::Idle
+                };
+                msg.respond_to
+                    .send(
+                        serde_json::to_string(&SuccessResponse {
+                            id: msg.request.id,
+                            result: ResponseResult::AgentInfo {
+                                agent: agent_info(status),
+                            },
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+                if gets == 1 {
+                    first_get_tx.send(()).unwrap();
+                }
+            }
+        });
+
+        let (mut client, server, _path) = local_stream_pair("agent-wait-wake");
+        client
+            .write_all(
+                br#"{"id":"wait_wake","method":"agent.wait","params":{"target":"worker","until":["idle"],"timeout_ms":60000}}"#,
+            )
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let server_event_hub = event_hub.clone();
+        let server_api_tx = api_tx.clone();
+        let server_thread = std::thread::spawn(move || {
+            handle_connection(
+                server,
+                &server_api_tx,
+                &server_event_hub,
+                &server_running,
+                None,
+            )
+        });
+        first_get_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Let the wait finish its first pass and block on the hub.
+        std::thread::sleep(Duration::from_millis(300));
+
+        let reads = event_hub.history_reads();
+        for _ in 0..5 {
+            event_hub.push(status_event("pane_2", AgentStatus::Idle));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let reads_after_other_pane = event_hub.history_reads();
+
+        event_hub.push(status_event("pane_1", AgentStatus::Idle));
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = line_tx.send(read_line(&mut client));
+        });
+        let line = line_rx.recv_timeout(Duration::from_secs(5));
+        // Release the connection whatever happened above, so a failure does not hang the test.
+        running.store(false, Ordering::Relaxed);
+        event_hub.wake_waiters();
+        server_thread.join().unwrap().unwrap();
+        drop(api_tx);
+        responder.join().unwrap();
+
+        assert_eq!(
+            reads_after_other_pane, reads,
+            "events about another pane woke the agent wait"
+        );
+        let line = line.expect("the agent wait did not end when an event about its pane arrived");
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], "wait_wake");
+        assert_eq!(response["result"]["agent"]["agent_status"], "idle");
+    }
+
+    #[test]
     fn events_wait_agent_status_returns_initial_match() {
         let (api_tx, responder) =
             spawn_pane_get_responder(crate::api::schema::AgentStatus::Blocked);
