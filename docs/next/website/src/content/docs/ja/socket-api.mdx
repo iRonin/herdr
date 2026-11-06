@@ -717,6 +717,8 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
 
 worktree のイベント購読には `worktree.created`、`worktree.opened`、`worktree.removed` があります。worktree イベントは Git チェックアウトのライフサイクルを記述します。`worktree.created` は開かれた `workspace` と作成された `worktree` を含みます。`worktree.opened` は対象の `workspace`、開かれた `worktree`、`already_open` を含みます。`worktree.removed` は `workspace_id`、削除された `worktree`、`forced` を含みます。
 
+保持中の `events.subscribe` 接続を、その購読に該当するイベントでのみ起こすサーバーは、`ping` の結果の `capabilities.filtered_subscription_wake: true`（および `herdr status --json`）でそれを報告します。この能力があれば、ペインごとに 1 本ずつ接続を保持するクライアントでも、あるペインのイベントが他のペインの接続を起こすことはありません。この能力がない古いサーバーはフィールドを返しません。欠落した値は `false` として扱ってください。購読が何をどの順序で配信するかは、この能力に依存しません。
+
 ライフサイクルイベントには `events.subscribe` を使ってください。ワンショットの wait がサポートされる場合、専用の wait ヘルパーが別途ドキュメント化されます。
 
 ## ペインの読み取り

@@ -10683,6 +10683,11 @@
                 "null"
               ]
             },
+            "filtered_subscription_wake": {
+              "default": false,
+              "description": "Whether an event wakes only the held `events.subscribe` connections whose subscriptions can\nmatch it, so a client may hold one subscription per pane without every event costing a\nwake-up for each of them. Servers that predate it do not send the field, which reads false.",
+              "type": "boolean"
+            },
             "health_check": {
               "default": false,
               "description": "Whether this server supports endpoint health probes.",

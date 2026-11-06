@@ -79,6 +79,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         ssh_agent_registration: false,
+        filtered_subscription_wake: true,
     })
 }
 
@@ -1678,6 +1679,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                filtered_subscription_wake: true,
             }),
             None,
             None,
@@ -1688,6 +1690,37 @@ mod tests {
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "req_1");
         assert!(matches!(parsed.result, ResponseResult::Pong { .. }));
+    }
+
+    #[test]
+    fn a_running_server_advertises_filtered_subscription_wake_in_ping() {
+        // WHY: a client that wants to hold one subscription per pane reads this from `ping`; an
+        // older server omits it, so the client must be able to tell the two apart. The capability is
+        // read from the real server over its socket, not from the builder function.
+        let _guard = env_lock().lock().unwrap();
+        let dir = unique_test_path("api-capability-ping");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("herdr.sock");
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &path);
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let handle =
+            start_server_with_stop_control(api_tx, EventHub::default(), ServerStop::default());
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        let handle = handle.unwrap();
+
+        let mut client = crate::ipc::connect_local_stream(&path).unwrap();
+        client
+            .write_all(b"{\"id\":\"cap\",\"method\":\"ping\",\"params\":{}}\n")
+            .unwrap();
+        client.flush().unwrap();
+        let pong: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        drop(handle);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(pong["result"]["type"], "pong");
+        assert_eq!(
+            pong["result"]["capabilities"]["filtered_subscription_wake"], true,
+            "{pong}"
+        );
     }
 
     #[test]

@@ -814,6 +814,7 @@ fn success_response_round_trips() {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                filtered_subscription_wake: true,
             }),
         },
     };
@@ -821,6 +822,21 @@ fn success_response_round_trips() {
     let json = serde_json::to_string(&response).unwrap();
     let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, response);
+}
+
+#[test]
+fn capabilities_of_an_older_server_read_filtered_subscription_wake_as_false() {
+    // An older server does not send the field: a client must see "not supported", not an error.
+    let older: ServerCapabilities = serde_json::from_str(
+        r#"{"live_handoff":true,"detached_server_daemon":true,"endpoint_protocol_generation":1,
+            "surface_interest":true,"health_check":true,"ssh_agent_registration":true}"#,
+    )
+    .unwrap();
+    assert!(!older.filtered_subscription_wake);
+    assert!(older.ssh_agent_registration);
+    let newer: ServerCapabilities =
+        serde_json::from_str(r#"{"live_handoff":true,"filtered_subscription_wake":true}"#).unwrap();
+    assert!(newer.filtered_subscription_wake);
 }
 
 #[test]

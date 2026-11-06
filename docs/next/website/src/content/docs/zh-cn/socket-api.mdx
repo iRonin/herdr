@@ -702,6 +702,8 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
 
 Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree.removed`。Worktree 事件描述 Git 检出的生命周期。`worktree.created` 包含打开的 `workspace` 和创建的 `worktree`。`worktree.opened` 包含目标 `workspace`、打开的 `worktree` 和 `already_open`。`worktree.removed` 包含 `workspace_id`、被移除的 `worktree` 和 `forced`。
 
+只在事件与订阅匹配时才唤醒保持中的 `events.subscribe` 连接的服务器，会在 `ping` 结果的 `capabilities.filtered_subscription_wake: true`（以及 `herdr status --json`）中报告这一点。有了它，按窗格各保持一个连接的客户端不会因为某个窗格的事件而唤醒其他窗格的连接。早于该能力的旧服务器不会返回此字段，请把缺失的值当作 `false`。订阅送达什么内容、按什么顺序，都不依赖这个能力。
+
 生命周期事件用 `events.subscribe`。支持一次性等待时,专门的等待辅助命令会单独在文档中说明。
 
 ## 读取窗格

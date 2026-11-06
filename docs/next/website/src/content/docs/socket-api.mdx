@@ -933,6 +933,13 @@ an authoritative read; a delayed payload may predate their latest snapshot.
 
 Worktree event subscriptions include `worktree.created`, `worktree.opened`, and `worktree.removed`. Worktree events describe Git checkout lifecycle. `worktree.created` includes the opened `workspace` and created `worktree`. `worktree.opened` includes the target `workspace`, opened `worktree`, and `already_open`. `worktree.removed` includes the `workspace_id`, removed `worktree`, and `forced`.
 
+A server that wakes a held `events.subscribe` connection only for the events its subscriptions can
+match reports `capabilities.filtered_subscription_wake: true` in the `ping` result (and in
+`herdr status --json`). With it, a client can hold one connection per pane, and an event about one
+pane does not wake the connections of the others. Servers that predate the capability leave the
+field out; read a missing value as `false`. What a subscription delivers, and in which order, does
+not depend on it.
+
 Use `events.subscribe` for lifecycle events. Dedicated wait helpers are documented separately when a one-shot wait is supported.
 
 ## Reading panes
