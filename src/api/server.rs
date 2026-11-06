@@ -2141,9 +2141,17 @@ mod tests {
 
     #[test]
     fn events_wait_agent_status_returns_not_found_when_tab_closes() {
-        // `tab.close` publishes `tab.closed` and no `pane.closed` for the panes inside. The wait
-        // must still end with `pane_not_found` promptly, not with `timeout` after the 1 s snapshot.
-        let event_hub = EventHub::default();
+        // `tab.close` publishes `tab.closed` and no `pane.closed` for the panes inside, so the
+        // event names no pane. The wait must still end with `pane_not_found` as soon as it is
+        // published. WHY the intervals are 30 s and the wait's own limit 3 s: the first two
+        // `pane.get` calls (the initial snapshot and the first pass) report a live pane, so only the
+        // wake by `tab.closed` (an event whose panes are unknown wakes every waiter) can lead to the
+        // third call that finds the pane gone. A hub that did not wake the wait would leave it to
+        // end with `timeout`, and a sample or liveness timeout cannot mask that.
+        let event_hub = EventHub::with_timing(WaitTiming {
+            liveness: Duration::from_secs(30),
+            agent_status_snapshot: Duration::from_secs(30),
+        });
         let responder_event_hub = event_hub.clone();
         let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let responder = std::thread::spawn(move || {
@@ -2153,16 +2161,9 @@ mod tests {
                     panic!("unexpected request: {:?}", msg.request.method);
                 };
                 pane_get_count += 1;
-                let response = if pane_get_count == 1 {
-                    serde_json::to_string(&SuccessResponse {
-                        id: msg.request.id,
-                        result: ResponseResult::PaneInfo {
-                            pane: pane_info("pane_1", crate::api::schema::AgentStatus::Unknown),
-                        },
-                    })
-                    .unwrap()
-                } else {
+                let response = if pane_get_count <= 2 {
                     if pane_get_count == 2 {
+                        // Published during the first pass, after the pass took its cursor.
                         responder_event_hub.push(crate::api::schema::EventEnvelope {
                             event: crate::api::schema::EventKind::TabClosed,
                             data: crate::api::schema::EventData::TabClosed {
@@ -2171,6 +2172,14 @@ mod tests {
                             },
                         });
                     }
+                    serde_json::to_string(&SuccessResponse {
+                        id: msg.request.id,
+                        result: ResponseResult::PaneInfo {
+                            pane: pane_info("pane_1", crate::api::schema::AgentStatus::Unknown),
+                        },
+                    })
+                    .unwrap()
+                } else {
                     error_response_json(
                         msg.request.id,
                         "pane_not_found",
@@ -2183,13 +2192,19 @@ mod tests {
 
         let (mut client, server, _path) = local_stream_pair("wait-tab-close");
         client
-            .write_all(br#"{"id":"wait_tab_close","method":"events.wait","params":{"match_event":{"event":"pane_agent_status_changed","pane_id":"pane_1","agent_status":"done"},"timeout_ms":500}}"#)
+            .write_all(br#"{"id":"wait_tab_close","method":"events.wait","params":{"match_event":{"event":"pane_agent_status_changed","pane_id":"pane_1","agent_status":"done"},"timeout_ms":3000}}"#)
             .unwrap();
         client.write_all(b"\n").unwrap();
         client.flush().unwrap();
 
         let running = Arc::new(AtomicBool::new(true));
+        let started = std::time::Instant::now();
         handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait took {:?}: it was not woken by tab.closed",
+            started.elapsed()
+        );
 
         let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(response["id"], "wait_tab_close");
