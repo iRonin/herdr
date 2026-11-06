@@ -112,6 +112,13 @@ fn interests_wake_on(
             .any(|interest| interest.matches(event, scope))
 }
 
+/// Whether the hub would wake a waiter with these interests for this event (for tests of the
+/// interests a subscription kind declares).
+#[cfg(test)]
+pub(super) fn would_wake(interests: &[WakeInterest], event: &EventEnvelope) -> bool {
+    interests_wake_on(interests, event, &EventScope::of(&event.data))
+}
+
 /// Which panes an event is about, as far as waking waiters goes.
 enum EventScope<'a> {
     /// The event is about exactly these panes, by the ids it carries (none: about no pane).
@@ -216,6 +223,9 @@ struct Waiter {
     woken_at: AtomicU64,
     /// The sequence of the cursor of the thread's current pass, set with the hub mutex held.
     cursor_sequence: AtomicU64,
+    /// How many notifications `push` and `wake_waiters` have sent it.
+    #[cfg(test)]
+    wakes: AtomicU64,
 }
 
 /// A waiter whose cursor is this many events behind the newest one is woken whatever the event
@@ -253,6 +263,8 @@ impl EventHubState {
 
 impl Waiter {
     fn notify(&self) {
+        #[cfg(test)]
+        self.wakes.fetch_add(1, Ordering::Relaxed);
         self.wake.notify_one();
     }
 
@@ -312,6 +324,12 @@ impl EventWaiter {
                 true
             }
         }
+    }
+
+    /// How many times the hub has notified this waiter.
+    #[cfg(test)]
+    pub(super) fn wake_count(&self) -> u64 {
+        self.shared.wakes.load(Ordering::Relaxed)
     }
 }
 
@@ -418,6 +436,8 @@ impl EventHub {
             wake: Condvar::new(),
             woken_at: AtomicU64::new(0),
             cursor_sequence: AtomicU64::new(0),
+            #[cfg(test)]
+            wakes: AtomicU64::new(0),
         });
         if let Ok(mut state) = self.inner.state.lock() {
             shared
@@ -466,8 +486,243 @@ impl EventHub {
     }
 }
 
+/// Events of every kind, for tests of what wakes what. `event` names every `EventKind` on purpose:
+/// a new kind must get a sample here before the crate's tests build.
+#[cfg(test)]
+pub(super) mod samples {
+    use crate::api::schema::{
+        AgentStatus, EventData, EventEnvelope, EventKind, PaneInfo, PaneLayoutPane, PaneLayoutRect,
+        PaneLayoutSnapshot, PaneReadState, TabInfo, WorkspaceInfo, WorktreeInfo,
+    };
+
+    pub(in crate::api) fn pane_info(pane_id: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id: pane_id.into(),
+            terminal_id: "term_1".into(),
+            workspace_id: "workspace_1".into(),
+            tab_id: "tab_1".into(),
+            focused: true,
+            cwd: None,
+            foreground_cwd: None,
+            restore_error: None,
+            label: None,
+            agent: Some("pi".into()),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            display_agent: None,
+            agent_status: AgentStatus::Working,
+            state_labels: Default::default(),
+            tokens: Default::default(),
+            agent_session: None,
+            scroll: None,
+            revision: 0,
+        }
+    }
+
+    fn workspace_info() -> WorkspaceInfo {
+        WorkspaceInfo {
+            workspace_id: "workspace_1".into(),
+            number: 1,
+            label: "one".into(),
+            focused: true,
+            pane_count: 1,
+            tab_count: 1,
+            active_tab_id: "tab_1".into(),
+            agent_status: AgentStatus::Idle,
+            tokens: Default::default(),
+            worktree: None,
+        }
+    }
+
+    fn tab_info() -> TabInfo {
+        TabInfo {
+            tab_id: "tab_1".into(),
+            workspace_id: "workspace_1".into(),
+            number: 1,
+            label: "one".into(),
+            focused: true,
+            pane_count: 1,
+            agent_status: AgentStatus::Idle,
+        }
+    }
+
+    fn worktree_info() -> WorktreeInfo {
+        WorktreeInfo {
+            path: "/tmp/wt".into(),
+            branch: None,
+            is_bare: false,
+            is_detached: false,
+            is_prunable: false,
+            is_linked_worktree: true,
+            open_workspace_id: None,
+            label: "wt".into(),
+        }
+    }
+
+    /// The panes `event` is about are `pane_id` and, for a move, its new id `moved_<pane_id>`; the
+    /// events that name no pane use ids that are not `pane_id`.
+    pub(in crate::api) fn event(kind: EventKind, pane_id: &str) -> EventEnvelope {
+        let workspace_id = || "workspace_1".to_string();
+        let tab_id = || "tab_1".to_string();
+        let data = match kind {
+            EventKind::WorkspaceCreated => EventData::WorkspaceCreated {
+                workspace: workspace_info(),
+            },
+            EventKind::WorkspaceUpdated => EventData::WorkspaceUpdated {
+                workspace: workspace_info(),
+            },
+            EventKind::WorkspaceMetadataUpdated => EventData::WorkspaceMetadataUpdated {
+                workspace: workspace_info(),
+            },
+            EventKind::WorkspaceClosed => EventData::WorkspaceClosed {
+                workspace_id: workspace_id(),
+                workspace: None,
+            },
+            EventKind::WorkspaceRenamed => EventData::WorkspaceRenamed {
+                workspace_id: workspace_id(),
+                label: "renamed".into(),
+            },
+            EventKind::WorkspaceMoved => EventData::WorkspaceMoved {
+                workspace_id: workspace_id(),
+                insert_index: 0,
+                workspaces: Vec::new(),
+            },
+            EventKind::WorkspaceReordered => EventData::WorkspaceReordered {
+                workspace_ids: vec![workspace_id()],
+                before_workspace_id: None,
+                workspaces: Vec::new(),
+            },
+            EventKind::WorkspaceFocused => EventData::WorkspaceFocused {
+                workspace_id: workspace_id(),
+            },
+            EventKind::WorktreeCreated => EventData::WorktreeCreated {
+                workspace: workspace_info(),
+                worktree: worktree_info(),
+            },
+            EventKind::WorktreeOpened => EventData::WorktreeOpened {
+                workspace: workspace_info(),
+                worktree: worktree_info(),
+                already_open: false,
+            },
+            EventKind::WorktreeRemoved => EventData::WorktreeRemoved {
+                workspace_id: workspace_id(),
+                workspace: None,
+                worktree: worktree_info(),
+                forced: false,
+            },
+            EventKind::TabCreated => EventData::TabCreated { tab: tab_info() },
+            EventKind::TabClosed => EventData::TabClosed {
+                tab_id: tab_id(),
+                workspace_id: workspace_id(),
+            },
+            EventKind::TabRenamed => EventData::TabRenamed {
+                tab_id: tab_id(),
+                workspace_id: workspace_id(),
+                label: "renamed".into(),
+            },
+            EventKind::TabMoved => EventData::TabMoved {
+                tab_id: "tab_3".into(),
+                workspace_id: "workspace_2".into(),
+                insert_index: 0,
+                tabs: Vec::new(),
+                previous_tab_id: Some(tab_id()),
+                previous_workspace_id: Some(workspace_id()),
+            },
+            EventKind::TabFocused => EventData::TabFocused {
+                tab_id: tab_id(),
+                workspace_id: workspace_id(),
+            },
+            EventKind::PaneCreated => EventData::PaneCreated {
+                pane: pane_info(pane_id),
+            },
+            EventKind::PaneClosed => EventData::PaneClosed {
+                pane_id: pane_id.into(),
+                workspace_id: workspace_id(),
+            },
+            EventKind::PaneUpdated => EventData::PaneUpdated {
+                pane: pane_info(pane_id),
+            },
+            EventKind::PaneFocused => EventData::PaneFocused {
+                pane_id: pane_id.into(),
+                workspace_id: workspace_id(),
+            },
+            EventKind::PaneMoved => EventData::PaneMoved {
+                previous_pane_id: pane_id.into(),
+                previous_workspace_id: workspace_id(),
+                previous_tab_id: tab_id(),
+                pane: Box::new(pane_info(&format!("moved_{pane_id}"))),
+                created_workspace: None,
+                created_tab: None,
+                closed_workspace_id: None,
+                closed_tab_id: None,
+            },
+            EventKind::PaneOutputChanged => EventData::PaneOutputChanged {
+                pane_id: pane_id.into(),
+                workspace_id: workspace_id(),
+                revision: 1,
+            },
+            EventKind::PaneExited => EventData::PaneExited {
+                pane_id: pane_id.into(),
+                workspace_id: workspace_id(),
+            },
+            EventKind::PaneAgentDetected => EventData::PaneAgentDetected {
+                pane_id: pane_id.into(),
+                workspace_id: workspace_id(),
+                agent: Some("pi".into()),
+                released: false,
+                final_status: None,
+            },
+            EventKind::PaneAgentStatusChanged => EventData::PaneAgentStatusChanged {
+                pane_id: pane_id.into(),
+                workspace_id: workspace_id(),
+                agent_status: AgentStatus::Working,
+                agent: Some("pi".into()),
+                title: None,
+                display_agent: None,
+                state_labels: Default::default(),
+            },
+            EventKind::PaneReadStateChanged => EventData::PaneReadStateChanged {
+                read_state: PaneReadState {
+                    pane_id: pane_id.into(),
+                    workspace_id: workspace_id(),
+                    seen: true,
+                    agent_status: AgentStatus::Idle,
+                },
+            },
+            EventKind::LayoutUpdated => EventData::LayoutUpdated {
+                layout: PaneLayoutSnapshot {
+                    workspace_id: workspace_id(),
+                    tab_id: tab_id(),
+                    zoomed: false,
+                    area: PaneLayoutRect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 24,
+                    },
+                    focused_pane_id: pane_id.into(),
+                    panes: vec![PaneLayoutPane {
+                        pane_id: pane_id.into(),
+                        focused: true,
+                        rect: PaneLayoutRect {
+                            x: 0,
+                            y: 0,
+                            width: 80,
+                            height: 24,
+                        },
+                    }],
+                    splits: Vec::new(),
+                },
+            },
+        };
+        EventEnvelope { event: kind, data }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::samples::event as sample;
     use super::*;
     use crate::api::schema::{EventData, EventEnvelope, EventKind};
 
@@ -617,5 +872,331 @@ mod tests {
             hub.events_after_checked(0),
             Err(EventHistoryError::Unavailable)
         );
+    }
+
+    // ---- which events wake which waiter ----------------------------------------------------------
+
+    /// Takes the cursor, pushes `event` and says whether the waiter was woken (its wait returned at
+    /// once because of the event) rather than timing out.
+    fn woken_by(hub: &EventHub, waiter: &EventWaiter, event: EventEnvelope) -> bool {
+        let cursor = waiter.cursor();
+        hub.push(event);
+        waiter.wait_after(cursor, Duration::from_millis(5))
+    }
+
+    #[test]
+    fn a_waiter_on_one_pane_is_not_woken_by_events_about_another_pane() {
+        // The point of the filtered wake: with one subscriber per pane, an event about pane B must
+        // not cost the subscriber of pane A a thread wake-up.
+        let hub = EventHub::default();
+        let a = hub.waiter(vec![WakeInterest::pane("pane_a")]);
+        for kind in [
+            EventKind::PaneAgentStatusChanged,
+            EventKind::PaneReadStateChanged,
+            EventKind::PaneUpdated,
+            EventKind::PaneFocused,
+            EventKind::PaneClosed,
+        ] {
+            assert!(!woken_by(&hub, &a, sample(kind, "pane_b")), "{kind:?}");
+        }
+        assert_eq!(a.wake_count(), 0);
+    }
+
+    #[test]
+    fn a_waiter_on_one_pane_is_woken_at_once_by_an_event_about_that_pane() {
+        let hub = EventHub::default();
+        let a = hub.waiter(vec![WakeInterest::pane("pane_a")]);
+        let b = hub.waiter(vec![WakeInterest::pane("pane_b")]);
+        let cursor = a.cursor();
+        hub.push(sample(EventKind::PaneAgentStatusChanged, "pane_a"));
+        let started = std::time::Instant::now();
+        assert!(a.wait_after(cursor, FAR));
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert_eq!((a.wake_count(), b.wake_count()), (1, 0));
+    }
+
+    #[test]
+    fn a_pane_and_kind_interest_ignores_other_kinds_about_the_same_pane() {
+        // A read-state subscription consumes only `pane.read_state_changed`: the many other
+        // events about its own pane must not wake it.
+        let hub = EventHub::default();
+        let waiter = hub.waiter(vec![WakeInterest::pane_kind(
+            "pane_a",
+            EventKind::PaneReadStateChanged,
+        )]);
+        assert!(!woken_by(
+            &hub,
+            &waiter,
+            sample(EventKind::PaneAgentStatusChanged, "pane_a")
+        ));
+        assert!(!woken_by(
+            &hub,
+            &waiter,
+            sample(EventKind::PaneReadStateChanged, "pane_b")
+        ));
+        assert!(woken_by(
+            &hub,
+            &waiter,
+            sample(EventKind::PaneReadStateChanged, "pane_a")
+        ));
+    }
+
+    #[test]
+    fn a_kind_interest_sees_every_event_of_its_kind_from_any_pane_and_no_other() {
+        // A `workspace.renamed` or `pane.created` subscription is not about one pane: it must see
+        // all events of its kind, as it did when every event woke every connection.
+        let hub = EventHub::default();
+        let created = hub.waiter(vec![WakeInterest::kind(EventKind::PaneCreated)]);
+        assert!(woken_by(
+            &hub,
+            &created,
+            sample(EventKind::PaneCreated, "pane_a")
+        ));
+        assert!(woken_by(
+            &hub,
+            &created,
+            sample(EventKind::PaneCreated, "pane_b")
+        ));
+        assert!(!woken_by(
+            &hub,
+            &created,
+            sample(EventKind::PaneClosed, "pane_a")
+        ));
+        assert!(!woken_by(
+            &hub,
+            &created,
+            sample(EventKind::TabCreated, "pane_a")
+        ));
+    }
+
+    #[test]
+    fn an_interest_in_every_event_sees_every_kind() {
+        let hub = EventHub::default();
+        let waiter = hub.waiter(vec![WakeInterest::any()]);
+        for kind in samples_of_every_kind() {
+            assert!(woken_by(&hub, &waiter, sample(kind, "pane_a")), "{kind:?}");
+        }
+    }
+
+    fn samples_of_every_kind() -> Vec<EventKind> {
+        crate::api::schema::KNOWN_EVENT_KINDS.to_vec()
+    }
+
+    #[test]
+    fn a_waiter_with_interests_in_two_panes_is_woken_by_either() {
+        let hub = EventHub::default();
+        let waiter = hub.waiter(vec![
+            WakeInterest::pane("pane_a"),
+            WakeInterest::pane_kind("pane_b", EventKind::PaneReadStateChanged),
+        ]);
+        assert!(woken_by(
+            &hub,
+            &waiter,
+            sample(EventKind::PaneUpdated, "pane_a")
+        ));
+        assert!(woken_by(
+            &hub,
+            &waiter,
+            sample(EventKind::PaneReadStateChanged, "pane_b")
+        ));
+        assert!(!woken_by(
+            &hub,
+            &waiter,
+            sample(EventKind::PaneUpdated, "pane_c")
+        ));
+    }
+
+    #[test]
+    fn an_event_whose_panes_are_unknown_wakes_every_waiter() {
+        // A tab or workspace that closes (or a tab that moves) takes panes along without naming
+        // them: nobody can say it does not concern them, so everybody is woken, whatever they
+        // listen for, including a waiter with no event interest at all.
+        for kind in [
+            EventKind::TabClosed,
+            EventKind::TabMoved,
+            EventKind::WorkspaceClosed,
+            EventKind::WorktreeRemoved,
+        ] {
+            let hub = EventHub::default();
+            let waiters = [
+                hub.waiter(vec![WakeInterest::pane("pane_a")]),
+                hub.waiter(vec![WakeInterest::pane_kind(
+                    "pane_b",
+                    EventKind::PaneReadStateChanged,
+                )]),
+                hub.waiter(vec![WakeInterest::kind(EventKind::WorkspaceFocused)]),
+                hub.waiter(Vec::new()),
+            ];
+            let cursors: Vec<_> = waiters.iter().map(EventWaiter::cursor).collect();
+            hub.push(sample(kind, "pane_a"));
+            for (index, (waiter, cursor)) in waiters.iter().zip(cursors).enumerate() {
+                assert!(
+                    waiter.wait_after(cursor, FAR),
+                    "{kind:?} did not wake waiter {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn events_that_leave_every_pane_alone_wake_no_pane_waiter() {
+        let hub = EventHub::default();
+        let waiter = hub.waiter(vec![WakeInterest::pane("pane_a")]);
+        for kind in [
+            EventKind::WorkspaceCreated,
+            EventKind::WorkspaceUpdated,
+            EventKind::WorkspaceMetadataUpdated,
+            EventKind::WorkspaceRenamed,
+            EventKind::WorkspaceMoved,
+            EventKind::WorkspaceReordered,
+            EventKind::WorkspaceFocused,
+            EventKind::WorktreeCreated,
+            EventKind::WorktreeOpened,
+            EventKind::TabCreated,
+            EventKind::TabRenamed,
+            EventKind::TabFocused,
+        ] {
+            assert!(!woken_by(&hub, &waiter, sample(kind, "pane_b")), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_moved_pane_wakes_the_waiters_of_its_old_and_its_new_id() {
+        let hub = EventHub::default();
+        let old = hub.waiter(vec![WakeInterest::pane("pane_a")]);
+        let new = hub.waiter(vec![WakeInterest::pane("moved_pane_a")]);
+        let other = hub.waiter(vec![WakeInterest::pane("pane_b")]);
+        let cursors = [old.cursor(), new.cursor(), other.cursor()];
+        hub.push(sample(EventKind::PaneMoved, "pane_a"));
+        assert!(old.wait_after(cursors[0], FAR));
+        assert!(new.wait_after(cursors[1], FAR));
+        assert!(!other.wait_after(cursors[2], Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn a_layout_update_wakes_the_waiters_of_the_panes_in_it() {
+        let hub = EventHub::default();
+        let inside = hub.waiter(vec![WakeInterest::pane("pane_a")]);
+        let outside = hub.waiter(vec![WakeInterest::pane("pane_b")]);
+        let cursors = [inside.cursor(), outside.cursor()];
+        hub.push(sample(EventKind::LayoutUpdated, "pane_a"));
+        assert!(inside.wait_after(cursors[0], FAR));
+        assert!(!outside.wait_after(cursors[1], Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn a_waiter_with_no_interests_is_woken_by_no_event_but_by_the_stop_wake() {
+        // A sampling-only connection (output matches, scroll changes) never reads the history:
+        // events must not wake it, the server's stop must.
+        let hub = EventHub::default();
+        let waiter = hub.waiter(Vec::new());
+        assert!(!woken_by(
+            &hub,
+            &waiter,
+            sample(EventKind::PaneUpdated, "pane_a")
+        ));
+        assert_eq!(waiter.wake_count(), 0);
+        let cursor = waiter.cursor();
+        hub.wake_waiters();
+        let started = std::time::Instant::now();
+        waiter.wait_after(cursor, FAR);
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert_eq!(waiter.wake_count(), 1);
+    }
+
+    #[test]
+    fn waking_waiters_wakes_every_registered_waiter() {
+        // Shutdown: every connection thread, whatever it listens for, is released by one call.
+        let hub = EventHub::default();
+        let waiters = [
+            hub.waiter(vec![WakeInterest::pane("pane_a")]),
+            hub.waiter(vec![WakeInterest::kind(EventKind::WorkspaceFocused)]),
+            hub.waiter(Vec::new()),
+        ];
+        let threads: Vec<_> = waiters
+            .into_iter()
+            .map(|waiter| {
+                let cursor = waiter.cursor();
+                std::thread::spawn(move || {
+                    let started = std::time::Instant::now();
+                    waiter.wait_after(cursor, FAR);
+                    started.elapsed()
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(50));
+        hub.wake_waiters();
+        for thread in threads {
+            assert!(thread.join().unwrap() < Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn a_wake_that_is_already_pending_is_not_sent_again() {
+        // A burst of matching events wakes the thread once: it reads them all in its next pass.
+        let hub = EventHub::default();
+        let waiter = hub.waiter(vec![WakeInterest::pane("pane_a")]);
+        let cursor = waiter.cursor();
+        for _ in 0..50 {
+            hub.push(sample(EventKind::PaneUpdated, "pane_a"));
+        }
+        assert_eq!(waiter.wake_count(), 1);
+        assert!(waiter.wait_after(cursor, FAR));
+        // The next pass starts a new cursor, and a later event wakes it again.
+        assert!(woken_by(
+            &hub,
+            &waiter,
+            sample(EventKind::PaneUpdated, "pane_a")
+        ));
+        assert_eq!(waiter.wake_count(), 2);
+    }
+
+    #[test]
+    fn a_waiter_that_falls_half_the_history_behind_is_woken_whatever_the_events_are() {
+        // A subscription connection that sleeps through events of other panes must still read the
+        // history before it loses events (`events_lost` closes the connection).
+        let hub = EventHub::default();
+        let waiter = hub.waiter(vec![WakeInterest::pane("pane_a")]);
+        let cursor = waiter.cursor();
+        for _ in 0..LAG_WAKE_EVENTS - 1 {
+            hub.push(sample(EventKind::PaneUpdated, "pane_b"));
+        }
+        assert_eq!(waiter.wake_count(), 0);
+        hub.push(sample(EventKind::PaneUpdated, "pane_b"));
+        assert_eq!(waiter.wake_count(), 1);
+        let started = std::time::Instant::now();
+        assert!(waiter.wait_after(cursor, FAR));
+        assert!(started.elapsed() < Duration::from_secs(30));
+        // Once it has looked (a new cursor), the count starts again.
+        let cursor = waiter.cursor();
+        hub.push(sample(EventKind::PaneUpdated, "pane_b"));
+        assert!(!waiter.wait_after(cursor, Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn a_dropped_waiter_is_no_longer_woken_or_counted() {
+        let hub = EventHub::default();
+        let waiter = hub.waiter(vec![WakeInterest::any()]);
+        let other = hub.waiter(vec![WakeInterest::any()]);
+        assert_eq!(hub.inner.state.lock().unwrap().waiters.len(), 2);
+        drop(waiter);
+        let remaining = hub.inner.state.lock().unwrap();
+        assert_eq!(remaining.waiters.len(), 1);
+        assert!(Arc::ptr_eq(&remaining.waiters[0], &other.shared));
+    }
+
+    #[test]
+    fn a_waiter_registered_late_is_not_woken_for_events_before_it() {
+        let hub = EventHub::default();
+        for _ in 0..LAG_WAKE_EVENTS * 2 {
+            hub.push(sample(EventKind::PaneUpdated, "pane_b"));
+        }
+        let waiter = hub.waiter(vec![WakeInterest::pane("pane_a")]);
+        assert!(!woken_by(
+            &hub,
+            &waiter,
+            sample(EventKind::PaneUpdated, "pane_b")
+        ));
+        assert_eq!(waiter.wake_count(), 0);
     }
 }

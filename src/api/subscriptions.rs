@@ -1419,4 +1419,205 @@ mod tests {
         };
         assert_eq!(error.error.code, "pane_not_found");
     }
+
+    // ---- the interests a subscription declares to the hub ------------------------------------------------
+
+    /// Every subscription kind, on `pane_a`, positioned at the hub's current end.
+    fn subscriptions_on_pane_a(event_hub: &EventHub) -> Vec<(String, ActiveSubscription)> {
+        let last_sequence = event_hub.current_sequence();
+        let mut all = Vec::new();
+        for kind in crate::api::schema::KNOWN_EVENT_KINDS {
+            all.push((
+                format!("event subscription {kind:?}"),
+                ActiveSubscription::Event(ActiveEventSubscription {
+                    event_kind: *kind,
+                    last_sequence,
+                }),
+            ));
+        }
+        all.push((
+            "read state of pane_a".into(),
+            ActiveSubscription::ReadStateChanged(ActiveReadStateChangedSubscription {
+                pane_id: "pane_a".into(),
+                last_sequence,
+            }),
+        ));
+        for status_filter in [None, Some(AgentStatus::Idle)] {
+            all.push((
+                format!("agent status of pane_a (filter {status_filter:?})"),
+                ActiveSubscription::AgentStatusChanged(Box::new(
+                    ActiveAgentStatusChangedSubscription {
+                        pane_id: "pane_a".into(),
+                        status_filter,
+                        last_status: Some(AgentStatus::Working),
+                        last_presentation: Some(PanePresentationSnapshot {
+                            title: None,
+                            display_agent: None,
+                            state_labels: HashMap::new(),
+                        }),
+                        last_sequence,
+                        initial_event: None,
+                        snapshot_requested: false,
+                        request_prefix: "test".into(),
+                    },
+                )),
+            ));
+        }
+        all.push((
+            "scroll of pane_a".into(),
+            ActiveSubscription::ScrollChanged(ActiveScrollChangedSubscription {
+                pane_id: "pane_a".into(),
+                last_scroll: None,
+                request_prefix: "test".into(),
+            }),
+        ));
+        all.push((
+            "output match on pane_a".into(),
+            ActiveSubscription::OutputMatched(ActiveOutputMatchedSubscription {
+                pane_id: "pane_a".into(),
+                source: crate::api::schema::ReadSource::Recent,
+                lines: None,
+                matcher: crate::api::schema::OutputMatch::Substring {
+                    value: "never".into(),
+                },
+                regex: None,
+                strip_ansi: true,
+                currently_matching: false,
+                request_prefix: "test".into(),
+            }),
+        ));
+        all
+    }
+
+    /// Runs an event of every kind, about `pane_a` and about `pane_b`, through every subscription
+    /// kind by the production path (`poll_batch` on a real hub, with a stand-in app that answers
+    /// every request and counts the `pane.get` ones), and returns what the hub failed to wake a
+    /// subscription for although the subscription reacted: it produced an event or asked the app
+    /// for a snapshot. `declared` maps a subscription's own interests to the ones the hub is given
+    /// (the real test passes them through; the control strips them).
+    /// The second value counts the reactions seen, so a test cannot pass by seeing none.
+    fn unwoken_reactions(
+        declared: impl Fn(Vec<WakeInterest>) -> Vec<WakeInterest>,
+    ) -> (Vec<String>, usize) {
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let pane_gets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let responder = {
+            let pane_gets = std::sync::Arc::clone(&pane_gets);
+            std::thread::spawn(move || {
+                while let Some(message) = api_rx.blocking_recv() {
+                    if matches!(
+                        message.request.method,
+                        crate::api::schema::Method::PaneGet(_)
+                    ) {
+                        pane_gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let _ = message.respond_to.send(
+                        serde_json::json!({
+                            "id": message.request.id,
+                            "error": {"code": "pane_not_found", "message": "stand-in app"}
+                        })
+                        .to_string(),
+                    );
+                }
+            })
+        };
+        let mut unwoken = Vec::new();
+        let mut reactions = 0;
+        for kind in crate::api::schema::KNOWN_EVENT_KINDS {
+            for pane in ["pane_a", "pane_b"] {
+                let event_hub = EventHub::default();
+                let event = crate::api::event_hub::samples::event(*kind, pane);
+                let mut subscriptions = subscriptions_on_pane_a(&event_hub);
+                event_hub.push(event.clone());
+                for (name, subscription) in &mut subscriptions {
+                    let interests = declared(subscription.wake_interests());
+                    let gets_before = pane_gets.load(std::sync::atomic::Ordering::SeqCst);
+                    let produced = subscription
+                        .poll_batch(&api_tx, &event_hub, false)
+                        .expect("poll_batch")
+                        .len();
+                    let asked_app =
+                        pane_gets.load(std::sync::atomic::Ordering::SeqCst) - gets_before;
+                    if produced == 0 && asked_app == 0 {
+                        continue;
+                    }
+                    reactions += 1;
+                    if !crate::api::event_hub::would_wake(&interests, &event) {
+                        unwoken.push(format!(
+                            "{name} reacted to {kind:?} about {pane} (events {produced}, pane.get {asked_app}) but its interests {interests:?} do not wake it"
+                        ));
+                    }
+                }
+            }
+        }
+        drop(api_tx);
+        responder.join().unwrap();
+        (unwoken, reactions)
+    }
+
+    #[test]
+    fn wake_interests_cover_every_event_a_subscription_reacts_to() {
+        // WHY: a subscription that reacts to an event its connection is never woken for delivers
+        // it only when the liveness timeout runs out. The interests are declared apart from the
+        // code that consumes events, so this runs the consuming code itself.
+        let (unwoken, reactions) = unwoken_reactions(|interests| interests);
+        assert!(unwoken.is_empty(), "{unwoken:#?}");
+        // Not vacuous: the event subscriptions alone react 27 times (once per kind and pane
+        // they match), and the pane subscriptions add theirs.
+        assert!(reactions >= 60, "only {reactions} reactions were seen");
+    }
+
+    #[test]
+    fn the_interest_check_fails_when_a_subscription_declares_no_interest() {
+        // The negative control of the check above: with the declared interests thrown away it
+        // must find the reactions that nothing would wake the connection for.
+        let (unwoken, _) = unwoken_reactions(|_| Vec::new());
+        assert!(
+            unwoken
+                .iter()
+                .any(|line| line.starts_with("agent status of pane_a")),
+            "{unwoken:#?}"
+        );
+        assert!(
+            unwoken
+                .iter()
+                .any(|line| line.starts_with("read state of pane_a")),
+            "{unwoken:#?}"
+        );
+    }
+
+    #[test]
+    fn each_subscription_kind_declares_the_narrowest_interest_that_covers_it() {
+        // The check above only finds interests that are too narrow. Too wide is allowed but costs
+        // wake-ups, which is the whole point of the filter: pin the interest of each kind.
+        let event_hub = EventHub::default();
+        for (name, subscription) in subscriptions_on_pane_a(&event_hub) {
+            let expected = match &subscription {
+                ActiveSubscription::Event(subscription) => {
+                    vec![WakeInterest::kind(subscription.event_kind)]
+                }
+                ActiveSubscription::ReadStateChanged(_) => vec![WakeInterest::pane_kind(
+                    "pane_a",
+                    EventKind::PaneReadStateChanged,
+                )],
+                ActiveSubscription::AgentStatusChanged(_) => vec![WakeInterest::pane("pane_a")],
+                ActiveSubscription::ScrollChanged(_) | ActiveSubscription::OutputMatched(_) => {
+                    Vec::new()
+                }
+            };
+            assert_eq!(subscription.wake_interests(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn sampling_subscriptions_declare_no_event_interest() {
+        // Output matches and scroll changes are sampled on a timer and never read the history.
+        let event_hub = EventHub::default();
+        for (name, subscription) in subscriptions_on_pane_a(&event_hub) {
+            if name.starts_with("scroll") || name.starts_with("output") {
+                assert!(subscription.wake_interests().is_empty(), "{name}");
+            }
+        }
+    }
 }

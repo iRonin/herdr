@@ -727,3 +727,244 @@ fn removing_a_tab_or_workspace_takes_a_snapshot_at_once() {
         reply_to_probe(request);
     }
 }
+
+// ---- the filtered wake: which held connection an event wakes ---------------------------------------------
+
+/// Answers the `pane.read_state` probe of a read-state subscription with the pane it asked about.
+fn reply_to_read_state_probe(request: ApiRequestMessage) {
+    let Method::PaneReadState(target) = &request.request.method else {
+        panic!(
+            "unexpected subscription probe: {:?}",
+            request.request.method
+        );
+    };
+    let pane_id = target.pane_id.clone();
+    reply(
+        request,
+        ResponseResult::PaneReadState {
+            read_state: PaneReadState {
+                pane_id,
+                workspace_id: "workspace_1".into(),
+                seen: true,
+                agent_status: AgentStatus::Idle,
+            },
+        },
+    );
+}
+
+/// One connection holding a `pane.read_state_changed` subscription for each of `panes`, started and
+/// idle: it has answered its probes and is blocked on the hub.
+fn hold_read_state_subscriptions(test: &mut SocketTest, id: &str, panes: &[&str]) -> Client {
+    let mut client = test.connect();
+    let subscriptions: Vec<Value> = panes
+        .iter()
+        .map(|pane| json!({"type": "pane.read_state_changed", "pane_id": pane}))
+        .collect();
+    client.subscribe(id, Value::Array(subscriptions));
+    for _ in panes {
+        reply_to_read_state_probe(test.app_request());
+    }
+    client.assert_started(id);
+    // Let the connection thread finish its first pass and block on the hub.
+    std::thread::sleep(Duration::from_millis(300));
+    client
+}
+
+fn sample_event(kind: EventKind, pane_id: &str) -> EventEnvelope {
+    crate::api::event_hub::samples::event(kind, pane_id)
+}
+
+/// Waits until the hub's history has been read at least `count` more times than `before`.
+fn wait_for_history_reads(hub: &EventHub, before: u64, count: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while hub.history_reads() < before + count && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    hub.history_reads() >= before + count
+}
+
+#[test]
+fn a_subscriber_on_one_pane_is_not_woken_by_events_about_another_pane() {
+    // WHY: with one subscriber per pane (a per-pane client holds many), an event about pane B must
+    // not cost the subscriber of pane A a thread wake-up and a history read. The liveness interval is
+    // 30 s, so a history read inside this test can only have been caused by an event.
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let mut client = hold_read_state_subscriptions(&mut test, "a", &["pane_1"]);
+    let reads = test.hub.history_reads();
+    for _ in 0..40 {
+        test.hub.push(read_state_changed("pane_2"));
+        test.hub
+            .push(sample_event(EventKind::PaneAgentStatusChanged, "pane_2"));
+        test.hub
+            .push(sample_event(EventKind::PaneUpdated, "pane_2"));
+        test.hub
+            .push(sample_event(EventKind::WorkspaceFocused, "pane_2"));
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        test.hub.history_reads(),
+        reads,
+        "160 events about other panes woke the subscriber of pane_1"
+    );
+    // Not deaf: its own pane's event still arrives.
+    test.hub.push(read_state_changed("pane_1"));
+    let delivered = client
+        .next_line(Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(delivered["event"], "pane.read_state_changed");
+    assert_eq!(delivered["data"]["pane_id"], "pane_1");
+}
+
+#[test]
+fn a_subscriber_on_a_pane_is_woken_promptly_by_an_event_about_that_pane() {
+    // The liveness interval is 30 s: only the wake can deliver this within 5 s.
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let mut client = hold_read_state_subscriptions(&mut test, "a", &["pane_1"]);
+    let other = hold_read_state_subscriptions(&mut test, "b", &["pane_2"]);
+    let reads = test.hub.history_reads();
+    let started = Instant::now();
+    test.hub.push(read_state_changed("pane_1"));
+    let delivered = client
+        .next_line(Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(delivered["data"]["pane_id"], "pane_1");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // Exactly the one subscriber that the event is about read the history.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(test.hub.history_reads(), reads + 1);
+    drop(other);
+}
+
+#[test]
+fn a_subscription_that_is_not_about_one_pane_still_sees_every_event_of_its_kind() {
+    // `pane.created`, `workspace.renamed` and the like name no pane in the subscription: they must
+    // keep seeing every event of their kind, from any pane, while per-pane subscribers sit idle.
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let _idle = hold_read_state_subscriptions(&mut test, "idle", &["pane_1"]);
+    let mut created = test.connect();
+    created.subscribe("created", json!([{"type": "pane.created"}]));
+    created.assert_started("created");
+    let mut renamed = test.connect();
+    renamed.subscribe("renamed", json!([{"type": "workspace.renamed"}]));
+    renamed.assert_started("renamed");
+    std::thread::sleep(Duration::from_millis(300));
+
+    test.hub
+        .push(sample_event(EventKind::PaneCreated, "pane_7"));
+    test.hub.push(renamed_event(0));
+    test.hub
+        .push(sample_event(EventKind::PaneCreated, "pane_8"));
+    test.hub.push(sample_event(EventKind::PaneClosed, "pane_8"));
+    test.hub.push(renamed_event(1));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for pane in ["pane_7", "pane_8"] {
+        let event = created.next_line(deadline).unwrap();
+        assert_eq!(event["event"], "pane_created");
+        assert_eq!(event["data"]["pane"]["pane_id"], pane);
+    }
+    renamed.assert_renames(0..2, deadline);
+}
+
+#[test]
+fn a_connection_with_subscriptions_on_two_panes_wakes_for_either_and_for_no_other() {
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let mut client = hold_read_state_subscriptions(&mut test, "two", &["pane_1", "pane_2"]);
+    let deadline = || Instant::now() + Duration::from_secs(5);
+    test.hub.push(read_state_changed("pane_2"));
+    assert_eq!(
+        client.next_line(deadline()).unwrap()["data"]["pane_id"],
+        "pane_2"
+    );
+    test.hub.push(read_state_changed("pane_1"));
+    assert_eq!(
+        client.next_line(deadline()).unwrap()["data"]["pane_id"],
+        "pane_1"
+    );
+    // A third pane is nobody's concern here.
+    std::thread::sleep(Duration::from_millis(200));
+    let reads = test.hub.history_reads();
+    test.hub.push(read_state_changed("pane_3"));
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(test.hub.history_reads(), reads);
+}
+
+#[test]
+fn an_event_that_removes_panes_without_naming_them_wakes_every_held_connection() {
+    // A tab or workspace that closes (or a tab that moves) carries no pane list: nobody can tell it
+    // does not concern them, so every connection looks (a history read each). 30 s liveness again.
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let _a = hold_read_state_subscriptions(&mut test, "a", &["pane_1"]);
+    let _b = hold_read_state_subscriptions(&mut test, "b", &["pane_2"]);
+    let mut renamed = test.connect();
+    renamed.subscribe("renamed", json!([{"type": "workspace.renamed"}]));
+    renamed.assert_started("renamed");
+    std::thread::sleep(Duration::from_millis(300));
+    let reads = test.hub.history_reads();
+    test.hub.push(sample_event(EventKind::TabClosed, "pane_1"));
+    assert!(
+        wait_for_history_reads(&test.hub, reads, 3),
+        "tab.closed woke only {} of 3 connections",
+        test.hub.history_reads() - reads
+    );
+}
+
+#[test]
+fn a_quiet_subscriber_keeps_up_with_a_flood_of_events_about_other_panes() {
+    // WHY: the history keeps 512 events of every kind and a subscription that falls out of it is
+    // closed with `events_lost`. A subscriber that no event is about is not woken by them, so the hub
+    // must still wake it before it falls behind (half the history). 1200 events about another
+    // pane, in bursts, with a 30 s liveness interval: the subscriber must survive and still deliver.
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let mut client = hold_read_state_subscriptions(&mut test, "quiet", &["pane_1"]);
+    for _ in 0..4 {
+        let reads = test.hub.history_reads();
+        for _ in 0..300 {
+            test.hub
+                .push(sample_event(EventKind::PaneUpdated, "pane_2"));
+        }
+        assert!(
+            wait_for_history_reads(&test.hub, reads, 1),
+            "the subscriber did not look at the history while 300 events about another pane arrived"
+        );
+    }
+    test.hub.push(read_state_changed("pane_1"));
+    let delivered = client
+        .next_line(Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    assert!(delivered.get("error").is_none(), "{delivered}");
+    assert_eq!(delivered["data"]["pane_id"], "pane_1");
+}
+
+#[test]
+fn stopping_the_server_releases_every_kind_of_held_connection_at_once() {
+    // Shutdown wakes all, whatever the connection listens for: a per-pane subscription, an event
+    // kind, an agent-status subscription. 30 s intervals, so a single `wake_waiters` must do it.
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let _read = hold_read_state_subscriptions(&mut test, "read", &["pane_1"]);
+    let mut renamed = test.connect();
+    renamed.subscribe("renamed", json!([{"type": "workspace.renamed"}]));
+    renamed.assert_started("renamed");
+    let mut status = test.connect();
+    status.subscribe("status", idle_agent_status_subscription());
+    reply_to_probe(test.app_request());
+    status.assert_started("status");
+    answer_pane_gets_for(&mut test, Duration::from_millis(400));
+
+    test.running.store(false, Ordering::Relaxed);
+    test.hub.wake_waiters();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while test.workers.iter().any(|worker| !worker.is_finished()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let running: Vec<usize> = test
+        .workers
+        .iter()
+        .enumerate()
+        .filter(|(_, worker)| !worker.is_finished())
+        .map(|(index, _)| index)
+        .collect();
+    assert!(
+        running.is_empty(),
+        "connections {running:?} kept running after the server stopped"
+    );
+}
