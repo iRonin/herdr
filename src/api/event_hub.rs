@@ -5,8 +5,12 @@ use std::time::Duration;
 use crate::api::schema::{EventData, EventEnvelope, EventKind};
 
 /// The longest a held connection thread blocks on the hub before it looks at its socket (a closed
-/// peer) and the server's `running` flag again. Nothing else wakes an idle connection.
-const SUBSCRIPTION_LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
+/// peer) and the server's `running` flag again. Nothing else wakes an idle connection, so this is
+/// the idle cost of every held connection (one wake-up per interval) and the time a closed peer
+/// goes unnoticed. Stopping the server does not wait for it: `wake_waiters` releases every
+/// connection at once. A connection that samples live state (the agent-status snapshot, output and
+/// scroll) wakes sooner, for its own sample, whatever this is.
+const SUBSCRIPTION_LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
 /// How long a wait sleeps instead when the history lock is poisoned and cannot be waited on.
 const POISONED_HISTORY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How often a `pane.agent_status_changed` subscription asks the app for a pane snapshot while no
@@ -760,6 +764,15 @@ mod tests {
             .events_after_checked(hub.current_sequence())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn the_liveness_interval_is_five_seconds_and_the_agent_status_snapshot_stays_at_one() {
+        // WHY: the liveness interval is the idle cost of a held connection; the snapshot is how soon a
+        // change that no event reports reaches an agent-status subscriber. They are separate on purpose.
+        let timing = WaitTiming::default();
+        assert_eq!(timing.liveness, Duration::from_secs(5));
+        assert_eq!(timing.agent_status_snapshot, Duration::from_secs(1));
     }
 
     #[test]

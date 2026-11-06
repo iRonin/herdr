@@ -429,13 +429,14 @@ fn an_idle_event_subscription_does_not_poll_the_history() {
     client.subscribe("idle", json!([{"type": "workspace.renamed"}]));
     client.assert_started("idle");
     let reads_before = test.hub.history_reads();
-    std::thread::sleep(Duration::from_millis(2500));
+    std::thread::sleep(Duration::from_millis(3500));
     let reads = test.hub.history_reads() - reads_before;
-    // At 3284e19a the connection thread read the history every 100 ms: about 25 reads here.
-    // Now it blocks on the hub and looks again once per liveness interval (1 s): 2 or 3 reads.
+    // Before the event hub the connection thread read the history every 100 ms: about 35 reads here.
+    // Now it blocks on the hub and looks again once per liveness interval (5 s), so none in this
+    // window; at the 1 s interval of the previous release there were 3 or 4.
     assert!(
-        reads <= 5,
-        "an idle subscription read the event history {reads} times in 2.5 s"
+        reads <= 1,
+        "an idle subscription read the event history {reads} times in 3.5 s"
     );
 }
 
@@ -451,9 +452,10 @@ fn an_idle_agent_status_subscription_asks_the_app_for_a_pane_once_per_snapshot_i
     client.assert_started("idle-status");
     let pane_gets = answer_pane_gets_for(&mut test, Duration::from_millis(2500));
     // At 3284e19a every idle 100 ms pass asked the app for the pane: about 25 requests here.
-    // Now the snapshot is taken once per interval (1 s): 2 or 3 requests.
+    // Now the snapshot is taken once per interval (1 s: the first pass and two more), and it stays
+    // at 1 s when the liveness interval is 5 s: fewer than 2 requests would be a slower snapshot.
     assert!(
-        pane_gets <= 5,
+        (2..=5).contains(&pane_gets),
         "an idle agent-status subscription asked for the pane {pane_gets} times in 2.5 s"
     );
 }
@@ -967,4 +969,53 @@ fn stopping_the_server_releases_every_kind_of_held_connection_at_once() {
         running.is_empty(),
         "connections {running:?} kept running after the server stopped"
     );
+}
+
+#[test]
+fn a_held_agent_status_subscription_notices_a_change_only_the_snapshot_sees_within_the_snapshot_interval(
+) {
+    // WHY: the snapshot is the safety net for a change that no event reports. It must not slow down
+    // to the liveness interval (5 s) of a connection that has nothing else to do: with production
+    // timing the change below reaches the subscriber within the 2.5 s window, not after 5 s.
+    let mut test = SocketTest::new();
+    let mut client = test.connect();
+    client.subscribe("snapshot", idle_agent_status_subscription());
+    reply_to_probe(test.app_request());
+    client.assert_started("snapshot");
+    answer_pane_gets_with_status_for(&mut test, Duration::from_millis(300), AgentStatus::Working);
+    // The pane turns idle with no event: only a snapshot can tell.
+    answer_pane_gets_with_status_for(&mut test, Duration::from_millis(2500), AgentStatus::Idle);
+    let delivered = client
+        .next_line(Instant::now() + Duration::from_millis(200))
+        .unwrap();
+    assert_eq!(delivered["event"], "pane.agent_status_changed");
+    assert_eq!(delivered["data"]["agent_status"], "idle");
+}
+
+#[test]
+fn an_agent_status_wait_notices_a_change_only_the_snapshot_sees_within_the_snapshot_interval() {
+    // The same for `events.wait`: its blocking time is the shorter of the liveness interval (5 s)
+    // and the next snapshot (1 s), so a change that no event reports ends the wait within the window.
+    let mut test = SocketTest::new();
+    let mut client = test.connect();
+    client.send(json!({
+        "id": "wait-snapshot",
+        "method": "events.wait",
+        "params": {
+            "match_event": {
+                "event": "pane_agent_status_changed",
+                "pane_id": "pane_1",
+                "agent_status": "idle"
+            },
+            "timeout_ms": 20_000
+        }
+    }));
+    answer_pane_gets_with_status_for(&mut test, Duration::from_millis(300), AgentStatus::Working);
+    answer_pane_gets_with_status_for(&mut test, Duration::from_millis(2500), AgentStatus::Idle);
+    let response = client
+        .next_line(Instant::now() + Duration::from_millis(200))
+        .unwrap();
+    assert_eq!(response["id"], "wait-snapshot");
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["event"]["data"]["agent_status"], "idle");
 }

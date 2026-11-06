@@ -940,6 +940,9 @@ pane does not wake the connections of the others. Servers that predate the capab
 field out; read a missing value as `false`. What a subscription delivers, and in which order, does
 not depend on it.
 
+A held subscription connection that its client has closed is released within about five seconds;
+until then it costs the server one wake-up every five seconds, like any idle held connection.
+
 Use `events.subscribe` for lifecycle events. Dedicated wait helpers are documented separately when a one-shot wait is supported.
 
 ## Reading panes

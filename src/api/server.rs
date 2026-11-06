@@ -2364,7 +2364,13 @@ mod tests {
 
         let running = Arc::new(AtomicBool::new(true));
         let server_running = Arc::clone(&running);
-        let event_hub = EventHub::default();
+        // A closed peer is noticed when the thread looks at its socket again, at the latest after
+        // the liveness interval (5 s in production, pinned by its own test): a short one keeps this
+        // test fast and still shows that the connection ends because the client left.
+        let event_hub = EventHub::with_timing(WaitTiming {
+            liveness: Duration::from_millis(200),
+            ..WaitTiming::default()
+        });
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
             let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
@@ -2398,6 +2404,7 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
         let server_running = Arc::clone(&running);
         let event_hub = EventHub::default();
+        let waking_hub = event_hub.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
             let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
@@ -2408,7 +2415,11 @@ mod tests {
         let ack: serde_json::Value = serde_json::from_str(&ack).unwrap();
         assert_eq!(ack["result"]["type"], "subscription_started");
 
+        // What `ServerHandle::drop` does: the stop flag, then the wake-up. With the production
+        // timing the connection would otherwise wait out its liveness interval (5 s), which is
+        // longer than the 2 s allowed here: the test fails if shutdown relied on the timeout.
         running.store(false, Ordering::Relaxed);
+        waking_hub.wake_waiters();
 
         let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(result.is_ok());
@@ -2459,6 +2470,73 @@ mod tests {
         assert!(
             released,
             "a subscription blocked on the hub was not released when the server handle was dropped"
+        );
+    }
+
+    #[test]
+    fn shutdown_ends_held_connections_without_waiting_for_the_liveness_interval() {
+        // WHY: a held connection blocks on the hub for up to the liveness interval (5 s in
+        // production). Stopping the server must not wait for that: `ServerHandle::drop` wakes every
+        // connection. With the production timing a stop that relied on the timeout would take 5 s;
+        // here it must take under 2 s, for each of several connections.
+        assert!(WaitTiming::default().liveness >= Duration::from_secs(5));
+        let _guard = env_lock().lock().unwrap();
+        let dir = unique_test_path("api-shutdown-wakes");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("herdr.sock");
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &path);
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let handle = start_server_inner(api_tx, EventHub::default(), None, None);
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        let handle = handle.unwrap();
+
+        let mut clients = Vec::new();
+        for subscription in ["workspace.created", "tab.created", "pane.closed"] {
+            let mut client = crate::ipc::connect_local_stream(&path).unwrap();
+            client
+                .write_all(
+                    format!(
+                        r#"{{"id":"held","method":"events.subscribe","params":{{"subscriptions":[{{"type":"{subscription}"}}]}}}}"#
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            client.write_all(b"\n").unwrap();
+            client.flush().unwrap();
+            let ack: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+            assert_eq!(ack["result"]["type"], "subscription_started");
+            clients.push(client);
+        }
+        // Let every connection thread finish its first pass and block on the hub.
+        std::thread::sleep(Duration::from_millis(500));
+
+        let stopped_at = Instant::now();
+        drop(handle);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        for mut client in clients {
+            let done_tx = done_tx.clone();
+            std::thread::spawn(move || {
+                let mut rest = String::new();
+                let _ = client.read_to_string(&mut rest);
+                let _ = done_tx.send(stopped_at.elapsed());
+            });
+        }
+        let mut slowest = Duration::ZERO;
+        let mut ended = 0;
+        while ended < 3 {
+            match done_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(elapsed) => {
+                    slowest = slowest.max(elapsed);
+                    ended += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(ended, 3, "only {ended} of 3 held connections ended");
+        assert!(
+            slowest < Duration::from_secs(2),
+            "the slowest held connection took {slowest:?} to end after the server stopped"
         );
     }
 
