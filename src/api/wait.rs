@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use regex::Regex;
 
+use crate::api::event_hub::WakeInterest;
 use crate::api::schema::{
     ErrorBody, ErrorResponse, EventData, EventEnvelope, EventKind, EventMatch, EventsWaitParams,
     Method, Request, ResponseResult, Subscription, SubscriptionEventData,
@@ -397,10 +398,12 @@ fn wait_for_resolved_agent(
     let expected_agent = wait.initial.agent.clone();
     let pane_id = wait.initial.pane_id.clone();
     let mut last_event_sequence = wait.last_event_sequence;
+    // Every event this wait reads is about its own pane (status, detection, update, move, close).
+    let waiter = event_hub.waiter(vec![WakeInterest::pane(pane_id.clone())]);
 
     loop {
-        // Take the cursor BEFORE the stop check and the history read (see `EventHub::wait_cursor`).
-        let cursor = event_hub.wait_cursor();
+        // Take the cursor BEFORE the stop check and the history read (see `EventWaiter::cursor`).
+        let cursor = waiter.cursor();
         if should_stop_connection(stream, running)? {
             return Ok(None);
         }
@@ -527,7 +530,7 @@ fn wait_for_resolved_agent(
                 .map(Some);
         }
         // This wait probes only after a relevant event (and at its deadline), so it blocks on the hub.
-        event_hub.wait_for_event_after(
+        waiter.wait_after(
             cursor,
             hub_wait_timeout(event_hub.timing().liveness, deadline, None),
         );
@@ -745,11 +748,12 @@ pub(super) fn wait_for_event(
 
     let timing = event_hub.timing();
     let sample_interval = active.sample_interval(&timing);
+    let waiter = event_hub.waiter(active.wake_interests());
     // The first pass samples (the initial snapshot of an agent-status wait is delivered then).
     let mut sample_due_at = std::time::Instant::now();
     loop {
-        // Take the cursor BEFORE the stop check and the history read (see `EventHub::wait_cursor`).
-        let cursor = event_hub.wait_cursor();
+        // Take the cursor BEFORE the stop check and the history read (see `EventWaiter::cursor`).
+        let cursor = waiter.cursor();
         if should_stop_connection(stream, running)? {
             return Ok(None);
         }
@@ -787,7 +791,7 @@ pub(super) fn wait_for_event(
             ));
         }
 
-        event_hub.wait_for_event_after(
+        waiter.wait_after(
             cursor,
             hub_wait_timeout(
                 timing.liveness,

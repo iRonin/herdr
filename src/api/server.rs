@@ -1024,8 +1024,16 @@ fn stream_subscriptions(
         return Err(err);
     }
 
-    // The history is the only thing that wakes an idle connection; sampling subscriptions also come
-    // due on their own interval, and the liveness interval bounds every wait (see `EventHub`).
+    // Events that match a subscription wake an idle connection (nothing else does: an event about
+    // another pane leaves it asleep); sampling subscriptions also come due on their own interval,
+    // and the liveness interval bounds every wait (see `EventHub`). The waiter is registered
+    // before the first cursor, so no event after it can be missed.
+    let waiter = event_hub.waiter(
+        subscriptions
+            .iter()
+            .flat_map(ActiveSubscription::wake_interests)
+            .collect(),
+    );
     let timing = event_hub.timing();
     let intervals: Vec<Option<Duration>> = subscriptions
         .iter()
@@ -1036,7 +1044,7 @@ fn stream_subscriptions(
     loop {
         // Take the cursor BEFORE the stop check and the history read: an event, or the server's
         // stop wake-up, arriving at any point after this makes the wait below return at once.
-        let cursor = event_hub.wait_cursor();
+        let cursor = waiter.cursor();
         if should_stop_connection(&mut stream, running)? {
             return Ok(());
         }
@@ -1075,7 +1083,7 @@ fn stream_subscriptions(
                 }
             }
         }
-        event_hub.wait_for_event_after(
+        waiter.wait_after(
             cursor,
             next_wake_timeout(&timing, &intervals, &due, Instant::now()),
         );

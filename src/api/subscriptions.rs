@@ -4,6 +4,7 @@ use regex::Regex;
 
 use crate::api::event_hub::EventHistoryError;
 use crate::api::event_hub::WaitTiming;
+use crate::api::event_hub::WakeInterest;
 use crate::api::schema::{
     ErrorBody, ErrorResponse, EventKind, Method, PaneAgentStatusChangedEvent,
     PaneOutputMatchedEvent, PaneReadState, PaneScrollChangedEvent, PaneScrollInfo, Request,
@@ -297,6 +298,30 @@ impl ActiveSubscription {
             Self::ReadStateChanged(subscription) => {
                 serde_json::to_value(subscription.poll(event_hub)?).ok()
             }
+        }
+    }
+
+    /// The events that can change what this subscription does, so the hub wakes the connection
+    /// thread for those and no others (see `WakeInterest`). It sits beside the code that consumes
+    /// the events and must stay in step with it: `wake_interests_cover_every_event_a_subscription_reacts_to`
+    /// runs an event of every kind through each subscription and fails when one reacts to an event
+    /// its interests do not match.
+    pub(super) fn wake_interests(&self) -> Vec<WakeInterest> {
+        match self {
+            Self::Event(subscription) => vec![WakeInterest::kind(subscription.event_kind)],
+            // Terminal output and scroll position are sampled on a timer and never read from the
+            // history: no event changes what these do.
+            Self::OutputMatched(_) | Self::ScrollChanged(_) => Vec::new(),
+            // Every event about its pane (status, title, close, move, read flag, ...) and, through
+            // the hub, every event that may remove or renumber its pane without naming it.
+            Self::AgentStatusChanged(subscription) => {
+                vec![WakeInterest::pane(subscription.pane_id.clone())]
+            }
+            // Only the read-state events of its own pane.
+            Self::ReadStateChanged(subscription) => vec![WakeInterest::pane_kind(
+                subscription.pane_id.clone(),
+                EventKind::PaneReadStateChanged,
+            )],
         }
     }
 
