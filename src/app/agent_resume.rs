@@ -1001,3 +1001,12 @@ mod tests {
         assert_eq!(shell_command_from_argv(&[]), None);
     }
 }
+
+/// Placeholder until the behaviour is written: no shell is told to exit, so the tests of it fail at run time and not at build time.
+#[cfg(all(test, unix))]
+fn exit_with_command_suffix(_shell: &str) -> Option<&'static str> {
+    None
+}
+
+#[cfg(all(test, unix))]
+mod close_when_resumed_agent_exits_tests;

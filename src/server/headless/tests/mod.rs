@@ -7035,6 +7035,86 @@ async fn headless_scheduled_tasks_start_pending_agent_resume_without_foreground_
     shutdown_test_runtimes(&mut server);
 }
 
+/// The server loop publishes a pane's agent exit BEFORE the app handles the pane's death, and that exit clears the agent's
+/// session from the pane. A pane that ends with its resumed agent must therefore take its session checkpoint before that
+/// publish: a checkpoint taken after it saves the pane without the session it is resumed from. This test goes through the
+/// server loop's own entry point, the order the real server has, which a test of the app alone does not.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_resumed_pane_ending_with_its_agent_keeps_its_session_in_the_layout_the_server_saves() {
+    let _guard = crate::config::test_config_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let config_home = std::env::temp_dir().join(format!(
+        "herdr-resumed-exit-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::env::set_var("XDG_CONFIG_HOME", &config_home);
+    std::env::remove_var(crate::session::SESSION_ENV_VAR);
+
+    for flagged in [true, false] {
+        let mut server = test_headless_server();
+        server.app.policy.persist_session = true;
+        let mut workspace = crate::workspace::Workspace::test_new("resumed");
+        let agent_pane = workspace.tabs[0].root_pane;
+        let _other_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let terminal_id = workspace.terminal_id(agent_pane).cloned().unwrap();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.ensure_test_terminals();
+        let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::path("/sessions/agent.jsonl")
+                .unwrap(),
+        });
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Pi),
+            crate::detect::AgentState::Idle,
+        );
+        terminal.closes_when_resumed_agent_exits = flagged;
+
+        server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+            pane_id: agent_pane,
+            exit_reason: crate::platform::ChildExitReason::Exited,
+        });
+        assert!(server.app.find_pane(agent_pane).is_none());
+        server.app.save_session_on_shutdown();
+
+        let snapshot = crate::persist::load().expect("a layout is saved");
+        let panes = &snapshot.workspaces[0].tabs[0].panes;
+        let session = panes
+            .values()
+            .find_map(|pane| pane.agent_session.as_ref())
+            .map(|session| session.value.as_str());
+        if flagged {
+            assert_eq!(panes.len(), 2, "both panes are in the saved layout");
+            assert_eq!(
+                session,
+                Some("/sessions/agent.jsonl"),
+                "the layout saved after the pane ended lost the session it is resumed from"
+            );
+        } else {
+            // The control: upstream's behaviour for a pane that is not flagged is unchanged.
+            assert_eq!(
+                panes.len(),
+                1,
+                "an unflagged pane's end is saved as it happened"
+            );
+            assert_eq!(session, None);
+        }
+        shutdown_test_runtimes(&mut server);
+    }
+
+    std::env::remove_var("XDG_CONFIG_HOME");
+    let _ = std::fs::remove_dir_all(config_home);
+}
+
 #[test]
 fn direct_terminal_input_acknowledges_its_blocked_pane_after_forwarding() {
     with_terminal_session_test_server(|server, terminal_id, terminal_id_string, public_pane_id| {
