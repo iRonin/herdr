@@ -68,7 +68,9 @@ pane_history = true
 
 When enabled, Herdr stores saved pane history in `session-history.json` next to `session.json`. Treat the Herdr config/session directory like terminal history.
 
-History is replayed only when it matches the exact saved layout. History from a different layout, including after manual snapshot recovery, is ignored. Older history files without layout verification are also ignored; newly saved history can be replayed on the next restart.
+History is replayed only when it matches the exact saved layout. History from a different layout, including after manual snapshot recovery, is ignored.
+
+A history file written by an older Herdr has no layout verification. Herdr replays it only when its structure fits the saved session: the same number of workspaces, the same number of tabs in each workspace, and every saved screen belongs to a pane that tab has. A pane with no saved screen, for example one that was blank when the file was saved, simply comes back empty. A file that does not fit is ignored. History saved after the restart carries layout verification and replays on the next restart under the exact-layout rule.
 
 ## Native agent session restore
 

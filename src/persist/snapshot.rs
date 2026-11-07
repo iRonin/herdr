@@ -425,6 +425,11 @@ pub(super) enum HistoryLayoutMatch {
 }
 
 /// Decide whether `history` was saved together with `snapshot`.
+///
+/// A history file with a fingerprint belongs to the saved layout only when the fingerprint is the layout's own: no
+/// structure can stand in for it. A history file without one was written by an older herdr, before history recorded a
+/// fingerprint. Ignoring it would bring every pane back with an empty screen on the first restart after an upgrade, so it
+/// is accepted when it has the structure of the saved session (see `legacy_history_fits_session`).
 pub(super) fn match_history_to_layout(
     history: &SessionHistorySnapshot,
     snapshot: &SessionSnapshot,
@@ -433,8 +438,38 @@ pub(super) fn match_history_to_layout(
         Some(fingerprint) if layout_fingerprint(snapshot).as_deref() == Some(fingerprint) => {
             HistoryLayoutMatch::Fingerprint
         }
-        _ => HistoryLayoutMatch::Mismatch,
+        Some(_) => HistoryLayoutMatch::Mismatch,
+        None if legacy_history_fits_session(history, snapshot) => {
+            HistoryLayoutMatch::LegacyStructure
+        }
+        None => HistoryLayoutMatch::Mismatch,
     }
+}
+
+/// True when a history file without a fingerprint has the structure of the saved session: the same number of
+/// workspaces, the same number of tabs in each, and in each tab only panes the session has.
+///
+/// History is keyed by workspace and tab position and by the raw id of each pane, so a file that fits names the same panes.
+/// The panes of a tab need not all appear: a pane whose screen was blank when the file was saved has no entry. An entry for
+/// a pane the tab does not have means the file belongs to another layout.
+fn legacy_history_fits_session(
+    history: &SessionHistorySnapshot,
+    snapshot: &SessionSnapshot,
+) -> bool {
+    history.workspaces.len() == snapshot.workspaces.len()
+        && history.workspaces.iter().zip(&snapshot.workspaces).all(
+            |(history_workspace, workspace)| {
+                history_workspace.tabs.len() == workspace.tabs.len()
+                    && history_workspace.tabs.iter().zip(&workspace.tabs).all(
+                        |(history_tab, tab)| {
+                            history_tab
+                                .panes
+                                .keys()
+                                .all(|pane| tab.panes.contains_key(pane))
+                        },
+                    )
+            },
+        )
 }
 
 /// Capture pane screen history separately from the structural session snapshot.
