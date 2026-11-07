@@ -60,8 +60,12 @@ pub(super) struct ActiveAgentStatusChangedSubscription {
     last_presentation: Option<PanePresentationSnapshot>,
     last_sequence: u64,
     initial_event: Option<PaneAgentStatusChangedEvent>,
-    /// Set when the history held an event about this pane that is not a status change (see
-    /// `note_pane_event`); the next pass takes a snapshot at once. Cleared when one has run.
+    /// A snapshot this subscription owes: set when the history held an event about this pane that
+    /// is not a status change (see `note_pane_event`), and when a snapshot was thrown away because
+    /// the history moved before or while the app answered it (see `poll_snapshot`). The connection
+    /// does not block while it is set (`ActiveSubscription::snapshot_owed`): the next pass reads the
+    /// history and takes the snapshot at once. Cleared when a snapshot has run against an
+    /// unchanged history.
     snapshot_requested: bool,
     request_prefix: String,
 }
@@ -322,6 +326,20 @@ impl ActiveSubscription {
                 subscription.pane_id.clone(),
                 EventKind::PaneReadStateChanged,
             )],
+        }
+    }
+
+    /// Whether this subscription still owes a snapshot of its pane: a connection holding one must
+    /// not block on the hub (an event about another pane, the very thing that makes a snapshot be
+    /// thrown away, does not wake it) but make its next pass at once. Every pass either reads at
+    /// least one new event or takes a snapshot that the app answers, so this cannot spin.
+    pub(super) fn snapshot_owed(&self) -> bool {
+        match self {
+            Self::AgentStatusChanged(subscription) => subscription.snapshot_requested,
+            Self::Event(_)
+            | Self::OutputMatched(_)
+            | Self::ScrollChanged(_)
+            | Self::ReadStateChanged(_) => false,
         }
     }
 
@@ -607,6 +625,8 @@ impl ActiveAgentStatusChangedSubscription {
         event_hub: &EventHub,
     ) -> Result<Option<SubscriptionEventEnvelope>, ErrorResponse> {
         if event_hub.current_sequence() != self.last_sequence {
+            // Events the history holds are not read yet: read them first, then take the snapshot.
+            self.snapshot_requested = true;
             return Ok(None);
         } else if let Some(event) = self.initial_event.take() {
             return Ok(Some(SubscriptionEventEnvelope {
@@ -623,6 +643,11 @@ impl ActiveAgentStatusChangedSubscription {
         );
         let after_snapshot_sequence = event_hub.current_sequence();
         if after_snapshot_sequence != before_snapshot_sequence {
+            // The pane may have changed in step with the events published meanwhile: this answer
+            // is not trusted, the snapshot is still owed. The connection is woken only by events
+            // about its own pane, so it must see for itself (`snapshot_owed`) that it has to look
+            // again, or an event about another pane would delay the snapshot by a whole sample.
+            self.snapshot_requested = true;
             return Ok(None);
         }
         // A snapshot ran against an unchanged history: a pending request is served.

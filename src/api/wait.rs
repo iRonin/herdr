@@ -791,6 +791,10 @@ pub(super) fn wait_for_event(
             ));
         }
 
+        // A snapshot thrown away because the history moved is still owed (see `snapshot_owed`).
+        if active.snapshot_owed() {
+            continue;
+        }
         waiter.wait_after(
             cursor,
             hub_wait_timeout(

@@ -1084,6 +1084,11 @@ fn stream_subscriptions(
                 }
             }
         }
+        // A snapshot thrown away because the history moved is still owed, and the event that moved
+        // it may be about another pane, which wakes nobody: look again at once instead of waiting.
+        if subscriptions.iter().any(ActiveSubscription::snapshot_owed) {
+            continue;
+        }
         waiter.wait_after(
             cursor,
             next_wake_timeout(&timing, &intervals, &due, Instant::now()),
