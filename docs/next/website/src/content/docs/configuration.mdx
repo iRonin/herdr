@@ -645,6 +645,26 @@ Pi resumes substitute the current `agent.pi_program` value for a generated or sa
 
 Only panes with a valid native session reference from an official integration can resume; other panes restore as normal shells. See [Session state and restore](/docs/session-state/) for supported Agents and persistence behavior.
 
+## Closing a resumed Agent's pane when it ends
+
+A pane's program is its shell, and a server restart resumes an Agent by typing the resume command into that shell. When the Agent ends, the shell stays, so the pane stays open as an idle shell. To close such a pane when the Agent ends normally, set:
+
+```toml
+[session]
+close_pane_when_resumed_agent_exits = true
+```
+
+The default is `false`, which changes nothing: the resume command is typed exactly as before and the pane stays open when the Agent ends.
+
+With the setting on, Herdr types `<resume command> && exit` into the pane's shell (`<resume command>; and exit` for fish), so the shell ends with the Agent only when the Agent ends with exit status 0:
+
+- A crash, an Agent killed by a signal, or a command that cannot be found ends with another status. The shell and the pane stay open, showing what the shell printed.
+- Only panes resumed by a server restart are affected. Panes you start yourself are not.
+- It applies to panes whose shell is `sh`, `dash`, `bash`, `zsh`, or `fish`. For any other shell Herdr types the command unchanged, the pane stays open, and the server log names the shell once.
+- The setting is read when each resume command is typed, so a config reload applies to the resumes that start after it.
+- A server stop does not drop the Agent from the saved layout: the layout is saved before any pane is signalled, and a pane whose Agent ends at the moment of an operating-system shutdown stays in the layout saved last. An Agent that ended normally less than five seconds before the server stops comes back at the next start.
+- A value that is not `true` or `false` is reported by `herdr config check`, keeps the setting off, and does not affect other settings.
+
 ## IME cursor tracking
 
 On macOS, AI Agent TUIs that hide the hardware cursor can prevent native input-method candidate windows from following the focused pane. Reveal a cursor anchor for those panes with:

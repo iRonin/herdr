@@ -158,6 +158,9 @@ pub struct App {
     pane_exit_checkpoint_pending: bool,
     /// Shells for which `close_pane_when_resumed_agent_exits` could not be applied, each named once in the log.
     unsupported_resume_close_shells_logged: std::collections::HashSet<String>,
+    /// Panes of a resumed agent whose end has already taken its session checkpoint, so that the second place that sees the
+    /// event does not save again after the end of the agent cleared the session.
+    resumed_agent_exit_checkpoints: std::collections::HashSet<crate::layout::PaneId>,
     pub(crate) detached_process_children: Vec<std::process::Child>,
     tab_bar_status_generation: u64,
     tab_bar_datetimes: Vec<tab_bar_status::TabBarDatetimeRuntime>,
@@ -680,6 +683,7 @@ impl App {
             session_writer,
             pane_exit_checkpoint_pending: false,
             unsupported_resume_close_shells_logged: std::collections::HashSet::new(),
+            resumed_agent_exit_checkpoints: std::collections::HashSet::new(),
             detached_process_children: Vec::new(),
             tab_bar_status_generation: 0,
             tab_bar_datetimes: Vec::new(),

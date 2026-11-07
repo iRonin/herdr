@@ -319,7 +319,12 @@ impl App {
             }
         };
 
+        // Read here, when the command is typed: the plan can start long after the restore.
+        let ends_with_agent = self.resume_close_suffix(pane_id, &terminal_id, &plan.agent);
         let mut input = resume_command;
+        if let Some(suffix) = ends_with_agent {
+            input.push_str(suffix);
+        }
         input.push('\r');
         if let Err(err) = runtime.try_send_bytes(Bytes::from(input)) {
             tracing::warn!(
@@ -337,8 +342,57 @@ impl App {
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.pending_agent_resume_plan = None;
             terminal.respawn_shell_on_exit = false;
+            terminal.closes_when_resumed_agent_exits = ends_with_agent.is_some();
         }
         true
+    }
+
+    /// What to type after a resume command so the pane's shell ends with the agent, when the agent ends normally. `None`
+    /// when `[session] close_pane_when_resumed_agent_exits` is off (the command is then typed exactly as upstream types
+    /// it), and for a shell whose spelling is not proven: that one is named once in the log.
+    fn resume_close_suffix(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        terminal_id: &crate::terminal::TerminalId,
+        agent: &str,
+    ) -> Option<&'static str> {
+        if !self.state.close_pane_when_resumed_agent_exits {
+            return None;
+        }
+        let shell = crate::pane::pane_shell(&self.state.default_shell);
+        let suffix = exit_with_command_suffix(&shell);
+        if suffix.is_none()
+            && self
+                .unsupported_resume_close_shells_logged
+                .insert(shell.clone())
+        {
+            tracing::info!(
+                pane = pane_id.raw(),
+                terminal = %terminal_id,
+                agent = %agent,
+                shell = %shell,
+                "close_pane_when_resumed_agent_exits is not applied to panes of this shell: its syntax for ending the shell after a successful command is not known; the pane stays open when the agent ends"
+            );
+        }
+        suffix
+    }
+}
+
+/// The text that ends an interactive shell after the command typed before it, only when that command succeeded (exit status 0),
+/// so a crash, a kill or a missing command leaves the shell and its pane open. Decided by the shell's base name, and only for
+/// shells whose spelling a test runs: a shell outside this list gets `None`, never a guess.
+///
+/// - `sh`, `dash`, `bash`, `zsh`: `&& exit`.
+/// - `fish`: `; and exit`. `and` exists in every fish version; `&&` only since 3.0.
+fn exit_with_command_suffix(shell: &str) -> Option<&'static str> {
+    if !cfg!(unix) {
+        return None;
+    }
+    let name = shell.rsplit('/').next().unwrap_or(shell);
+    match name.strip_prefix('-').unwrap_or(name) {
+        "sh" | "dash" | "bash" | "zsh" => Some(" && exit"),
+        "fish" => Some("; and exit"),
+        _ => None,
     }
 }
 
@@ -1000,12 +1054,6 @@ mod tests {
         );
         assert_eq!(shell_command_from_argv(&[]), None);
     }
-}
-
-/// Placeholder until the behaviour is written: no shell is told to exit, so the tests of it fail at run time and not at build time.
-#[cfg(all(test, unix))]
-fn exit_with_command_suffix(_shell: &str) -> Option<&'static str> {
-    None
 }
 
 #[cfg(all(test, unix))]

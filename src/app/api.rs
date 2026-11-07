@@ -224,6 +224,19 @@ impl App {
             return self.handle_api_worktree_remove_finished(*result);
         }
 
+        // A pane whose shell was typed `<agent> && exit` ends with its agent when the agent ends normally. When the operating
+        // system shuts down, it signals every process: the agent exits 0, its shell follows, and this event can reach the
+        // server before the server knows it is stopping. Take the session checkpoint that a pane ended by a signal gets,
+        // and take it here, before the pane's agent exit is applied below: that exit clears the agent's session from the
+        // pane, and a checkpoint taken after it would save the pane without the session it is resumed from.
+        let resumed_agent_pane_ended = matches!(
+            &ev,
+            AppEvent::PaneDied { pane_id, .. } if self.pane_closes_with_resumed_agent(*pane_id)
+        );
+        if let AppEvent::PaneDied { pane_id, .. } = &ev {
+            self.checkpoint_session_before_resumed_agent_pane_exit(*pane_id);
+        }
+
         let mut worktree_restore_updates = Vec::new();
         if let AppEvent::PaneDied { pane_id, .. } = &ev {
             if self
@@ -285,14 +298,17 @@ impl App {
             }
         }
 
-        let checkpointed_pane_exit = matches!(
+        let signaled_pane_exit = matches!(
             &ev,
             AppEvent::PaneDied {
                 pane_id,
                 exit_reason,
             } if exit_reason.requires_session_checkpoint() && self.find_pane(*pane_id).is_some() && !self.overlay_panes.contains_key(pane_id)
         );
-        if checkpointed_pane_exit {
+        // The checkpoint of a resumed agent's pane is already taken, before its agent's exit was applied: a second one now
+        // would save the session that exit cleared.
+        let checkpointed_pane_exit = signaled_pane_exit || resumed_agent_pane_ended;
+        if signaled_pane_exit && !resumed_agent_pane_ended {
             self.checkpoint_session_before_pane_exit();
         }
 
@@ -376,6 +392,7 @@ impl App {
         if checkpointed_pane_exit {
             self.finish_checkpointed_pane_exit();
         }
+        self.resumed_agent_exit_checkpoints.clear();
         if let Some(agents) = manifest_update_agents {
             self.reset_agent_detection_for_agents(&agents);
         }
@@ -551,6 +568,31 @@ impl App {
         if was_overlay_active && self.state.active == Some(overlay.ws_idx) {
             self.state.mode = Mode::Terminal;
         }
+    }
+
+    /// The session checkpoint of a pane that ends with its resumed agent, taken at most once per pane. The server loop calls it
+    /// before it publishes the pane's agent exit, and `handle_internal_event` calls it too for callers that do not go through
+    /// the server loop: whichever comes first takes the checkpoint, while the pane still has the session the agent exit clears.
+    /// A second save after that exit would replace the good checkpoint with a layout that lacks the session.
+    pub(crate) fn checkpoint_session_before_resumed_agent_pane_exit(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+    ) -> bool {
+        if !self.pane_closes_with_resumed_agent(pane_id)
+            || !self.resumed_agent_exit_checkpoints.insert(pane_id)
+        {
+            return false;
+        }
+        self.checkpoint_session_before_pane_exit();
+        true
+    }
+
+    /// Whether the shell of this pane was typed `<agent> && exit` (or the shell's spelling of it) by a restart resume, so
+    /// that it ends with its agent when the agent ends normally.
+    pub(crate) fn pane_closes_with_resumed_agent(&self, pane_id: crate::layout::PaneId) -> bool {
+        self.find_pane(pane_id)
+            .and_then(|(_, pane_state)| self.state.terminals.get(&pane_state.attached_terminal_id))
+            .is_some_and(|terminal| terminal.closes_when_resumed_agent_exits)
     }
 
     fn runtime_exit_action(&self, pane_id: crate::layout::PaneId) -> RuntimeExitAction {
