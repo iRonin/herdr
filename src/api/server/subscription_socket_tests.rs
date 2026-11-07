@@ -1019,3 +1019,115 @@ fn an_agent_status_wait_notices_a_change_only_the_snapshot_sees_within_the_snaps
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(response["result"]["event"]["data"]["agent_status"], "idle");
 }
+
+// A snapshot of the pane that is discarded because the event history moved while the app answered
+// its `pane.get` must be retried at once. Before the filtered wake the event that moved the history
+// woke the connection whatever pane it was about, which made the retry; an event about ANOTHER pane
+// no longer wakes the connection, so the connection has to see for itself that it still owes the
+// snapshot. Every test below sets both intervals long enough (30 s, or 1 s for the sample) that only
+// such a retry can deliver within the window.
+
+#[test]
+fn a_requested_snapshot_that_an_event_about_another_pane_interrupts_is_retried_at_once() {
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let mut client = test.connect();
+    client.subscribe("retry", idle_agent_status_subscription());
+    let probe = test.app_request();
+    assert!(probe.request.id.ends_with(":probe"));
+    reply_to_probe_with_status(probe, AgentStatus::Done);
+    client.assert_started("retry");
+    assert_eq!(
+        answer_pane_gets_with_status_for(&mut test, Duration::from_millis(400), AgentStatus::Done),
+        1
+    );
+    // The subscribed pane is viewed: done turns idle with no status event, a snapshot is requested.
+    test.hub.push(read_state_changed("pane_1"));
+    let request = test.app_request();
+    assert!(matches!(request.request.method, Method::PaneGet(_)));
+    // While the app answers that pane.get, an event about another pane is published.
+    test.hub.push(read_state_changed("pane_2"));
+    reply_to_probe_with_status(request, AgentStatus::Idle);
+    let started = Instant::now();
+    let retries =
+        answer_pane_gets_with_status_for(&mut test, Duration::from_secs(3), AgentStatus::Idle);
+    let delivered = client.next_line(Instant::now() + Duration::from_millis(300));
+    assert_idle_delivered(delivered, retries, started);
+}
+
+#[test]
+fn an_events_wait_snapshot_that_an_event_about_another_pane_interrupts_is_retried_at_once() {
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let mut client = test.connect();
+    client.send(json!({
+        "id": "wait-retry",
+        "method": "events.wait",
+        "params": {
+            "match_event": {
+                "event": "pane_agent_status_changed",
+                "pane_id": "pane_1",
+                "agent_status": "idle"
+            },
+            "timeout_ms": 20_000
+        }
+    }));
+    let probe = test.app_request();
+    assert!(probe.request.id.ends_with(":probe"));
+    reply_to_probe_with_status(probe, AgentStatus::Done);
+    assert_eq!(
+        answer_pane_gets_with_status_for(&mut test, Duration::from_millis(400), AgentStatus::Done),
+        1
+    );
+    test.hub.push(read_state_changed("pane_1"));
+    let request = test.app_request();
+    assert!(matches!(request.request.method, Method::PaneGet(_)));
+    test.hub.push(read_state_changed("pane_2"));
+    reply_to_probe_with_status(request, AgentStatus::Idle);
+    let started = Instant::now();
+    let retries =
+        answer_pane_gets_with_status_for(&mut test, Duration::from_secs(3), AgentStatus::Idle);
+    let response = client.next_line(Instant::now() + Duration::from_millis(300));
+    let response = response.map(|value| {
+        assert_eq!(value["id"], "wait-retry", "{value}");
+        value["result"]["event"].clone()
+    });
+    assert_idle_delivered(response, retries, started);
+}
+
+#[test]
+fn a_sampled_snapshot_that_an_event_about_another_pane_interrupts_is_retried_at_once() {
+    // The one-second sample is a safety net, but a sample that was thrown away is still owed: the
+    // next one is a whole interval away. The sample interval is 1 s, so a delivery within 0.7 s of
+    // the interruption cannot come from the next sample.
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(1));
+    let mut client = test.connect();
+    client.subscribe("sample-retry", idle_agent_status_subscription());
+    let probe = test.app_request();
+    assert!(probe.request.id.ends_with(":probe"));
+    reply_to_probe_with_status(probe, AgentStatus::Done);
+    client.assert_started("sample-retry");
+    // The first pass takes its snapshot (done); the next one is the sample, a second later.
+    let first = test.app_request();
+    assert!(matches!(first.request.method, Method::PaneGet(_)));
+    reply_to_probe_with_status(first, AgentStatus::Done);
+    let sample = test.app_request();
+    assert!(matches!(sample.request.method, Method::PaneGet(_)));
+    // The pane changed, but an event about another pane arrives before the app answers the sample.
+    test.hub.push(read_state_changed("pane_2"));
+    reply_to_probe_with_status(sample, AgentStatus::Idle);
+    let started = Instant::now();
+    let retries =
+        answer_pane_gets_with_status_for(&mut test, Duration::from_millis(700), AgentStatus::Idle);
+    let delivered = client.next_line(Instant::now() + Duration::from_millis(100));
+    assert_idle_delivered(delivered, retries, started);
+}
+
+fn assert_idle_delivered(delivered: Option<Value>, retries: usize, started: Instant) {
+    let delivered = delivered.expect("the connection closed or sent nothing");
+    assert_eq!(
+        delivered["data"]["agent_status"],
+        "idle",
+        "no idle delivery: {delivered} (retry pane.get count {retries}, {:?})",
+        started.elapsed()
+    );
+    assert!(retries >= 1, "delivered without a retry pane.get?");
+}
