@@ -1282,6 +1282,16 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    /// `env_lock` for the two tests that stop a real server. A test that fails while holding the
+    /// lock poisons it, and a plain `lock().unwrap()` would then fail the other of the two with a
+    /// `PoisonError` before its own check ran (its failure would say nothing about its own cause).
+    /// What the lock guards is the socket path variable, which each test sets and clears itself.
+    fn env_lock_after_a_failed_test() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn unique_test_path(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2445,7 +2455,7 @@ mod tests {
     fn dropping_the_server_handle_releases_a_held_subscription() {
         // Both intervals are 30 s, so only the wake-up in `ServerHandle::drop` can end a connection
         // that is blocked on the event hub within the deadline below.
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock_after_a_failed_test();
         let dir = unique_test_path("api-handle-drop");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("herdr.sock");
@@ -2495,7 +2505,7 @@ mod tests {
         // connection. With the production timing a stop that relied on the timeout would take 5 s;
         // here it must take under 2 s, for each of several connections.
         assert!(WaitTiming::default().liveness >= Duration::from_secs(5));
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock_after_a_failed_test();
         let dir = unique_test_path("api-shutdown-wakes");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("herdr.sock");
