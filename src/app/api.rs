@@ -583,7 +583,7 @@ impl App {
         {
             return false;
         }
-        self.checkpoint_session_before_pane_exit();
+        self.checkpoint_session_layout_before_pane_exit();
         true
     }
 

@@ -113,6 +113,54 @@ impl App {
         self.state.session_dirty = false;
     }
 
+    /// The checkpoint of a pane that ends with its resumed agent. Same bookkeeping as `checkpoint_session_before_pane_exit`, with
+    /// two differences, both because it runs on the server loop and can run once per agent exit in a burst of them:
+    ///
+    /// - It writes the layout only (`SessionWriter::save_layout_only`). The full save also captures and writes every pane's
+    ///   screen history, which took 3.9 s for 250 panes with 200 KB of history each (about 9 ms without the history). The next
+    ///   debounced autosave rewrites both files; a stop before it restores every pane, and the history file, whose layout
+    ///   fingerprint then no longer matches the saved layout, is ignored once.
+    /// - It never waits for a background save. While one is writing, it holds the writer, and it writes a layout captured before
+    ///   this exit, which still holds the pane and the agent session the pane was resumed from (this exit is what clears that
+    ///   session). The checkpoint is then pending on that file, and a stop keeps it, as for any other checkpoint; the autosave
+    ///   that `finish_checkpointed_pane_exit` schedules writes the current layout.
+    pub(crate) fn checkpoint_session_layout_before_pane_exit(&mut self) {
+        if !self.policy.persist_session
+            || (self.pane_exit_checkpoint_pending && !self.state.session_dirty)
+        {
+            return;
+        }
+        if self.state.workspaces.is_empty() {
+            self.checkpoint_session_before_pane_exit();
+            return;
+        }
+        let snapshot = crate::persist::capture(
+            &self.state.workspaces,
+            &self.state.terminals,
+            &self.terminal_runtimes,
+            self.state.active,
+            self.state.selected,
+        );
+        match self.session_writer.try_lock() {
+            Ok(mut writer) => writer.save_layout_only(&snapshot),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                tracing::info!(
+                    event = "persist.checkpoint",
+                    subsystem = "persist",
+                    outcome = "background_save_running",
+                    "a background save is writing; the pane-exit checkpoint relies on the layout it captured"
+                );
+            }
+            Err(std::sync::TryLockError::Poisoned(err)) => {
+                tracing::warn!(err = %err, "session writer is poisoned; refusing to modify session");
+                return;
+            }
+        }
+        self.session_save_deadline = None;
+        self.pane_exit_checkpoint_pending = true;
+        self.state.session_dirty = false;
+    }
+
     pub(crate) fn finish_checkpointed_pane_exit(&mut self) {
         if self.pane_exit_checkpoint_pending {
             self.state.session_dirty = false;
