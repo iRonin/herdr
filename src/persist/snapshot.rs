@@ -449,7 +449,10 @@ pub(super) fn match_history_to_layout(
 /// True when a history file without a fingerprint has the structure of the saved session: the same number of
 /// workspaces, the same number of tabs in each, and in each tab only panes the session has.
 ///
-/// History is keyed by workspace and tab position and by the raw id of each pane, so a file that fits names the same panes.
+/// History is keyed by workspace and tab position and by the raw id of each pane. A raw id names the same pane only within
+/// one server process: every restore hands out fresh ids and a later server starts counting again. So a fitting structure
+/// does not prove that the history and the session were saved together. `load_history` also refuses a file that is older than
+/// `session.json`, which the writer renames into place first.
 /// The panes of a tab need not all appear: a pane whose screen was blank when the file was saved has no entry. An entry for
 /// a pane the tab does not have means the file belongs to another layout.
 fn legacy_history_fits_session(

@@ -136,7 +136,7 @@ pub fn load_history() -> Option<SessionHistorySnapshot> {
     load_history_from(&session_history_path(), &session_path())
 }
 
-fn load_history_from(path: &Path, _session_path: &Path) -> Option<SessionHistorySnapshot> {
+fn load_history_from(path: &Path, session_path: &Path) -> Option<SessionHistorySnapshot> {
     if !path.exists() {
         return None;
     }
@@ -148,7 +148,15 @@ fn load_history_from(path: &Path, _session_path: &Path) -> Option<SessionHistory
         }
     };
     match parse_history_snapshot(&content) {
-        Ok(snapshot) => Some(snapshot),
+        Ok(snapshot) => {
+            if legacy_history_is_stale(&snapshot, path, session_path) {
+                warn!(
+                    "Ignoring pane history written by an older herdr: it is older than the saved session"
+                );
+                return None;
+            }
+            Some(snapshot)
+        }
         Err(err) => {
             if let Some(version) = snapshot_file_version(&content) {
                 if version > SNAPSHOT_VERSION {
@@ -163,6 +171,32 @@ fn load_history_from(path: &Path, _session_path: &Path) -> Option<SessionHistory
             warn!(err = %err, "failed to parse session history file, ignoring");
             None
         }
+    }
+}
+
+/// True when a history file without a layout fingerprint cannot be shown to come from the same save as `session.json`.
+///
+/// Such a file is matched to the saved session by structure and raw pane id, and a raw id names the same pane only within one
+/// server process. The writer renames `session.json` into place first and the history file second, in one save, so a pair from
+/// one save has a history file at least as new as the session file. A history file that is older comes from an earlier save (a
+/// later write of it failed), and a time that cannot be read proves nothing: both are stale. A history file with a
+/// fingerprint is never judged by its age: the fingerprint decides, at restore.
+fn legacy_history_is_stale(
+    snapshot: &SessionHistorySnapshot,
+    history: &Path,
+    session: &Path,
+) -> bool {
+    if snapshot.layout_fingerprint.is_some() {
+        return false;
+    }
+    let modified = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+    };
+    match (modified(history), modified(session)) {
+        (Some(history), Some(session)) => history < session,
+        _ => true,
     }
 }
 
