@@ -711,7 +711,16 @@ fn restore_tab(
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
-                        terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
+                        terminal = terminal.with_launch_argv(argv);
+                        // A pane the old server typed `<agent> && exit` into must end with its agent: a fresh shell in its
+                        // place would keep the pane open as the idle shell the setting exists to remove.
+                        #[cfg(unix)]
+                        let closes_with_agent = handoff_closes_with_agent;
+                        #[cfg(not(unix))]
+                        let closes_with_agent = false;
+                        if !closes_with_agent {
+                            terminal = terminal.with_respawn_shell_on_exit();
+                        }
                     }
                 }
                 if let Some(label) = saved_label {

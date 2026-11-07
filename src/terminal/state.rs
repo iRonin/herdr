@@ -349,7 +349,10 @@ pub struct TerminalState {
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
     /// A restart resume typed `<agent> && exit` (or the shell's equivalent) into this pane's shell, so the shell ends with the
-    /// agent when the agent ends normally. Never saved: it describes one shell's current command line.
+    /// agent when the agent ends normally. Never saved. It describes the command line the shell was typed, and it stays set
+    /// after an agent that ended with another status (which spent that command line and left the shell alive) until the shell
+    /// is replaced; the only effect of a stale flag is a session checkpoint when the pane's shell later ends, and a stop within
+    /// five seconds of it then brings the pane back.
     pub closes_when_resumed_agent_exits: bool,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     agent_process_acquisition_pending: bool,
