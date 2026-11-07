@@ -659,7 +659,7 @@ The default is `false`, which changes nothing: the resume command is typed exact
 With the setting on, Herdr types `<resume command> && exit` into the pane's shell (`<resume command>; and exit` for fish), so the shell ends with the Agent only when the Agent ends with exit status 0:
 
 - A crash, an Agent killed by a signal, or a command that cannot be found ends with another status. The shell and the pane stay open, showing what the shell printed.
-- Only panes resumed by a server restart are affected. Panes you start yourself are not.
+- Only panes resumed by a server restart are affected. Panes you start yourself are not. A pane moved to a new server by a live handoff behaves as it was resumed: the server that resumed it typed the exit into its shell, and the new server knows.
 - It applies to panes whose shell is `sh`, `dash`, `bash`, `zsh`, or `fish`. For any other shell Herdr types the command unchanged, the pane stays open, and the server log names the shell once.
 - The setting is read when each resume command is typed, so a config reload applies to the resumes that start after it.
 - A server stop does not drop the Agent from the saved layout: the layout is saved before any pane is signalled, and a pane whose Agent ends at the moment of an operating-system shutdown stays in the layout saved last. An Agent that ended normally less than five seconds before the server stops comes back at the next start.

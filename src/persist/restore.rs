@@ -596,6 +596,10 @@ fn restore_tab(
         let handoff_agent_state = imported_runtime
             .as_ref()
             .and_then(|imported| imported.state.agent_state.clone());
+        #[cfg(unix)]
+        let handoff_closes_with_agent = imported_runtime
+            .as_ref()
+            .is_some_and(|imported| imported.state.closes_when_resumed_agent_exits);
         let pending_native_agent_restore = if was_imported {
             None
         } else {
@@ -742,6 +746,11 @@ fn restore_tab(
                 #[cfg(unix)]
                 if let Some(agent_state) = handoff_agent_state {
                     terminal.restore_handoff_agent_state(agent_state);
+                }
+                // The old server typed the exit into this shell: it is still on the shell's command line.
+                #[cfg(unix)]
+                if handoff_closes_with_agent {
+                    terminal.closes_when_resumed_agent_exits = true;
                 }
                 panes.insert(*id, PaneState::new(terminal_id.clone()));
                 terminal_runtimes.insert(terminal_id, runtime);
@@ -2223,6 +2232,93 @@ mod tests {
                 state_before_handoff == AgentState::Blocked
             );
         }
+    }
+
+    /// A pane whose shell an earlier server typed `<agent> && exit` into keeps that line across a live handoff, so the new
+    /// server treats the pane's end like the old one did. The state of a pane without it is byte for byte what it was before
+    /// the field existed, and state from a server that does not know the field reads as false.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_carries_the_resumed_agent_close_flag_and_adds_nothing_without_it() {
+        for flagged in [false, true] {
+            let (snapshot, _) = snapshot_with_saved_pane_history();
+            let (events, _events_rx) = mpsc::channel(32);
+            let (workspaces, terminals, runtimes) = restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                4096,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+                events.clone(),
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            let snapshot_now = crate::persist::capture(
+                &workspaces,
+                &terminals,
+                &crate::terminal::TerminalRuntimeRegistry::from(HashMap::new()),
+                Some(0),
+                0,
+            );
+            let pane_id = workspaces[0].tabs[0].panes.keys().next().copied().unwrap();
+            let runtime = runtimes.values().next().unwrap();
+            runtime
+                .pause_handoff_reader(std::time::Duration::from_secs(2))
+                .unwrap();
+            let mut state = runtime.handoff_runtime_state(pane_id.raw());
+            state.closes_when_resumed_agent_exits = flagged;
+            let wire = serde_json::to_value(&state).unwrap();
+            assert_eq!(
+                wire.get("closes_when_resumed_agent_exits").is_some(),
+                flagged,
+                "the field is on the wire only when it is true: {wire}"
+            );
+            let received: crate::handoff_runtime::HandoffRuntimeState =
+                serde_json::from_value(wire).unwrap();
+            assert_eq!(received.closes_when_resumed_agent_exits, flagged);
+
+            let mut imports = HashMap::from([(
+                pane_id.raw(),
+                crate::handoff_runtime::ImportedHandoffRuntime {
+                    master_fd: runtime.duplicate_handoff_fd().unwrap(),
+                    state: received,
+                },
+            )]);
+            let (_, restored_terminals, restored_runtimes) = restore_handoff(
+                &snapshot_now,
+                4096,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                &mut imports,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            )
+            .expect("handoff restore should import the pane");
+            assert_eq!(restored_terminals.len(), 1);
+            assert_eq!(
+                restored_terminals
+                    .values()
+                    .next()
+                    .unwrap()
+                    .closes_when_resumed_agent_exits,
+                flagged
+            );
+            drop(restored_runtimes);
+            drop(runtimes);
+        }
+
+        // State sent by a server that has never heard of the field.
+        let old_state = serde_json::json!({
+            "pane_id": 1, "child_pid": 2, "rows": 24, "cols": 80,
+            "cell_width_px": 8, "cell_height_px": 16
+        });
+        let received: crate::handoff_runtime::HandoffRuntimeState =
+            serde_json::from_value(old_state).unwrap();
+        assert!(!received.closes_when_resumed_agent_exits);
     }
 
     #[tokio::test]
