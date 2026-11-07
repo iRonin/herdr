@@ -936,12 +936,16 @@ Worktree event subscriptions include `worktree.created`, `worktree.opened`, and 
 A server that wakes a held `events.subscribe` connection only for the events its subscriptions can
 match reports `capabilities.filtered_subscription_wake: true` in the `ping` result (and in
 `herdr status --json`). With it, a client can hold one connection per pane, and an event about one
-pane does not wake the connections of the others. Servers that predate the capability leave the
-field out; read a missing value as `false`. What a subscription delivers, and in which order, does
-not depend on it.
+pane does not wake the connections of the others. There are two exceptions: an event that removes
+panes or changes their ids without saying which (`tab.closed`, `tab.moved`, `workspace.closed`,
+`worktree.removed`) wakes every connection, and a connection that has fallen far behind the retained
+events is woken to catch up. Servers that predate the capability leave the field out; read a missing
+value as `false`. What a subscription delivers, and in which order, does not depend on it.
 
-A held subscription connection that its client has closed is released within about five seconds;
-until then it costs the server one wake-up every five seconds, like any idle held connection.
+A held subscription connection that its client has closed is released within about five seconds.
+Until then an idle connection costs the server at most one wake-up every five seconds; a connection
+that samples live state wakes more often for its samples (`pane.agent_status_changed` once a second,
+`pane.output_matched` and `pane.scroll_changed` every 100 ms).
 
 Use `events.subscribe` for lifecycle events. Dedicated wait helpers are documented separately when a one-shot wait is supported.
 
