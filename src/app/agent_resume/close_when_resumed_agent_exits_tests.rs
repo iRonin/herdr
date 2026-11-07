@@ -737,7 +737,8 @@ async fn the_checkpoint_of_a_resumed_agents_pane_does_not_wait_for_a_background_
     let started = Instant::now();
     assert!(app.checkpoint_session_before_resumed_agent_pane_exit(agent_pane));
     let waited = started.elapsed();
-    release_tx.send(()).unwrap();
+    // A checkpoint that waited outlived the ten seconds, and the holder is gone: report the wait below, not a send error.
+    let _ = release_tx.send(());
     background_save.join().unwrap();
 
     assert!(
