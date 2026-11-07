@@ -650,3 +650,109 @@ async fn the_next_autosave_removes_a_resumed_pane_that_ended() {
     std::env::remove_var("XDG_CONFIG_HOME");
     remove_scratch(&config_home);
 }
+
+fn session_history_file(config_home: &Path) -> PathBuf {
+    config_home
+        .join(if cfg!(debug_assertions) {
+            "herdr-dev"
+        } else {
+            "herdr"
+        })
+        .join("session-history.json")
+}
+
+/// The checkpoint of a resumed agent's pane runs on the server loop, once per agent exit in a burst of them, and with
+/// `[experimental] pane_history` on a full save takes seconds for a large layout (3.9 s for 250 panes with 200 KB of history
+/// each; 9 ms without the history). It writes the layout only and leaves the history file exactly as it is: not rewritten, not
+/// cleared. Control: the checkpoint upstream takes for an ordinary pane killed by a signal is the full save and does rewrite
+/// the history file, so this test can tell the two apart.
+#[tokio::test]
+async fn the_checkpoint_of_a_resumed_agents_pane_writes_the_layout_and_leaves_the_pane_history_file_alone(
+) {
+    let _guard = crate::config::test_config_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    const OLDER_SAVE: &str = r#"{"version":3,"layout_fingerprint":"older-save","workspaces":[]}"#;
+    for flagged in [true, false] {
+        let (mut app, agent_pane, config_home) = app_with_resumed_agent(flagged);
+        app.persist_pane_history = true;
+        let history = session_history_file(&config_home);
+        std::fs::create_dir_all(history.parent().unwrap()).unwrap();
+        std::fs::write(&history, OLDER_SAVE).unwrap();
+
+        if flagged {
+            assert!(app.checkpoint_session_before_resumed_agent_pane_exit(agent_pane));
+        } else {
+            app.handle_internal_event(crate::events::AppEvent::PaneDied {
+                pane_id: agent_pane,
+                exit_reason: ChildExitReason::Interrupted,
+            });
+        }
+
+        let snapshot = crate::persist::load().expect("the checkpoint must write the layout");
+        assert_eq!(
+            snapshot.workspaces[0].tabs[0].panes.len(),
+            2,
+            "flagged={flagged}: the checkpoint is taken while both panes are in the layout"
+        );
+        let after = std::fs::read_to_string(&history)
+            .unwrap_or_else(|_| panic!("flagged={flagged}: the history file was removed"));
+        if flagged {
+            assert_eq!(
+                after, OLDER_SAVE,
+                "the checkpoint of a resumed agent's pane must not rewrite the pane history file"
+            );
+        } else {
+            assert_ne!(
+                after, OLDER_SAVE,
+                "control: upstream's full checkpoint rewrites the pane history file"
+            );
+        }
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        remove_scratch(&config_home);
+    }
+}
+
+/// While a background save is writing it holds the session writer. The checkpoint must not wait for it: a wait would stall the
+/// server loop for the rest of that save (seconds with a large pane history). It relies on the layout the running save writes,
+/// which was captured before this exit and still holds the pane and its agent session, and it stays pending on that file.
+#[tokio::test]
+async fn the_checkpoint_of_a_resumed_agents_pane_does_not_wait_for_a_background_save() {
+    let _guard = crate::config::test_config_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut app, agent_pane, config_home) = app_with_resumed_agent(true);
+    let writer = app.session_writer.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let background_save = std::thread::spawn(move || {
+        let _held = writer.lock().unwrap();
+        locked_tx.send(()).unwrap();
+        // Held until the test says so, and for ten seconds at most: a checkpoint that waits fails the test instead of hanging it.
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+    locked_rx.recv().unwrap();
+
+    let started = Instant::now();
+    assert!(app.checkpoint_session_before_resumed_agent_pane_exit(agent_pane));
+    let waited = started.elapsed();
+    release_tx.send(()).unwrap();
+    background_save.join().unwrap();
+
+    assert!(
+        waited < Duration::from_secs(3),
+        "the checkpoint waited {waited:?} for a background save"
+    );
+    assert!(
+        app.pane_exit_checkpoint_pending,
+        "the checkpoint is pending on the layout the running save writes"
+    );
+    assert!(
+        crate::persist::load().is_none(),
+        "the checkpoint wrote nothing itself while the writer was busy"
+    );
+
+    std::env::remove_var("XDG_CONFIG_HOME");
+    remove_scratch(&config_home);
+}
