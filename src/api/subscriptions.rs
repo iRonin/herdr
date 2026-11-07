@@ -1645,4 +1645,53 @@ mod tests {
             }
         }
     }
+
+    fn agent_status_on_pane_a(event_hub: &EventHub) -> ActiveSubscription {
+        subscriptions_on_pane_a(event_hub)
+            .into_iter()
+            .find(|(name, _)| name == "agent status of pane_a (filter None)")
+            .map(|(_, subscription)| subscription)
+            .expect("an agent status subscription on pane_a")
+    }
+
+    #[test]
+    fn only_an_agent_status_subscription_with_a_snapshot_requested_owes_one() {
+        // WHY: a connection that owes a snapshot does not block on the hub (`snapshot_owed`), so a
+        // subscription that claimed to owe one for no reason would keep its connection awake.
+        let event_hub = EventHub::default();
+        for (name, subscription) in subscriptions_on_pane_a(&event_hub) {
+            assert!(!subscription.snapshot_owed(), "{name}");
+        }
+        let mut agent = agent_status_on_pane_a(&event_hub);
+        let ActiveSubscription::AgentStatusChanged(inner) = &mut agent else {
+            panic!("not an agent status subscription");
+        };
+        inner.snapshot_requested = true;
+        assert!(agent.snapshot_owed());
+    }
+
+    #[test]
+    fn a_snapshot_asked_for_while_the_history_holds_unread_events_stays_owed() {
+        // WHY: no snapshot is taken while the history holds events this subscription has not read
+        // (they may change what the pane's answer means). The snapshot is still owed, and the
+        // connection must make its next pass at once: the unread event may be about another pane,
+        // which does not wake it.
+        let event_hub = EventHub::default();
+        let mut agent = agent_status_on_pane_a(&event_hub);
+        event_hub.push(crate::api::event_hub::samples::event(
+            EventKind::WorkspaceCreated,
+            "pane_b",
+        ));
+        let (api_tx, _api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ActiveSubscription::AgentStatusChanged(inner) = &mut agent else {
+            panic!("not an agent status subscription");
+        };
+        assert!(!inner.snapshot_requested);
+        let result = inner.poll_snapshot(&api_tx, &event_hub);
+        assert!(matches!(result, Ok(None)), "no snapshot with unread events");
+        assert!(
+            agent.snapshot_owed(),
+            "a snapshot that was not taken must stay owed"
+        );
+    }
 }
