@@ -843,6 +843,11 @@ mod tests {
             ),
             ("a pane of another tab", &[&[&[1, 3], &[3]], &[&[4]]], no),
             (
+                "a pane of another tab, in the second tab",
+                &[&[&[1], &[3, 2]], &[&[4]]],
+                no,
+            ),
+            (
                 "a pane of another workspace",
                 &[&[&[1, 2], &[3]], &[&[4, 1]]],
                 no,

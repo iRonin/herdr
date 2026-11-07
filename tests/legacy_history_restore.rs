@@ -1,6 +1,7 @@
 //! A server that restores a session replays pane screen history written by an older herdr, which carries no layout
-//! fingerprint, only when the history's structure fits the saved session. End to end: a real server reads a saved
-//! `session.json` and `session-history.json` pair and a real shell pane shows (or does not show) the saved screen.
+//! fingerprint, only when the history file is no older than `session.json` and its structure fits the saved session.
+//! End to end: a real server reads a saved `session.json` and `session-history.json` pair and a real shell pane shows
+//! (or does not show) the saved screen.
 #![cfg(unix)]
 
 pub mod support;
@@ -16,24 +17,54 @@ const FIRST_TAB_SCREEN: &str = "LEGACY-SCREEN-OF-THE-FIRST-TAB";
 const SECOND_TAB_SCREEN: &str = "LEGACY-SCREEN-OF-THE-SECOND-TAB";
 const FOREIGN_PANE_SCREEN: &str = "LEGACY-SCREEN-OF-A-PANE-THE-SESSION-LACKS";
 
-struct RestoredServer {
-    child: std::process::Child,
+/// When the history file was written, against `session.json`.
+#[derive(Clone, Copy)]
+enum HistoryWritten {
+    /// A second after the session file, as the writer leaves a pair from one save (it renames the session first).
+    AfterSession,
+    /// A second before the session file: a history file from an earlier save.
+    BeforeSession,
+}
+
+/// The folder a server runs in: its config and data directory, runtime directory and socket. It outlives the servers
+/// started on it, so a second server can restore what the first one saved.
+struct Sandbox {
     base: PathBuf,
     data_dir: PathBuf,
+    runtime_dir: PathBuf,
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        support::cleanup_test_base(&self.base);
+    }
+}
+
+impl Sandbox {
+    fn history_path(&self) -> PathBuf {
+        self.data_dir.join("session-history.json")
+    }
+
+    fn socket_path(&self) -> PathBuf {
+        self.runtime_dir.join("herdr.sock")
+    }
+}
+
+struct Server {
+    child: std::process::Child,
     socket_path: PathBuf,
 }
 
-impl Drop for RestoredServer {
+impl Drop for Server {
     fn drop(&mut self) {
         let pid = self.child.id();
         let _ = self.child.kill();
         let _ = self.child.wait();
         support::unregister_spawned_herdr_pid(Some(pid));
-        support::cleanup_test_base(&self.base);
     }
 }
 
-impl RestoredServer {
+impl Server {
     fn request(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
         let mut stream = UnixStream::connect(&self.socket_path).unwrap();
         stream
@@ -74,7 +105,8 @@ impl RestoredServer {
     }
 
     /// Types a command whose output exists only if the pane's shell is alive and its screen can be read, and waits for
-    /// it. Without this an absence of saved text could only mean the pane was read too early.
+    /// it. Without this an absence of saved text could only mean the pane was read too early. Only for a server whose
+    /// panes do not already show `ALIVE-42` from a replayed screen.
     fn wait_until_every_shell_answers(&self) {
         for (pane_id, _, _) in self.pane_texts() {
             self.request(
@@ -100,27 +132,59 @@ impl RestoredServer {
         }
     }
 
-    /// Stops the server through its API and returns the path of the history file it saved on the way out.
-    fn stop(&mut self) -> PathBuf {
+    /// Waits until the first tab's and the second tab's saved screens are shown, each in exactly one pane. Returns the
+    /// panes, whose tabs the caller checks.
+    fn wait_for_the_saved_screens(&self) -> Vec<(String, String, String)> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let panes = self.pane_texts();
+            let showing = |marker: &str| {
+                panes
+                    .iter()
+                    .filter(|(_, _, text)| text.contains(marker))
+                    .count()
+            };
+            if showing(FIRST_TAB_SCREEN) == 1 && showing(SECOND_TAB_SCREEN) == 1 {
+                return panes;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the saved screens did not come back: {panes:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Stops the server through its API and waits for it to exit.
+    fn stop(&mut self) {
         self.request("server.stop", serde_json::json!({}));
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
                 assert!(status.success());
-                break;
+                return;
             }
             assert!(Instant::now() < deadline, "the server did not stop");
             std::thread::sleep(Duration::from_millis(25));
         }
-        self.data_dir.join("session-history.json")
     }
 }
 
-/// Starts a server on a saved session of two workspaces and the given history file.
+fn set_modified(path: &std::path::Path, at: SystemTime) {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(at)
+        .unwrap();
+}
+
+/// Writes a saved session of two workspaces and the given history file.
 ///
 /// Workspace `w1` has a tab of panes 3 and 4 (pane 4 was blank when the history was saved, so the history has no entry
-/// for it) and a tab of pane 7. Workspace `w2` has a tab of pane 9, also blank.
-fn start_server_with_history(history: &dyn Fn() -> serde_json::Value) -> RestoredServer {
+/// for it) and a tab of pane 7. Workspace `w2` has a tab of pane 9, also blank. The two files get explicit times, so the
+/// order they were written in does not depend on the speed of the disk.
+fn prepare_sandbox(history: &dyn Fn() -> serde_json::Value, written: HistoryWritten) -> Sandbox {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -133,7 +197,6 @@ fn start_server_with_history(history: &dyn Fn() -> serde_json::Value) -> Restore
     let base = fs::canonicalize(base).unwrap();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
     let data_dir = config_home.join(if cfg!(debug_assertions) {
         "herdr-dev"
     } else {
@@ -163,8 +226,19 @@ fn start_server_with_history(history: &dyn Fn() -> serde_json::Value) -> Restore
              "tabs": [tab(serde_json::json!({"Pane": 9}), &[9])]}
         ]
     });
-    fs::write(data_dir.join("session.json"), session.to_string()).unwrap();
-    fs::write(data_dir.join("session-history.json"), history().to_string()).unwrap();
+    let session_path = data_dir.join("session.json");
+    let history_path = data_dir.join("session-history.json");
+    fs::write(&session_path, session.to_string()).unwrap();
+    fs::write(&history_path, history().to_string()).unwrap();
+    let session_time = SystemTime::now() - Duration::from_secs(600);
+    set_modified(&session_path, session_time);
+    set_modified(
+        &history_path,
+        match written {
+            HistoryWritten::AfterSession => session_time + Duration::from_secs(1),
+            HistoryWritten::BeforeSession => session_time - Duration::from_secs(1),
+        },
+    );
     fs::write(
         data_dir.join("config.toml"),
         "onboarding = false\n[terminal]\ndefault_shell = \"/bin/sh\"\n[experimental]\npane_history = true\n",
@@ -172,15 +246,24 @@ fn start_server_with_history(history: &dyn Fn() -> serde_json::Value) -> Restore
     .unwrap();
 
     support::register_runtime_dir(&runtime_dir);
+    Sandbox {
+        base,
+        data_dir,
+        runtime_dir,
+    }
+}
+
+/// Starts a server on the sandbox's saved files.
+fn start_server(sandbox: &Sandbox) -> Server {
     // A shell inside a herdr pane exports HERDR_* variables (HERDR_SOCKET_PATH names the developer's live server):
     // strip every one, then set the few this test means to pass.
     let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
     support::sanitize_herdr_env_command(&mut command);
     let child = command
         .arg("server")
-        .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_dir)
-        .env("HERDR_SOCKET_PATH", &socket_path)
+        .env("XDG_CONFIG_HOME", sandbox.base.join("config"))
+        .env("XDG_RUNTIME_DIR", &sandbox.runtime_dir)
+        .env("HERDR_SOCKET_PATH", sandbox.socket_path())
         .env("SHELL", "/bin/sh")
         .env_remove("HERDR_CLIENT_SOCKET_PATH")
         .env_remove("HERDR_STARTUP_CWD")
@@ -192,13 +275,11 @@ fn start_server_with_history(history: &dyn Fn() -> serde_json::Value) -> Restore
         .spawn()
         .unwrap();
     support::register_spawned_herdr_pid(Some(child.id()));
-    let server = RestoredServer {
+    let server = Server {
         child,
-        base,
-        data_dir,
-        socket_path: socket_path.clone(),
+        socket_path: sandbox.socket_path(),
     };
-    support::wait_for_socket(&socket_path, Duration::from_secs(10));
+    support::wait_for_socket(&sandbox.socket_path(), Duration::from_secs(10));
     server
 }
 
@@ -228,7 +309,7 @@ fn tab_showing<'a>(panes: &'a [(String, String, String)], marker: &str) -> &'a s
         .unwrap_or_else(|| panic!("no pane shows {marker}: {panes:?}"))
 }
 
-fn assert_no_pane_shows_saved_screen(server: &RestoredServer, why: &str) {
+fn assert_no_pane_shows_saved_screen(server: &Server, why: &str) {
     server.wait_until_every_shell_answers();
     let panes = server.pane_texts();
     assert_eq!(panes.len(), 4, "{why}: {panes:?}");
@@ -244,38 +325,20 @@ fn assert_no_pane_shows_saved_screen(server: &RestoredServer, why: &str) {
 
 #[test]
 fn a_history_file_written_by_an_older_herdr_is_replayed_when_its_structure_matches_the_session() {
-    let mut server = start_server_with_history(&legacy_history);
+    let sandbox = prepare_sandbox(&legacy_history, HistoryWritten::AfterSession);
+    let mut server = start_server(&sandbox);
 
     // The screens come back in the panes they were saved from, and only there.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let panes = loop {
-        let panes = server.pane_texts();
-        let first = panes
-            .iter()
-            .filter(|(_, _, text)| text.contains(FIRST_TAB_SCREEN))
-            .collect::<Vec<_>>();
-        let second = panes
-            .iter()
-            .filter(|(_, _, text)| text.contains(SECOND_TAB_SCREEN))
-            .collect::<Vec<_>>();
-        if first.len() == 1 && second.len() == 1 {
-            break panes;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the saved screens did not come back: {panes:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let panes = server.wait_for_the_saved_screens();
     assert_eq!(panes.len(), 4, "{panes:?}");
     assert_eq!(tab_showing(&panes, FIRST_TAB_SCREEN), "w1:t1");
     assert_eq!(tab_showing(&panes, SECOND_TAB_SCREEN), "w1:t2");
 
-    // Once the server saves again, the history it writes carries the fingerprint, so the next restart needs no exception.
+    // Once the server saves again, the history it writes carries the fingerprint of the layout it saved.
     server.wait_until_every_shell_answers();
-    let history_path = server.stop();
+    server.stop();
     let saved: serde_json::Value =
-        serde_json::from_slice(&fs::read(history_path).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(sandbox.history_path()).unwrap()).unwrap();
     assert!(
         saved["layout_fingerprint"]
             .as_str()
@@ -283,51 +346,84 @@ fn a_history_file_written_by_an_older_herdr_is_replayed_when_its_structure_match
         "the history saved after the restore must carry a layout fingerprint: {}",
         saved["layout_fingerprint"]
     );
+
+    // A second server on the files the first one saved replays the screens again. A file with a fingerprint is replayed
+    // only when the fingerprint is its layout's own, so this shows the saved fingerprint is the right one.
+    let second = start_server(&sandbox);
+    let panes = second.wait_for_the_saved_screens();
+    assert_eq!(tab_showing(&panes, FIRST_TAB_SCREEN), "w1:t1");
+    assert_eq!(tab_showing(&panes, SECOND_TAB_SCREEN), "w1:t2");
 }
 
 #[test]
 fn a_history_file_written_by_an_older_herdr_for_another_structure_is_not_replayed() {
-    // Every variant keeps the screen of pane 3 in the file, so a server that skipped the structure check would show it.
+    // Every variant is as new as the session file, and keeps the screen of pane 3 in the file, so only the structure
+    // check can reject it, and a server that skipped the check would show the screens.
     for why in [
         "one workspace more",
         "one workspace fewer",
         "one tab fewer",
-        "a pane the tab does not have",
+        "a pane the first tab does not have",
+        "a pane of another tab, in the second tab",
     ] {
-        let mut server = start_server_with_history(&|| {
-            let mut history = legacy_history();
-            match why {
-                "one workspace more" => history["workspaces"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(serde_json::json!({"tabs": []})),
-                "one workspace fewer" => {
-                    history["workspaces"].as_array_mut().unwrap().pop();
-                }
-                "one tab fewer" => {
-                    history["workspaces"][0]["tabs"]
+        let sandbox = prepare_sandbox(
+            &|| {
+                let mut history = legacy_history();
+                match why {
+                    "one workspace more" => history["workspaces"]
                         .as_array_mut()
                         .unwrap()
-                        .pop();
+                        .push(serde_json::json!({"tabs": []})),
+                    "one workspace fewer" => {
+                        history["workspaces"].as_array_mut().unwrap().pop();
+                    }
+                    "one tab fewer" => {
+                        history["workspaces"][0]["tabs"]
+                            .as_array_mut()
+                            .unwrap()
+                            .pop();
+                    }
+                    "a pane the first tab does not have" => {
+                        history["workspaces"][0]["tabs"][0]["panes"]["8"] =
+                            screen(FOREIGN_PANE_SCREEN)
+                    }
+                    // Pane 3 belongs to the first tab; the second tab has only pane 7.
+                    _ => {
+                        history["workspaces"][0]["tabs"][1]["panes"]["3"] =
+                            screen(FOREIGN_PANE_SCREEN)
+                    }
                 }
-                _ => {
-                    history["workspaces"][0]["tabs"][0]["panes"]["8"] = screen(FOREIGN_PANE_SCREEN)
-                }
-            }
-            history
-        });
+                history
+            },
+            HistoryWritten::AfterSession,
+        );
+        let mut server = start_server(&sandbox);
         assert_no_pane_shows_saved_screen(&server, why);
         server.stop();
     }
 }
 
 #[test]
+fn a_history_file_written_by_an_older_herdr_before_the_session_file_is_not_replayed() {
+    // The structure fits and the pane ids agree, but the history file is older than the session: a write of the
+    // history failed after that earlier save, so its raw pane ids may name other panes.
+    let sandbox = prepare_sandbox(&legacy_history, HistoryWritten::BeforeSession);
+    let mut server = start_server(&sandbox);
+    assert_no_pane_shows_saved_screen(&server, "a history file older than the session file");
+    server.stop();
+}
+
+#[test]
 fn a_history_file_with_a_fingerprint_of_another_layout_is_not_replayed_whatever_its_structure() {
-    let mut server = start_server_with_history(&|| {
-        let mut history = legacy_history();
-        history["layout_fingerprint"] = serde_json::json!("0".repeat(64));
-        history
-    });
+    let sandbox = prepare_sandbox(
+        &|| {
+            let mut history = legacy_history();
+            history["layout_fingerprint"] = serde_json::json!("0".repeat(64));
+            history
+        },
+        HistoryWritten::AfterSession,
+    );
+    let mut server = start_server(&sandbox);
     assert_no_pane_shows_saved_screen(&server, "a fingerprint that is not this layout's");
     server.stop();
 }

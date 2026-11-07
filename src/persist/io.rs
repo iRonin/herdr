@@ -133,11 +133,14 @@ pub fn load() -> Option<SessionSnapshot> {
 }
 
 pub fn load_history() -> Option<SessionHistorySnapshot> {
-    let path = session_history_path();
+    load_history_from(&session_history_path(), &session_path())
+}
+
+fn load_history_from(path: &Path, _session_path: &Path) -> Option<SessionHistorySnapshot> {
     if !path.exists() {
         return None;
     }
-    let content = match std::fs::read_to_string(&path) {
+    let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) => {
             warn!(err = %err, "failed to read session history file");
@@ -219,6 +222,92 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    fn set_modified(path: &Path, at: std::time::SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+
+    /// A saved session and a history file beside it, the history written with `fingerprint`.
+    fn saved_pair(name: &str, fingerprint: Option<&str>) -> (TestTempPath, TestTempPath) {
+        let (session_path, history_path) = temp_session_paths(name);
+        save_to_path(&session_path, &empty_snapshot()).unwrap();
+        let mut history = history_snapshot("saved screen");
+        history.layout_fingerprint = fingerprint.map(String::from);
+        save_history_to_path(&history_path, Some(&history)).unwrap();
+        (session_path, history_path)
+    }
+
+    fn at(seconds: u64, nanos: u32) -> std::time::SystemTime {
+        // A fixed instant whose nanoseconds are not round, so a comparison that drops them is seen.
+        std::time::UNIX_EPOCH + std::time::Duration::new(seconds, nanos)
+    }
+
+    #[test]
+    fn a_history_file_without_a_fingerprint_older_than_the_session_is_not_loaded() {
+        // Both writers rename the session first and the history second, so a history file from the same save is never
+        // older than the session file. An older one comes from an earlier save: its raw pane ids may name other panes.
+        let session_time = at(1_700_000_000, 123_456_789);
+        let cases = [
+            (
+                "a second newer",
+                session_time + std::time::Duration::from_secs(1),
+                true,
+            ),
+            (
+                "a nanosecond newer",
+                session_time + std::time::Duration::from_nanos(1),
+                true,
+            ),
+            ("the same instant", session_time, true),
+            (
+                "a nanosecond older",
+                session_time - std::time::Duration::from_nanos(1),
+                false,
+            ),
+            (
+                "a second older",
+                session_time - std::time::Duration::from_secs(1),
+                false,
+            ),
+            (
+                "an hour older",
+                session_time - std::time::Duration::from_secs(3600),
+                false,
+            ),
+        ];
+        for (name, history_time, loaded) in cases {
+            let (session_path, history_path) = saved_pair("legacy-age", None);
+            set_modified(&session_path, session_time);
+            set_modified(&history_path, history_time);
+            assert_eq!(
+                load_history_from(&history_path, &session_path).is_some(),
+                loaded,
+                "history without a fingerprint, written {name} than the session"
+            );
+        }
+    }
+
+    #[test]
+    fn a_history_file_with_a_fingerprint_is_loaded_whatever_its_age() {
+        // The fingerprint decides for such a file, at restore. Its age never rejects it here.
+        let (session_path, history_path) = saved_pair("fingerprinted-age", Some("0123abcd"));
+        set_modified(&session_path, at(1_700_000_000, 0));
+        set_modified(&history_path, at(1_600_000_000, 0));
+        assert!(load_history_from(&history_path, &session_path).is_some());
+    }
+
+    #[test]
+    fn a_history_file_without_a_fingerprint_is_not_loaded_when_the_session_time_is_unknown() {
+        // Without the session's time the file cannot be shown to belong to it: the answer is upstream's, no history.
+        let (session_path, history_path) = saved_pair("unknown-session-time", None);
+        clear_path(&session_path).unwrap();
+        assert!(load_history_from(&history_path, &session_path).is_none());
     }
 
     #[test]
