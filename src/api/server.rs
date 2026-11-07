@@ -1287,11 +1287,12 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    /// `env_lock` for the two tests that stop a real server. A test that fails while holding the
-    /// lock poisons it, and a plain `lock().unwrap()` would then fail the other of the two with a
-    /// `PoisonError` before its own check ran (its failure would say nothing about its own cause).
-    /// What the lock guards is the socket path variable, which each test sets and clears itself.
-    fn env_lock_after_a_failed_test() -> std::sync::MutexGuard<'static, ()> {
+    /// Takes `env_lock`. A test that fails while holding the lock poisons it, and a plain
+    /// `lock().unwrap()` would then fail every test that takes it afterwards with a `PoisonError`
+    /// before its own check ran (its failure would say nothing about its own cause, and a mutant
+    /// would be reported as killed by a test that measured nothing). What the lock guards is the
+    /// environment each test sets and clears itself, so the poison is ignored.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
         env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1459,7 +1460,7 @@ mod tests {
 
     #[test]
     fn api_accept_thread_spawn_failure_removes_bound_socket() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let dir = unique_test_path("api-accept-spawn-failure");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("herdr.sock");
@@ -1477,7 +1478,7 @@ mod tests {
 
     #[test]
     fn socket_path_prefers_explicit_env_override() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let unique = format!("/tmp/herdr-test-{}.sock", std::process::id());
         std::env::remove_var(crate::session::SESSION_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
@@ -1488,7 +1489,7 @@ mod tests {
 
     #[test]
     fn socket_path_defaults_to_config_dir_even_when_xdg_runtime_dir_is_set() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let config_home = unique_test_path("socket-default-config-home");
         let runtime_dir = unique_test_path("socket-default-runtime");
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
@@ -1508,7 +1509,7 @@ mod tests {
 
     #[test]
     fn socket_path_uses_named_session_dir() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let config_home = unique_test_path("socket-named-config-home");
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
@@ -1712,7 +1713,7 @@ mod tests {
         // WHY: a client that wants to hold one subscription per pane reads this from `ping`; an
         // older server omits it, so the client must be able to tell the two apart. The capability is
         // read from the real server over its socket, not from the builder function.
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let dir = unique_test_path("api-capability-ping");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("herdr.sock");
@@ -2460,7 +2461,7 @@ mod tests {
     fn dropping_the_server_handle_releases_a_held_subscription() {
         // Both intervals are 30 s, so only the wake-up in `ServerHandle::drop` can end a connection
         // that is blocked on the event hub within the deadline below.
-        let _guard = env_lock_after_a_failed_test();
+        let _guard = lock_env();
         let dir = unique_test_path("api-handle-drop");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("herdr.sock");
@@ -2510,7 +2511,7 @@ mod tests {
         // connection. With the production timing a stop that relied on the timeout would take 5 s;
         // here it must take under 2 s, for each of several connections.
         assert!(WaitTiming::default().liveness >= Duration::from_secs(5));
-        let _guard = env_lock_after_a_failed_test();
+        let _guard = lock_env();
         let dir = unique_test_path("api-shutdown-wakes");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("herdr.sock");
