@@ -757,3 +757,173 @@ async fn the_checkpoint_of_a_resumed_agents_pane_does_not_wait_for_a_background_
     std::env::remove_var("XDG_CONFIG_HOME");
     remove_scratch(&config_home);
 }
+
+/// Holds the session writer from another thread, as a background save does while it writes, until the returned sender fires
+/// (or ten seconds pass, so that a checkpoint that waits fails its test instead of hanging it).
+fn hold_the_session_writer(
+    app: &App,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let writer = app.session_writer.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _held = writer.lock().unwrap();
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+    locked_rx.recv().unwrap();
+    (release_tx, holder)
+}
+
+/// A checkpoint that finds the session writer busy writes nothing and says the pane is covered. The layout the running save
+/// writes was captured before the changes made since, so a stop that trusts it drops them: a new pane is missing from the
+/// saved layout and its agent is not resumed. The stop must write the layout the checkpoint captured, after the running save
+/// ends, and that layout holds both the changes and the pane that ended, with the session it is resumed from.
+#[tokio::test]
+async fn a_stop_after_a_checkpoint_that_found_the_writer_busy_still_saves_what_changed_since_the_background_save_began(
+) {
+    let _guard = crate::config::test_config_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut app, agent_pane, config_home) = app_with_resumed_agent(true);
+    let (release, holder) = hold_the_session_writer(&app);
+
+    // The background save captures its layout now and waits for the writer.
+    app.start_background_session_save();
+    assert!(app.session_save_thread.is_some());
+
+    // A change after that capture: a new workspace.
+    app.state
+        .workspaces
+        .push(crate::workspace::Workspace::test_new("added"));
+    app.state.ensure_test_terminals();
+    app.state.mark_session_dirty();
+    app.sync_session_save_schedule();
+
+    // The flagged agent's pane ends while the writer is busy.
+    app.handle_internal_event(crate::events::AppEvent::PaneDied {
+        pane_id: agent_pane,
+        exit_reason: ChildExitReason::Exited,
+    });
+    assert!(app.find_pane(agent_pane).is_none());
+
+    let _ = release.send(());
+    holder.join().unwrap();
+    app.save_session_on_shutdown();
+    if let Some(thread) = app.session_save_thread.take() {
+        thread.join().unwrap();
+    }
+
+    let snapshot = crate::persist::load().expect("the stop must leave a saved layout");
+    assert_eq!(
+        snapshot.workspaces.len(),
+        2,
+        "the workspace added after the background save began is not in the saved layout"
+    );
+    assert_eq!(
+        snapshot.workspaces[0].tabs[0].panes.len(),
+        2,
+        "both panes of the first workspace are in the saved layout"
+    );
+    assert_eq!(
+        snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .find_map(|pane| pane.agent_session.as_ref())
+            .map(|session| session.value.as_str()),
+        Some("/sessions/agent.jsonl"),
+        "the pane that ended lost the session it is resumed from"
+    );
+
+    std::env::remove_var("XDG_CONFIG_HOME");
+    remove_scratch(&config_home);
+}
+
+/// The layout a busy checkpoint kept is replaced by the next checkpoint that gets the writer: that one writes a newer layout, and
+/// a stop must not write the older one over it. (This passes before the kept layout exists; a mutant that keeps the old one
+/// shows what it guards.)
+#[tokio::test]
+async fn a_later_checkpoint_that_gets_the_writer_replaces_the_layout_an_earlier_busy_one_kept() {
+    let _guard = crate::config::test_config_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut app, _agent_pane, config_home) = app_with_resumed_agent(true);
+
+    let (release, holder) = hold_the_session_writer(&app);
+    app.checkpoint_session_layout_before_pane_exit();
+    let _ = release.send(());
+    holder.join().unwrap();
+
+    app.state
+        .workspaces
+        .push(crate::workspace::Workspace::test_new("added later"));
+    app.state.ensure_test_terminals();
+    app.state.mark_session_dirty();
+    app.checkpoint_session_layout_before_pane_exit();
+    app.save_session_on_shutdown();
+
+    let snapshot = crate::persist::load().expect("the later checkpoint wrote a layout");
+    assert_eq!(
+        snapshot.workspaces.len(),
+        2,
+        "a stop wrote the older layout that the busy checkpoint kept over the newer one"
+    );
+
+    std::env::remove_var("XDG_CONFIG_HOME");
+    remove_scratch(&config_home);
+}
+
+/// When the last workspace's panes end, the server creates a replacement workspace on its own, which schedules a save and
+/// would clear the checkpoint. The layout a busy checkpoint kept must survive that, as upstream's checkpoint does.
+#[tokio::test]
+async fn the_layout_a_busy_checkpoint_kept_survives_the_automatic_workspace_that_replaces_the_last_one(
+) {
+    let _guard = crate::config::test_config_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut app, agent_pane, config_home) = app_with_resumed_agent(true);
+    app.state.default_shell = "/bin/sh".into();
+    let other_pane = app.state.workspaces[0].tabs[0]
+        .panes
+        .keys()
+        .copied()
+        .find(|id| *id != agent_pane)
+        .unwrap();
+    let (release, holder) = hold_the_session_writer(&app);
+
+    app.handle_internal_event(crate::events::AppEvent::PaneDied {
+        pane_id: agent_pane,
+        exit_reason: ChildExitReason::Exited,
+    });
+    // The operating system signals every process: the other pane ends too, and the workspace is gone.
+    app.handle_internal_event(crate::events::AppEvent::PaneDied {
+        pane_id: other_pane,
+        exit_reason: ChildExitReason::Interrupted,
+    });
+    assert!(app.state.workspaces.is_empty());
+    assert!(app.ensure_default_workspace());
+
+    let _ = release.send(());
+    holder.join().unwrap();
+    app.save_session_on_shutdown();
+
+    let snapshot = crate::persist::load().expect("the stop must leave a saved layout");
+    assert_eq!(snapshot.workspaces.len(), 1);
+    assert_eq!(
+        snapshot.workspaces[0].tabs[0].panes.len(),
+        2,
+        "both panes are in the saved layout"
+    );
+    assert_eq!(
+        snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .find_map(|pane| pane.agent_session.as_ref())
+            .map(|session| session.value.as_str()),
+        Some("/sessions/agent.jsonl")
+    );
+
+    shut_down_runtimes(&mut app);
+    std::env::remove_var("XDG_CONFIG_HOME");
+    remove_scratch(&config_home);
+}
