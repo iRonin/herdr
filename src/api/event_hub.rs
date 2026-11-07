@@ -335,6 +335,12 @@ impl EventWaiter {
     pub(super) fn wake_count(&self) -> u64 {
         self.shared.wakes.load(Ordering::Relaxed)
     }
+
+    /// How many interests the hub scans for this waiter on every push.
+    #[cfg(test)]
+    pub(super) fn interest_count(&self) -> usize {
+        self.shared.interests.len()
+    }
 }
 
 impl Drop for EventWaiter {
@@ -434,7 +440,22 @@ impl EventHub {
     /// (see `WakeInterest`), by `wake_waiters`, and by a backlog of events it has not looked at
     /// (see `LAG_WAKE_EVENTS`). Register BEFORE the first `EventWaiter::cursor`; the registration
     /// ends when the returned guard is dropped.
+    ///
+    /// Equal interests are kept once: every `push` scans every interest of every waiter with the
+    /// hub mutex held, on the application's thread, and one request can carry tens of thousands of
+    /// identical subscriptions. What is left is at most one interest per event kind plus one or two
+    /// per distinct pane.
     pub(super) fn waiter(&self, interests: Vec<WakeInterest>) -> EventWaiter {
+        let mut seen = std::collections::HashSet::new();
+        let interests: Vec<WakeInterest> = interests
+            .into_iter()
+            .filter(|interest| {
+                seen.insert((
+                    interest.kind.map(|kind| std::mem::discriminant(&kind)),
+                    interest.pane.clone(),
+                ))
+            })
+            .collect();
         let shared = Arc::new(Waiter {
             interests,
             wake: Condvar::new(),
@@ -895,6 +916,61 @@ mod tests {
         let cursor = waiter.cursor();
         hub.push(event);
         waiter.wait_after(cursor, Duration::from_millis(5))
+    }
+
+    #[test]
+    fn equal_interests_are_registered_once() {
+        // WHY: `push` scans every interest of every waiter with the hub mutex held, on the
+        // application's thread, and a single request can carry tens of thousands of identical
+        // subscriptions: the scan must stay bounded by what is distinct, and dropping the copies
+        // must not change what wakes the waiter.
+        let hub = EventHub::default();
+        let mut interests = Vec::new();
+        for _ in 0..5_000 {
+            interests.push(WakeInterest::kind(EventKind::PaneCreated));
+            interests.push(WakeInterest::pane("pane_a"));
+            interests.push(WakeInterest::pane_kind(
+                "pane_a",
+                EventKind::PaneReadStateChanged,
+            ));
+            interests.push(WakeInterest::pane_kind(
+                "pane_b",
+                EventKind::PaneReadStateChanged,
+            ));
+        }
+        let waiter = hub.waiter(interests);
+        assert_eq!(waiter.interest_count(), 4);
+        // Each distinct interest still wakes the waiter, and nothing else does.
+        assert!(woken_by(
+            &hub,
+            &waiter,
+            sample(EventKind::PaneCreated, "pane_c")
+        ));
+        assert!(woken_by(
+            &hub,
+            &waiter,
+            sample(EventKind::PaneAgentStatusChanged, "pane_a")
+        ));
+        assert!(woken_by(
+            &hub,
+            &waiter,
+            sample(EventKind::PaneReadStateChanged, "pane_b")
+        ));
+        assert!(!woken_by(
+            &hub,
+            &waiter,
+            sample(EventKind::PaneAgentStatusChanged, "pane_b")
+        ));
+        // Interests that differ only in the kind or only in the pane are not copies.
+        let distinct = hub.waiter(vec![
+            WakeInterest::kind(EventKind::PaneCreated),
+            WakeInterest::kind(EventKind::PaneClosed),
+            WakeInterest::pane("pane_a"),
+            WakeInterest::pane("pane_b"),
+            WakeInterest::pane_kind("pane_a", EventKind::PaneClosed),
+            WakeInterest::pane_kind("pane_b", EventKind::PaneClosed),
+        ]);
+        assert_eq!(distinct.interest_count(), 6);
     }
 
     #[test]
