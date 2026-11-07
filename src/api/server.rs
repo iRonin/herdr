@@ -2043,6 +2043,145 @@ mod tests {
         assert_eq!(response["result"]["agent"]["agent_status"], "idle");
     }
 
+    /// Runs an `agent.wait` on pane_1 (agent_get answers working, then idle) with both intervals at
+    /// 30 s, publishes `event` once the wait is blocked on the hub, and returns its response. Panics
+    /// when the wait does not end within 3 s: only the hub wake can end it that fast.
+    fn agent_wait_response_to_event(
+        case: &str,
+        event: crate::api::schema::EventEnvelope,
+    ) -> serde_json::Value {
+        use crate::api::schema::AgentStatus;
+
+        let event_hub = EventHub::with_timing(WaitTiming {
+            liveness: Duration::from_secs(30),
+            agent_status_snapshot: Duration::from_secs(30),
+        });
+        let (first_get_tx, first_get_rx) = std::sync::mpsc::channel();
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let mut gets = 0;
+            while let Some(msg) = api_rx.blocking_recv() {
+                assert!(matches!(msg.request.method, Method::AgentGet(_)));
+                gets += 1;
+                let status = if gets == 1 {
+                    AgentStatus::Working
+                } else {
+                    AgentStatus::Idle
+                };
+                msg.respond_to
+                    .send(
+                        serde_json::to_string(&SuccessResponse {
+                            id: msg.request.id,
+                            result: ResponseResult::AgentInfo {
+                                agent: agent_info(status),
+                            },
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+                if gets == 1 {
+                    first_get_tx.send(()).unwrap();
+                }
+            }
+        });
+
+        let (mut client, server, _path) = local_stream_pair(&format!("agent-wait-kind-{case}"));
+        client
+            .write_all(
+                format!(
+                    r#"{{"id":"wait_{case}","method":"agent.wait","params":{{"target":"worker","until":["idle"],"timeout_ms":60000}}}}"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let server_event_hub = event_hub.clone();
+        let server_api_tx = api_tx.clone();
+        let server_thread = std::thread::spawn(move || {
+            handle_connection(
+                server,
+                &server_api_tx,
+                &server_event_hub,
+                &server_running,
+                None,
+            )
+        });
+        first_get_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Let the wait finish its first pass and block on the hub.
+        std::thread::sleep(Duration::from_millis(300));
+
+        event_hub.push(event);
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = line_tx.send(read_line(&mut client));
+        });
+        let line = line_rx.recv_timeout(Duration::from_secs(3));
+        // Release the connection whatever happened above, so a failure does not hang the test.
+        running.store(false, Ordering::Relaxed);
+        event_hub.wake_waiters();
+        server_thread.join().unwrap().unwrap();
+        drop(api_tx);
+        responder.join().unwrap();
+        let line = line.unwrap_or_else(|_| {
+            panic!("the agent wait ({case}) did not end within 3 s of the event: nothing woke it")
+        });
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], format!("wait_{case}"));
+        response
+    }
+
+    #[test]
+    fn an_agent_wait_reacts_at_once_to_every_kind_of_event_about_its_pane() {
+        // WHY: the agent wait's event loop reacts to six kinds of event about its pane, and the
+        // interest it registers with the hub (`WakeInterest::pane`) has to cover every one of them,
+        // or that event ends the wait only at the liveness tick (5 s). The drift check of the
+        // subscriptions cannot see this loop, so each kind is run through the real wait with both
+        // intervals at 30 s. An interest narrowed to the status event alone fails every case but
+        // the first.
+        use crate::api::event_hub::samples::event;
+        use crate::api::schema::{EventData, EventEnvelope, EventKind};
+
+        // Events that make the wait probe the agent (which then says idle: the wait is matched).
+        for (case, kind) in [
+            ("status", EventKind::PaneAgentStatusChanged),
+            ("updated", EventKind::PaneUpdated),
+            ("detected", EventKind::PaneAgentDetected),
+        ] {
+            let response = agent_wait_response_to_event(case, event(kind, "pane_1"));
+            assert!(response.get("error").is_none(), "{case}: {response}");
+            assert_eq!(
+                response["result"]["agent"]["agent_status"], "idle",
+                "{case}: {response}"
+            );
+        }
+        // Events that end the wait: the agent is gone from the pane it waits on.
+        let released = EventEnvelope {
+            event: EventKind::PaneAgentDetected,
+            data: EventData::PaneAgentDetected {
+                pane_id: "pane_1".into(),
+                workspace_id: "workspace_1".into(),
+                agent: Some("pi".into()),
+                released: true,
+                final_status: None,
+            },
+        };
+        for (case, event) in [
+            ("released", released),
+            ("moved", event(EventKind::PaneMoved, "pane_1")),
+            ("closed", event(EventKind::PaneClosed, "pane_1")),
+            ("exited", event(EventKind::PaneExited, "pane_1")),
+        ] {
+            let response = agent_wait_response_to_event(case, event);
+            assert_eq!(
+                response["error"]["code"], "agent_not_running",
+                "{case}: {response}"
+            );
+        }
+    }
+
     #[test]
     fn events_wait_agent_status_returns_initial_match() {
         let (api_tx, responder) =
