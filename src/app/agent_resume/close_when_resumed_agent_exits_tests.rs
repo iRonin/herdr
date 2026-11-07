@@ -496,8 +496,8 @@ async fn a_clean_agent_end_closes_the_pane_and_only_when_the_setting_is_on() {
     }
 }
 
-/// A crash, a kill and a missing command keep the pane. The agent binary crashed on its first render in every resumed pane at
-/// once on 29 Sep 2026: closing those panes would have taken their saved sessions out of the layout.
+/// A crash, a kill and a missing command keep the pane. An agent binary that crashes on its first render does so in every
+/// resumed pane at once: closing those panes would take their saved sessions out of the layout.
 #[tokio::test]
 async fn an_agent_that_does_not_end_normally_keeps_its_pane() {
     for name in REAL_SHELLS {

@@ -2321,6 +2321,85 @@ mod tests {
         assert!(!received.closes_when_resumed_agent_exits);
     }
 
+    /// A pane that was started with a command (so its layout holds a launch command), resumed by a restart and typed
+    /// `<agent> && exit`, must still end with its agent after a live handoff. Every imported pane with a launch command is
+    /// otherwise given a fresh shell when its shell exits, which would keep the pane open as an idle shell, the very thing
+    /// the setting removes. A pane that is not flagged keeps that rule as it is (the control).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_handed_off_pane_that_closes_with_its_agent_is_not_given_a_fresh_shell_by_its_launch_command(
+    ) {
+        let launch_argv = vec!["pi".to_string(), "--model".to_string(), "opus".to_string()];
+        for flagged in [false, true] {
+            let (snapshot, _) = snapshot_with_saved_pane_history();
+            let (events, _events_rx) = mpsc::channel(32);
+            let (workspaces, terminals, runtimes) = restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                4096,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+                events.clone(),
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            let mut snapshot_now = crate::persist::capture(
+                &workspaces,
+                &terminals,
+                &crate::terminal::TerminalRuntimeRegistry::from(HashMap::new()),
+                Some(0),
+                0,
+            );
+            // The layout the old server hands over carries the pane's saved launch command.
+            for pane in snapshot_now.workspaces[0].tabs[0].panes.values_mut() {
+                pane.launch_argv = Some(launch_argv.clone());
+            }
+            let pane_id = workspaces[0].tabs[0].panes.keys().next().copied().unwrap();
+            let runtime = runtimes.values().next().unwrap();
+            runtime
+                .pause_handoff_reader(std::time::Duration::from_secs(2))
+                .unwrap();
+            let mut state = runtime.handoff_runtime_state(pane_id.raw());
+            state.closes_when_resumed_agent_exits = flagged;
+            let mut imports = HashMap::from([(
+                pane_id.raw(),
+                crate::handoff_runtime::ImportedHandoffRuntime {
+                    master_fd: runtime.duplicate_handoff_fd().unwrap(),
+                    state,
+                },
+            )]);
+            let (_, restored_terminals, restored_runtimes) = restore_handoff(
+                &snapshot_now,
+                4096,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                &mut imports,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            )
+            .expect("handoff restore should import the pane");
+            assert_eq!(restored_terminals.len(), 1);
+            let terminal = restored_terminals.values().next().unwrap();
+            assert_eq!(
+                terminal.launch_argv.as_deref(),
+                Some(launch_argv.as_slice()),
+                "the saved launch command must survive the handoff, flagged or not"
+            );
+            assert_eq!(terminal.closes_when_resumed_agent_exits, flagged);
+            assert_eq!(
+                terminal.respawn_shell_on_exit, !flagged,
+                "flagged={flagged}: a pane typed `<agent> && exit` must close with its agent; any other imported pane with a \
+                 launch command keeps getting a fresh shell"
+            );
+            drop(restored_runtimes);
+            drop(runtimes);
+        }
+    }
+
     #[tokio::test]
     async fn restore_seeds_saved_pane_history_into_runtime() {
         let (snapshot, history) = snapshot_with_saved_pane_history();

@@ -17,6 +17,7 @@ const WAIT: Duration = Duration::from_secs(30);
 /// One test's world: a config home, a runtime dir, a session saved by an earlier "run" with one pane whose agent session is
 /// `session.jsonl`, and a fake agent named `pi` that the pane's shell finds first on its PATH.
 struct World {
+    launch_argv: Option<Vec<&'static str>>,
     base: PathBuf,
     config_home: PathBuf,
     runtime_dir: PathBuf,
@@ -26,6 +27,20 @@ struct World {
 
 impl World {
     fn new(agent_body: &str, setting: Option<bool>) -> Self {
+        Self::build(agent_body, setting, None)
+    }
+
+    /// Like `new`, with a pane that was started with a command: its saved layout holds the launch command
+    /// `pi --model opus`, which the restart replays (plus the session) instead of the plain resume command.
+    fn with_launch_command(agent_body: &str, setting: Option<bool>) -> Self {
+        Self::build(agent_body, setting, Some(vec!["pi", "--model", "opus"]))
+    }
+
+    fn build(
+        agent_body: &str,
+        setting: Option<bool>,
+        launch_argv: Option<Vec<&'static str>>,
+    ) -> Self {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -53,7 +68,7 @@ impl World {
         fs::write(
             &agent,
             format!(
-                "#!/bin/sh\necho \"start $$\" >> '{log}'\n{body}\n",
+                "#!/bin/sh\necho \"start $$\" >> '{log}'\necho \"args $*\" >> '{log}'\n{body}\n",
                 log = log.display(),
                 body = agent_body.replace("{LOG}", &log.display().to_string())
             ),
@@ -73,6 +88,7 @@ impl World {
         )
         .unwrap();
         let world = Self {
+            launch_argv,
             base,
             config_home,
             runtime_dir,
@@ -84,15 +100,19 @@ impl World {
     }
 
     fn save_session(&self) {
+        let mut pane = serde_json::json!({"cwd": self.base, "agent_session": {
+            "source": "herdr:pi", "agent": "pi", "kind": "path",
+            "value": self.session_path()
+        }});
+        if let Some(argv) = &self.launch_argv {
+            pane["launch_argv"] = serde_json::json!(argv);
+        }
         let snapshot = serde_json::json!({
             "version": 3, "active": 0, "selected": 0,
             "workspaces": [{
                 "id": "w1", "custom_name": "resumed", "identity_cwd": self.base,
                 "tabs": [{"layout": {"Pane": 7},
-                          "panes": {"7": {"cwd": self.base, "agent_session": {
-                              "source": "herdr:pi", "agent": "pi", "kind": "path",
-                              "value": self.session_path()
-                          }}},
+                          "panes": {"7": pane},
                           "zoomed": false, "focused": 7, "root_pane": 7}]
             }]
         });
@@ -105,6 +125,15 @@ impl World {
 
     fn agent_log(&self) -> String {
         fs::read_to_string(self.base.join("agent.log")).unwrap_or_default()
+    }
+
+    /// The arguments of every run of the fake agent, one string per run.
+    fn agent_args(&self) -> Vec<String> {
+        self.agent_log()
+            .lines()
+            .filter_map(|line| line.strip_prefix("args "))
+            .map(str::to_string)
+            .collect()
     }
 
     fn agent_starts(&self) -> Vec<u32> {
@@ -141,7 +170,7 @@ impl World {
             .unwrap();
         support::register_spawned_herdr_pid(Some(child.id()));
         support::wait_for_socket(&self.socket, Duration::from_secs(10));
-        Server { child }
+        Server { child, gone: false }
     }
 
     fn api(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -241,9 +270,55 @@ impl Drop for World {
 
 struct Server {
     child: Child,
+    /// The child has been waited for: its pid may be reused, so it must not be signalled again.
+    gone: bool,
 }
 
 impl Server {
+    /// A live handoff through the API: the server starts a replacement, hands every pane over and ends. Returns when the
+    /// replacement answers on the same socket.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn live_handoff(mut self, world: &World) -> HandedOffServer {
+        let before =
+            support::herdr_server_pids_for_runtime_dir(&world.runtime_dir).unwrap_or_default();
+        let moved = world.api("server.live_handoff", serde_json::json!({}));
+        assert!(moved.get("error").is_none(), "{moved}");
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(status.success(), "the old server ended with {status:?}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the old server did not end after the handoff"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let old_pid = self.child.id();
+        support::unregister_spawned_herdr_pid(Some(old_pid));
+        self.gone = true;
+        let deadline = Instant::now() + WAIT;
+        let replacement = loop {
+            let pids =
+                support::herdr_server_pids_for_runtime_dir(&world.runtime_dir).unwrap_or_default();
+            if let Some(pid) = pids
+                .iter()
+                .copied()
+                .find(|pid| *pid != old_pid && !before.contains(pid))
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no replacement server appeared; servers: {pids:?}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        support::wait_for_socket(&world.socket, Duration::from_secs(10));
+        HandedOffServer { pid: replacement }
+    }
+
     /// `herdr server stop` through the API, then waits for the process to end.
     fn stop(mut self, world: &World) {
         let stopped = world.api("server.stop", serde_json::json!({}));
@@ -262,6 +337,9 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        if self.gone {
+            return;
+        }
         let pid = self.child.id();
         // portable-pty-free: SIGTERM asks the server to stop; the kill is the last resort.
         unsafe {
@@ -279,6 +357,45 @@ impl Drop for Server {
         let _ = self.child.wait();
         support::unregister_spawned_herdr_pid(Some(pid));
     }
+}
+
+/// The server that took over the panes in a live handoff. It is not a child of the test, so it is stopped through the API and
+/// waited for by its pid.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct HandedOffServer {
+    pid: u32,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl HandedOffServer {
+    fn stop(self, world: &World) {
+        let stopped = world.api("server.stop", serde_json::json!({}));
+        assert!(stopped.get("error").is_none(), "{stopped}");
+        let deadline = Instant::now() + WAIT;
+        while !process_is_gone(self.pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the replacement server did not stop"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+/// True when no live process has this pid (a zombie that nobody has reaped yet counts as gone).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn process_is_gone(pid: u32) -> bool {
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        return true;
+    }
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit(')')
+                .next()
+                .map(|rest| rest.trim_start().to_string())
+        })
+        .is_some_and(|rest| rest.starts_with('Z'))
 }
 
 /// An agent that stays until it is told to stop, and exits 0 on SIGHUP or SIGTERM (a well-behaved agent), writing which.
@@ -379,8 +496,8 @@ fn a_clean_agent_end_closes_the_pane_only_when_the_setting_is_on() {
     }
 }
 
-/// A crash keeps the pane, with the setting on. On 29 Sep 2026 the agent binary crashed on its first render in every resumed
-/// pane at once; closing those panes would have taken their sessions out of the layout.
+/// A crash keeps the pane, with the setting on. An agent binary that crashes on its first render does so in every resumed pane
+/// at once; closing those panes would take their sessions out of the layout.
 #[test]
 fn a_crashed_agent_keeps_its_pane_and_its_shell() {
     let world = World::new("exit 1", Some(true));
@@ -392,5 +509,85 @@ fn a_crashed_agent_keeps_its_pane_and_its_shell() {
     world.type_into(&panes[0], &format!("touch '{}'", alive.display()));
     world.wait_until("the shell to answer after the crash", |_| alive.exists());
     assert_eq!(world.pane_ids(), panes);
+    server.stop(&world);
+}
+
+/// A pane that was started with a command (its layout holds a launch command) is resumed by a restart, then handed to a new
+/// server in a live handoff. When its agent ends normally on the new server the pane must close with it: the new server must
+/// not give the pane a fresh shell the way it does for any other imported pane with a launch command.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_pane_started_with_a_command_closes_with_its_agent_after_a_live_handoff() {
+    let world = World::with_launch_command(WELL_BEHAVED_AGENT, Some(true));
+    let server = world.start();
+    world.wait_until("the agent to be resumed", |w| w.agent_starts().len() == 1);
+    // The restart replayed the saved launch command: its flags, then the session. Without that this test would not be about a
+    // pane with a launch command.
+    let args = world.agent_args();
+    assert!(
+        args.len() == 1 && args[0].starts_with("--model opus --session "),
+        "the launch command was not replayed: {args:?}"
+    );
+    let agent_pid = world.agent_starts()[0];
+    assert_eq!(world.pane_ids().len(), 1);
+
+    let handed = server.live_handoff(&world);
+    assert_eq!(world.pane_ids().len(), 1, "the handoff lost the pane");
+
+    // The agent ends normally on the new server: SIGTERM, exit status 0, then the shell's `exit`.
+    assert_eq!(
+        unsafe { libc::kill(agent_pid as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    world.wait_until("the pane to close on the new server", |w| {
+        w.pane_ids().is_empty()
+    });
+    assert!(world.agent_log().contains("got-term"));
+    handed.stop(&world);
+}
+
+/// The flag that a pane closes with its agent crosses a live handoff: the old server typed the exit into the pane's shell, the
+/// new server must still treat the pane's end like the old one did. A pane that ends on the new server just before it stops
+/// is still in the layout it saves last, with its agent session; the next start resumes it. This fails when either half of
+/// the handoff field is missing, the old server's export or the new server's import.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_pane_that_ends_after_a_live_handoff_is_still_in_the_saved_layout_with_its_session() {
+    let world = world_with_a_well_behaved_agent(Some(true));
+    let server = world.start();
+    world.wait_until("the agent to be resumed", |w| w.agent_starts().len() == 1);
+    let agent_pid = world.agent_starts()[0];
+
+    let handed = server.live_handoff(&world);
+    assert_eq!(world.pane_ids().len(), 1, "the handoff lost the pane");
+
+    assert_eq!(
+        unsafe { libc::kill(agent_pid as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    world.wait_until("the pane to close on the new server", |w| {
+        w.pane_ids().is_empty()
+    });
+    assert!(world.agent_log().contains("got-term"));
+    handed.stop(&world);
+
+    let (panes, sessions) = world.saved_layout();
+    assert_eq!(
+        panes,
+        1,
+        "the pane that ended after the handoff is not in the saved layout\n{}",
+        world.diagnostics()
+    );
+    assert_eq!(
+        sessions,
+        vec![world.session_path().display().to_string()],
+        "the layout saved after the handoff lost the agent's session\n{}",
+        world.diagnostics()
+    );
+
+    let server = world.start();
+    world.wait_until("the agent to be resumed again", |w| {
+        w.agent_starts().len() == 2
+    });
     server.stop(&world);
 }
