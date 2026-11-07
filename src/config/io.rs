@@ -416,6 +416,13 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
             .problem()
             .map(str::to_string),
     );
+    diagnostics.extend(
+        config
+            .session
+            .close_pane_when_resumed_agent_exits
+            .problem()
+            .map(str::to_string),
+    );
 
     Ok(LoadedConfig {
         config,
@@ -1079,6 +1086,80 @@ ssh_config_files = ["~/.config/my host/ssh_config", "/etc/extra_config"]
             assert_eq!(startup.config.session.log_retained_files.files(), 3);
             assert!(startup.diagnostics.is_empty(), "{:?}", startup.diagnostics);
         });
+    }
+
+    /// A wrong type for `close_pane_when_resumed_agent_exits` is reported for that key alone, at startup and on a reload.
+    /// Any other wrong type makes the startup load fall back to the defaults for EVERY setting (a parse error).
+    #[test]
+    fn a_bad_close_pane_when_resumed_agent_exits_value_is_reported_without_resetting_other_settings(
+    ) {
+        for bad in ["\"yes\"", "1", "1979-05-27"] {
+            let content = format!("[session]\nclose_pane_when_resumed_agent_exits = {bad}\nstop_timeout_ms = 5000\n[agent]\npi_program = \"custom-pi\"\n");
+            with_config_file(Some(&content), || {
+                let startup = Config::load();
+                assert_eq!(startup.config.agent.pi_program, "custom-pi", "{bad}");
+                assert_eq!(startup.config.session.stop_timeout_ms, 5000, "{bad}");
+                assert!(
+                    !startup
+                        .config
+                        .session
+                        .close_pane_when_resumed_agent_exits
+                        .enabled(),
+                    "{bad}"
+                );
+                assert_eq!(
+                    startup.diagnostics.len(),
+                    1,
+                    "{bad}: {:?}",
+                    startup.diagnostics
+                );
+                assert!(
+                    startup.diagnostics[0].starts_with(
+                        "session.close_pane_when_resumed_agent_exits must be true or false (got "
+                    ),
+                    "{bad}: {:?}",
+                    startup.diagnostics
+                );
+
+                let live = load_live_config().unwrap();
+                assert_eq!(live.config.agent.pi_program, "custom-pi", "{bad}");
+                assert_eq!(live.config.session.stop_timeout_ms, 5000, "{bad}");
+                // The startup load reads a TOML date through its key capture, as a string; the live load names it a datetime.
+                // Both report the key and its wrong type, and neither resets anything.
+                if bad != "1979-05-27" {
+                    assert_eq!(live.diagnostics, startup.diagnostics, "{bad}");
+                }
+                assert_eq!(live.diagnostics.len(), 1, "{bad}: {:?}", live.diagnostics);
+                assert!(
+                    live.diagnostics[0].starts_with(
+                        "session.close_pane_when_resumed_agent_exits must be true or false (got "
+                    ),
+                    "{bad}: {:?}",
+                    live.diagnostics
+                );
+                assert!(live.invalid_sections.is_empty(), "{bad}");
+            });
+        }
+
+        with_config_file(
+            Some("[session]\nclose_pane_when_resumed_agent_exits = true\n"),
+            || {
+                let startup = Config::load();
+                assert!(startup
+                    .config
+                    .session
+                    .close_pane_when_resumed_agent_exits
+                    .enabled());
+                assert!(startup.diagnostics.is_empty(), "{:?}", startup.diagnostics);
+                let live = load_live_config().unwrap();
+                assert!(live
+                    .config
+                    .session
+                    .close_pane_when_resumed_agent_exits
+                    .enabled());
+                assert!(live.diagnostics.is_empty(), "{:?}", live.diagnostics);
+            },
+        );
     }
 
     #[test]

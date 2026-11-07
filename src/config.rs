@@ -131,6 +131,12 @@ impl Config {
                     .problem()
                     .map(str::to_string),
             )
+            .chain(
+                self.session
+                    .close_pane_when_resumed_agent_exits
+                    .problem()
+                    .map(str::to_string),
+            )
             .collect()
     }
 

@@ -438,6 +438,10 @@ pub struct SessionConfig {
     /// Rotated copies to keep beside herdr-server.log and herdr-client.log. Default: 0 (none, as upstream).
     /// Read when each herdr process starts; a bad value is reported by `herdr config check` and keeps the other settings.
     pub log_retained_files: crate::logging::LogRetention,
+    /// Close a pane in which a server restart resumed an agent when that agent ends normally (exit status 0), instead of
+    /// leaving an idle shell. Default: false (as upstream). A crash, a signal or a shell herdr does not know keeps the pane.
+    /// A bad value is reported by `herdr config check` and keeps the other settings.
+    pub close_pane_when_resumed_agent_exits: crate::agent_resume::CloseResumedPane,
 }
 
 fn default_stop_timeout_ms() -> u64 {
@@ -451,6 +455,7 @@ impl Default for SessionConfig {
             startup_per_agent_delay_ms: 100,
             stop_timeout_ms: default_stop_timeout_ms(),
             log_retained_files: crate::logging::LogRetention::default(),
+            close_pane_when_resumed_agent_exits: crate::agent_resume::CloseResumedPane::default(),
         }
     }
 }
@@ -1809,6 +1814,83 @@ stop_timeout_ms = 5000
             assert!(
                 diagnostics[0].contains("session.log_retained_files"),
                 "{diagnostics:?}"
+            );
+            // `config_diagnostic_summary` words its notice from these phrases: a bad value for this one key must not
+            // claim that the defaults are in use.
+            assert!(
+                !diagnostics[0].contains("using defaults"),
+                "{diagnostics:?}"
+            );
+            assert!(
+                !diagnostics[0].contains("keeping current config"),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn close_pane_when_resumed_agent_exits_defaults_off_as_upstream_and_parses() {
+        let default_config: Config = toml::from_str("").unwrap();
+        assert!(!default_config
+            .session
+            .close_pane_when_resumed_agent_exits
+            .enabled());
+        assert_eq!(
+            default_config
+                .session
+                .close_pane_when_resumed_agent_exits
+                .problem(),
+            None
+        );
+        assert!(!Config::default()
+            .session
+            .close_pane_when_resumed_agent_exits
+            .enabled());
+
+        for (value, enabled) in [("true", true), ("false", false)] {
+            let config: Config = toml::from_str(&format!(
+                "[session]\nclose_pane_when_resumed_agent_exits = {value}\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                config.session.close_pane_when_resumed_agent_exits.enabled(),
+                enabled,
+                "{value}"
+            );
+            assert!(config.collect_diagnostics().is_empty(), "{value}");
+        }
+    }
+
+    /// A wrong type for the key is that key's problem alone. If it were a parse error, herdr would fall back to the defaults
+    /// for every setting in the file, and one of them can be the program name it detects the Pi agent by.
+    #[test]
+    fn a_bad_close_pane_when_resumed_agent_exits_value_parses_off_and_is_reported_as_a_diagnostic()
+    {
+        for (value, type_name) in [
+            ("\"yes\"", "string"),
+            ("1", "integer"),
+            ("0", "integer"),
+            ("2.5", "float"),
+            ("[true]", "array"),
+            // A datetime and an inline table reach the type as a map, not as a scalar.
+            ("1979-05-27", "datetime"),
+            ("{ enabled = true }", "table"),
+        ] {
+            let toml = format!("[session]\nclose_pane_when_resumed_agent_exits = {value}\nstop_timeout_ms = 5000\n[agent]\npi_program = \"custom-pi\"\n");
+            let config: Config = toml::from_str(&toml)
+                .unwrap_or_else(|err| panic!("{value} must not fail the whole config: {err}"));
+            assert!(
+                !config.session.close_pane_when_resumed_agent_exits.enabled(),
+                "{value}"
+            );
+            assert_eq!(config.session.stop_timeout_ms, 5000, "{value}");
+            assert_eq!(config.agent.pi_program, "custom-pi", "{value}");
+            let diagnostics = config.collect_diagnostics();
+            assert_eq!(diagnostics.len(), 1, "{value}: {diagnostics:?}");
+            assert_eq!(
+                diagnostics[0],
+                format!("session.close_pane_when_resumed_agent_exits must be true or false (got {type_name}); keeping it off"),
+                "{value}"
             );
             // `config_diagnostic_summary` words its notice from these phrases: a bad value for this one key must not
             // claim that the defaults are in use.

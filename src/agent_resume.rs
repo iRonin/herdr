@@ -107,6 +107,49 @@ impl AgentResumePlan {
     }
 }
 
+/// The `[session] close_pane_when_resumed_agent_exits` setting: a pane in which a server restart resumed an agent closes
+/// when that agent ends normally. The default, false, is upstream's behaviour: the pane stays as an idle shell. Any value in
+/// the file deserializes: a bad one becomes a per-key problem (see `problem`) and the setting stays off, instead of a parse
+/// error, which would reset every setting in the file to its default (the program name herdr detects the Pi agent by included).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CloseResumedPane {
+    enabled: bool,
+    problem: Option<String>,
+}
+
+impl CloseResumedPane {
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// What is wrong with the configured value, when something is. The value in use is named in the text.
+    pub fn problem(&self) -> Option<&str> {
+        self.problem.as_deref()
+    }
+
+    pub(crate) fn from_value(value: &toml::Value) -> Self {
+        match value {
+            toml::Value::Boolean(enabled) => Self {
+                enabled: *enabled,
+                problem: None,
+            },
+            other => Self {
+                enabled: false,
+                problem: Some(format!(
+                    "session.close_pane_when_resumed_agent_exits must be true or false (got {}); keeping it off",
+                    other.type_str()
+                )),
+            },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CloseResumedPane {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        toml::Value::deserialize(deserializer).map(|value| Self::from_value(&value))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedAgentSession {
     pub source: String,

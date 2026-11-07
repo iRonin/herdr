@@ -636,6 +636,75 @@ fn config_check_accepts_log_retained_files_and_reports_a_bad_value_for_that_key_
     cleanup_test_base(&base);
 }
 
+/// `[session] close_pane_when_resumed_agent_exits` is a boolean. A value of another type must be reported for that key
+/// alone: a parse error would make herdr fall back to the defaults for every setting in the file.
+#[test]
+fn config_check_accepts_close_pane_when_resumed_agent_exits_and_reports_a_bad_value_for_that_key_alone(
+) {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let config_dir = config_home.join(app_dir_name());
+    fs::create_dir_all(&config_dir).unwrap();
+    let check = |config: &str| {
+        fs::write(config_dir.join("config.toml"), config).unwrap();
+        let output = run_named_cli(&config_home, &runtime_dir, &["config", "check"]);
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    };
+
+    for good in ["true", "false"] {
+        let (code, stdout) = check(&format!(
+            "[session]\nclose_pane_when_resumed_agent_exits = {good}\n"
+        ));
+        assert_eq!(
+            code,
+            Some(0),
+            "close_pane_when_resumed_agent_exits = {good}: {stdout}"
+        );
+        assert!(stdout.contains("config: ok"), "{stdout}");
+    }
+
+    for (bad, expected) in [
+        (
+            "\"yes\"",
+            "session.close_pane_when_resumed_agent_exits must be true or false (got string)",
+        ),
+        (
+            "1",
+            "session.close_pane_when_resumed_agent_exits must be true or false (got integer)",
+        ),
+        (
+            "2.5",
+            "session.close_pane_when_resumed_agent_exits must be true or false (got float)",
+        ),
+    ] {
+        let (code, stdout) = check(&format!(
+            "[session]\nclose_pane_when_resumed_agent_exits = {bad}\nstop_timeout_ms = 5000\n"
+        ));
+        assert_eq!(
+            code,
+            Some(1),
+            "close_pane_when_resumed_agent_exits = {bad}: {stdout}"
+        );
+        assert!(stdout.contains(expected), "{bad}: {stdout}");
+        // A known key with a bad value is a diagnostic of its own, not an unknown key and not a failed parse that
+        // resets every other setting.
+        assert!(!stdout.contains("unknown config key"), "{bad}: {stdout}");
+        assert!(!stdout.contains("using defaults"), "{bad}: {stdout}");
+        assert!(!stdout.contains("parse error"), "{bad}: {stdout}");
+        assert_eq!(
+            stdout.lines().count(),
+            2,
+            "one issue and nothing else: {stdout}"
+        );
+    }
+
+    cleanup_test_base(&base);
+}
+
 #[test]
 fn config_check_reports_unknown_theme_names() {
     let base = unique_test_dir();

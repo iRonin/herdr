@@ -456,6 +456,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # The maximum is 10. Read when each herdr process starts.
 # log_retained_files = 0
 
+# Close a pane in which a server restart resumed an agent when that agent ends normally (exit
+# status 0), instead of leaving an idle shell. A crash, a kill or a missing command keeps the
+# pane. Applies to bash, zsh, sh, dash and fish panes; other shells keep the pane open.
+# close_pane_when_resumed_agent_exits = false
+
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.
 # When true (default), herdr runs remote ssh through a generated config that

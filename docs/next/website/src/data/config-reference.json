@@ -1527,6 +1527,12 @@
           "type": "integer",
           "default": "0",
           "description": "Rotated copies to keep beside herdr-server.log and herdr-client.log when a log reaches its 5 MB size limit (herdr-server.log.1, .2, and so on). 0 keeps none: the full log is deleted, as before. The maximum is 10: a value above 10 keeps 10 copies; any other value that is not a whole number of 0 or more keeps none. herdr config check reports both, and other settings are not affected. Lowering the number does not delete the higher-numbered copies. Read when each herdr process starts: restart the server to apply."
+        },
+        {
+          "key": "session.close_pane_when_resumed_agent_exits",
+          "type": "boolean",
+          "default": "false",
+          "description": "Close a pane in which a server restart resumed an agent when that agent ends normally (exit status 0), instead of leaving an idle shell. herdr types `<resume command> && exit` into the pane's shell (`; and exit` for fish); a crash, a kill or a missing command (any other exit status) keeps the pane open. Applies to panes whose shell is sh, dash, bash, zsh or fish; for any other shell the command is typed unchanged, the pane stays open, and the server log names the shell once. Read when each resume command is typed, so a config reload applies to the next resume. A value that is not true or false is reported by herdr config check, keeps the setting off, and does not affect other settings."
         }
       ]
     },
