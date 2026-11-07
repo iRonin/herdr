@@ -156,6 +156,9 @@ pub struct App {
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     session_writer: Arc<std::sync::Mutex<crate::persist::SessionWriter>>,
     pane_exit_checkpoint_pending: bool,
+    /// The layout a pane-exit checkpoint captured when a background save held the session writer, so that it could not write it.
+    /// Written by `save_session_on_shutdown` while the checkpoint is still pending; see `session.rs`.
+    deferred_checkpoint: Option<crate::persist::SessionSnapshot>,
     /// Shells for which `close_pane_when_resumed_agent_exits` could not be applied, each named once in the log.
     unsupported_resume_close_shells_logged: std::collections::HashSet<String>,
     /// Panes of a resumed agent whose end has already taken its session checkpoint, so that the second place that sees the
@@ -682,6 +685,7 @@ impl App {
             session_save_thread: None,
             session_writer,
             pane_exit_checkpoint_pending: false,
+            deferred_checkpoint: None,
             unsupported_resume_close_shells_logged: std::collections::HashSet::new(),
             resumed_agent_exit_checkpoints: std::collections::HashSet::new(),
             detached_process_children: Vec::new(),
@@ -794,18 +798,26 @@ impl App {
 
         let cwd = self.resolve_new_terminal_cwd(None);
         let preserve_checkpoint = self.pane_exit_checkpoint_pending && !self.state.session_dirty;
+        // Creating the workspace schedules a save, which clears the kept layout together with the pending flag.
+        let kept_checkpoint = if preserve_checkpoint {
+            self.deferred_checkpoint.take()
+        } else {
+            None
+        };
 
         match self.create_workspace_with_options(cwd, true) {
             Ok(_) => {
                 if preserve_checkpoint {
                     // Automatic replacement is part of pane removal, not a new user mutation.
                     self.pane_exit_checkpoint_pending = true;
+                    self.deferred_checkpoint = kept_checkpoint;
                     self.finish_checkpointed_pane_exit();
                 }
                 true
             }
             Err(err) => {
                 tracing::error!(err = %err, "failed to create default workspace");
+                self.deferred_checkpoint = kept_checkpoint;
                 self.state.mode = Mode::Navigate;
                 false
             }
