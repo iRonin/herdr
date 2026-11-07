@@ -413,6 +413,30 @@ pub(super) fn layout_fingerprint(snapshot: &SessionSnapshot) -> Option<String> {
     Some(format!("{:x}", Sha256::digest(bytes)))
 }
 
+/// Why a saved history file may be replayed into the restored panes, or that it may not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HistoryLayoutMatch {
+    /// The history carries the fingerprint of exactly this saved layout.
+    Fingerprint,
+    /// The history carries no fingerprint, so an older herdr wrote it, and its structure fits the saved layout.
+    LegacyStructure,
+    /// The history belongs to another layout, or cannot be shown to belong to this one.
+    Mismatch,
+}
+
+/// Decide whether `history` was saved together with `snapshot`.
+pub(super) fn match_history_to_layout(
+    history: &SessionHistorySnapshot,
+    snapshot: &SessionSnapshot,
+) -> HistoryLayoutMatch {
+    match history.layout_fingerprint.as_deref() {
+        Some(fingerprint) if layout_fingerprint(snapshot).as_deref() == Some(fingerprint) => {
+            HistoryLayoutMatch::Fingerprint
+        }
+        _ => HistoryLayoutMatch::Mismatch,
+    }
+}
+
 /// Capture pane screen history separately from the structural session snapshot.
 pub fn capture_history(
     snapshot: &SessionSnapshot,
@@ -650,6 +674,191 @@ mod tests {
         assert_ne!(
             layout_fingerprint(&snapshot).as_deref(),
             Some(expected.as_str())
+        );
+    }
+
+    /// What a saved session or history holds: workspace, then tab, then the raw ids of that tab's panes.
+    type Shape<'a> = &'a [&'a [&'a [u32]]];
+
+    fn session_of_shape(shape: Shape<'_>) -> SessionSnapshot {
+        let pane = || PaneSnapshot {
+            cwd: PathBuf::from("/"),
+            label: None,
+            agent_name: None,
+            managed_agent_kind: None,
+            agent_session: None,
+            agent_resume: None,
+            launch_argv: None,
+        };
+        SessionSnapshot {
+            version: SNAPSHOT_VERSION,
+            workspaces: shape
+                .iter()
+                .enumerate()
+                .map(|(index, tabs)| WorkspaceSnapshot {
+                    id: Some(format!("w{index}")),
+                    custom_name: None,
+                    identity_cwd: PathBuf::from("/"),
+                    worktree_space: None,
+                    public_pane_numbers: HashMap::new(),
+                    next_public_pane_number: 0,
+                    public_tab_numbers: Vec::new(),
+                    next_public_tab_number: 0,
+                    tabs: tabs
+                        .iter()
+                        .map(|ids| {
+                            let (last, rest) = ids.split_last().expect("a tab has a pane");
+                            TabSnapshot {
+                                custom_name: None,
+                                layout: rest.iter().rev().fold(
+                                    LayoutSnapshot::Pane(*last),
+                                    |second, id| LayoutSnapshot::Split {
+                                        direction: DirectionSnapshot::Horizontal,
+                                        ratio: 0.5,
+                                        first: Box::new(LayoutSnapshot::Pane(*id)),
+                                        second: Box::new(second),
+                                    },
+                                ),
+                                panes: ids.iter().map(|id| (*id, pane())).collect(),
+                                zoomed: false,
+                                focused: Some(ids[0]),
+                                root_pane: Some(ids[0]),
+                            }
+                        })
+                        .collect(),
+                    active_tab: 0,
+                })
+                .collect(),
+            active: Some(0),
+            selected: 0,
+            sidebar_width: Some(26),
+            sidebar_section_split: Some(0.5),
+            collapsed_space_keys: Default::default(),
+        }
+    }
+
+    fn history_of_shape(shape: Shape<'_>, fingerprint: Option<String>) -> SessionHistorySnapshot {
+        SessionHistorySnapshot {
+            version: SNAPSHOT_VERSION,
+            layout_fingerprint: fingerprint,
+            workspaces: shape
+                .iter()
+                .map(|tabs| WorkspaceHistorySnapshot {
+                    tabs: tabs
+                        .iter()
+                        .map(|ids| TabHistorySnapshot {
+                            panes: ids
+                                .iter()
+                                .map(|id| {
+                                    (
+                                        *id,
+                                        PaneHistorySnapshot {
+                                            ansi: format!("screen of pane {id}\r\n"),
+                                            lines: 1,
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn history_without_a_fingerprint_matches_only_a_session_of_the_same_structure() {
+        // The saved session: workspace 0 has a tab of panes 1 and 2 and a tab of pane 3; workspace 1 has a tab of pane 4.
+        let saved: Shape<'_> = &[&[&[1, 2], &[3]], &[&[4]]];
+        let session = session_of_shape(saved);
+        let legacy = HistoryLayoutMatch::LegacyStructure;
+        let no = HistoryLayoutMatch::Mismatch;
+        // A herdr that saved history left out every pane whose screen was blank: its panes are a subset of the session's.
+        let cases: &[(&str, Shape<'_>, HistoryLayoutMatch)] = &[
+            ("every pane has a screen", saved, legacy),
+            (
+                "a blank pane has no entry",
+                &[&[&[1], &[3]], &[&[4]]],
+                legacy,
+            ),
+            (
+                "a tab of blank panes has an empty entry",
+                &[&[&[], &[3]], &[&[4]]],
+                legacy,
+            ),
+            ("every pane is blank", &[&[&[], &[]], &[&[]]], legacy),
+            (
+                "an extra workspace",
+                &[&[&[1, 2], &[3]], &[&[4]], &[&[5]]],
+                no,
+            ),
+            ("a missing workspace", &[&[&[1, 2], &[3]]], no),
+            ("no workspace at all", &[], no),
+            ("an extra tab", &[&[&[1, 2], &[3], &[]], &[&[4]]], no),
+            ("a missing tab", &[&[&[1, 2]], &[&[4]]], no),
+            (
+                "a tab left out of a workspace",
+                &[&[&[1, 2], &[3]], &[]],
+                no,
+            ),
+            (
+                "a pane the session does not have",
+                &[&[&[1, 2, 9], &[3]], &[&[4]]],
+                no,
+            ),
+            ("a pane of another tab", &[&[&[1, 3], &[3]], &[&[4]]], no),
+            (
+                "a pane of another workspace",
+                &[&[&[1, 2], &[3]], &[&[4, 1]]],
+                no,
+            ),
+            (
+                "the tabs of a workspace swapped",
+                &[&[&[3], &[1, 2]], &[&[4]]],
+                no,
+            ),
+        ];
+        for (name, history_shape, expected) in cases {
+            let history = history_of_shape(history_shape, None);
+            assert_eq!(
+                match_history_to_layout(&history, &session),
+                *expected,
+                "history without a fingerprint, {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn history_with_a_fingerprint_matches_only_the_layout_it_was_saved_with() {
+        let saved: Shape<'_> = &[&[&[1, 2], &[3]], &[&[4]]];
+        let session = session_of_shape(saved);
+        let fingerprint = layout_fingerprint(&session).unwrap();
+
+        let same = history_of_shape(saved, Some(fingerprint));
+        assert_eq!(
+            match_history_to_layout(&same, &session),
+            HistoryLayoutMatch::Fingerprint
+        );
+
+        // The structure fits, the layout does not (a pane's directory changed): structure never rescues a fingerprint.
+        let mut moved = session_of_shape(saved);
+        moved.workspaces[0].tabs[0].panes.get_mut(&1).unwrap().cwd = PathBuf::from("/tmp");
+        assert_eq!(
+            match_history_to_layout(&same, &moved),
+            HistoryLayoutMatch::Mismatch,
+            "a fingerprinted history of another layout is ignored even when its structure fits"
+        );
+
+        // A fingerprint that is nobody's layout, over a structure that fits.
+        let invented = history_of_shape(saved, Some("0".repeat(64)));
+        assert_eq!(
+            match_history_to_layout(&invented, &session),
+            HistoryLayoutMatch::Mismatch
+        );
+        let empty = history_of_shape(saved, Some(String::new()));
+        assert_eq!(
+            match_history_to_layout(&empty, &session),
+            HistoryLayoutMatch::Mismatch
         );
     }
 

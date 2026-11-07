@@ -269,12 +269,19 @@ fn restore_with_imports_and_failures(
     render_dirty: Arc<RenderSignal>,
 ) -> RestoreFailures<RestoredSession> {
     let history = history.filter(|history| {
-        let matches = history.layout_fingerprint.is_some()
-            && history.layout_fingerprint == super::snapshot::layout_fingerprint(snapshot);
-        if !matches {
-            tracing::warn!("Ignoring pane history without a matching session layout");
+        match super::snapshot::match_history_to_layout(history, snapshot) {
+            super::snapshot::HistoryLayoutMatch::Fingerprint => true,
+            super::snapshot::HistoryLayoutMatch::LegacyStructure => {
+                tracing::info!(
+                    "Replaying pane history written by an older herdr: it has no layout fingerprint, but its structure matches the saved session"
+                );
+                true
+            }
+            super::snapshot::HistoryLayoutMatch::Mismatch => {
+                tracing::warn!("Ignoring pane history without a matching session layout");
+                false
+            }
         }
-        matches
     });
     let mut workspaces = Vec::new();
     let mut terminals = HashMap::new();
@@ -2296,18 +2303,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_rejects_history_from_another_layout_or_without_provenance() {
-        for legacy in [false, true] {
+    async fn restore_replays_history_by_fingerprint_or_for_an_older_herdr_by_structure() {
+        // A history file is replayed when it carries the fingerprint of this layout. One written by an older herdr carries no
+        // fingerprint: it is replayed only when its structure fits the saved session. Anything else is ignored.
+        // Every mismatch keeps pane 0's own screen in the file, so a restore that skipped the structure check would show it.
+        for (case, replayed) in [
+            ("a fingerprint of another layout, the same structure", false),
+            ("an older herdr, the same structure", true),
+            ("an older herdr, one pane more", false),
+            ("an older herdr, one tab more", false),
+            ("an older herdr, one workspace more", false),
+        ] {
             let (mut snapshot, history) = snapshot_with_saved_pane_history();
             let mut value = serde_json::to_value(history).unwrap();
-            if legacy {
+            if case.starts_with("an older herdr") {
                 value.as_object_mut().unwrap().remove("layout_fingerprint");
-            } else {
-                snapshot.workspaces[0].tabs[0]
-                    .panes
-                    .get_mut(&0)
-                    .unwrap()
-                    .cwd = std::env::temp_dir();
+            }
+            match case {
+                "a fingerprint of another layout, the same structure" => {
+                    snapshot.workspaces[0].tabs[0]
+                        .panes
+                        .get_mut(&0)
+                        .unwrap()
+                        .cwd = std::env::temp_dir();
+                }
+                "an older herdr, one pane more" => {
+                    let panes = value["workspaces"][0]["tabs"][0]["panes"]
+                        .as_object_mut()
+                        .unwrap();
+                    let screen = panes["0"].clone();
+                    panes.insert("9".to_string(), screen);
+                }
+                "an older herdr, one tab more" => {
+                    let tabs = value["workspaces"][0]["tabs"].as_array_mut().unwrap();
+                    tabs.push(serde_json::json!({"panes": {}}));
+                }
+                "an older herdr, one workspace more" => {
+                    let workspaces = value["workspaces"].as_array_mut().unwrap();
+                    workspaces.push(serde_json::json!({"tabs": []}));
+                }
+                _ => {}
             }
             let history = serde_json::from_value(value).unwrap();
             let (events, _rx) = mpsc::channel(8);
@@ -2325,11 +2360,12 @@ mod tests {
                 Arc::new(RenderSignal::new()),
             );
             let runtime = runtimes.values().next().unwrap();
-            assert!(
-                !runtime
+            assert_eq!(
+                runtime
                     .recent_unwrapped_text(10)
                     .contains("RESTORED_HISTORY"),
-                "screen history must belong to the exact saved layout"
+                replayed,
+                "{case}: screen history must be replayed only when it belongs to the saved layout"
             );
             for (_, runtime) in runtimes {
                 runtime.shutdown();
