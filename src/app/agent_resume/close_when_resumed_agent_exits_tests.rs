@@ -997,3 +997,63 @@ async fn a_checkpoint_before_a_started_background_save_takes_the_writer_still_ke
     std::env::remove_var("XDG_CONFIG_HOME");
     remove_scratch(&config_home);
 }
+
+/// A save thread that has finished but is not yet reaped (the handle is reaped only when the next background save starts, so it
+/// stays after every autosave) is not busy: its write has landed. The checkpoint must write the current layout at once and keep
+/// nothing, or every checkpoint after an autosave would wait for the stop.
+#[tokio::test]
+async fn a_checkpoint_after_a_finished_background_save_writes_the_layout_at_once() {
+    let _guard = crate::config::test_config_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut app, agent_pane, config_home) = app_with_resumed_agent(true);
+
+    // A background save that already wrote its layout; its handle has not been reaped.
+    let captured = crate::persist::capture(
+        &app.state.workspaces,
+        &app.state.terminals,
+        &app.terminal_runtimes,
+        app.state.active,
+        app.state.selected,
+    );
+    let writer = app.session_writer.clone();
+    let finished = std::thread::spawn(move || {
+        writer.lock().unwrap().save(&captured, None);
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !finished.is_finished() {
+        assert!(Instant::now() < deadline, "the save thread did not finish");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    app.session_save_thread = Some(finished);
+
+    // A change after that save: a new workspace.
+    app.state
+        .workspaces
+        .push(crate::workspace::Workspace::test_new("added"));
+    app.state.ensure_test_terminals();
+    app.state.mark_session_dirty();
+    app.sync_session_save_schedule();
+
+    app.handle_internal_event(crate::events::AppEvent::PaneDied {
+        pane_id: agent_pane,
+        exit_reason: ChildExitReason::Exited,
+    });
+    assert!(app.find_pane(agent_pane).is_none());
+
+    // No stop: the checkpoint itself must have written the layout.
+    let snapshot = crate::persist::load().expect("the checkpoint wrote a layout");
+    assert_eq!(
+        snapshot.workspaces.len(),
+        2,
+        "the checkpoint treated a finished save thread as busy and wrote nothing at once"
+    );
+    assert!(
+        app.deferred_checkpoint.is_none(),
+        "the checkpoint kept a layout although it wrote it"
+    );
+
+    shut_down_runtimes(&mut app);
+    std::env::remove_var("XDG_CONFIG_HOME");
+    remove_scratch(&config_home);
+}

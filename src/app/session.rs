@@ -125,11 +125,12 @@ impl App {
     ///   fingerprint then no longer matches the saved layout, is ignored once.
     /// - It never waits for a background save. While one runs (from the start of its thread, before it takes the writer, to its
     ///   end), the layout that save writes was captured before changes made since and lands after anything written now, so it
-    ///   is no checkpoint of this moment. The checkpoint keeps the layout it just
-    ///   captured instead (`deferred_checkpoint`), which holds those changes and the pane that is ending with the agent session it
-    ///   was resumed from (this exit is what clears that session). `save_session_on_shutdown` writes the kept layout after the
-    ///   running save ends. Anything that clears or sets the pending flag clears or replaces it: an autosave or a full save
-    ///   supersedes it, and a later checkpoint that gets the writer writes a newer layout.
+    ///   is no checkpoint of this moment. The checkpoint keeps the layout it just captured instead (`deferred_checkpoint`),
+    ///   which holds those changes and the pane that is ending with the agent session it was resumed from (this exit is what
+    ///   clears that session). `save_session_on_shutdown` writes the kept layout after the running save ends. Anything that
+    ///   clears or sets the pending flag clears or replaces it: an autosave or a full save supersedes it, and a later checkpoint
+    ///   that gets the writer writes a newer layout. A save thread that has finished but is not yet reaped is not busy: its write
+    ///   has landed, and the checkpoint writes the newer layout over it.
     pub(crate) fn checkpoint_session_layout_before_pane_exit(&mut self) {
         if !self.policy.persist_session
             || (self.pane_exit_checkpoint_pending && !self.state.session_dirty)
