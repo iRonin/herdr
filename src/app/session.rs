@@ -123,8 +123,9 @@ impl App {
     ///   screen history, which took 3.9 s for 250 panes with 200 KB of history each (about 9 ms without the history). The next
     ///   debounced autosave rewrites both files; a stop before it restores every pane, and the history file, whose layout
     ///   fingerprint then no longer matches the saved layout, is ignored once.
-    /// - It never waits for a background save. While one is writing, it holds the writer, and the layout that save writes was
-    ///   captured before changes made since, so it is no checkpoint of this moment. The checkpoint keeps the layout it just
+    /// - It never waits for a background save. While one runs (from the start of its thread, before it takes the writer, to its
+    ///   end), the layout that save writes was captured before changes made since and lands after anything written now, so it
+    ///   is no checkpoint of this moment. The checkpoint keeps the layout it just
     ///   captured instead (`deferred_checkpoint`), which holds those changes and the pane that is ending with the agent session it
     ///   was resumed from (this exit is what clears that session). `save_session_on_shutdown` writes the kept layout after the
     ///   running save ends. Anything that clears or sets the pending flag clears or replaces it: an autosave or a full save
@@ -146,7 +147,18 @@ impl App {
             self.state.active,
             self.state.selected,
         );
-        match self.session_writer.try_lock() {
+        // A save thread that has not finished is busy even before it takes the writer: its layout was captured earlier and
+        // it will write it over anything written now.
+        let background_save_running = self
+            .session_save_thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished());
+        let writer = if background_save_running {
+            Err(std::sync::TryLockError::WouldBlock)
+        } else {
+            self.session_writer.try_lock()
+        };
+        match writer {
             Ok(mut writer) => {
                 writer.save_layout_only(&snapshot);
                 self.deferred_checkpoint = None;
