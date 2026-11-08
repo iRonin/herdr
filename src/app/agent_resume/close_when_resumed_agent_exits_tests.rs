@@ -927,3 +927,73 @@ async fn the_layout_a_busy_checkpoint_kept_survives_the_automatic_workspace_that
     std::env::remove_var("XDG_CONFIG_HOME");
     remove_scratch(&config_home);
 }
+
+/// A background save captures its layout on the server loop and then starts its thread, which takes the writer only when it
+/// runs. A checkpoint that comes in between finds the writer free, but the save that is about to write is still older than
+/// the changes made since its capture: it would write its layout over the checkpoint's, and a stop that trusts the checkpoint
+/// would drop those changes. A running save thread must count as busy, as a held writer does.
+#[tokio::test]
+async fn a_checkpoint_before_a_started_background_save_takes_the_writer_still_keeps_its_layout_for_the_stop(
+) {
+    let _guard = crate::config::test_config_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut app, agent_pane, config_home) = app_with_resumed_agent(true);
+
+    // A background save whose layout was captured now and whose thread has not yet taken the writer.
+    let captured = crate::persist::capture(
+        &app.state.workspaces,
+        &app.state.terminals,
+        &app.terminal_runtimes,
+        app.state.active,
+        app.state.selected,
+    );
+    let writer = app.session_writer.clone();
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    app.session_save_thread = Some(std::thread::spawn(move || {
+        let _ = wait.recv_timeout(Duration::from_secs(10));
+        writer.lock().unwrap().save(&captured, None);
+    }));
+
+    // A change after that capture: a new workspace.
+    app.state
+        .workspaces
+        .push(crate::workspace::Workspace::test_new("added"));
+    app.state.ensure_test_terminals();
+    app.state.mark_session_dirty();
+    app.sync_session_save_schedule();
+
+    // The flagged agent's pane ends before the save thread takes the writer.
+    app.handle_internal_event(crate::events::AppEvent::PaneDied {
+        pane_id: agent_pane,
+        exit_reason: ChildExitReason::Exited,
+    });
+    assert!(app.find_pane(agent_pane).is_none());
+
+    // The save thread now writes its older layout; then the server stops.
+    let _ = go.send(());
+    app.save_session_on_shutdown();
+    if let Some(thread) = app.session_save_thread.take() {
+        thread.join().unwrap();
+    }
+
+    let snapshot = crate::persist::load().expect("the stop must leave a saved layout");
+    assert_eq!(
+        snapshot.workspaces.len(),
+        2,
+        "the older background save wrote over the checkpoint: the workspace added after its capture is not in the saved layout"
+    );
+    assert_eq!(
+        snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .find_map(|pane| pane.agent_session.as_ref())
+            .map(|session| session.value.as_str()),
+        Some("/sessions/agent.jsonl"),
+        "the pane that ended lost the session it is resumed from"
+    );
+
+    shut_down_runtimes(&mut app);
+    std::env::remove_var("XDG_CONFIG_HOME");
+    remove_scratch(&config_home);
+}
