@@ -541,6 +541,17 @@ async fn run_client_loop(
                     })
                 }),
         );
+        shell.set_endpoint_selective_hyperlinks_supported(
+            &endpoint::ClientEndpointId::Local,
+            initial
+                .as_ref()
+                .and_then(|(_, handshake)| handshake.endpoint_capabilities.as_ref())
+                .is_some_and(|capabilities| {
+                    capabilities.iter().any(|capability| {
+                        capability == crate::protocol::endpoint::SELECTIVE_HYPERLINKS_CAPABILITY
+                    })
+                }),
+        );
         if local_unavailable {
             shell.set_endpoint_status(
                 &endpoint::ClientEndpointId::Local,
@@ -1428,6 +1439,12 @@ async fn run_client_loop(
                         shell.set_endpoint_agent_view_projection_supported(
                             &endpoint_id,
                             agent_view_projection_supported,
+                        );
+                        shell.set_endpoint_selective_hyperlinks_supported(
+                            &endpoint_id,
+                            negotiation.supports_capability(
+                                crate::protocol::endpoint::SELECTIVE_HYPERLINKS_CAPABILITY,
+                            ),
                         );
                         shell.compose(state.reported_size.0, state.reported_size.1)
                     });
