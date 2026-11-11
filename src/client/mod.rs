@@ -1458,6 +1458,13 @@ async fn run_client_loop(
                         negotiation,
                         false,
                     );
+                    // The preference may have changed while the handshake was running.
+                    write_stream.send_to(
+                        &endpoint_id,
+                        &ClientMessage::ClientShellMouseCapture {
+                            enabled: state.shell_mouse_capture_preference,
+                        },
+                    );
                     if let Some(frame) = frame {
                         state.present_frame(frame);
                     }

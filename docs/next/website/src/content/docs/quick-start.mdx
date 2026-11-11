@@ -23,7 +23,7 @@ Ctrl-click opens pane links when your terminal sends the modified click to Herdr
 
 Explicit hyperlinks normally remain available to the outer terminal, including labeled web links and application links such as `vscode://`. Use the terminal's usual shortcut, such as Command-click or Ctrl-click. The terminal opens these links on your local computer, including when Herdr runs over SSH, while Herdr's mouse controls remain available.
 
-Explicit hyperlinks keep their full destination when the label wraps across pane rows. Native detection of a plain-text URL may stop at a row boundary; Herdr's Ctrl-click still resolves the full wrapped URL when the terminal forwards the gesture.
+Plain-text `http://` and `https://` URLs also use native terminal shortcuts. Their full destination is retained across terminal auto-wraps, including when part of the URL is scrolled out of view. Actual line breaks and spaces end a plain-text URL.
 
 With `ui.mouse_capture = true` (the default), pane links matched by an enabled, available plugin handler are reserved for Herdr instead. Ctrl-click invokes the matching handler when the terminal forwards that gesture. A handler launch failure shows an error and stops. Native terminal shortcuts are unavailable for these reserved links. If Herdr receives a Ctrl-click on an unmatched `http://` or `https://` link, it opens the default browser on the machine running the Herdr client. Some macOS terminals turn Ctrl-click into a context-menu action; that gesture cannot activate a reserved plugin link.
 

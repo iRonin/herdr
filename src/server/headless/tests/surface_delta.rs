@@ -118,6 +118,11 @@ fn native_hyperlinks_reserve_only_enabled_plugin_matches_per_client() {
             .as_bytes(),
         );
     }
+    write_shared_test_pane(
+        &mut server,
+        pane_id,
+        b"\r\nhttps://example.test/plain\r\nhttps://example.test/plain-wrapped/abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    );
     let root = server
         .client_socket_path
         .parent()
@@ -140,6 +145,11 @@ command = ["unused"]
 id = "note"
 title = "Note"
 pattern = "^obsidian://"
+action = "open"
+[[link_handlers]]
+id = "web"
+title = "Web"
+pattern = "^https://example[.]test($|/plain)"
 action = "open"
 "#,
     )
@@ -164,12 +174,13 @@ action = "open"
     let all = HashSet::from([
         "https://example.test",
         "https://example.test/wrapped",
+        "https://example.test/plain",
+        "https://example.test/plain-wrapped/abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
         "obsidian://open?vault=notes",
         "vscode://file/local",
         "winscp-sftp://host/path",
     ]);
     let ordinary = HashSet::from([
-        "https://example.test",
         "https://example.test/wrapped",
         "vscode://file/local",
         "winscp-sftp://host/path",
@@ -197,6 +208,22 @@ action = "open"
     assert_eq!(
         targets(&recv_pane_surface(&native, "native peer").frame),
         all
+    );
+    let response = server.app.handle_api_request(api::schema::Request {
+        id: "hover-reserved-label".into(),
+        method: api::schema::Method::PaneLinkResolve(api::schema::PaneLinkActivateParams {
+            pane_id: initial.panes[0].pane_id.clone(),
+            viewport_row: 0,
+            col: 1,
+            content_revision: None,
+            offset_from_bottom: None,
+        }),
+    });
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(
+        response["result"]["regions"],
+        serde_json::json!([{ "row": 0, "start_col": 0, "end_col": 2 }]),
+        "plugin reservation must retain server-resolved hover regions"
     );
 
     // A blocked filesystem worker must not stop input handling or frame output.
@@ -300,6 +327,93 @@ action = "open"
     let updated = decode_surface_message(&mut decoder, message);
     assert_eq!(targets(&updated.frame), all);
     shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn wrapped_plain_text_links_update_every_native_segment() {
+    use crate::protocol::render_ansi::BlitEncoder;
+
+    let pattern = regex::Regex::new("/claimed$").unwrap();
+    for reserved in [false, true] {
+        let (mut server, _control, render, pane_id) =
+            retained_test_server_with_control(b"ordinary text");
+        enable_delta(&mut server, 1);
+        server.clients.get_mut(&1).unwrap().shell_mouse_capture = reserved;
+        if reserved {
+            server.app.plugin_link_patterns = vec![pattern.clone()];
+        }
+        server.render_and_stream();
+        let (_, message) = receive_message(&render);
+        let mut decoder = protocol::surface_reuse::Decoder::new(true, false);
+        let initial = decode_surface_message(&mut decoder, message);
+        let width = initial.panes[0].inner_rect.width;
+        let prefix = format!("https://example.test/{}", "x".repeat(usize::from(width)));
+        let mut encoder = BlitEncoder::new();
+        let mut host = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let encoded = encoder.encode(&initial.frame, true);
+        host.write(&encoded.bytes);
+        encoder.commit(initial.frame, encoded);
+
+        for (bytes, expected, native) in [
+            (
+                format!("\r\x1b[2J\x1b[H{prefix}/claimed"),
+                Some(format!("{prefix}/claimed")),
+                !reserved,
+            ),
+            // Only the last row changes. Earlier cells must acquire the new URI,
+            // including when a plugin previously hid their native targets.
+            (
+                "\x1b[7D\x1b[Kpublic".to_owned(),
+                Some(format!("{prefix}/public")),
+                true,
+            ),
+            ("\x1b[Hxxxx".to_owned(), None, false),
+        ] {
+            write_shared_test_pane(&mut server, pane_id, bytes.as_bytes());
+            if !server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])) {
+                server.render_and_stream();
+            }
+            let (_, message) = receive_message(&render);
+            let surface = if matches!(message, ServerMessage::PaneSurfacePatch(_)) {
+                server.clients[&1]
+                    .render_state
+                    .last_pane_surface()
+                    .unwrap()
+                    .clone()
+            } else {
+                decode_surface_message(&mut decoder, message)
+            };
+            let encoded = encoder.encode(&surface.frame, false);
+            host.write(&encoded.bytes);
+            let area = surface.panes[0].inner_rect;
+            let mut linked_rows = HashSet::new();
+            for y in area.y..area.y + area.height {
+                for x in area.x..area.x + area.width {
+                    let uri = host.viewport_hyperlink_uri(x, u32::from(y)).unwrap();
+                    if let Some(uri) = uri {
+                        assert!(native, "plugin-owned or removed URL stayed native");
+                        assert_eq!(Some(&uri), expected.as_ref());
+                        linked_rows.insert(y);
+                    }
+                }
+            }
+            if native {
+                assert!(
+                    linked_rows.len() >= 2,
+                    "every wrapped segment must be native"
+                );
+                assert_eq!(
+                    host.viewport_hyperlink_uri(area.x, u32::from(area.y))
+                        .unwrap(),
+                    expected
+                );
+            } else {
+                assert!(linked_rows.is_empty());
+            }
+            encoder.commit(surface.frame, encoded);
+        }
+        shutdown_test_runtimes(&mut server);
+    }
 }
 
 #[tokio::test]
