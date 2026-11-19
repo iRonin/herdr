@@ -110,6 +110,81 @@ mod tests {
         );
     }
 
+    /// What the workspace aggregate reports for panes in this exact layout order, each given as
+    /// `(agent state, seen)`. Layout order is fixed, so a case and its mirror image really do
+    /// present the panes in opposite orders.
+    fn aggregate_of(panes: &[(AgentState, bool)]) -> (AgentState, bool) {
+        let mut ws = Workspace::test_new("test");
+        for _ in 1..panes.len() {
+            ws.test_split(Direction::Horizontal);
+        }
+        let ids = ws.tabs[0].layout.pane_ids();
+        assert_eq!(
+            ids.len(),
+            panes.len(),
+            "the fixture holds one pane per case entry"
+        );
+        let mut terminals = HashMap::new();
+        for (id, (state, seen)) in ids.iter().zip(panes) {
+            let mut terminal = terminal_for_pane(&ws, *id);
+            terminal.state = *state;
+            terminals.insert(terminal.id.clone(), terminal);
+            ws.tabs[0].panes.get_mut(id).unwrap().seen = *seen;
+        }
+        ws.aggregate_state(&terminals)
+    }
+
+    /// A space holding an agent that is blocked must show blocked, whether or not that block was
+    /// already read and whatever else the space holds. Upstream ranks every blocked pane first;
+    /// the fork's read-aware ranking let an unread finished agent (or a working one) hide a block
+    /// the user had merely looked at, which is the one state a space has to surface.
+    #[test]
+    fn aggregate_state_shows_blocked_when_any_agent_is_blocked_read_or_not() {
+        let read_blocked = (AgentState::Blocked, true);
+        let unread_blocked = (AgentState::Blocked, false);
+        for (other, label) in [
+            ((AgentState::Idle, false), "unread done"),
+            ((AgentState::Working, true), "working"),
+            ((AgentState::Idle, true), "read idle"),
+            ((AgentState::Unknown, true), "unknown"),
+        ] {
+            assert_eq!(
+                aggregate_of(&[read_blocked, other]),
+                read_blocked,
+                "read blocked then {label}"
+            );
+            assert_eq!(
+                aggregate_of(&[other, read_blocked]),
+                read_blocked,
+                "{label} then read blocked"
+            );
+        }
+        // The mark stays read-aware: an unread block anywhere in the space makes it unread,
+        // and the pane order must not decide which of two blocked agents wins.
+        assert_eq!(
+            aggregate_of(&[unread_blocked, read_blocked]),
+            unread_blocked
+        );
+        assert_eq!(
+            aggregate_of(&[read_blocked, unread_blocked]),
+            unread_blocked
+        );
+        assert_eq!(
+            aggregate_of(&[read_blocked, (AgentState::Idle, false), unread_blocked]),
+            unread_blocked
+        );
+        // Controls: with no blocked agent the order is unchanged (an unread finish still beats
+        // work in progress), so the checks above cannot pass by flattening everything.
+        assert_eq!(
+            aggregate_of(&[(AgentState::Working, true), (AgentState::Idle, false)]),
+            (AgentState::Idle, false)
+        );
+        assert_eq!(
+            aggregate_of(&[(AgentState::Idle, true), (AgentState::Working, true)]),
+            (AgentState::Working, true)
+        );
+    }
+
     #[test]
     fn aggregate_state_all_unknown() {
         let ws = Workspace::test_new("test");

@@ -2725,6 +2725,90 @@ mod tests {
         assert_eq!(tab.label, "2");
     }
 
+    /// One workspace whose tab `n` holds one pane per `(agent state, seen)` entry of `tabs[n]`,
+    /// in layout order.
+    fn app_with_agent_panes(tabs: &[&[(AgentState, bool)]]) -> App {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("api-container-status");
+        for (tab_idx, panes) in tabs.iter().enumerate() {
+            if tab_idx > 0 {
+                workspace.test_add_tab(None);
+            }
+            workspace.active_tab = tab_idx;
+            for _ in 1..panes.len() {
+                workspace.test_split(ratatui::layout::Direction::Horizontal);
+            }
+        }
+        workspace.active_tab = 0;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        for (tab_idx, panes) in tabs.iter().enumerate() {
+            let ids = app.state.workspaces[0].tabs[tab_idx].layout.pane_ids();
+            assert_eq!(ids.len(), panes.len(), "one pane per fixture entry");
+            for (id, (state, seen)) in ids.into_iter().zip(*panes) {
+                let pane = app.state.workspaces[0].tabs[tab_idx]
+                    .panes
+                    .get_mut(&id)
+                    .unwrap();
+                pane.seen = *seen;
+                let terminal_id = pane.attached_terminal_id.clone();
+                app.state.terminals.get_mut(&terminal_id).unwrap().state = *state;
+            }
+        }
+        app
+    }
+
+    /// The status the API reports for a tab or a workspace is what every client falls back on, so
+    /// a block the user has already read must still make its tab and workspace report blocked
+    /// while any unread finished or running agent sits beside it. A tab with no block keeps its
+    /// own ranking (the controls), so the checks cannot pass by reporting blocked everywhere.
+    #[test]
+    fn tab_and_workspace_info_report_blocked_when_any_agent_is_blocked_read_or_not() {
+        use crate::api::schema::AgentStatus;
+        let read_blocked = (AgentState::Blocked, true);
+        let unread_blocked = (AgentState::Blocked, false);
+        let unread_done = (AgentState::Idle, false);
+        let working = (AgentState::Working, true);
+        let app = app_with_agent_panes(&[
+            &[read_blocked, unread_done],
+            &[unread_done],
+            &[working, read_blocked],
+            &[working, unread_done],
+            &[read_blocked, unread_blocked],
+            &[unread_blocked, read_blocked],
+        ]);
+        let tab = |idx: usize| app.tab_info(0, idx).unwrap().agent_status;
+        assert_eq!(tab(0), AgentStatus::Blocked, "read blocked + unread done");
+        assert_eq!(tab(1), AgentStatus::Done, "control: unread done alone");
+        assert_eq!(tab(2), AgentStatus::Blocked, "working + read blocked");
+        assert_eq!(tab(3), AgentStatus::Done, "control: working + unread done");
+        assert_eq!(
+            tab(4),
+            AgentStatus::Blocked,
+            "read blocked + unread blocked"
+        );
+        assert_eq!(
+            tab(5),
+            AgentStatus::Blocked,
+            "unread blocked + read blocked"
+        );
+        assert_eq!(app.workspace_info(0).agent_status, AgentStatus::Blocked);
+
+        // The block is in one tab and the unread finish in another: only the workspace holds both.
+        let app = app_with_agent_panes(&[&[read_blocked], &[unread_done]]);
+        assert_eq!(app.workspace_info(0).agent_status, AgentStatus::Blocked);
+        assert_eq!(
+            app.tab_info(0, 0).unwrap().agent_status,
+            AgentStatus::Blocked
+        );
+        assert_eq!(app.tab_info(0, 1).unwrap().agent_status, AgentStatus::Done);
+
+        let app = app_with_agent_panes(&[&[read_blocked], &[working]]);
+        assert_eq!(app.workspace_info(0).agent_status, AgentStatus::Blocked);
+    }
+
     #[test]
     fn legacy_bare_tab_id_uses_tab_position_not_public_tab_number() {
         let mut app = test_app();

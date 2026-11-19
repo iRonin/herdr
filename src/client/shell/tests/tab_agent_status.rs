@@ -346,9 +346,10 @@ fn tabs_without_agents_render_stock_when_the_feature_is_on() {
     assert_eq!(stock_tab("tab_1").width, without_agent.width);
 }
 
-/// The mark belongs to the tab's highest-attention agent, mirroring the agent
-/// panel's own read-aware ordering: an unread block outranks a working agent in the
-/// same tab, and a block the user has already read ranks below it.
+/// The mark belongs to the tab's highest-attention agent, and a blocked agent is always the
+/// highest: an unread block outranks a working agent in the same tab, and a block the user has
+/// already read still outranks it, drawn hollow so it tells a seen block from one still waiting.
+/// (The agent panel keeps its own order, which sinks a read block; a tab is a container.)
 #[test]
 fn tab_status_mark_shows_the_highest_attention_agent() {
     let config = tab_status_config(true);
@@ -396,8 +397,8 @@ fn tab_status_mark_shows_the_highest_attention_agent() {
         Some(status_color(AgentStatus::Blocked, &config.palette))
     );
 
-    // Once the user has read the block it ranks below the working agent (the agent panel's
-    // read-aware order), so the same tab now carries the working agent's mark.
+    // Once the user has read the block the tab is still blocked, so the working agent beside it
+    // must not take the mark over; the mark turns hollow, in the same red.
     projected.agents[1].tokens.push((
         crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
         "1".into(),
@@ -410,11 +411,84 @@ fn tab_status_mark_shows_the_highest_attention_agent() {
     );
     assert_eq!(
         read_symbol,
-        agent_status_icon(&projected.agents[0], config.status_indicators)
+        agent_status_icon(&projected.agents[1], config.status_indicators)
+    );
+    assert_ne!(
+        read_symbol,
+        agent_status_icon(&projected.agents[0], config.status_indicators),
+        "the working agent's mark must not replace a block"
     );
     assert_eq!(
         read_fg,
-        Some(status_color(AgentStatus::Working, &config.palette))
+        Some(status_color(AgentStatus::Blocked, &config.palette))
+    );
+}
+
+/// A tab holding a blocked agent shows blocked whatever else it holds and whether or not the
+/// block was read. The mark stays read-aware: hollow when every blocked agent in the tab was
+/// already read, filled as soon as one is unread, whichever of them comes last in the tab.
+#[test]
+fn tab_status_mark_is_blocked_when_any_agent_in_the_tab_is_blocked_read_or_not() {
+    let config = tab_status_config(true);
+    let red = Some(config.palette.red);
+    let agent_in_tab = |index: usize, status: AgentStatus, read: bool| {
+        let mut agent = snapshot_with_agent(status).agents.remove(0);
+        agent.pane_id = format!("pane_{index}");
+        agent.focused = index == 1;
+        if read {
+            agent.tokens.push((
+                crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
+                "1".into(),
+            ));
+        }
+        agent
+    };
+    let marks = |specs: &[(AgentStatus, bool)]| {
+        let mut projected = snapshot();
+        projected.tabs[0].agent_status = AgentStatus::Unknown;
+        projected.agents = specs
+            .iter()
+            .enumerate()
+            .map(|(index, (status, read))| agent_in_tab(index + 1, *status, *read))
+            .collect();
+        rendered_tab_mark(&config, &projected)
+    };
+    let read_blocked = (AgentStatus::Blocked, true);
+    let unread_blocked = (AgentStatus::Blocked, false);
+
+    for other in [
+        (AgentStatus::Done, false),
+        (AgentStatus::Working, false),
+        (AgentStatus::Idle, false),
+        (AgentStatus::Unknown, false),
+    ] {
+        for specs in [[read_blocked, other], [other, read_blocked]] {
+            assert_eq!(
+                marks(&specs),
+                ("○".into(), red),
+                "a read block beside {other:?}, in order {specs:?}"
+            );
+        }
+    }
+    for specs in [
+        [unread_blocked, read_blocked],
+        [read_blocked, unread_blocked],
+    ] {
+        assert_eq!(
+            marks(&specs),
+            ("●".into(), red),
+            "an unread block anywhere makes the tab's mark filled: {specs:?}"
+        );
+    }
+
+    // Controls: with no block the tab keeps its own ranking, an unread finish above work, so
+    // the cases above cannot pass by drawing every tab red.
+    assert_eq!(
+        marks(&[(AgentStatus::Working, false), (AgentStatus::Done, false)]),
+        (
+            status_icon(AgentStatus::Done, config.status_indicators).into(),
+            Some(status_color(AgentStatus::Done, &config.palette))
+        )
     );
 }
 

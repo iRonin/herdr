@@ -348,6 +348,7 @@ mod new_tab_prompt_inversion;
 mod panel_scope;
 mod popup_focus_projection;
 mod space_agent_counts;
+mod space_shows_blocked;
 mod startup_overlays;
 mod tab_agent_context;
 mod tab_agent_status;
