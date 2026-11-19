@@ -215,13 +215,15 @@ impl EndpointAgentPresentation {
     }
 }
 
+/// The tab and workspace aggregates a client falls back on, from the agents it holds. A container
+/// is blocked when any agent in it is blocked, read or not (container rank, not the agent list's).
 fn project_aggregate_status(snapshot: &mut ClientShellSnapshot) {
     for tab in &mut snapshot.tabs {
         if let Some(agent) = snapshot
             .agents
             .iter()
             .filter(|agent| agent.tab_id == tab.tab_id)
-            .max_by_key(|agent| super::agent_status_priority(agent))
+            .max_by_key(|agent| super::agent_container_priority(agent))
         {
             tab.agent_status = agent.agent_status;
         }
@@ -231,7 +233,7 @@ fn project_aggregate_status(snapshot: &mut ClientShellSnapshot) {
             .agents
             .iter()
             .filter(|agent| agent.workspace_id == workspace.workspace_id)
-            .max_by_key(|agent| super::agent_status_priority(agent))
+            .max_by_key(|agent| super::agent_container_priority(agent))
         {
             workspace.agent_status = agent.agent_status;
         }

@@ -246,6 +246,31 @@ pub(super) fn agent_status_priority(agent: &crate::protocol::ClientShellAgent) -
     }
 }
 
+/// Rank of a state for the container that holds the agent (a space, a collapsed worktree group, a
+/// tab): unread blocked 5 > read blocked 4 > done 3 > working 2 > idle 1 > unknown 0. A container
+/// shows blocked when any agent in it is blocked, read or not, as upstream does; the read flag only
+/// splits the two blocked ranks, so the mark stays read-aware (an unread block anywhere wins over
+/// a read one).
+fn container_status_priority(status: crate::api::schema::AgentStatus, blocked_read: bool) -> u8 {
+    use crate::api::schema::AgentStatus;
+    match status {
+        AgentStatus::Blocked if blocked_read => 4,
+        AgentStatus::Blocked => 5,
+        AgentStatus::Done => 3,
+        AgentStatus::Working => 2,
+        AgentStatus::Idle => 1,
+        AgentStatus::Unknown => 0,
+    }
+}
+
+/// Container rank of a concrete agent: the agent a space, a collapsed worktree group or a tab shows
+/// is the one with the highest of these. Not `agent_status_priority`: that one orders AGENTS (the
+/// agent list, the navigator) and sinks a read block below an unread finish, which would let a calm
+/// agent hide a stuck one in the container's mark.
+pub(super) fn agent_container_priority(agent: &crate::protocol::ClientShellAgent) -> u8 {
+    container_status_priority(agent.agent_status, agent_is_blocked_read(agent))
+}
+
 fn status_text(status: crate::api::schema::AgentStatus) -> &'static str {
     use crate::api::schema::AgentStatus;
     match status {

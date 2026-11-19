@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
-use super::{
-    api_helpers::{pane_agent_status, tab_attention_priority},
-    App, Mode,
-};
+use super::{api_helpers::pane_agent_status, App, Mode};
 use crate::api::schema::{EventData, EventEnvelope, EventKind};
-use crate::{config::NewTerminalCwdConfig, workspace::Workspace};
+use crate::{
+    config::NewTerminalCwdConfig,
+    workspace::{container_attention_priority, Workspace},
+};
 
 pub(crate) fn resolve_new_terminal_cwd(
     policy: &NewTerminalCwdConfig,
@@ -215,7 +215,7 @@ impl App {
                     .get(&pane.attached_terminal_id)
                     .map(|terminal| (terminal.display_state(), pane.seen))
             })
-            .max_by_key(|(state, seen)| tab_attention_priority(*state, *seen))
+            .max_by_key(|(state, seen)| container_attention_priority(*state, *seen))
             .unwrap_or((crate::detect::AgentState::Unknown, true));
         Some(crate::api::schema::TabInfo {
             tab_id: self.public_tab_id(ws_idx, tab_idx)?,

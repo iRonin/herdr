@@ -47,12 +47,21 @@ impl Tab {
     }
 }
 
-fn pane_attention_priority(state: AgentState, seen: bool) -> u8 {
+/// Rank of one pane's state for the container that holds it, a workspace or a tab: unread blocked >
+/// read blocked > unread done > working > read idle > unknown.
+///
+/// A container shows blocked when any agent in it is blocked, read or not, as upstream does
+/// (`(Blocked, _) => 4`); the read flag only splits the two blocked ranks, so the mark stays
+/// read-aware (an unread block anywhere wins over a read one). The agent list orders agents by
+/// `tab_attention_priority` instead, which sinks a read block below an unread finish; that order
+/// is for agents and must not be used to pick what a container shows.
+pub(crate) fn container_attention_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
-        (AgentState::Blocked, false) => 4,
+        (AgentState::Blocked, false) => 5,
+        (AgentState::Blocked, true) => 4,
         (AgentState::Idle, false) => 3,
         (AgentState::Working, _) => 2,
-        (AgentState::Blocked, true) | (AgentState::Idle, true) => 1,
+        (AgentState::Idle, true) => 1,
         (AgentState::Unknown, _) => 0,
     }
 }
@@ -70,7 +79,7 @@ impl Workspace {
                     .get(&pane.attached_terminal_id)
                     .map(|terminal| (terminal.display_state(), pane.seen))
             })
-            .max_by_key(|(state, seen)| pane_attention_priority(*state, *seen))
+            .max_by_key(|(state, seen)| container_attention_priority(*state, *seen))
             .unwrap_or((AgentState::Unknown, true))
     }
 
@@ -95,18 +104,17 @@ mod tests {
     }
 
     #[test]
-    fn acknowledged_blocked_sinks_below_unread_done_and_working() {
-        assert!(
-            pane_attention_priority(AgentState::Blocked, false)
-                > pane_attention_priority(AgentState::Idle, false)
-        );
-        assert!(
-            pane_attention_priority(AgentState::Blocked, true)
-                < pane_attention_priority(AgentState::Working, true)
-        );
-        assert!(
-            pane_attention_priority(AgentState::Blocked, true)
-                < pane_attention_priority(AgentState::Idle, false)
+    fn container_rank_puts_any_block_first_and_an_unread_block_above_a_read_one() {
+        let rank = container_attention_priority;
+        assert!(rank(AgentState::Blocked, false) > rank(AgentState::Blocked, true));
+        assert!(rank(AgentState::Blocked, true) > rank(AgentState::Idle, false));
+        assert!(rank(AgentState::Idle, false) > rank(AgentState::Working, true));
+        assert!(rank(AgentState::Working, true) > rank(AgentState::Idle, true));
+        assert!(rank(AgentState::Idle, true) > rank(AgentState::Unknown, true));
+        // Working outranks idle whatever the read flag says, as upstream has it.
+        assert_eq!(
+            rank(AgentState::Working, false),
+            rank(AgentState::Working, true)
         );
     }
 

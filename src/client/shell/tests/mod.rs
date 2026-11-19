@@ -329,6 +329,51 @@ fn read_aware_agent_status_icon_and_priority_extend_upstream_only_for_read_block
     assert_eq!(agent_status_icon(&wrong_value, Dots), "●");
 }
 
+/// Containers (a space, a worktree group, a tab) and the agent list rank agents differently on
+/// purpose: a container shows blocked when any agent in it is blocked, read or not, while the
+/// agent list still sinks a read block below an unread finish. Both orders are pinned side by
+/// side, so changing one cannot silently change the other.
+#[test]
+fn container_and_agent_list_rank_a_read_block_differently_on_purpose() {
+    let token = || {
+        vec![(
+            crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
+            "1".into(),
+        )]
+    };
+    let unread_blocked = test_agent(AgentStatus::Blocked, Vec::new());
+    let read_blocked = test_agent(AgentStatus::Blocked, token());
+    let done = test_agent(AgentStatus::Done, Vec::new());
+    let working = test_agent(AgentStatus::Working, Vec::new());
+    let idle = test_agent(AgentStatus::Idle, Vec::new());
+    let unknown = test_agent(AgentStatus::Unknown, Vec::new());
+
+    // Container order: unread blocked > read blocked > done > working > idle > unknown.
+    let container = [
+        &unread_blocked,
+        &read_blocked,
+        &done,
+        &working,
+        &idle,
+        &unknown,
+    ]
+    .map(agent_container_priority);
+    assert!(
+        container.windows(2).all(|pair| pair[0] > pair[1]),
+        "container ranks must strictly descend: {container:?}"
+    );
+    // A block marker on a state that is not blocked changes nothing, as for the agent list.
+    assert_eq!(
+        agent_container_priority(&test_agent(AgentStatus::Working, token())),
+        agent_container_priority(&working)
+    );
+
+    // Agent list order: the read block still sinks below an unread finish and below working.
+    assert!(agent_status_priority(&read_blocked) < agent_status_priority(&done));
+    assert!(agent_status_priority(&read_blocked) < agent_status_priority(&working));
+    assert!(agent_status_priority(&unread_blocked) > agent_status_priority(&done));
+}
+
 mod agents_worktrees_notifications;
 mod chrome_context;
 mod close_pane;

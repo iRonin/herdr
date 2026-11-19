@@ -660,6 +660,7 @@ pub(in crate::client::shell) fn render_parent_group_toggle(
 
 /// A workspace aggregate whose status stays wire-compatible while its icon can
 /// reflect read state from the winning concrete agent (Blocked + read = hollow).
+/// The winner is chosen by container rank, so any blocked agent wins the space.
 #[derive(Clone, Copy)]
 pub(in crate::client::shell) struct DisplayedWorkspaceStatus<'a> {
     status: crate::api::schema::AgentStatus,
@@ -683,8 +684,8 @@ impl DisplayedWorkspaceStatus<'_> {
 
     fn priority(self) -> u8 {
         self.agent.map_or_else(
-            || status_priority(self.status),
-            super::agent_status_priority,
+            || container_status_priority(self.status, false),
+            super::agent_container_priority,
         )
     }
 }
@@ -697,7 +698,7 @@ pub(in crate::client::shell) fn workspace_status<'a>(
         .agents
         .iter()
         .filter(|agent| agent.workspace_id == workspace.workspace_id)
-        .max_by_key(|agent| super::agent_status_priority(agent));
+        .max_by_key(|agent| super::agent_container_priority(agent));
     DisplayedWorkspaceStatus {
         status: agent.map_or(workspace.agent_status, |agent| agent.agent_status),
         agent,
