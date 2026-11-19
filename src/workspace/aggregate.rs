@@ -118,9 +118,12 @@ mod tests {
         );
     }
 
-    /// What the workspace aggregate reports for panes in this exact layout order, each given as
-    /// `(agent state, seen)`. Layout order is fixed, so a case and its mirror image really do
-    /// present the panes in opposite orders.
+    /// What the workspace aggregate reports for these panes, each given as `(agent state, seen)` and
+    /// placed in layout order. `aggregate_state` walks the tab's pane map (a `HashMap`), not the
+    /// layout, so a case and its mirror image do NOT control the order the aggregate sees them in:
+    /// the mirror cases only add samples. The tie rule itself is pinned by
+    /// `container_rank_puts_any_block_first_and_an_unread_block_above_a_read_one`, whose strict ranks
+    /// leave no tie between an unread and a read block.
     fn aggregate_of(panes: &[(AgentState, bool)]) -> (AgentState, bool) {
         let mut ws = Workspace::test_new("test");
         for _ in 1..panes.len() {
@@ -167,8 +170,9 @@ mod tests {
                 "{label} then read blocked"
             );
         }
-        // The mark stays read-aware: an unread block anywhere in the space makes it unread,
-        // and the pane order must not decide which of two blocked agents wins.
+        // The mark stays read-aware: an unread block anywhere in the space makes it unread. The
+        // map order is not controlled here (see `aggregate_of`); the strict rank test above is
+        // what proves an unread block wins whichever pane the walk reaches last.
         assert_eq!(
             aggregate_of(&[unread_blocked, read_blocked]),
             unread_blocked

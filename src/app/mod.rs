@@ -2784,15 +2784,15 @@ mod tests {
         assert_eq!(tab(1), AgentStatus::Done, "control: unread done alone");
         assert_eq!(tab(2), AgentStatus::Blocked, "working + read blocked");
         assert_eq!(tab(3), AgentStatus::Done, "control: working + unread done");
-        assert_eq!(
-            tab(4),
-            AgentStatus::Blocked,
-            "read blocked + unread blocked"
-        );
+        // Tabs 4 and 5 hold a read and an unread block. The wire status carries no read flag, so
+        // they only check that two blocks still report blocked (the old rank did too); they are not
+        // opposite orders, because tab_info walks the pane map, not the layout. Which block marks the
+        // tab is the client's job, tested in client::shell.
+        assert_eq!(tab(4), AgentStatus::Blocked, "two blocks, one read");
         assert_eq!(
             tab(5),
             AgentStatus::Blocked,
-            "unread blocked + read blocked"
+            "two blocks, one read (second fixture)"
         );
         assert_eq!(app.workspace_info(0).agent_status, AgentStatus::Blocked);
 
