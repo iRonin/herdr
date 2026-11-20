@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 #[cfg(all(test, unix))]
 use std::fs;
 
+use crate::api::event_hub::WaitTiming;
 use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, Request, ResponseResult, ServerCapabilities, SuccessResponse,
 };
@@ -39,11 +40,14 @@ pub struct ServerHandle {
     path: PathBuf,
     identity: SocketFileIdentity,
     running: Arc<AtomicBool>,
+    event_hub: EventHub,
 }
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        // Connection threads blocked on the hub notice the flag now, not after their liveness interval.
+        self.event_hub.wake_waiters();
 
         if let Err(err) = self.remove_socket_file_if_owned() {
             if err.kind() != std::io::ErrorKind::NotFound {
@@ -119,6 +123,7 @@ fn start_server_inner(
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
+    let handle_event_hub = event_hub.clone();
     let spawned = crate::thread_spawn::spawn_named("herdr-api-accept", move || {
         run_accept_loop(
             listener.incoming(),
@@ -164,6 +169,7 @@ fn start_server_inner(
         path,
         identity,
         running,
+        event_hub: handle_event_hub,
     })
 }
 
@@ -959,13 +965,33 @@ fn stream_subscriptions(
         return Err(err);
     }
 
+    // The history is the only thing that wakes an idle connection; sampling subscriptions also come
+    // due on their own interval, and the liveness interval bounds every wait (see `EventHub`).
+    let timing = event_hub.timing();
+    let intervals: Vec<Option<Duration>> = subscriptions
+        .iter()
+        .map(|subscription| subscription.sample_interval(&timing))
+        .collect();
+    // The first pass samples every sampling subscription (the initial snapshot is delivered then).
+    let mut due = vec![Instant::now(); subscriptions.len()];
     loop {
+        // Take the cursor BEFORE the stop check and the history read: an event, or the server's
+        // stop wake-up, arriving at any point after this makes the wait below return at once.
+        let cursor = event_hub.wait_cursor();
         if should_stop_connection(&mut stream, running)? {
             return Ok(());
         }
 
-        for subscription in &mut subscriptions {
-            let events = match subscription.poll_batch(api_tx, event_hub) {
+        let now = Instant::now();
+        for (index, subscription) in subscriptions.iter_mut().enumerate() {
+            let sample_due = match intervals[index] {
+                Some(interval) if now >= due[index] => {
+                    due[index] = now + interval;
+                    true
+                }
+                _ => false,
+            };
+            let events = match subscription.poll_batch(api_tx, event_hub, sample_due) {
                 Ok(events) => events,
                 Err(error) => {
                     write_json_line_allow_disconnect(
@@ -990,8 +1016,27 @@ fn stream_subscriptions(
                 }
             }
         }
-        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+        event_hub.wait_for_event_after(
+            cursor,
+            next_wake_timeout(&timing, &intervals, &due, Instant::now()),
+        );
     }
+}
+
+/// How long a connection thread may block before it must look again: its liveness interval, or
+/// less when a sampling subscription comes due sooner.
+fn next_wake_timeout(
+    timing: &WaitTiming,
+    intervals: &[Option<Duration>],
+    due: &[Instant],
+    now: Instant,
+) -> Duration {
+    intervals
+        .iter()
+        .zip(due)
+        .filter(|(interval, _)| interval.is_some())
+        .map(|(_, due)| due.saturating_duration_since(now))
+        .fold(timing.liveness, Duration::min)
 }
 
 fn write_text_line(stream: &mut LocalStream, value: &str) -> std::io::Result<()> {
@@ -1848,6 +1893,66 @@ mod tests {
     }
 
     #[test]
+    fn events_wait_agent_status_returns_not_found_when_tab_closes() {
+        // `tab.close` publishes `tab.closed` and no `pane.closed` for the panes inside. The wait
+        // must still end with `pane_not_found` promptly, not with `timeout` after the 1 s snapshot.
+        let event_hub = EventHub::default();
+        let responder_event_hub = event_hub.clone();
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let mut pane_get_count = 0;
+            while let Some(msg) = api_rx.blocking_recv() {
+                let Method::PaneGet(_) = msg.request.method else {
+                    panic!("unexpected request: {:?}", msg.request.method);
+                };
+                pane_get_count += 1;
+                let response = if pane_get_count == 1 {
+                    serde_json::to_string(&SuccessResponse {
+                        id: msg.request.id,
+                        result: ResponseResult::PaneInfo {
+                            pane: pane_info("pane_1", crate::api::schema::AgentStatus::Unknown),
+                        },
+                    })
+                    .unwrap()
+                } else {
+                    if pane_get_count == 2 {
+                        responder_event_hub.push(crate::api::schema::EventEnvelope {
+                            event: crate::api::schema::EventKind::TabClosed,
+                            data: crate::api::schema::EventData::TabClosed {
+                                tab_id: "tab_1".into(),
+                                workspace_id: "ws_1".into(),
+                            },
+                        });
+                    }
+                    error_response_json(
+                        msg.request.id,
+                        "pane_not_found",
+                        "pane pane_1 not found".into(),
+                    )
+                };
+                msg.respond_to.send(response).unwrap();
+            }
+        });
+
+        let (mut client, server, _path) = local_stream_pair("wait-tab-close");
+        client
+            .write_all(br#"{"id":"wait_tab_close","method":"events.wait","params":{"match_event":{"event":"pane_agent_status_changed","pane_id":"pane_1","agent_status":"done"},"timeout_ms":500}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(response["id"], "wait_tab_close");
+        assert_eq!(response["error"]["code"], "pane_not_found");
+        assert_eq!(response["error"]["message"], "pane pane_1 not found");
+        drop(api_tx);
+        responder.join().unwrap();
+    }
+
+    #[test]
     fn wait_for_output_stops_when_client_disconnects() {
         let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let (first_read_tx, first_read_rx) = std::sync::mpsc::channel();
@@ -2061,5 +2166,52 @@ mod tests {
         let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(result.is_ok());
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn dropping_the_server_handle_releases_a_held_subscription() {
+        // Both intervals are 30 s, so only the wake-up in `ServerHandle::drop` can end a connection
+        // that is blocked on the event hub within the deadline below.
+        let _guard = env_lock().lock().unwrap();
+        let dir = unique_test_path("api-handle-drop");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("herdr.sock");
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &path);
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let event_hub = EventHub::with_timing(WaitTiming {
+            liveness: Duration::from_secs(30),
+            agent_status_snapshot: Duration::from_secs(30),
+        });
+        let handle = start_server_inner(api_tx, event_hub, None, None);
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        let handle = handle.unwrap();
+
+        let mut client = crate::ipc::connect_local_stream(&path).unwrap();
+        client
+            .write_all(
+                br#"{"id":"held","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.created"}]}}"#,
+            )
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+        let ack: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(ack["result"]["type"], "subscription_started");
+        // Let the connection thread finish its first pass and block on the hub.
+        std::thread::sleep(Duration::from_millis(300));
+
+        drop(handle);
+        // The connection thread returning closes its end, which the client sees as the end of its stream.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut rest = String::new();
+            let _ = client.read_to_string(&mut rest);
+            let _ = done_tx.send(());
+        });
+        let released = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            released,
+            "a subscription blocked on the hub was not released when the server handle was dropped"
+        );
     }
 }

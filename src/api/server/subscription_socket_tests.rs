@@ -1,7 +1,7 @@
 use super::*;
 use crate::api::schema::{
-    AgentStatus, EventData, EventEnvelope, EventKind, PaneInfo, PaneReadResult, ReadFormat,
-    ReadSource,
+    AgentStatus, EventData, EventEnvelope, EventKind, PaneInfo, PaneReadResult, PaneReadState,
+    ReadFormat, ReadSource,
 };
 use crate::ipc::{poll_local_stream_read_count, LocalStreamReadCount};
 use interprocess::local_socket::traits::Listener as _;
@@ -22,9 +22,22 @@ struct SocketTest {
 
 impl SocketTest {
     fn new() -> Self {
+        Self::with_hub(EventHub::default())
+    }
+
+    /// A test whose connections block for `liveness` and sample the agent-status snapshot every
+    /// `snapshot`: with 30 s, only a hub wake can explain a delivery within a few seconds.
+    fn with_timing(liveness: Duration, snapshot: Duration) -> Self {
+        Self::with_hub(EventHub::with_timing(WaitTiming {
+            liveness,
+            agent_status_snapshot: snapshot,
+        }))
+    }
+
+    fn with_hub(hub: EventHub) -> Self {
         let (api_tx, api_rx) = mpsc::unbounded_channel();
         Self {
-            hub: EventHub::default(),
+            hub,
             running: Arc::new(AtomicBool::new(true)),
             api_tx,
             api_rx,
@@ -78,6 +91,8 @@ impl SocketTest {
 impl Drop for SocketTest {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        // What `ServerHandle::drop` does: connection threads blocked on the hub notice the flag now.
+        self.hub.wake_waiters();
         self.api_rx.close();
         while self.api_rx.try_recv().is_ok() {}
         let deadline = Instant::now() + APP_RESPONSE_TIMEOUT + Duration::from_secs(1);
@@ -214,6 +229,10 @@ fn reply(request: ApiRequestMessage, result: ResponseResult) {
 }
 
 fn reply_to_probe(request: ApiRequestMessage) {
+    reply_to_probe_with_status(request, AgentStatus::Working);
+}
+
+fn reply_to_probe_with_status(request: ApiRequestMessage, agent_status: AgentStatus) {
     let result = match request.request.method {
         Method::PaneGet(_) => ResponseResult::PaneInfo {
             pane: PaneInfo {
@@ -231,7 +250,7 @@ fn reply_to_probe(request: ApiRequestMessage) {
                 terminal_title: None,
                 terminal_title_stripped: None,
                 display_agent: None,
-                agent_status: AgentStatus::Working,
+                agent_status,
                 state_labels: Default::default(),
                 tokens: Default::default(),
                 agent_session: None,
@@ -353,4 +372,356 @@ fn lagging_subscription_closes_without_interrupting_other_clients() {
     let response = ordinary.response();
     assert_eq!(response["id"], "ordinary");
     assert_eq!(response["result"]["type"], "workspace_list");
+}
+
+fn idle_agent_status_subscription() -> Value {
+    json!([{"type": "pane.agent_status_changed", "pane_id": "pane_1"}])
+}
+
+fn agent_status_event(title: Option<&str>) -> EventEnvelope {
+    EventEnvelope {
+        event: EventKind::PaneAgentStatusChanged,
+        data: EventData::PaneAgentStatusChanged {
+            pane_id: "pane_1".into(),
+            workspace_id: "workspace_1".into(),
+            agent_status: AgentStatus::Working,
+            agent: Some("pi".into()),
+            title: title.map(Into::into),
+            display_agent: None,
+            state_labels: Default::default(),
+        },
+    }
+}
+
+/// Answers every app request that arrives during `window` with the probe reply and returns how
+/// many `pane.get` requests there were.
+fn answer_pane_gets_for(test: &mut SocketTest, window: Duration) -> usize {
+    answer_pane_gets_with_status_for(test, window, AgentStatus::Working)
+}
+
+/// `answer_pane_gets_for`, answering every `pane.get` with `agent_status`.
+fn answer_pane_gets_with_status_for(
+    test: &mut SocketTest,
+    window: Duration,
+    agent_status: AgentStatus,
+) -> usize {
+    let end = Instant::now() + window;
+    let mut pane_gets = 0;
+    while Instant::now() < end {
+        match test.api_rx.try_recv() {
+            Ok(request) => {
+                if matches!(request.request.method, Method::PaneGet(_)) {
+                    pane_gets += 1;
+                }
+                reply_to_probe_with_status(request, agent_status);
+            }
+            Err(mpsc::error::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
+            Err(error) => panic!("app request channel closed: {error}"),
+        }
+    }
+    pane_gets
+}
+
+#[test]
+fn an_idle_event_subscription_does_not_poll_the_history() {
+    let mut test = SocketTest::new();
+    let mut client = test.connect();
+    client.subscribe("idle", json!([{"type": "workspace.renamed"}]));
+    client.assert_started("idle");
+    let reads_before = test.hub.history_reads();
+    std::thread::sleep(Duration::from_millis(2500));
+    let reads = test.hub.history_reads() - reads_before;
+    // At 3284e19a the connection thread read the history every 100 ms: about 25 reads here.
+    // Now it blocks on the hub and looks again once per liveness interval (1 s): 2 or 3 reads.
+    assert!(
+        reads <= 5,
+        "an idle subscription read the event history {reads} times in 2.5 s"
+    );
+}
+
+#[test]
+fn an_idle_agent_status_subscription_asks_the_app_for_a_pane_once_per_snapshot_interval() {
+    let mut test = SocketTest::new();
+    let mut client = test.connect();
+    client.subscribe("idle-status", idle_agent_status_subscription());
+    // Setup probe, as the server pins its cursor.
+    let probe = test.app_request();
+    assert!(probe.request.id.ends_with(":probe"));
+    reply_to_probe(probe);
+    client.assert_started("idle-status");
+    let pane_gets = answer_pane_gets_for(&mut test, Duration::from_millis(2500));
+    // At 3284e19a every idle 100 ms pass asked the app for the pane: about 25 requests here.
+    // Now the snapshot is taken once per interval (1 s): 2 or 3 requests.
+    assert!(
+        pane_gets <= 5,
+        "an idle agent-status subscription asked for the pane {pane_gets} times in 2.5 s"
+    );
+}
+
+#[test]
+fn an_event_wakes_an_idle_connection_that_would_otherwise_sleep_for_30_seconds() {
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let mut client = test.connect();
+    client.subscribe("wake", json!([{"type": "workspace.renamed"}]));
+    client.assert_started("wake");
+    // Let the connection thread block on the hub, then publish.
+    std::thread::sleep(Duration::from_millis(300));
+    test.hub.push(renamed_event(0));
+    // With a 30 s liveness interval only the hub wake can deliver this within 5 s.
+    client.assert_renames(0..1, Instant::now() + Duration::from_secs(5));
+}
+
+#[test]
+fn a_title_change_event_reaches_an_idle_agent_status_subscriber_without_waiting_for_a_snapshot() {
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let mut client = test.connect();
+    client.subscribe("title", idle_agent_status_subscription());
+    let probe = test.app_request();
+    assert!(probe.request.id.ends_with(":probe"));
+    reply_to_probe(probe);
+    client.assert_started("title");
+    // No status filter, so there is no initial event; the first pass takes its snapshot.
+    answer_pane_gets_for(&mut test, Duration::from_millis(300));
+    // The app emits this event when an agent reports a new title (`emit_pane_state_update`). With
+    // both intervals at 30 s, only the hub wake can deliver it within 5 s: it does not wait for
+    // the 1 s snapshot of production.
+    let mut event = agent_status_event(Some("fixing the bug"));
+    if let EventData::PaneAgentStatusChanged { title, .. } = &mut event.data {
+        assert_eq!(title.as_deref(), Some("fixing the bug"));
+    }
+    test.hub.push(event);
+    let delivered = client
+        .next_line(Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(delivered["event"], "pane.agent_status_changed");
+    assert_eq!(delivered["data"]["title"], "fixing the bug");
+}
+
+#[test]
+fn a_closed_peer_is_noticed_within_the_liveness_interval() {
+    let mut test = SocketTest::with_timing(Duration::from_millis(200), Duration::from_secs(30));
+    let mut client = test.connect();
+    client.subscribe("close", json!([{"type": "workspace.renamed"}]));
+    client.assert_started("close");
+    std::thread::sleep(Duration::from_millis(100));
+    drop(client);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !test.workers[0].is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        test.workers[0].is_finished(),
+        "the connection thread did not notice that its peer closed"
+    );
+}
+
+#[test]
+fn stopping_the_server_releases_a_connection_blocked_on_the_hub() {
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let mut client = test.connect();
+    client.subscribe("stop", json!([{"type": "workspace.renamed"}]));
+    client.assert_started("stop");
+    std::thread::sleep(Duration::from_millis(300));
+    // What `ServerHandle::drop` does, once: a single wake-up must be enough (it is not repeated here, which would hide a
+    // lost one); `dropping_the_server_handle_releases_a_held_subscription` pins the real `ServerHandle::drop`.
+    test.running.store(false, Ordering::Relaxed);
+    test.hub.wake_waiters();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !test.workers[0].is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        test.workers[0].is_finished(),
+        "a connection blocked on the hub kept running after the server stopped"
+    );
+}
+
+#[test]
+fn an_events_wait_ends_when_the_matching_event_arrives_without_polling() {
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let mut client = test.connect();
+    client.send(json!({
+        "id": "wait",
+        "method": "events.wait",
+        "params": {
+            "match_event": {
+                "event": "pane_agent_status_changed",
+                "pane_id": "pane_1",
+                "agent_status": "idle"
+            },
+            "timeout_ms": 60_000
+        }
+    }));
+    // Setup probe and the first snapshot: the pane is working, so there is no match yet.
+    answer_pane_gets_for(&mut test, Duration::from_millis(500));
+    let mut event = agent_status_event(None);
+    if let EventData::PaneAgentStatusChanged { agent_status, .. } = &mut event.data {
+        *agent_status = AgentStatus::Idle;
+    }
+    test.hub.push(event);
+    // With a 30 s liveness and snapshot interval only the hub wake can end the wait within 5 s.
+    let response = client
+        .next_line(Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(response["id"], "wait");
+    assert!(response.get("error").is_none(), "{response}");
+}
+
+#[test]
+fn a_pane_event_takes_a_snapshot_at_once_but_only_for_the_subscribed_pane() {
+    // Both intervals are 30 s: a `pane.get` within the test can only be the answer to an event.
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let mut client = test.connect();
+    client.subscribe("pane-events", idle_agent_status_subscription());
+    let probe = test.app_request();
+    assert!(probe.request.id.ends_with(":probe"));
+    reply_to_probe(probe);
+    client.assert_started("pane-events");
+    // The first pass takes its snapshot; then the connection blocks on the hub.
+    assert_eq!(
+        answer_pane_gets_for(&mut test, Duration::from_millis(400)),
+        1
+    );
+
+    let closed = |pane_id: &str| EventEnvelope {
+        event: EventKind::PaneClosed,
+        data: EventData::PaneClosed {
+            pane_id: pane_id.into(),
+            workspace_id: "workspace_1".into(),
+        },
+    };
+    // An event about another pane changes nothing this subscription reports.
+    test.hub.push(closed("pane_2"));
+    assert_eq!(
+        answer_pane_gets_for(&mut test, Duration::from_millis(400)),
+        0
+    );
+    // An event about the subscribed pane (here: it closed, so `pane.get` may now fail with
+    // `pane_not_found`) is checked at once, not at the next interval.
+    test.hub.push(closed("pane_1"));
+    let request = test.app_request();
+    assert!(matches!(request.request.method, Method::PaneGet(_)));
+    assert!(
+        request.request.id.ends_with(":pane"),
+        "{}",
+        request.request.id
+    );
+    reply_to_probe(request);
+}
+
+fn read_state_changed(pane_id: &str) -> EventEnvelope {
+    EventEnvelope {
+        event: EventKind::PaneReadStateChanged,
+        data: EventData::PaneReadStateChanged {
+            read_state: PaneReadState {
+                pane_id: pane_id.into(),
+                workspace_id: "workspace_1".into(),
+                seen: true,
+                agent_status: AgentStatus::Idle,
+            },
+        },
+    }
+}
+
+#[test]
+fn a_viewed_done_pane_reaches_an_agent_status_subscriber_at_once() {
+    // Viewing a done pane (or giving it the `auto_read` token late) turns done into idle with no
+    // `pane.agent_status_changed`; the app says so with `pane.read_state_changed`. Both intervals
+    // are 30 s, so only that event can make the subscription look at the pane within 5 s.
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let mut client = test.connect();
+    client.subscribe("read", idle_agent_status_subscription());
+    let probe = test.app_request();
+    assert!(probe.request.id.ends_with(":probe"));
+    reply_to_probe_with_status(probe, AgentStatus::Done);
+    client.assert_started("read");
+    // The first pass takes its snapshot (done); then the connection blocks on the hub.
+    assert_eq!(
+        answer_pane_gets_with_status_for(&mut test, Duration::from_millis(400), AgentStatus::Done),
+        1
+    );
+
+    // A read-state change of another pane is no concern of this subscription.
+    test.hub.push(read_state_changed("pane_2"));
+    assert_eq!(
+        answer_pane_gets_with_status_for(&mut test, Duration::from_millis(400), AgentStatus::Idle),
+        0
+    );
+    // The subscribed pane was viewed: its snapshot now says idle, and the subscriber is told.
+    test.hub.push(read_state_changed("pane_1"));
+    let request = test.app_request();
+    assert!(matches!(request.request.method, Method::PaneGet(_)));
+    reply_to_probe_with_status(request, AgentStatus::Idle);
+    let delivered = client
+        .next_line(Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(delivered["event"], "pane.agent_status_changed");
+    assert_eq!(delivered["data"]["agent_status"], "idle");
+}
+
+#[test]
+fn removing_a_tab_or_workspace_takes_a_snapshot_at_once() {
+    // `tab.close`, `workspace.close` and `tab.move_to_workspace` emit no `pane.closed` or
+    // `pane.moved` for the panes inside, yet `pane.get` answers `pane_not_found` (or another id)
+    // afterwards. Both intervals are 30 s, so a `pane.get` within the test answers one of them.
+    let mut test = SocketTest::with_timing(Duration::from_secs(30), Duration::from_secs(30));
+    let mut client = test.connect();
+    client.subscribe("removed", idle_agent_status_subscription());
+    let probe = test.app_request();
+    assert!(probe.request.id.ends_with(":probe"));
+    reply_to_probe(probe);
+    client.assert_started("removed");
+    assert_eq!(
+        answer_pane_gets_for(&mut test, Duration::from_millis(400)),
+        1
+    );
+
+    // Control: an event that cannot change the pane takes no snapshot.
+    test.hub.push(EventEnvelope {
+        event: EventKind::WorkspaceRenamed,
+        data: EventData::WorkspaceRenamed {
+            workspace_id: "workspace_1".into(),
+            label: "renamed".into(),
+        },
+    });
+    assert_eq!(
+        answer_pane_gets_for(&mut test, Duration::from_millis(400)),
+        0
+    );
+
+    let removals = [
+        EventEnvelope {
+            event: EventKind::TabClosed,
+            data: EventData::TabClosed {
+                tab_id: "tab_1".into(),
+                workspace_id: "workspace_1".into(),
+            },
+        },
+        EventEnvelope {
+            event: EventKind::WorkspaceClosed,
+            data: EventData::WorkspaceClosed {
+                workspace_id: "workspace_1".into(),
+                workspace: None,
+            },
+        },
+        EventEnvelope {
+            event: EventKind::TabMoved,
+            data: EventData::TabMoved {
+                tab_id: "tab_3".into(),
+                workspace_id: "workspace_2".into(),
+                insert_index: 0,
+                tabs: Vec::new(),
+            },
+        },
+    ];
+    for removal in removals {
+        let name = format!("{:?}", removal.event);
+        test.hub.push(removal);
+        let request = test.app_request();
+        assert!(
+            matches!(request.request.method, Method::PaneGet(_)),
+            "{name} must take a snapshot"
+        );
+        reply_to_probe(request);
+    }
 }
