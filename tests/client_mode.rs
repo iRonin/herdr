@@ -1279,6 +1279,196 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
     cleanup_test_base(&base);
 }
 
+/// A saved machine whose tab bar wraps (`ui.tab_bar_wrap`) is selected from Local, whose tab bar
+/// has one row. The handoff used to tell the machine the pane area measured on Local's layout, so
+/// the machine's panes were taller than the window and their bottom rows were hidden. What the
+/// user sees is checked: the last row of the machine's pane, found with `stty size` in the pane's
+/// own shell, must be on screen. The marker is built from pieces, so the echo of the typed command
+/// never contains it.
+#[test]
+fn a_machine_selected_from_local_shows_the_bottom_row_of_its_panes_under_a_wrapped_tab_bar() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let remote_config = base.join("remote-config");
+    let remote_runtime = base.join("remote-runtime");
+    let remote_api = remote_runtime.join("herdr.sock");
+    let remote_client = remote_runtime.join("herdr-client.sock");
+    let remote_server = spawn_server(&remote_config, &remote_runtime, &remote_api, &remote_client);
+    wait_for_socket(&remote_api, Duration::from_secs(10));
+    wait_for_socket(&remote_client, Duration::from_secs(10));
+    let created = send_json_request(
+        &remote_api,
+        &serde_json::json!({
+            "id": "remote-workspace", "method": "workspace.create",
+            "params": {"cwd": base, "focus": true, "label": "remote-ready"},
+        })
+        .to_string(),
+    );
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let remote_pane = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for number in 2..=10 {
+        let tab = send_json_request(
+            &remote_api,
+            &serde_json::json!({
+                "id": format!("remote-tab-{number}"), "method": "tab.create",
+                "params": {
+                    "workspace_id": workspace_id, "focus": false,
+                    "label": format!("wraptab-{number:02}-long-label"),
+                },
+            })
+            .to_string(),
+        );
+        assert_eq!(tab["result"]["type"], "tab_created", "{tab}");
+    }
+    // The pane starts a login shell, which reads the user's profile before it reads typed input. Wait until the shell itself
+    // has created a marker, so the echo of a typed command cannot stand in for it.
+    let shell_ready = base.join("remote-shell-ready");
+    send_pane_shell_command(
+        &remote_api,
+        &remote_pane,
+        &format!(": > {}", shell_ready.display()),
+    );
+    assert!(
+        wait_until(Duration::from_secs(60), Duration::from_millis(50), || {
+            shell_ready.exists()
+        }),
+        "pane shell did not run a command within 60s"
+    );
+
+    // The client reads the same config as its Local server: the tab bar wraps on both sides, and
+    // Local's one-tab bar has one row.
+    let local = spawn_server_with_config(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+        "onboarding = false\n\n[ui]\ntab_bar_wrap = true\n",
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    let created = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id": "local-workspace", "method": "workspace.create",
+            "params": {"cwd": base, "focus": true, "label": "local-online"},
+        })
+        .to_string(),
+    );
+    assert_eq!(created["result"]["type"], "workspace_created");
+    let catalog_dir = runtime_dir
+        .join("state")
+        .join(app_dir_name())
+        .join("client");
+    fs::create_dir_all(&catalog_dir).unwrap();
+    let profile = "0123456789abcdef0123456789abcdef";
+    fs::write(catalog_dir.join("endpoints.json"), serde_json::json!({
+        "version": 1, "selected_profile": null,
+        "ssh": [{"id": profile, "label": "Test remote", "target": "test-only", "session": "default", "enabled": true}],
+    }).to_string()).unwrap();
+
+    // The SSH executable is private to this client: it runs the real bridge against the disposable
+    // remote server above, never the developer's saved hosts.
+    let bin = base.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(base.join("home")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_herdr"), bin.join("herdr")).unwrap();
+    let quote =
+        |path: &std::path::Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    fs::write(bin.join("ssh"), format!(
+        "#!/bin/sh\nexport HOME={} XDG_CONFIG_HOME={} XDG_RUNTIME_DIR={} HERDR_SOCKET_PATH={}\nunset HERDR_CLIENT_SOCKET_PATH HERDR_SESSION\nfor arg do last=\"$arg\"; done\nexec /bin/sh -c \"$last\"\n",
+        quote(&base.join("home")), quote(&remote_config), quote(&remote_runtime), quote(&remote_api),
+    )).unwrap();
+    fs::set_permissions(bin.join("ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let client = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["client"],
+        &[("PATH", &path)],
+    );
+    let output = spawn_pty_drain(client._master.as_ref().unwrap().try_clone_reader().unwrap());
+    let screen_text = || {
+        let bytes = output
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .bytes
+            .clone();
+        terminal_screen::text(&bytes, 80, 24)
+    };
+    assert!(
+        wait_until(Duration::from_secs(20), Duration::from_millis(50), || {
+            let screen = screen_text();
+            screen.contains("local-online") && screen.contains("remote-ready")
+        }),
+        "Local and the saved machine must both be listed: {}",
+        screen_text()
+    );
+
+    let mut input = client._master.as_ref().unwrap().take_writer().unwrap();
+    input
+        .write_all(&sidebar_row_click(&screen_text(), "remote-ready"))
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(20), Duration::from_millis(50), || {
+            screen_text().contains("wraptab-02")
+        }),
+        "the saved machine's tab bar must be shown after selecting it: {}",
+        screen_text()
+    );
+    // Counted inside the wait: a frame split across two PTY reads shows a half-drawn bar first.
+    // At least four rows: with the bug present the pane is taller than the window, and the echo of
+    // a retried command can put the marker at PTY row 21; only under a bar of four rows or more
+    // is that row still hidden.
+    let bar_rows = || {
+        screen_text()
+            .lines()
+            .filter(|line| line.contains("wraptab-"))
+            .count()
+    };
+    assert!(
+        wait_until(Duration::from_secs(20), Duration::from_millis(50), || {
+            bar_rows() >= 4
+        }),
+        "guard: the bar must be at least 4 rows, or the echo of a retried command can lift the marker into view with the bug present: {}",
+        screen_text()
+    );
+
+    let last_row_marker = "r=$(stty size | cut -d' ' -f1); printf \"\\033[2J\\033[%d;1H%s%s\" \"$r\" BOTTOM_ ROW_MARK";
+    assert!(
+        wait_until(Duration::from_secs(20), Duration::from_millis(600), || {
+            if screen_text().contains("BOTTOM_ROW_MARK") {
+                return true;
+            }
+            send_pane_shell_command(&remote_api, &remote_pane, last_row_marker);
+            false
+        }),
+        "the last row of the machine's pane must be on screen under its {}-row tab bar: {}",
+        bar_rows(),
+        screen_text()
+    );
+    drop(input);
+    drop(client);
+    drop(local);
+    drop(remote_server);
+    cleanup_test_base(&base);
+}
+
 #[test]
 fn client_shell_detaches_restores_and_freshly_reattaches_to_current_state() {
     let _lock = test_lock();

@@ -204,6 +204,11 @@ impl PendingEndpointActivation {
         resize_geometry(&self.resize).expect("activation resize was validated before construction")
     }
 
+    /// Whether `resize` asks for another pane area than the one this handoff is waiting for.
+    pub(crate) fn resize_changes_pane_area(&self, resize: &crate::protocol::ClientMessage) -> bool {
+        resize_geometry(resize).is_some_and(|geometry| geometry != self.geometry())
+    }
+
     pub(crate) fn presentation_sync_endpoint(&self) -> Option<&ClientEndpointId> {
         match self.phase {
             ActivationPhase::ActivatingTarget { .. } => Some(&self.target.endpoint_id),
