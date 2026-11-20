@@ -2255,3 +2255,184 @@ fn client_receives_notify_on_agent_state_change() {
 
     cleanup_spawned_herdr(spawned, base);
 }
+
+/// What a client's terminal shows right now, as a terminal that can be asked which link a cell carries.
+fn client_terminal(output: &SharedOutput) -> ghostty_vt::Terminal {
+    let bytes = output
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .bytes
+        .clone();
+    let mut terminal = ghostty_vt::Terminal::new(80, 24, 0).unwrap();
+    terminal.write(&bytes);
+    terminal
+}
+
+/// Every cell of the terminal that shows exactly `glyph`: its column, its row and the link it carries.
+fn cells_showing(terminal: &ghostty_vt::Terminal, glyph: char) -> Vec<(u16, u16, Option<String>)> {
+    let mut cells = Vec::new();
+    for y in 0..24u16 {
+        for x in 0..80u16 {
+            let (_, shown) = terminal.screen_cell(x, u32::from(y)).unwrap();
+            if shown == [u32::from(glyph)] {
+                let link = terminal.viewport_hyperlink_uri(x, u32::from(y)).unwrap();
+                cells.push((x, y, link));
+            }
+        }
+    }
+    cells
+}
+
+/// A pane prints file:// links and the client, with mouse capture on and no plugin, writes them on to
+/// its own terminal as OSC 8, so the terminal's own click opens them. The links are the ones a person
+/// sees in an agent's output: `herdr`'s own Ctrl-click opens only http(s), so a file:// link that the
+/// client drops cannot be opened at all. Since 0.9.4 the client dropped every pane link while capture
+/// was on. The assertions read the bytes the client wrote to its terminal, and what a terminal fed
+/// those bytes shows, never the server's or the client's internal state.
+#[test]
+fn mouse_capture_client_keeps_pane_file_hyperlinks_for_the_outer_terminal() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let (server, client, output) = attach_thin_client_with_config(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+        "onboarding = false\n[ui]\nmouse_capture = true\n",
+    );
+
+    // One short link, and one whose label is longer than the pane is wide, so that it wraps onto
+    // several rows. The label glyphs occur nowhere else on the client's screen.
+    let short_uri = "file:///x";
+    let wrapped_uri = "file:///wrapped/label.txt";
+    let wrapped_label_cells = 150;
+    let link_file = base.join("links.bin");
+    fs::write(
+        &link_file,
+        format!(
+            "\x1b]8;;{short_uri}\x1b\\Q\x1b]8;;\x1b\\\r\n\
+             \x1b]8;;{wrapped_uri}\x1b\\{}\x1b]8;;\x1b\\\r\n",
+            "Z".repeat(wrapped_label_cells)
+        ),
+    )
+    .unwrap();
+    let panes = send_json_request(
+        &api_socket,
+        r#"{"id":"panes","method":"pane.list","params":{}}"#,
+    );
+    let pane_id = panes["result"]["panes"][0]["pane_id"]
+        .as_str()
+        .expect("attached pane id")
+        .to_owned();
+    let before = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id": "read-before",
+            "method": "pane.read",
+            "params": {"pane_id": pane_id, "source": "visible"}
+        })
+        .to_string(),
+    );
+    let typed = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id": "print-links",
+            "method": "pane.send_text",
+            "params": {"pane_id": pane_id, "text": format!("cat {}\n", link_file.display())}
+        })
+        .to_string(),
+    );
+    assert!(
+        typed.get("error").is_none(),
+        "{typed}\npane list: {panes}\npane before: {before}\nclient's screen: {}",
+        read_output(&output)
+    );
+
+    // The labels reached the client's screen. Without this, a missing link would only prove that
+    // nothing was printed.
+    let drawn = wait_until(Duration::from_secs(15), Duration::from_millis(50), || {
+        let terminal = client_terminal(&output);
+        cells_showing(&terminal, 'Q').len() == 1
+            && cells_showing(&terminal, 'Z').len() == wrapped_label_cells
+    });
+    if !drawn {
+        let terminal = client_terminal(&output);
+        let pane = send_json_request(
+            &api_socket,
+            &serde_json::json!({
+                "id": "read",
+                "method": "pane.read",
+                "params": {"pane_id": pane_id, "source": "visible"}
+            })
+            .to_string(),
+        );
+        let bytes = output
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .bytes
+            .clone();
+        let tail = bytes[bytes.len().saturating_sub(2000)..]
+            .chunks(100)
+            .map(|chunk| format!("{:?}", String::from_utf8_lossy(chunk)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!(
+            "the printed labels never reached the client's screen: {} Q cells, {} Z cells\n\
+             pane list: {panes}\nserver's pane before: {before}\nserver's pane: {}\nlast client bytes:\n{tail}\nclient's screen: {}",
+            cells_showing(&terminal, 'Q').len(),
+            cells_showing(&terminal, 'Z').len(),
+            pane["result"]["read"]["text"],
+            read_output(&output)
+        );
+    }
+
+    let bytes = output
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .bytes
+        .clone();
+    for uri in [short_uri, wrapped_uri] {
+        let opener = format!("\x1b]8;;{uri}\x1b\\");
+        assert!(
+            bytes
+                .windows(opener.len())
+                .any(|part| part == opener.as_bytes()),
+            "the client must write the OSC 8 opener for {uri} to its terminal with mouse capture on"
+        );
+    }
+    let terminal = client_terminal(&output);
+    assert_eq!(
+        cells_showing(&terminal, 'Q')
+            .into_iter()
+            .map(|(_, _, link)| link)
+            .collect::<Vec<_>>(),
+        [Some(short_uri.to_owned())],
+        "the terminal must see the short link on its label"
+    );
+    let wrapped = cells_showing(&terminal, 'Z');
+    let mut rows = wrapped.iter().map(|(_, y, _)| *y).collect::<Vec<_>>();
+    rows.dedup();
+    assert!(
+        rows.len() >= 2,
+        "the long label must wrap onto several rows to test wrapped links: {rows:?}"
+    );
+    for (x, y, link) in wrapped {
+        assert_eq!(
+            link.as_deref(),
+            Some(wrapped_uri),
+            "every row of the wrapped label keeps its link; cell {x},{y} lost it"
+        );
+    }
+
+    drop(client);
+    let _ = send_json_request(
+        &api_socket,
+        r#"{"id":"stop","method":"server.stop","params":{}}"#,
+    );
+    cleanup_spawned_herdr(server, base);
+}
