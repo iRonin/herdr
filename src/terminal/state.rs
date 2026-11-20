@@ -158,6 +158,12 @@ pub struct TerminalState {
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
+    /// A restart resume typed `<agent> && exit` (or the shell's equivalent) into this pane's shell, so the shell ends with the
+    /// agent when the agent ends normally. Never saved. It describes the command line the shell was typed, and it stays set
+    /// after an agent that ended with another status (which spent that command line and left the shell alive) until the shell
+    /// is replaced; the only effect of a stale flag is a session checkpoint when the pane's shell later ends, and a stop within
+    /// five seconds of it then brings the pane back.
+    pub closes_when_resumed_agent_exits: bool,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
@@ -198,6 +204,7 @@ impl TerminalState {
             revision: 0,
             launch_argv: None,
             respawn_shell_on_exit: false,
+            closes_when_resumed_agent_exits: false,
             recent_agent_process_exit: None,
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
@@ -2340,6 +2347,7 @@ impl TerminalState {
         self.last_agent_completion_seq = None;
         self.launch_argv = None;
         self.respawn_shell_on_exit = false;
+        self.closes_when_resumed_agent_exits = false;
         self.recent_agent_process_exit = None;
         self.agent_process_acquisition_pending = false;
         self.pending_agent_resume_plan = None;

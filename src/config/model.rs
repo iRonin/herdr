@@ -270,6 +270,10 @@ pub struct SessionConfig {
     pub resume_agents_on_restore: bool,
     /// Milliseconds between automatic agent restores. Zero disables spacing.
     pub startup_per_agent_delay_ms: u32,
+    /// Close a pane in which a server restart resumed an agent when that agent ends normally (exit status 0), instead of
+    /// leaving an idle shell. Default: false (as upstream). A crash, a signal or a shell herdr does not know keeps the pane.
+    /// A bad value is reported by `herdr config check` and keeps the other settings.
+    pub close_pane_when_resumed_agent_exits: crate::agent_resume::CloseResumedPane,
 }
 
 impl Default for SessionConfig {
@@ -277,6 +281,7 @@ impl Default for SessionConfig {
         Self {
             resume_agents_on_restore: true,
             startup_per_agent_delay_ms: 100,
+            close_pane_when_resumed_agent_exits: crate::agent_resume::CloseResumedPane::default(),
         }
     }
 }
@@ -1444,6 +1449,82 @@ startup_per_agent_delay_ms = 0
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.session.resume_agents_on_restore);
         assert_eq!(config.session.startup_per_agent_delay_ms, 0);
+    }
+
+    #[test]
+    fn close_pane_when_resumed_agent_exits_defaults_off_as_upstream_and_parses() {
+        let default_config: Config = toml::from_str("").unwrap();
+        assert!(!default_config
+            .session
+            .close_pane_when_resumed_agent_exits
+            .enabled());
+        assert_eq!(
+            default_config
+                .session
+                .close_pane_when_resumed_agent_exits
+                .problem(),
+            None
+        );
+        assert!(!Config::default()
+            .session
+            .close_pane_when_resumed_agent_exits
+            .enabled());
+
+        for (value, enabled) in [("true", true), ("false", false)] {
+            let config: Config = toml::from_str(&format!(
+                "[session]\nclose_pane_when_resumed_agent_exits = {value}\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                config.session.close_pane_when_resumed_agent_exits.enabled(),
+                enabled,
+                "{value}"
+            );
+            assert!(config.collect_diagnostics().is_empty(), "{value}");
+        }
+    }
+
+    /// A wrong type for the key is that key's problem alone. If it were a parse error, herdr would fall back to the defaults
+    /// for every setting in the file.
+    #[test]
+    fn a_bad_close_pane_when_resumed_agent_exits_value_parses_off_and_is_reported_as_a_diagnostic()
+    {
+        for (value, type_name) in [
+            ("\"yes\"", "string"),
+            ("1", "integer"),
+            ("0", "integer"),
+            ("2.5", "float"),
+            ("[true]", "array"),
+            // A datetime and an inline table reach the type as a map, not as a scalar.
+            ("1979-05-27", "datetime"),
+            ("{ enabled = true }", "table"),
+        ] {
+            let toml = format!("[session]\nclose_pane_when_resumed_agent_exits = {value}\nstartup_per_agent_delay_ms = 5000\n");
+            let config: Config = toml::from_str(&toml)
+                .unwrap_or_else(|err| panic!("{value} must not fail the whole config: {err}"));
+            assert!(
+                !config.session.close_pane_when_resumed_agent_exits.enabled(),
+                "{value}"
+            );
+            assert_eq!(config.session.startup_per_agent_delay_ms, 5000, "{value}");
+            let diagnostics = config.collect_diagnostics();
+            assert_eq!(diagnostics.len(), 1, "{value}: {diagnostics:?}");
+            assert_eq!(
+                diagnostics[0],
+                format!("session.close_pane_when_resumed_agent_exits must be true or false (got {type_name}); keeping it off"),
+                "{value}"
+            );
+            // `config_diagnostic_summary` words its notice from these phrases: a bad value for this one key must not
+            // claim that the defaults are in use.
+            assert!(
+                !diagnostics[0].contains("using defaults"),
+                "{diagnostics:?}"
+            );
+            assert!(
+                !diagnostics[0].contains("keeping current config"),
+                "{diagnostics:?}"
+            );
+        }
     }
 
     #[test]
