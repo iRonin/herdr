@@ -565,7 +565,13 @@ impl ClientState {
         &mut self,
         frame_data: impl Into<frame_output::ComposedFrame>,
     ) -> bool {
-        self.try_present_frame_to(&mut io::stdout(), frame_data)
+        // A unit test that drives a whole handoff presents frames. They go nowhere, not into the
+        // test runner's output, where escape sequences would end up inside the result lines.
+        #[cfg(test)]
+        let mut output = io::sink();
+        #[cfg(not(test))]
+        let mut output = io::stdout();
+        self.try_present_frame_to(&mut output, frame_data)
     }
 
     pub(super) fn try_present_frame_to(
