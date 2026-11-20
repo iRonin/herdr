@@ -2843,7 +2843,7 @@ fn workspace_drag_rejects_foreign_endpoint_slots() {
 }
 
 #[test]
-fn workspace_aggregate_mark_uses_read_aware_concrete_agent_priority() {
+fn workspace_aggregate_mark_ranks_any_blocked_agent_first_and_stays_read_aware() {
     use crate::api::schema::AgentStatus;
     use crate::config::StatusIndicatorStyle;
 
@@ -2902,8 +2902,10 @@ fn workspace_aggregate_mark_uses_read_aware_concrete_agent_priority() {
     let mut working = agent("working", AgentStatus::Working, 3);
     working.pane_id = "pane_2".into();
     snapshot.agents.push(working);
-    let working = mark(&mut state);
-    assert_eq!(working, ("◐".into(), state.config.palette.yellow));
+    // A working agent beside the read block does not hide it: the space is blocked either way,
+    // and the hollow mark says the user has already seen the block.
+    let beside_working = mark(&mut state);
+    assert_eq!(beside_working, ("○".into(), state.config.palette.red));
 
     state
         .endpoints

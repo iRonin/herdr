@@ -201,7 +201,9 @@ fn focused_tabs(snapshot: &ClientShellSnapshot) -> Vec<&ClientShellTab> {
 /// The tab's highest-attention live agent, if it has one. The server only admits panes whose
 /// terminal `is_agent_terminal()` to the snapshot's agent list, which is the same "pane with an
 /// agent" gate the v0.8.x tab marks filtered on — so this reproduces that selection from the wire.
-/// `max_by_key` keeps the last maximum, so ties preserve snapshot order.
+/// A tab is a container, so the winner is picked by container rank: any blocked agent wins, an
+/// unread block over a read one. `max_by_key` keeps the last maximum, so ties between equally
+/// ranked agents preserve snapshot order.
 fn tab_agent<'a>(
     snapshot: &'a ClientShellSnapshot,
     tab: &ClientShellTab,
@@ -210,7 +212,7 @@ fn tab_agent<'a>(
         .agents
         .iter()
         .filter(|agent| agent.tab_id == tab.tab_id)
-        .max_by_key(|agent| super::agent_status_priority(agent))
+        .max_by_key(|agent| super::agent_container_priority(agent))
 }
 
 /// Mark and colour the `ui.tab_agent_status` prefix draws at the head of a tab label. The mark

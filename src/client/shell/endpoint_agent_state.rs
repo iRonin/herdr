@@ -215,13 +215,15 @@ impl EndpointAgentPresentation {
     }
 }
 
+/// The tab and workspace aggregates a client falls back on, from the agents it holds. A container
+/// is blocked when any agent in it is blocked, read or not (container rank, not the agent list's).
 fn project_aggregate_status(snapshot: &mut ClientShellSnapshot) {
     for tab in &mut snapshot.tabs {
         if let Some(agent) = snapshot
             .agents
             .iter()
             .filter(|agent| agent.tab_id == tab.tab_id)
-            .max_by_key(|agent| super::agent_status_priority(agent))
+            .max_by_key(|agent| super::agent_container_priority(agent))
         {
             tab.agent_status = agent.agent_status;
         }
@@ -231,7 +233,7 @@ fn project_aggregate_status(snapshot: &mut ClientShellSnapshot) {
             .agents
             .iter()
             .filter(|agent| agent.workspace_id == workspace.workspace_id)
-            .max_by_key(|agent| super::agent_status_priority(agent))
+            .max_by_key(|agent| super::agent_container_priority(agent))
         {
             workspace.agent_status = agent.agent_status;
         }
@@ -378,8 +380,11 @@ mod tests {
         assert!(super::super::agent_is_blocked_read(&snapshot.agents[0]));
     }
 
+    /// A tab or a space holding a blocked agent is blocked, whether or not the user has read that
+    /// block and whatever else it holds. The agent list still sinks a read block (that is a
+    /// property of agents, not of the containers that hold them).
     #[test]
-    fn projected_aggregates_rank_working_over_read_blocked_but_not_unread_blocked() {
+    fn projected_aggregates_report_blocked_when_any_agent_is_blocked_read_or_not() {
         let mut snapshot = snapshot(AgentStatus::Blocked, 4, 1);
         snapshot.tabs[0].tab_id = "tab".into();
         snapshot.workspaces[0].workspace_id = "workspace".into();
@@ -387,20 +392,46 @@ mod tests {
             crate::protocol::CLIENT_SHELL_BLOCKED_READ_TOKEN.into(),
             "1".into(),
         ));
-        let mut working = agent(AgentStatus::Working, 5);
-        working.pane_id = "working-pane".into();
-        snapshot.agents.push(working);
+        let mut other = agent(AgentStatus::Working, 5);
+        other.pane_id = "other-pane".into();
+        snapshot.agents.push(other);
+        // Start every case from a status no case expects, so a projection that does nothing fails.
+        let project = |snapshot: &mut ClientShellSnapshot| {
+            snapshot.tabs[0].agent_status = AgentStatus::Unknown;
+            snapshot.workspaces[0].agent_status = AgentStatus::Unknown;
+            project_aggregate_status(snapshot);
+            (
+                snapshot.tabs[0].agent_status,
+                snapshot.workspaces[0].agent_status,
+            )
+        };
 
-        project_aggregate_status(&mut snapshot);
+        // Read blocked beside a working agent.
+        assert_eq!(
+            project(&mut snapshot),
+            (AgentStatus::Blocked, AgentStatus::Blocked)
+        );
 
-        assert_eq!(snapshot.tabs[0].agent_status, AgentStatus::Working);
-        assert_eq!(snapshot.workspaces[0].agent_status, AgentStatus::Working);
+        // Read blocked beside an unread finish.
+        snapshot.agents[1].agent_status = AgentStatus::Done;
+        assert_eq!(
+            project(&mut snapshot),
+            (AgentStatus::Blocked, AgentStatus::Blocked)
+        );
 
+        // Unread blocked beside the same unread finish.
         snapshot.agents[0].tokens.clear();
-        project_aggregate_status(&mut snapshot);
+        assert_eq!(
+            project(&mut snapshot),
+            (AgentStatus::Blocked, AgentStatus::Blocked)
+        );
 
-        assert_eq!(snapshot.tabs[0].agent_status, AgentStatus::Blocked);
-        assert_eq!(snapshot.workspaces[0].agent_status, AgentStatus::Blocked);
+        // Control: with nothing blocked the order is the old one, an unread finish above work.
+        snapshot.agents[0].agent_status = AgentStatus::Working;
+        assert_eq!(
+            project(&mut snapshot),
+            (AgentStatus::Done, AgentStatus::Done)
+        );
     }
 
     #[test]

@@ -19,6 +19,7 @@ mod aggregate;
 mod git;
 mod tab;
 
+pub(crate) use self::aggregate::container_attention_priority;
 use self::git::git_status_cache_key_for_space;
 pub(crate) use self::{git::git_status_snapshot_for_cwd_with_demand, tab::MovedPane};
 pub use self::{

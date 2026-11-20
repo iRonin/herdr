@@ -120,7 +120,9 @@ fi
 
 The sidebar rolls state upward.
 
-A blocked agent makes its pane, tab, and workspace look blocked. A working agent makes the workspace look active. A done agent stays visible until you view it.
+A blocked agent makes its pane, tab, and workspace look blocked, whether or not you have already seen the block. A working or finished agent beside it never takes the mark over. The mark tells the two cases apart: while at least one blocked agent in the tab or workspace is still unseen it shows the usual blocked mark (a filled red dot, or a red `×` with `status_indicators = "symbols"`), and once you have seen every blocked agent in it, a hollow red `○`. A working agent makes the workspace look active. A done agent stays visible until you view it.
+
+The agents list is the exception. It orders agents one by one, so with the priority sort, and in the current-space view, a blocked agent you have already seen still sits below a finished agent you have not.
 
 This is the main Herdr workflow: start several agents, let them work in parallel, and use the sidebar to see which project needs a decision, which one is still running, and which one is ready to review.
 
