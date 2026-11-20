@@ -2326,13 +2326,21 @@ fn a_machine_selected_from_local_shows_the_bottom_row_of_its_panes_under_a_wrapp
         "the saved machine's tab bar must be shown after selecting it: {}",
         screen_text()
     );
-    let bar_rows = screen_text()
-        .lines()
-        .filter(|line| line.contains("wraptab-"))
-        .count();
+    // Counted inside the wait: a frame split across two PTY reads shows a half-drawn bar first.
+    // At least four rows: with the bug present the pane is taller than the window, and the echo of
+    // a retried command can put the marker at PTY row 21; only under a bar of four rows or more
+    // is that row still hidden.
+    let bar_rows = || {
+        screen_text()
+            .lines()
+            .filter(|line| line.contains("wraptab-"))
+            .count()
+    };
     assert!(
-        bar_rows >= 2,
-        "guard: the machine's tab bar wraps to several rows, saw {bar_rows}: {}",
+        wait_until(Duration::from_secs(20), Duration::from_millis(50), || {
+            bar_rows() >= 4
+        }),
+        "guard: the bar must be at least 4 rows, or the echo of a retried command can lift the marker into view with the bug present: {}",
         screen_text()
     );
 
@@ -2345,7 +2353,8 @@ fn a_machine_selected_from_local_shows_the_bottom_row_of_its_panes_under_a_wrapp
             send_pane_shell_command(&remote_api, &remote_pane, last_row_marker);
             false
         }),
-        "the last row of the machine's pane must be on screen under its {bar_rows}-row tab bar: {}",
+        "the last row of the machine's pane must be on screen under its {}-row tab bar: {}",
+        bar_rows(),
         screen_text()
     );
     drop(input);
