@@ -1798,3 +1798,362 @@ fn resize_message_preserves_the_latest_surface_dimensions() {
         Some(crate::protocol::ClientSurfaceSize { cols: 80, rows: 24 })
     );
 }
+
+fn wrapped_snapshot(boot_id: &str, tabs: usize) -> crate::protocol::ClientShellSnapshot {
+    let mut snapshot = test_snapshot(boot_id, 1);
+    snapshot.focused_workspace_id = Some("ws".into());
+    snapshot.focused_tab_id = Some("tab_1".into());
+    snapshot.focused_pane_id = Some("pane".into());
+    snapshot.workspaces = vec![crate::protocol::ClientShellWorkspace {
+        workspace_id: "ws".into(),
+        active_tab_id: "tab_1".into(),
+        new_workspace_cwd: "/repo".into(),
+        number: 1,
+        label: "space".into(),
+        custom_label: false,
+        branch: None,
+        git_ahead_behind: None,
+        tokens: Vec::new(),
+        worktree: None,
+        focused: true,
+        agent_count: 0,
+        agent_status: crate::api::schema::AgentStatus::Idle,
+    }];
+    snapshot.tabs = (1..=tabs)
+        .map(|number| crate::protocol::ClientShellTab {
+            tab_id: format!("tab_{number}"),
+            workspace_id: "ws".into(),
+            number,
+            label: format!("agent-tab-{number:02}"),
+            custom_label: false,
+            zoomed: false,
+            focused: number == 1,
+            agent_status: crate::api::schema::AgentStatus::Idle,
+        })
+        .collect();
+    snapshot.panes = vec![crate::protocol::ClientShellPane {
+        pane_id: "pane".into(),
+        workspace_id: "ws".into(),
+        tab_id: "tab_1".into(),
+        label: None,
+        cwd: None,
+        foreground_cwd: None,
+        focused: true,
+        right_click_passthrough: false,
+    }];
+    snapshot
+}
+
+fn surface_for(
+    boot_id: &str,
+    revision: u64,
+    geometry: crate::protocol::ClientSurfaceSize,
+) -> crate::protocol::PaneSurfaceFrame {
+    let mut surface = surface(boot_id, revision, "pane");
+    surface.frame = crate::protocol::FrameData::from_ratatui_buffer_with_hyperlinks(
+        &ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(
+            0,
+            0,
+            geometry.cols,
+            geometry.rows,
+        )),
+        None,
+        &[],
+    );
+    let rect = crate::protocol::SurfaceRect {
+        x: 0,
+        y: 0,
+        width: geometry.cols,
+        height: geometry.rows,
+    };
+    surface.panes[0].rect = rect;
+    surface.panes[0].inner_rect = rect;
+    surface
+}
+
+/// The pane areas the `ClientShellResize` messages told this endpoint about, oldest first.
+fn told_geometries(sent: &SentMessages) -> Vec<crate::protocol::ClientSurfaceSize> {
+    sent.lock()
+        .unwrap()
+        .iter()
+        .filter_map(resize_geometry)
+        .collect()
+}
+
+/// The pane area the last `ClientShellResize` told this endpoint about.
+fn last_told_geometry(sent: &SentMessages) -> Option<crate::protocol::ClientSurfaceSize> {
+    told_geometries(sent).last().copied()
+}
+
+/// A handoff from Local (one tab, a one-row tab bar) to a saved machine whose snapshot has 45
+/// tabs, in a 167x86 window. It is driven up to the point where the machine's own layout is about
+/// to be projected: the machine has answered target-on with a snapshot and a surface.
+struct MachineHandoff {
+    state: crate::client::ClientState,
+    endpoints: EndpointRegistry,
+    commands: crate::client::endpoint_commands::EndpointCommands,
+    pending: Option<PendingEndpointActivation>,
+    target: ClientEndpointId,
+    remote_sent: SentMessages,
+    /// The pane area of the layout on screen when the machine was selected: Local's.
+    source_layout: crate::protocol::ClientSurfaceSize,
+}
+
+impl MachineHandoff {
+    fn start(tab_bar_wrap: bool) -> Self {
+        use crate::client::{
+            endpoint_commands::EndpointCommands, shell_runtime::begin_endpoint_activation,
+            ClientState,
+        };
+        let mut config = crate::config::Config::default();
+        config.ui.tab_bar_wrap = tab_bar_wrap;
+        let mut shell = crate::client::ClientShellState::new(
+            crate::client::ClientShellConfig::from_config(&config),
+        );
+        let profile = super::super::SavedSshEndpoint {
+            id: super::super::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+            label: "Remote".into(),
+            target: "dev@example.com".into(),
+            session: "main".into(),
+            enabled: true,
+            local_sessions: Vec::new(),
+        };
+        let target = ClientEndpointId::Ssh(profile.id.clone());
+        shell.set_endpoint_catalog(&[profile]);
+        shell.set_snapshot(Box::new(wrapped_snapshot("local-boot", 1)));
+        shell.set_endpoint_status(&target, ClientEndpointStatus::Online);
+        shell.set_endpoint_snapshot(&target, Box::new(wrapped_snapshot("remote-boot", 45)));
+        let local_sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let remote_sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut endpoints = EndpointRegistry::new(
+            FakeTransport {
+                sent: local_sent,
+                fail_after_write: false,
+            },
+            1,
+            negotiation(),
+        );
+        endpoints.insert(
+            target.clone(),
+            FakeTransport {
+                sent: remote_sent.clone(),
+                fail_after_write: false,
+            },
+            7,
+            negotiation(),
+            false,
+        );
+
+        let mut state = ClientState::test_new();
+        state.reported_size = (167, 86);
+        let source_layout = shell.surface_size(167, 86);
+        state.shell = Some(shell);
+        let mut commands = EndpointCommands::default();
+        let mut pending = None;
+        let mut serial = 70;
+        let mut scheduled = None;
+        begin_endpoint_activation(
+            &mut state,
+            &mut endpoints,
+            &mut commands,
+            &mut pending,
+            &mut serial,
+            target.clone(),
+            None,
+            false,
+            Instant::now(),
+            &mut scheduled,
+        )
+        .unwrap();
+        let activation = pending.as_mut().unwrap();
+        activation.receive_response(
+            &ClientEndpointId::Local,
+            1,
+            "client-shell-surface:70:off",
+            &surface_success("client-shell-surface:70:off", false, 1),
+            &mut endpoints,
+        );
+        let told = last_told_geometry(&remote_sent).expect("activation resize");
+        activation.receive_response(
+            &target,
+            7,
+            "client-shell-surface:70:on",
+            &surface_success("client-shell-surface:70:on", true, 1),
+            &mut endpoints,
+        );
+        activation.receive_snapshot(&target, 7, &wrapped_snapshot("remote-boot", 45));
+        assert_eq!(
+            activation.receive_surface(&target, 7, surface_for("remote-boot", 1, told)),
+            SurfaceActivationProgress::Ready
+        );
+        Self {
+            state,
+            endpoints,
+            commands,
+            pending,
+            target,
+            remote_sent,
+            source_layout,
+        }
+    }
+
+    fn activation(&mut self) -> &mut PendingEndpointActivation {
+        self.pending.as_mut().expect("the handoff is pending")
+    }
+
+    fn complete(&mut self) {
+        crate::client::shell_runtime::complete_endpoint_activation(
+            &mut self.state,
+            &mut self.endpoints,
+            &mut self.pending,
+            &mut self.commands,
+        )
+        .unwrap();
+    }
+
+    /// The pane area the layout on screen leaves in the window.
+    fn own_layout(&self) -> crate::protocol::ClientSurfaceSize {
+        self.state.shell.as_ref().unwrap().surface_size(167, 86)
+    }
+
+    /// The machine answers the presentation sync: the snapshot of `revision` with `tabs` tabs and a
+    /// surface of the same revision drawn at `geometry`. The snapshot is cached the way the
+    /// client does while the handoff holds the old frame.
+    fn answer_presentation_sync(
+        &mut self,
+        tabs: usize,
+        revision: u64,
+        geometry: crate::protocol::ClientSurfaceSize,
+    ) -> SurfaceActivationProgress {
+        let mut snapshot = wrapped_snapshot("remote-boot", tabs);
+        snapshot.revision = revision;
+        self.state
+            .shell
+            .as_mut()
+            .unwrap()
+            .cache_endpoint_snapshot_inactive_for_generation(
+                &self.target,
+                7,
+                Box::new(snapshot.clone()),
+            );
+        let activation = self.pending.as_mut().expect("the handoff is pending");
+        activation.receive_response(
+            &self.target,
+            7,
+            "client-shell-surface:70:presentation-sync",
+            &surface_success("client-shell-surface:70:presentation-sync", true, revision),
+            &mut self.endpoints,
+        );
+        activation.receive_snapshot(&self.target, 7, &snapshot);
+        activation.receive_surface(
+            &self.target,
+            7,
+            surface_for("remote-boot", revision, geometry),
+        )
+    }
+
+    /// The machine acknowledges the effects fence and the handoff completes.
+    fn finish_presentation_effects(&mut self) {
+        let target = self.target.clone();
+        assert_eq!(
+            self.activation()
+                .receive_presentation_effects_ready(&target, 7, "70:7:remote-boot"),
+            SurfaceActivationProgress::Ready
+        );
+        self.complete();
+        assert!(self.pending.is_none(), "the handoff completed");
+    }
+}
+
+/// Selecting a machine measures the pane area from the layout that is on screen at that moment:
+/// the source's. The machine's own tab bar can be taller (`ui.tab_bar_wrap` with many tabs), and
+/// the area under it is then shorter than what the machine was told. The machine keeps sizing its
+/// panes to the taller area, so the bottom rows of every pane sit below the window's edge.
+#[test]
+fn a_machine_is_told_the_pane_area_under_its_own_wrapped_tab_bar() {
+    let mut handoff = MachineHandoff::start(true);
+    let source_layout = handoff.source_layout;
+    assert_eq!(
+        last_told_geometry(&handoff.remote_sent),
+        Some(source_layout),
+        "the activation measures the layout on screen when the machine is selected"
+    );
+
+    // The machine's own layout is projected here.
+    handoff.complete();
+    let wanted = handoff.own_layout();
+    assert!(
+        wanted.rows + 1 < source_layout.rows,
+        "guard: the machine's tab bar wraps to several rows ({} of {} rows left)",
+        wanted.rows,
+        source_layout.rows
+    );
+    assert_eq!(
+        last_told_geometry(&handoff.remote_sent),
+        Some(wanted),
+        "the machine must be told the pane area under its own tab bar, not the source's"
+    );
+
+    // A surface for the old pane area cannot finish the handoff; one for the new area does.
+    assert_eq!(
+        handoff.answer_presentation_sync(45, 1, source_layout),
+        SurfaceActivationProgress::Pending
+    );
+    let target = handoff.target.clone();
+    assert_eq!(
+        handoff
+            .activation()
+            .receive_surface(&target, 7, surface_for("remote-boot", 1, wanted)),
+        SurfaceActivationProgress::Ready
+    );
+    handoff.complete();
+    handoff.finish_presentation_effects();
+    assert_eq!(handoff.endpoints.active_id(), &handoff.target);
+    assert_eq!(last_told_geometry(&handoff.remote_sent), Some(wanted));
+}
+
+/// Control for the test above: inside one machine the snapshot path already tells the machine the
+/// new pane area when a snapshot changes the tab bar's height (a workspace switch, a new tab). This
+/// is the behaviour the activation path was missing.
+#[test]
+fn a_snapshot_that_changes_the_tab_bar_height_resizes_the_active_machine() {
+    use crate::client::{shell_runtime::install_client_shell_snapshot, ClientState};
+    let mut config = crate::config::Config::default();
+    config.ui.tab_bar_wrap = true;
+    let mut shell = crate::client::ClientShellState::new(
+        crate::client::ClientShellConfig::from_config(&config),
+    );
+    shell.set_snapshot(Box::new(wrapped_snapshot("local-boot", 1)));
+    let local_sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut endpoints = EndpointRegistry::new(
+        FakeTransport {
+            sent: local_sent.clone(),
+            fail_after_write: false,
+        },
+        1,
+        negotiation(),
+    );
+    let mut state = ClientState::test_new();
+    state.reported_size = (167, 86);
+    let before = shell.surface_size(167, 86);
+    state.shell = Some(shell);
+    let mut next = wrapped_snapshot("local-boot", 45);
+    next.revision = 2;
+    install_client_shell_snapshot(
+        &mut state,
+        &ClientEndpointId::Local,
+        Box::new(next),
+        false,
+        &mut endpoints,
+        &mut crate::platform::RealPrefixInputSource::default(),
+    )
+    .unwrap();
+    let after = state.shell.as_ref().unwrap().surface_size(167, 86);
+    assert!(
+        after.rows + 1 < before.rows,
+        "guard: the wrapped tab bar grew ({} to {} rows)",
+        before.rows,
+        after.rows
+    );
+    assert_eq!(last_told_geometry(&local_sent), Some(after));
+}
