@@ -1894,6 +1894,7 @@ struct MachineHandoff {
     commands: crate::client::endpoint_commands::EndpointCommands,
     pending: Option<PendingEndpointActivation>,
     target: ClientEndpointId,
+    local_sent: SentMessages,
     remote_sent: SentMessages,
     /// The pane area of the layout on screen when the machine was selected: Local's.
     source_layout: crate::protocol::ClientSurfaceSize,
@@ -1927,7 +1928,7 @@ impl MachineHandoff {
         let remote_sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut endpoints = EndpointRegistry::new(
             FakeTransport {
-                sent: local_sent,
+                sent: local_sent.clone(),
                 fail_after_write: false,
             },
             1,
@@ -1992,6 +1993,7 @@ impl MachineHandoff {
             commands,
             pending,
             target,
+            local_sent,
             remote_sent,
             source_layout,
         }
@@ -2009,6 +2011,42 @@ impl MachineHandoff {
             &mut self.commands,
         )
         .unwrap();
+    }
+
+    fn respond(
+        &mut self,
+        endpoint: &ClientEndpointId,
+        generation: u64,
+        request_id: &str,
+        response: &[u8],
+    ) {
+        self.pending
+            .as_mut()
+            .expect("the handoff is pending")
+            .receive_response(
+                endpoint,
+                generation,
+                request_id,
+                response,
+                &mut self.endpoints,
+            );
+    }
+
+    /// Local, being restored, delivers its snapshot of `revision`.
+    fn answer_source_snapshot(&mut self, revision: u64) {
+        let mut snapshot = wrapped_snapshot("local-boot", 1);
+        snapshot.revision = revision;
+        self.state
+            .shell
+            .as_mut()
+            .unwrap()
+            .cache_endpoint_snapshot_inactive_for_generation(
+                &ClientEndpointId::Local,
+                1,
+                Box::new(snapshot.clone()),
+            );
+        self.activation()
+            .receive_snapshot(&ClientEndpointId::Local, 1, &snapshot);
     }
 
     /// The pane area the layout on screen leaves in the window.
@@ -2156,4 +2194,178 @@ fn a_snapshot_that_changes_the_tab_bar_height_resizes_the_active_machine() {
         after.rows
     );
     assert_eq!(last_told_geometry(&local_sent), Some(after));
+}
+
+/// The handoff projects the machine's layout twice: once when the target surface is ready, and
+/// again when the presentation sync's snapshot, paired with its surface, replaces it. That
+/// snapshot can differ from the first (tabs opened or closed, labels that carry context percent
+/// or a lifecycle marker), and then the tab bar wraps to another number of rows. The pane area
+/// must be measured after that second projection too.
+#[test]
+fn a_machine_is_told_the_pane_area_under_the_layout_its_presentation_sync_projects() {
+    let mut handoff = MachineHandoff::start(true);
+    let source_layout = handoff.source_layout;
+
+    // First projection: the machine's 45 tabs.
+    handoff.complete();
+    let first = handoff.own_layout();
+    assert_eq!(last_told_geometry(&handoff.remote_sent), Some(first));
+
+    // While the handoff synchronizes, tabs were opened: the snapshot paired with the sync's
+    // surface has 90.
+    assert_eq!(
+        handoff.answer_presentation_sync(90, 2, first),
+        SurfaceActivationProgress::Ready
+    );
+    handoff.complete();
+    let second = handoff.own_layout();
+    assert!(
+        second.rows + 1 < first.rows,
+        "guard: the second layout's tab bar has more rows ({} then {} rows left)",
+        first.rows,
+        second.rows
+    );
+    assert_eq!(
+        last_told_geometry(&handoff.remote_sent),
+        Some(second),
+        "the machine must be told the pane area under the layout the sync projected"
+    );
+
+    // The handoff now waits for a surface of the new area; one for the old area does not do.
+    assert_eq!(
+        handoff.answer_presentation_sync(90, 3, first),
+        SurfaceActivationProgress::Pending
+    );
+    let target = handoff.target.clone();
+    assert_eq!(
+        handoff
+            .activation()
+            .receive_surface(&target, 7, surface_for("remote-boot", 3, second)),
+        SurfaceActivationProgress::Ready
+    );
+    handoff.complete();
+    handoff.finish_presentation_effects();
+    assert_eq!(handoff.endpoints.active_id(), &handoff.target);
+    assert_eq!(
+        told_geometries(&handoff.remote_sent),
+        vec![source_layout, first, second],
+        "each pane area is told once, and the machine ends with the last one"
+    );
+}
+
+/// A handoff that is rolled back after the machine was told its own pane area. The restore of
+/// the source reuses the handoff's resize, which now carries the machine's size; the source's
+/// own layout is projected again when it is restored, and the same measurement tells it its own
+/// pane area.
+#[test]
+fn a_rollback_after_the_machine_was_told_its_pane_area_tells_the_source_its_own_again() {
+    let mut handoff = MachineHandoff::start(true);
+    let source_layout = handoff.source_layout;
+    handoff.complete();
+    let machine_layout = handoff.own_layout();
+    assert_ne!(
+        machine_layout, source_layout,
+        "guard: the two layouts leave different pane areas"
+    );
+    assert_eq!(
+        last_told_geometry(&handoff.remote_sent),
+        Some(machine_layout)
+    );
+
+    // The machine's presentation fails: it is released, then the source is restored.
+    assert_eq!(
+        handoff.pending.as_mut().unwrap().rollback(
+            &mut handoff.endpoints,
+            "machine lost during synchronization".into(),
+            false
+        ),
+        ActivationRollback::Pending
+    );
+    let target = handoff.target.clone();
+    handoff.respond(
+        &target,
+        7,
+        "client-shell-surface:70:rollback-target-off",
+        &surface_success("client-shell-surface:70:rollback-target-off", false, 1),
+    );
+    handoff.respond(
+        &ClientEndpointId::Local,
+        1,
+        "client-shell-surface:70:rollback-source-on",
+        &surface_success("client-shell-surface:70:rollback-source-on", true, 2),
+    );
+    handoff.answer_source_snapshot(2);
+    // The source was restored at the size the handoff carried, the machine's.
+    assert_eq!(
+        handoff.activation().receive_surface(
+            &ClientEndpointId::Local,
+            1,
+            surface_for("local-boot", 2, machine_layout)
+        ),
+        SurfaceActivationProgress::Ready
+    );
+
+    // The source's own layout is projected here.
+    handoff.complete();
+    assert_eq!(handoff.own_layout(), source_layout);
+    assert_eq!(
+        last_told_geometry(&handoff.local_sent),
+        Some(source_layout),
+        "the restored source must be told the pane area under its own tab bar"
+    );
+
+    // The handoff converges: the source's surface of that area finishes the restore.
+    handoff.respond(
+        &ClientEndpointId::Local,
+        1,
+        "client-shell-surface:70:presentation-sync",
+        &surface_success("client-shell-surface:70:presentation-sync", true, 3),
+    );
+    handoff.answer_source_snapshot(3);
+    assert_eq!(
+        handoff.activation().receive_surface(
+            &ClientEndpointId::Local,
+            1,
+            surface_for("local-boot", 3, source_layout)
+        ),
+        SurfaceActivationProgress::Ready
+    );
+    handoff.complete();
+    assert_eq!(
+        handoff.activation().receive_presentation_effects_ready(
+            &ClientEndpointId::Local,
+            1,
+            "70:1:local-boot"
+        ),
+        SurfaceActivationProgress::Ready
+    );
+    handoff.complete();
+    assert!(handoff.pending.is_none(), "the rollback completed");
+    assert_eq!(handoff.endpoints.active_id(), &ClientEndpointId::Local);
+    assert_eq!(last_told_geometry(&handoff.local_sent), Some(source_layout));
+}
+
+/// Default behaviour: with `ui.tab_bar_wrap` off both layouts have a one-row tab bar, the pane
+/// area the activation measured is the right one, and the machine is told it exactly once.
+#[test]
+fn a_machine_whose_layout_leaves_the_same_pane_area_is_told_it_once() {
+    let mut handoff = MachineHandoff::start(false);
+    let area = handoff.source_layout;
+    handoff.complete();
+    assert_eq!(
+        handoff.own_layout(),
+        area,
+        "guard: with tab_bar_wrap off both layouts leave the same pane area"
+    );
+    assert_eq!(
+        handoff.answer_presentation_sync(45, 1, area),
+        SurfaceActivationProgress::Ready
+    );
+    handoff.complete();
+    handoff.finish_presentation_effects();
+    assert_eq!(
+        told_geometries(&handoff.remote_sent),
+        vec![area],
+        "the machine receives one ClientShellResize, the activation's"
+    );
 }
