@@ -36,4 +36,9 @@ pub struct ServerCapabilities {
     /// Supports connection-scoped `server.ssh_agent.register` on the local JSON API.
     #[serde(default)]
     pub ssh_agent_registration: bool,
+    /// Whether an event wakes only the held `events.subscribe` connections whose subscriptions can
+    /// match it, so a client may hold one subscription per pane without every event costing a
+    /// wake-up for each of them. Servers that predate it do not send the field, which reads false.
+    #[serde(default)]
+    pub filtered_subscription_wake: bool,
 }

@@ -79,6 +79,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         ssh_agent_registration: false,
+        filtered_subscription_wake: true,
     })
 }
 
@@ -965,8 +966,16 @@ fn stream_subscriptions(
         return Err(err);
     }
 
-    // The history is the only thing that wakes an idle connection; sampling subscriptions also come
-    // due on their own interval, and the liveness interval bounds every wait (see `EventHub`).
+    // Events that match a subscription wake an idle connection (nothing else does: an event about
+    // another pane leaves it asleep); sampling subscriptions also come due on their own interval,
+    // and the liveness interval bounds every wait (see `EventHub`). The waiter is registered
+    // before the first cursor, so no event after it can be missed.
+    let waiter = event_hub.waiter(
+        subscriptions
+            .iter()
+            .flat_map(ActiveSubscription::wake_interests)
+            .collect(),
+    );
     let timing = event_hub.timing();
     let intervals: Vec<Option<Duration>> = subscriptions
         .iter()
@@ -977,7 +986,7 @@ fn stream_subscriptions(
     loop {
         // Take the cursor BEFORE the stop check and the history read: an event, or the server's
         // stop wake-up, arriving at any point after this makes the wait below return at once.
-        let cursor = event_hub.wait_cursor();
+        let cursor = waiter.cursor();
         if should_stop_connection(&mut stream, running)? {
             return Ok(());
         }
@@ -1016,7 +1025,12 @@ fn stream_subscriptions(
                 }
             }
         }
-        event_hub.wait_for_event_after(
+        // A snapshot thrown away because the history moved is still owed, and the event that moved
+        // it may be about another pane, which wakes nobody: look again at once instead of waiting.
+        if subscriptions.iter().any(ActiveSubscription::snapshot_owed) {
+            continue;
+        }
+        waiter.wait_after(
             cursor,
             next_wake_timeout(&timing, &intervals, &due, Instant::now()),
         );
@@ -1210,6 +1224,17 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    /// Takes `env_lock`. A test that fails while holding the lock poisons it, and a plain
+    /// `lock().unwrap()` would then fail every test that takes it afterwards with a `PoisonError`
+    /// before its own check ran (its failure would say nothing about its own cause, and a mutant
+    /// would be reported as killed by a test that measured nothing). What the lock guards is the
+    /// environment each test sets and clears itself, so the poison is ignored.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn unique_test_path(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1372,7 +1397,7 @@ mod tests {
 
     #[test]
     fn api_accept_thread_spawn_failure_removes_bound_socket() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let dir = unique_test_path("api-accept-spawn-failure");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("herdr.sock");
@@ -1390,7 +1415,7 @@ mod tests {
 
     #[test]
     fn socket_path_prefers_explicit_env_override() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let unique = format!("/tmp/herdr-test-{}.sock", std::process::id());
         std::env::remove_var(crate::session::SESSION_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
@@ -1401,7 +1426,7 @@ mod tests {
 
     #[test]
     fn socket_path_defaults_to_config_dir_even_when_xdg_runtime_dir_is_set() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let config_home = unique_test_path("socket-default-config-home");
         let runtime_dir = unique_test_path("socket-default-runtime");
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
@@ -1421,7 +1446,7 @@ mod tests {
 
     #[test]
     fn socket_path_uses_named_session_dir() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let config_home = unique_test_path("socket-named-config-home");
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
@@ -1574,6 +1599,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                filtered_subscription_wake: true,
             }),
             None,
             None,
@@ -1583,6 +1609,37 @@ mod tests {
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "req_1");
         assert!(matches!(parsed.result, ResponseResult::Pong { .. }));
+    }
+
+    #[test]
+    fn a_running_server_advertises_filtered_subscription_wake_in_ping() {
+        // WHY: a client that wants to hold one subscription per pane reads this from `ping`; an
+        // older server omits it, so the client must be able to tell the two apart. The capability is
+        // read from the real server over its socket, not from the builder function.
+        let _guard = lock_env();
+        let dir = unique_test_path("api-capability-ping");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("herdr.sock");
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &path);
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let handle =
+            start_server_with_stop_control(api_tx, EventHub::default(), ServerStop::default());
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        let handle = handle.unwrap();
+
+        let mut client = crate::ipc::connect_local_stream(&path).unwrap();
+        client
+            .write_all(b"{\"id\":\"cap\",\"method\":\"ping\",\"params\":{}}\n")
+            .unwrap();
+        client.flush().unwrap();
+        let pong: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        drop(handle);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(pong["result"]["type"], "pong");
+        assert_eq!(
+            pong["result"]["capabilities"]["filtered_subscription_wake"], true,
+            "{pong}"
+        );
     }
 
     #[test]
@@ -1781,6 +1838,252 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_wait_ends_at_once_when_an_event_about_its_pane_arrives() {
+        // WHY: an agent wait blocks on the event hub and only events about its own pane can end it
+        // or make it probe. With a 30 s liveness interval only the hub wake can end it within 5 s,
+        // and an event about another pane must not wake it at all (a history read would show it).
+        use crate::api::schema::{AgentStatus, EventData, EventEnvelope, EventKind};
+
+        let event_hub = EventHub::with_timing(WaitTiming {
+            liveness: Duration::from_secs(30),
+            agent_status_snapshot: Duration::from_secs(30),
+        });
+        let status_event = |pane_id: &str, agent_status| EventEnvelope {
+            event: EventKind::PaneAgentStatusChanged,
+            data: EventData::PaneAgentStatusChanged {
+                pane_id: pane_id.into(),
+                workspace_id: "ws_1".into(),
+                agent_status,
+                agent: Some("pi".into()),
+                title: None,
+                display_agent: None,
+                state_labels: HashMap::new(),
+            },
+        };
+        let (first_get_tx, first_get_rx) = std::sync::mpsc::channel();
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let mut gets = 0;
+            while let Some(msg) = api_rx.blocking_recv() {
+                assert!(matches!(msg.request.method, Method::AgentGet(_)));
+                gets += 1;
+                let status = if gets == 1 {
+                    AgentStatus::Working
+                } else {
+                    AgentStatus::Idle
+                };
+                msg.respond_to
+                    .send(
+                        serde_json::to_string(&SuccessResponse {
+                            id: msg.request.id,
+                            result: ResponseResult::AgentInfo {
+                                agent: agent_info(status),
+                            },
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+                if gets == 1 {
+                    first_get_tx.send(()).unwrap();
+                }
+            }
+        });
+
+        let (mut client, server, _path) = local_stream_pair("agent-wait-wake");
+        client
+            .write_all(
+                br#"{"id":"wait_wake","method":"agent.wait","params":{"target":"worker","until":["idle"],"timeout_ms":60000}}"#,
+            )
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let server_event_hub = event_hub.clone();
+        let server_api_tx = api_tx.clone();
+        let server_thread = std::thread::spawn(move || {
+            handle_connection(
+                server,
+                &server_api_tx,
+                &server_event_hub,
+                &server_running,
+                None,
+            )
+        });
+        first_get_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Let the wait finish its first pass and block on the hub.
+        std::thread::sleep(Duration::from_millis(300));
+
+        let reads = event_hub.history_reads();
+        for _ in 0..5 {
+            event_hub.push(status_event("pane_2", AgentStatus::Idle));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let reads_after_other_pane = event_hub.history_reads();
+
+        event_hub.push(status_event("pane_1", AgentStatus::Idle));
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = line_tx.send(read_line(&mut client));
+        });
+        let line = line_rx.recv_timeout(Duration::from_secs(5));
+        // Release the connection whatever happened above, so a failure does not hang the test.
+        running.store(false, Ordering::Relaxed);
+        event_hub.wake_waiters();
+        server_thread.join().unwrap().unwrap();
+        drop(api_tx);
+        responder.join().unwrap();
+
+        assert_eq!(
+            reads_after_other_pane, reads,
+            "events about another pane woke the agent wait"
+        );
+        let line = line.expect("the agent wait did not end when an event about its pane arrived");
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], "wait_wake");
+        assert_eq!(response["result"]["agent"]["agent_status"], "idle");
+    }
+
+    /// Runs an `agent.wait` on pane_1 (agent_get answers working, then idle) with both intervals at
+    /// 30 s, publishes `event` once the wait is blocked on the hub, and returns its response. Panics
+    /// when the wait does not end within 3 s: only the hub wake can end it that fast.
+    fn agent_wait_response_to_event(
+        case: &str,
+        event: crate::api::schema::EventEnvelope,
+    ) -> serde_json::Value {
+        use crate::api::schema::AgentStatus;
+
+        let event_hub = EventHub::with_timing(WaitTiming {
+            liveness: Duration::from_secs(30),
+            agent_status_snapshot: Duration::from_secs(30),
+        });
+        let (first_get_tx, first_get_rx) = std::sync::mpsc::channel();
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let mut gets = 0;
+            while let Some(msg) = api_rx.blocking_recv() {
+                assert!(matches!(msg.request.method, Method::AgentGet(_)));
+                gets += 1;
+                let status = if gets == 1 {
+                    AgentStatus::Working
+                } else {
+                    AgentStatus::Idle
+                };
+                msg.respond_to
+                    .send(
+                        serde_json::to_string(&SuccessResponse {
+                            id: msg.request.id,
+                            result: ResponseResult::AgentInfo {
+                                agent: agent_info(status),
+                            },
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+                if gets == 1 {
+                    first_get_tx.send(()).unwrap();
+                }
+            }
+        });
+
+        let (mut client, server, _path) = local_stream_pair(&format!("agent-wait-kind-{case}"));
+        client
+            .write_all(
+                format!(
+                    r#"{{"id":"wait_{case}","method":"agent.wait","params":{{"target":"worker","until":["idle"],"timeout_ms":60000}}}}"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let server_event_hub = event_hub.clone();
+        let server_api_tx = api_tx.clone();
+        let server_thread = std::thread::spawn(move || {
+            handle_connection(
+                server,
+                &server_api_tx,
+                &server_event_hub,
+                &server_running,
+                None,
+            )
+        });
+        first_get_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Let the wait finish its first pass and block on the hub.
+        std::thread::sleep(Duration::from_millis(300));
+
+        event_hub.push(event);
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = line_tx.send(read_line(&mut client));
+        });
+        let line = line_rx.recv_timeout(Duration::from_secs(3));
+        // Release the connection whatever happened above, so a failure does not hang the test.
+        running.store(false, Ordering::Relaxed);
+        event_hub.wake_waiters();
+        server_thread.join().unwrap().unwrap();
+        drop(api_tx);
+        responder.join().unwrap();
+        let line = line.unwrap_or_else(|_| {
+            panic!("the agent wait ({case}) did not end within 3 s of the event: nothing woke it")
+        });
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], format!("wait_{case}"));
+        response
+    }
+
+    #[test]
+    fn an_agent_wait_reacts_at_once_to_every_kind_of_event_about_its_pane() {
+        // WHY: the agent wait's event loop reacts to six kinds of event about its pane, and the
+        // interest it registers with the hub (`WakeInterest::pane`) has to cover every one of them,
+        // or that event ends the wait only at the liveness tick (5 s). The drift check of the
+        // subscriptions cannot see this loop, so each kind is run through the real wait with both
+        // intervals at 30 s. An interest narrowed to the status event alone fails every case but
+        // the first.
+        use crate::api::event_hub::samples::event;
+        use crate::api::schema::{EventData, EventEnvelope, EventKind};
+
+        // Events that make the wait probe the agent (which then says idle: the wait is matched).
+        for (case, kind) in [
+            ("status", EventKind::PaneAgentStatusChanged),
+            ("updated", EventKind::PaneUpdated),
+            ("detected", EventKind::PaneAgentDetected),
+        ] {
+            let response = agent_wait_response_to_event(case, event(kind, "pane_1"));
+            assert!(response.get("error").is_none(), "{case}: {response}");
+            assert_eq!(
+                response["result"]["agent"]["agent_status"], "idle",
+                "{case}: {response}"
+            );
+        }
+        // Events that end the wait: the agent is gone from the pane it waits on.
+        let released = EventEnvelope {
+            event: EventKind::PaneAgentDetected,
+            data: EventData::PaneAgentDetected {
+                pane_id: "pane_1".into(),
+                workspace_id: "workspace_1".into(),
+                agent: Some("pi".into()),
+                released: true,
+                final_status: None,
+            },
+        };
+        for (case, event) in [
+            ("released", released),
+            ("moved", event(EventKind::PaneMoved, "pane_1")),
+            ("closed", event(EventKind::PaneClosed, "pane_1")),
+            ("exited", event(EventKind::PaneExited, "pane_1")),
+        ] {
+            let response = agent_wait_response_to_event(case, event);
+            assert_eq!(
+                response["error"]["code"], "agent_not_running",
+                "{case}: {response}"
+            );
+        }
+    }
+
+    #[test]
     fn events_wait_agent_status_returns_initial_match() {
         let (api_tx, responder) =
             spawn_pane_get_responder(crate::api::schema::AgentStatus::Blocked);
@@ -1834,10 +2137,25 @@ mod tests {
         responder.join().unwrap();
     }
 
-    #[test]
-    fn events_wait_agent_status_returns_not_found_when_pane_closes() {
-        let event_hub = EventHub::default();
-        let responder_event_hub = event_hub.clone();
+    /// Runs an `events.wait` for pane_1 turning done (both intervals 30 s, the wait's own limit 3 s)
+    /// against a stand-in app whose `pane.get` reports a live pane twice (the subscription's probe
+    /// and the first pass) and `pane_not_found` after that. `event` is published 300 ms after the
+    /// first pass ended, when the wait is blocked on the hub and no `pane.get` is in flight. Then
+    /// only the wake by that event and the snapshot it requests can lead to the third `pane.get`
+    /// that finds the pane gone: not a sample, not the liveness interval, and not the retry of a
+    /// snapshot that an event interrupted (an event published while a `pane.get` is in flight is
+    /// retried whatever its kind, which would hide a missing request). Returns the response and
+    /// how long the wait took.
+    fn events_wait_response_to_event_after_the_first_pass(
+        case: &str,
+        event: crate::api::schema::EventEnvelope,
+    ) -> (serde_json::Value, Duration) {
+        let event_hub = EventHub::with_timing(WaitTiming {
+            liveness: Duration::from_secs(30),
+            agent_status_snapshot: Duration::from_secs(30),
+        });
+        let publisher_event_hub = event_hub.clone();
+        let (first_pass_tx, first_pass_rx) = std::sync::mpsc::channel::<()>();
         let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let responder = std::thread::spawn(move || {
             let mut pane_get_count = 0;
@@ -1846,7 +2164,7 @@ mod tests {
                     panic!("unexpected request: {:?}", msg.request.method);
                 };
                 pane_get_count += 1;
-                let response = if pane_get_count == 1 {
+                let response = if pane_get_count <= 2 {
                     serde_json::to_string(&SuccessResponse {
                         id: msg.request.id,
                         result: ResponseResult::PaneInfo {
@@ -1855,15 +2173,6 @@ mod tests {
                     })
                     .unwrap()
                 } else {
-                    if pane_get_count == 2 {
-                        responder_event_hub.push(crate::api::schema::EventEnvelope {
-                            event: crate::api::schema::EventKind::PaneClosed,
-                            data: crate::api::schema::EventData::PaneClosed {
-                                pane_id: "pane_1".into(),
-                                workspace_id: "ws_1".into(),
-                            },
-                        });
-                    }
                     error_response_json(
                         msg.request.id,
                         "pane_not_found",
@@ -1871,85 +2180,83 @@ mod tests {
                     )
                 };
                 msg.respond_to.send(response).unwrap();
+                if pane_get_count == 2 {
+                    let _ = first_pass_tx.send(());
+                }
+            }
+        });
+        let publisher = std::thread::spawn(move || {
+            if first_pass_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+                // Let the wait finish its first pass and block on the hub.
+                std::thread::sleep(Duration::from_millis(300));
+                publisher_event_hub.push(event);
             }
         });
 
-        let (mut client, server, _path) = local_stream_pair("wait-close");
+        let (mut client, server, _path) = local_stream_pair(&format!("wait-event-{case}"));
         client
-            .write_all(br#"{"id":"wait_close","method":"events.wait","params":{"match_event":{"event":"pane_agent_status_changed","pane_id":"pane_1","agent_status":"done"},"timeout_ms":500}}"#)
+            .write_all(
+                format!(
+                    r#"{{"id":"wait_{case}","method":"events.wait","params":{{"match_event":{{"event":"pane_agent_status_changed","pane_id":"pane_1","agent_status":"done"}},"timeout_ms":3000}}}}"#
+                )
+                .as_bytes(),
+            )
             .unwrap();
         client.write_all(b"\n").unwrap();
         client.flush().unwrap();
 
         let running = Arc::new(AtomicBool::new(true));
+        let started = std::time::Instant::now();
         handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+        let elapsed = started.elapsed();
 
         let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
-        assert_eq!(response["id"], "wait_close");
-        assert_eq!(response["error"]["code"], "pane_not_found");
-        assert_eq!(response["error"]["message"], "pane pane_1 not found");
+        assert_eq!(response["id"], format!("wait_{case}"));
         drop(api_tx);
         responder.join().unwrap();
+        publisher.join().unwrap();
+        (response, elapsed)
+    }
+
+    #[test]
+    fn events_wait_agent_status_returns_not_found_when_pane_closes() {
+        // WHY: `pane.closed` is about the pane the wait watches, so it wakes the wait and requests a
+        // snapshot, which finds the pane gone. Without the snapshot request the wait would end with
+        // `timeout` after its 3 s limit.
+        let (response, elapsed) = events_wait_response_to_event_after_the_first_pass(
+            "pane-close",
+            crate::api::event_hub::samples::event(
+                crate::api::schema::EventKind::PaneClosed,
+                "pane_1",
+            ),
+        );
+        assert_eq!(response["error"]["code"], "pane_not_found", "{response}");
+        assert_eq!(response["error"]["message"], "pane pane_1 not found");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the wait took {elapsed:?}: pane.closed did not end it"
+        );
     }
 
     #[test]
     fn events_wait_agent_status_returns_not_found_when_tab_closes() {
-        // `tab.close` publishes `tab.closed` and no `pane.closed` for the panes inside. The wait
-        // must still end with `pane_not_found` promptly, not with `timeout` after the 1 s snapshot.
-        let event_hub = EventHub::default();
-        let responder_event_hub = event_hub.clone();
-        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
-        let responder = std::thread::spawn(move || {
-            let mut pane_get_count = 0;
-            while let Some(msg) = api_rx.blocking_recv() {
-                let Method::PaneGet(_) = msg.request.method else {
-                    panic!("unexpected request: {:?}", msg.request.method);
-                };
-                pane_get_count += 1;
-                let response = if pane_get_count == 1 {
-                    serde_json::to_string(&SuccessResponse {
-                        id: msg.request.id,
-                        result: ResponseResult::PaneInfo {
-                            pane: pane_info("pane_1", crate::api::schema::AgentStatus::Unknown),
-                        },
-                    })
-                    .unwrap()
-                } else {
-                    if pane_get_count == 2 {
-                        responder_event_hub.push(crate::api::schema::EventEnvelope {
-                            event: crate::api::schema::EventKind::TabClosed,
-                            data: crate::api::schema::EventData::TabClosed {
-                                tab_id: "tab_1".into(),
-                                workspace_id: "ws_1".into(),
-                            },
-                        });
-                    }
-                    error_response_json(
-                        msg.request.id,
-                        "pane_not_found",
-                        "pane pane_1 not found".into(),
-                    )
-                };
-                msg.respond_to.send(response).unwrap();
-            }
-        });
-
-        let (mut client, server, _path) = local_stream_pair("wait-tab-close");
-        client
-            .write_all(br#"{"id":"wait_tab_close","method":"events.wait","params":{"match_event":{"event":"pane_agent_status_changed","pane_id":"pane_1","agent_status":"done"},"timeout_ms":500}}"#)
-            .unwrap();
-        client.write_all(b"\n").unwrap();
-        client.flush().unwrap();
-
-        let running = Arc::new(AtomicBool::new(true));
-        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
-
-        let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
-        assert_eq!(response["id"], "wait_tab_close");
-        assert_eq!(response["error"]["code"], "pane_not_found");
+        // WHY: `tab.close` publishes `tab.closed` and no `pane.closed` for the panes inside, so the
+        // event names no pane: it must wake the wait (an event whose panes are unknown wakes every
+        // waiter) and request a snapshot, which finds the pane gone. Without either the wait would
+        // end with `timeout` after its 3 s limit.
+        let (response, elapsed) = events_wait_response_to_event_after_the_first_pass(
+            "tab-close",
+            crate::api::event_hub::samples::event(
+                crate::api::schema::EventKind::TabClosed,
+                "pane_1",
+            ),
+        );
+        assert_eq!(response["error"]["code"], "pane_not_found", "{response}");
         assert_eq!(response["error"]["message"], "pane pane_1 not found");
-        drop(api_tx);
-        responder.join().unwrap();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the wait took {elapsed:?}: tab.closed did not end it"
+        );
     }
 
     #[test]
@@ -2117,7 +2424,13 @@ mod tests {
 
         let running = Arc::new(AtomicBool::new(true));
         let server_running = Arc::clone(&running);
-        let event_hub = EventHub::default();
+        // A closed peer is noticed when the thread looks at its socket again, at the latest after
+        // the liveness interval (5 s in production, pinned by its own test): a short one keeps this
+        // test fast and still shows that the connection ends because the client left.
+        let event_hub = EventHub::with_timing(WaitTiming {
+            liveness: Duration::from_millis(200),
+            ..WaitTiming::default()
+        });
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
             let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
@@ -2151,6 +2464,7 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
         let server_running = Arc::clone(&running);
         let event_hub = EventHub::default();
+        let waking_hub = event_hub.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
             let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
@@ -2161,7 +2475,11 @@ mod tests {
         let ack: serde_json::Value = serde_json::from_str(&ack).unwrap();
         assert_eq!(ack["result"]["type"], "subscription_started");
 
+        // What `ServerHandle::drop` does: the stop flag, then the wake-up. With the production
+        // timing the connection would otherwise wait out its liveness interval (5 s), which is
+        // longer than the 2 s allowed here: the test fails if shutdown relied on the timeout.
         running.store(false, Ordering::Relaxed);
+        waking_hub.wake_waiters();
 
         let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(result.is_ok());
@@ -2172,7 +2490,7 @@ mod tests {
     fn dropping_the_server_handle_releases_a_held_subscription() {
         // Both intervals are 30 s, so only the wake-up in `ServerHandle::drop` can end a connection
         // that is blocked on the event hub within the deadline below.
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let dir = unique_test_path("api-handle-drop");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("herdr.sock");
@@ -2212,6 +2530,73 @@ mod tests {
         assert!(
             released,
             "a subscription blocked on the hub was not released when the server handle was dropped"
+        );
+    }
+
+    #[test]
+    fn shutdown_ends_held_connections_without_waiting_for_the_liveness_interval() {
+        // WHY: a held connection blocks on the hub for up to the liveness interval (5 s in
+        // production). Stopping the server must not wait for that: `ServerHandle::drop` wakes every
+        // connection. With the production timing a stop that relied on the timeout would take 5 s;
+        // here it must take under 2 s, for each of several connections.
+        assert!(WaitTiming::default().liveness >= Duration::from_secs(5));
+        let _guard = lock_env();
+        let dir = unique_test_path("api-shutdown-wakes");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("herdr.sock");
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &path);
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let handle = start_server_inner(api_tx, EventHub::default(), None, None);
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        let handle = handle.unwrap();
+
+        let mut clients = Vec::new();
+        for subscription in ["workspace.created", "tab.created", "pane.closed"] {
+            let mut client = crate::ipc::connect_local_stream(&path).unwrap();
+            client
+                .write_all(
+                    format!(
+                        r#"{{"id":"held","method":"events.subscribe","params":{{"subscriptions":[{{"type":"{subscription}"}}]}}}}"#
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            client.write_all(b"\n").unwrap();
+            client.flush().unwrap();
+            let ack: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+            assert_eq!(ack["result"]["type"], "subscription_started");
+            clients.push(client);
+        }
+        // Let every connection thread finish its first pass and block on the hub.
+        std::thread::sleep(Duration::from_millis(500));
+
+        let stopped_at = Instant::now();
+        drop(handle);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        for mut client in clients {
+            let done_tx = done_tx.clone();
+            std::thread::spawn(move || {
+                let mut rest = String::new();
+                let _ = client.read_to_string(&mut rest);
+                let _ = done_tx.send(stopped_at.elapsed());
+            });
+        }
+        let mut slowest = Duration::ZERO;
+        let mut ended = 0;
+        while ended < 3 {
+            match done_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(elapsed) => {
+                    slowest = slowest.max(elapsed);
+                    ended += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(ended, 3, "only {ended} of 3 held connections ended");
+        assert!(
+            slowest < Duration::from_secs(2),
+            "the slowest held connection took {slowest:?} to end after the server stopped"
         );
     }
 }
