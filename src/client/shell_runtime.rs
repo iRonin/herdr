@@ -463,6 +463,11 @@ pub(super) fn complete_endpoint_activation(
         return Ok(None);
     }
     if completion == endpoint::ActivationCompletion::AwaitingPresentationEffects {
+        // The presentation sync just projected the snapshot that was paired with its surface. It
+        // can differ from the first one (tabs opened or closed, labels that carry context percent
+        // or a lifecycle marker), and the tab bar then wraps to another number of rows. When the
+        // pane area changed the resize restarts the sync, and a failed send runs the rollback.
+        resize_activation_to_projected_layout(state, endpoints, pending);
         return Ok(None);
     }
 
