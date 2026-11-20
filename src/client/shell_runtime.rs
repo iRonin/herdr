@@ -374,6 +374,42 @@ pub(super) fn begin_endpoint_activation(
     Ok(())
 }
 
+/// `PendingEndpointActivation::complete` has just projected the endpoint's own layout. The
+/// activation's resize was measured on the layout that was on screen when the endpoint was
+/// selected, which is the source's. A tab bar of another height (`ui.tab_bar_wrap` with many tabs,
+/// `hide_tab_bar_when_single_tab`) leaves the endpoint another pane area, and an endpoint that was
+/// told the old one keeps sizing its panes to it, so their bottom rows sit outside the window.
+/// Tell the endpoint the area it now has, through the path a window resize takes during a handoff.
+/// Returns true when sending it failed and the rollback took over.
+fn resize_activation_to_projected_layout(
+    state: &mut ClientState,
+    endpoints: &mut endpoint::EndpointRegistry,
+    pending: &mut Option<endpoint::PendingEndpointActivation>,
+) -> bool {
+    let error = {
+        let (Some(shell), Some(activation)) = (state.shell.as_ref(), pending.as_mut()) else {
+            return false;
+        };
+        let resize = client_shell_resize_message(
+            shell,
+            state.reported_size.0,
+            state.reported_size.1,
+            state.reported_cell_size.0,
+            state.reported_cell_size.1,
+            state.pixel_mouse_available(),
+        );
+        if !activation.resize_changes_pane_area(&resize) {
+            return false;
+        }
+        match activation.update_resize(resize, endpoints) {
+            Ok(()) => return false,
+            Err(error) => error,
+        }
+    };
+    rollback_endpoint_activation(state, endpoints, pending, error, false);
+    true
+}
+
 pub(super) fn complete_endpoint_activation(
     state: &mut ClientState,
     endpoints: &mut endpoint::EndpointRegistry,
@@ -407,6 +443,9 @@ pub(super) fn complete_endpoint_activation(
         completion,
         endpoint::ActivationCompletion::AwaitingPresentationSync { .. }
     ) {
+        if resize_activation_to_projected_layout(state, endpoints, pending) {
+            return Ok(None);
+        }
         // The coherent target frame can replace the frozen source now, but the registry keeps
         // pane input disabled until a second projection epoch has replayed host modes/effects.
         state.unfreeze_presentation();
