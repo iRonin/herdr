@@ -989,6 +989,12 @@
           "description": "Allow dragging a tab from the tab row onto a sidebar workspace entry to move that tab (with all its panes) to the workspace."
         },
         {
+          "key": "ui.resize_hidden_panes",
+          "type": "boolean",
+          "default": "true",
+          "description": "Resize the panes of tabs and workspaces no client is showing whenever a client's pane area changes, so a background agent already has the right width when its tab is shown. false resizes a tab only while a client shows it, and once more when it is shown again: a hidden agent keeps its old width until then, and reading a hidden pane returns lines at that width. A server setting."
+        },
+        {
           "key": "ui.prompt_new_workspace_name",
           "type": "boolean",
           "default": "false",

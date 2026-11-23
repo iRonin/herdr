@@ -665,6 +665,27 @@ With the setting on, Herdr types `<resume command> && exit` into the pane's shel
 - A server stop does not drop the Agent from the saved layout. `herdr server stop` and `herdr server restart` save the layout before any pane is signalled, and so does a host shutdown or restart that Herdr is told about. When panes are ended from outside with no such notice, keeping them in the saved layout is best effort: it holds only if the server stops within five seconds of the pane's end and nothing else in the session changed in between. A pane that closed because its Agent ended normally less than five seconds before the server stops can come back at the next start, and its Agent is resumed. That save holds the layout only, without the pane screens (`[experimental] pane_history`): the next regular save, within five seconds, writes both. A stop before it still restores every pane, but when the layout changed since the last full save the saved screens no longer match it and are ignored once, so the restored panes start with empty screens.
 - A value that is not `true` or `false` is reported by `herdr config check`, keeps the setting off, and does not affect other settings.
 
+## Resizing panes nobody is showing
+
+Herdr tells a pane's program its size whenever the pane's size changes (the program receives `SIGWINCH`). By default it does this for every pane of every tab and workspace, including the ones nobody is looking at: when the window is resized, the sidebar is collapsed or dragged, or the tab bar gains or loses a row, each pane is resized, so a background Agent already has the right width when its tab comes back. A window drag is one resize per step, and every shell in every tab receives each one. Some shells and prompt themes (zsh with powerlevel10k, for one) grow in memory with every resize signal until the next command is typed, which adds up on a server with many idle shell tabs. To resize only what is being shown, set:
+
+```toml
+[ui]
+resize_hidden_panes = false
+```
+
+The default is `true`, which is the behaviour described above and is what Herdr did before the setting existed. It is a server setting, like the pane defaults.
+
+With `false`, a tab's panes are resized only while a client shows that tab:
+
+- A tab or workspace nobody shows keeps its size when the window, the sidebar or the tab bar changes. The tab being shown is resized as usual.
+- When a hidden tab or workspace is shown again, its panes are resized once, to the size they would have by then. A tab that is shown again at a size it already has is not resized and its programs receive no signal. If the workspace being shown has a tab bar with a different number of rows than the previous one (with `ui.tab_bar_wrap`), its panes are resized twice: first to the previous pane area, then to their own.
+- With several clients attached, each tab is still sized to the client that shows it. A tab no client shows keeps its size, including when one of two clients detaches, and with no client attached no pane is resized.
+- A hidden Agent keeps its old width until its tab is shown, and what it prints in the meantime is wrapped at that width. `herdr pane read` and the agent read commands return lines at that width for a hidden pane. When the tab is shown, a program that redraws on resize redraws once.
+- A live handoff to a new server still makes the first client that attaches afterwards nudge the program of every pane to redraw, hidden panes included: each pane is made one row shorter and then restored, which is two resizes, once per handoff.
+- The setting is read at startup and on config reload. Switching it back to `true` does not resize anything at that moment: the next time a client's pane area changes, every tab is brought to the current size, as before.
+- A value that is not `true` or `false` is reported by `herdr config check`, and a running server keeps its current setting.
+
 ## IME cursor tracking
 
 On macOS, AI Agent TUIs that hide the hardware cursor can prevent native input-method candidate windows from following the focused pane. Reveal a cursor anchor for those panes with:
