@@ -344,6 +344,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # The wrapped bar uses at most half of the available height.
 # tab_bar_wrap = false
 
+# Resize the panes of tabs and workspaces nobody is showing whenever the window
+# changes size, so a background agent already has the right width. false resizes a
+# tab only while a client shows it, and once more when it is shown again.
+# resize_hidden_panes = true
+
 # Show the highest-attention agent status on each top tab.
 # Uses the same status marks as the agents panel.
 # tab_agent_status = false

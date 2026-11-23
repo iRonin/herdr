@@ -1243,6 +1243,11 @@ pub struct UiConfig {
     /// Allow dragging a tab from the tab row onto a sidebar workspace entry to
     /// move the tab (and all its panes) to that workspace. Default: false.
     pub tab_drag_move_workspace: bool,
+    /// Resize the panes of tabs and workspaces no client is showing whenever a client's pane
+    /// area changes, so a background agent already has the right width when its tab is shown.
+    /// `false` resizes a tab only while a client shows it and once more when it is shown again.
+    /// Default: true, which is upstream's behaviour.
+    pub resize_hidden_panes: bool,
     /// Ordered entries shown at the right edge of the desktop tab row. Empty by default.
     pub tab_bar_right: Vec<TabBarRightEntryConfig>,
     /// Text inserted between visible right-side tab bar entries. Default: one space.
@@ -1498,6 +1503,7 @@ impl Default for UiConfig {
             tab_agent_status: false,
             tab_agent_context: false,
             tab_drag_move_workspace: false,
+            resize_hidden_panes: true,
             tab_bar_right: Vec::new(),
             tab_bar_right_separator: " ".into(),
             window_title: super::window_title::default_window_title(),
@@ -2195,6 +2201,19 @@ tab_agent_context = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.ui.tab_agent_context);
+    }
+
+    #[test]
+    fn resize_hidden_panes_defaults_on_and_parses() {
+        let default_config = Config::default();
+        assert!(default_config.ui.resize_hidden_panes);
+
+        let toml = r#"
+[ui]
+resize_hidden_panes = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.ui.resize_hidden_panes);
     }
 
     #[test]

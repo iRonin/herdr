@@ -852,6 +852,9 @@ pub struct AppState {
     /// Whether the previous tick left an `Auto` overlay on screen, so its expiry can be detected.
     pub(crate) pane_scrollbar_overlay_shown: bool,
     pub pane_gaps: bool,
+    /// `[ui] resize_hidden_panes`. When false, a tab's panes are resized only while a client shows
+    /// that tab; a tab nobody shows keeps its size until it is shown again.
+    pub resize_hidden_panes: bool,
     pub show_agent_labels_on_pane_borders: bool,
     pub tab_bar_right: Vec<TabBarStatusSegment>,
     pub tab_bar_right_separator: String,
@@ -1231,6 +1234,7 @@ impl AppState {
             pane_scroll_activity: std::collections::HashMap::new(),
             pane_scrollbar_overlay_shown: false,
             pane_gaps: false,
+            resize_hidden_panes: true,
             show_agent_labels_on_pane_borders: false,
             tab_bar_right: Vec::new(),
             tab_bar_right_separator: " ".into(),
