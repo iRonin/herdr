@@ -1539,6 +1539,12 @@
           "type": "boolean",
           "default": "false",
           "description": "Close a pane in which a server restart resumed an agent when that agent ends normally (exit status 0), instead of leaving an idle shell. herdr types `<resume command> && exit` into the pane's shell (`; and exit` for fish); a crash, a kill or a missing command (any other exit status) keeps the pane open. Applies to panes whose shell is sh, dash, bash, zsh or fish; for any other shell the command is typed unchanged, the pane stays open, and the server log names the shell once. Read when each resume command is typed, so a config reload applies to the next resume. A value that is not true or false is reported by herdr config check, keeps the setting off, and does not affect other settings."
+        },
+        {
+          "key": "session.skip_ended_agent_panes_on_restore",
+          "type": "boolean",
+          "default": "false",
+          "description": "Do not bring back, at the next server start, a pane whose agent has ended and left its shell idle at the prompt (the agent quit, crashed or was killed). A resume command that never produced an agent counts the same, 180 seconds after it was typed. While this is on, each save of the session marks such a pane in session.json; typing anything into the pane removes the mark, and a plain shell that never held an agent never has one. At the start the marked panes are left out, a tab with no pane left is dropped, and so is a workspace with no tab left. The server log names every pane left out, with its saved agent session when it has one, and the first save after a start that dropped something keeps a copy of the old session.json in the session-backups folder. With the default (false) every saved pane comes back, as before, and session.json carries no mark. Older herdr versions ignore the mark. The restore reads the setting once, when the server starts; the saves follow a config reload. A value that is not true or false is reported by herdr config check, keeps the setting off, and does not affect other settings."
         }
       ]
     },

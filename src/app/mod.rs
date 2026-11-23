@@ -577,6 +577,10 @@ impl App {
                 .session
                 .close_pane_when_resumed_agent_exits
                 .enabled(),
+            skip_ended_agent_panes_on_restore: config
+                .session
+                .skip_ended_agent_panes_on_restore
+                .enabled(),
             default_shell: config.terminal.default_shell.clone(),
             shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
@@ -972,6 +976,8 @@ impl App {
         if !invalid_section("session") {
             self.state.close_pane_when_resumed_agent_exits =
                 config.session.close_pane_when_resumed_agent_exits.enabled();
+            self.state.skip_ended_agent_panes_on_restore =
+                config.session.skip_ended_agent_panes_on_restore.enabled();
         }
 
         if !invalid_section("session")
@@ -2260,6 +2266,87 @@ mod tests {
             app.state.resize_hidden_panes,
             "removing the key goes back to the default, which is upstream's behaviour"
         );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn app_copies_skip_ended_agent_panes_on_restore_from_config() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        assert!(!app.state.skip_ended_agent_panes_on_restore);
+
+        let config: Config =
+            toml::from_str("[session]\nskip_ended_agent_panes_on_restore = true\n").unwrap();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(
+            &config,
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        assert!(app.state.skip_ended_agent_panes_on_restore);
+    }
+
+    /// The setting is read when a resume is typed, so a reload must reach the live state; a bad value turns it off and
+    /// names itself without touching the other settings in the section.
+    #[test]
+    fn reload_config_updates_skip_ended_agent_panes_on_restore() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-skip-ended");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let mut app = test_app();
+        assert!(!app.state.skip_ended_agent_panes_on_restore);
+
+        std::fs::write(
+            &path,
+            "[session]\nskip_ended_agent_panes_on_restore = true\n",
+        )
+        .unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(app.state.skip_ended_agent_panes_on_restore);
+
+        std::fs::write(
+            &path,
+            "[session]\nskip_ended_agent_panes_on_restore = \"yes\"\n[agent]\npi_program = \"custom-pi\"\n",
+        )
+        .unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert_eq!(
+            report.diagnostics,
+            vec!["session.skip_ended_agent_panes_on_restore must be true or false (got string); keeping it off".to_string()]
+        );
+        assert!(!app.state.skip_ended_agent_panes_on_restore);
+        assert_eq!(app.state.pi_program, "custom-pi");
+
+        std::fs::write(
+            &path,
+            "[session]\nskip_ended_agent_panes_on_restore = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            app.reload_config().status,
+            crate::config::ConfigReloadStatus::Applied
+        );
+        assert!(app.state.skip_ended_agent_panes_on_restore);
+        std::fs::write(
+            &path,
+            "[session]\nskip_ended_agent_panes_on_restore = false\n",
+        )
+        .unwrap();
+        app.reload_config();
+        assert!(!app.state.skip_ended_agent_panes_on_restore);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
