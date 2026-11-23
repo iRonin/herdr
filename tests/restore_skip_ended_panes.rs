@@ -17,8 +17,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const WAIT: Duration = Duration::from_secs(30);
 
-/// A fake agent that runs until a trigger file exists and then ends with status 1, so it leaves its shell behind.
-const ENDS_ON_TRIGGER: &str = "while [ ! -e '{TRIGGER}' ]; do sleep 0.05; done\nexit 1";
+/// A fake agent that runs until a trigger file exists and then ends with status 1, so it leaves its shell behind. It prints a
+/// line first: herdr's detector follows up a foreground job only once it has seen output from it, so a silent job is never
+/// recognised as the agent and its end is never seen.
+const ENDS_ON_TRIGGER: &str =
+    "printf 'Working...\\n'\nwhile [ ! -e '{TRIGGER}' ]; do sleep 0.05; done\nexit 1";
 
 struct World {
     base: PathBuf,
@@ -270,25 +273,30 @@ impl World {
         }
     }
 
-    /// Waits until the panes named `names` all show the agent `pi` (herdr has detected the resumed fake agent in them).
-    fn wait_for_agents_in(&self, names: &[&str]) {
-        self.wait_until("the resumed agents to be detected", |w| {
-            names.iter().all(|name| {
-                w.panes()
-                    .iter()
-                    .any(|(pane, _, agent)| pane == name && agent.as_deref() == Some("pi"))
+    /// How many "agent changed" lines the server log holds that also contain every one of `needles`. A needle starts with a space
+    /// so that it names the line's `agent=` field and not the `previous_agent=` field before it.
+    fn agent_changes(&self, needles: &[&str]) -> usize {
+        fs::read_to_string(self.data_dir.join("herdr-server.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| {
+                line.contains("agent changed") && needles.iter().all(|needle| line.contains(needle))
             })
+            .count()
+    }
+
+    /// Waits until herdr's own detector has recognised the fake agent in each of the `count` panes. The pane list cannot tell:
+    /// a resumed pane lists the agent `pi` from the moment it is restored, before any process was seen.
+    fn wait_for_agents_detected(&self, count: usize) {
+        self.wait_until("the detector to recognise the resumed agents", |w| {
+            w.agent_changes(&[" agent=Some(Pi) "]) >= count
         });
     }
 
-    /// Waits until none of the panes named `names` shows an agent any more (herdr saw each agent end).
-    fn wait_for_agents_gone_from(&self, names: &[&str]) {
-        self.wait_until("the agents to end", |w| {
-            names.iter().all(|name| {
-                w.panes()
-                    .iter()
-                    .any(|(pane, _, agent)| pane == name && agent.is_none())
-            })
+    /// Waits until herdr's detector has seen each of the `count` agents end (the foreground job is the shell again).
+    fn wait_for_agents_ended(&self, count: usize) {
+        self.wait_until("the detector to see the agents end", |w| {
+            w.agent_changes(&[" agent=None "]) >= count
         });
     }
 
@@ -608,10 +616,10 @@ fn a_pane_whose_agent_ended_is_marked_by_the_server_and_left_out_at_the_next_sta
     let world = World::new(&Setup::new(Some(true)));
     let server = world.start();
     world.wait_until("both agents to be resumed", |w| w.agent_starts() == 2);
-    world.wait_for_agents_in(&["p7", "p9"]);
+    world.wait_for_agents_detected(2);
 
     world.trigger();
-    world.wait_for_agents_gone_from(&["p7", "p9"]);
+    world.wait_for_agents_ended(2);
     server.stop(&world);
 
     assert_eq!(
@@ -645,15 +653,16 @@ fn a_pane_whose_agent_ended_is_marked_by_the_server_and_left_out_at_the_next_sta
 }
 
 /// The control of the whole path: the same run with the setting off writes no mark and the next start brings every pane
-/// back, resuming the agents again.
+/// back. An agent that ended has already lost its saved session (as before this setting), so the panes come back as plain
+/// shells: the leftovers the setting is for.
 #[test]
 fn an_agent_that_ends_with_the_setting_off_leaves_no_mark_and_its_pane_comes_back() {
     let world = World::new(&Setup::new(None));
     let server = world.start();
     world.wait_until("both agents to be resumed", |w| w.agent_starts() == 2);
-    world.wait_for_agents_in(&["p7", "p9"]);
+    world.wait_for_agents_detected(2);
     world.trigger();
-    world.wait_for_agents_gone_from(&["p7", "p9"]);
+    world.wait_for_agents_ended(2);
     server.stop(&world);
 
     assert!(
@@ -664,8 +673,14 @@ fn an_agent_that_ends_with_the_setting_off_leaves_no_mark_and_its_pane_comes_bac
     assert_eq!(world.saved_panes().len(), 3);
 
     let server = world.start();
-    world.wait_until("the agents to be resumed again", |w| w.agent_starts() == 4);
-    assert_eq!(world.pane_names(), names(&["p7", "p8", "p9"]));
+    world.wait_until("the panes to be listed", |w| !w.pane_names().is_empty());
+    assert_eq!(
+        world.pane_names(),
+        names(&["p7", "p8", "p9"]),
+        "{}",
+        world.diagnostics()
+    );
+    assert_eq!(world.workspace_count(), 2);
     server.stop(&world);
 }
 
@@ -676,9 +691,9 @@ fn typing_into_a_pane_after_its_agent_ended_keeps_the_pane() {
     let world = World::new(&Setup::new(Some(true)));
     let server = world.start();
     world.wait_until("both agents to be resumed", |w| w.agent_starts() == 2);
-    world.wait_for_agents_in(&["p7", "p9"]);
+    world.wait_for_agents_detected(2);
     world.trigger();
-    world.wait_for_agents_gone_from(&["p7", "p9"]);
+    world.wait_for_agents_ended(2);
 
     let alive = world.base.join("ALIVE");
     world.type_into(
@@ -718,9 +733,9 @@ fn the_mark_crosses_a_live_handoff_and_no_pane_is_left_out_of_it() {
     let world = World::new(&Setup::new(Some(true)));
     let server = world.start();
     world.wait_until("both agents to be resumed", |w| w.agent_starts() == 2);
-    world.wait_for_agents_in(&["p7", "p9"]);
+    world.wait_for_agents_detected(2);
     world.trigger();
-    world.wait_for_agents_gone_from(&["p7", "p9"]);
+    world.wait_for_agents_ended(2);
 
     let handed = server.live_handoff(&world);
     assert_eq!(
