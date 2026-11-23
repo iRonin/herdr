@@ -99,7 +99,10 @@ fn compute_view_internal(
         compute_tab_surface(app, terminal_runtimes, area, resize_panes, cell_size);
 
     if resize_panes {
-        resize_background_tab_panes(app, terminal_runtimes, area, cell_size);
+        // `ui.resize_hidden_panes` off leaves a tab nobody shows at the size it has until it is shown.
+        if app.resize_hidden_panes {
+            resize_background_tab_panes(app, terminal_runtimes, area, cell_size);
+        }
         resize_popup_pane(app, terminal_runtimes, area, cell_size);
     }
 

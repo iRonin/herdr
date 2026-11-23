@@ -577,7 +577,10 @@ impl HeadlessServer {
             crate::kitty_graphics::HostCellSize::default()
         };
         let area = Rect::new(0, 0, cols, rows);
-        if self.app_client_count() == 1 {
+        // A lone client sizes every tab, so a tab nobody shows already has the right size when it is
+        // shown. With `ui.resize_hidden_panes` off only the tab that is shown is sized, as with
+        // several clients; a tab nobody shows is sized when it is shown again.
+        if self.app_client_count() == 1 && self.app.state.resize_hidden_panes {
             for (workspace_index, workspace) in self.app.state.workspaces.iter().enumerate() {
                 for tab_index in 0..workspace.tabs.len() {
                     crate::ui::resize_tab_surface(
@@ -647,6 +650,10 @@ impl HeadlessServer {
         for viewers in viewed_tabs.values_mut() {
             viewers.sort_unstable();
         }
+        // A controller entry outlives the client's visit to the tab, so with
+        // `ui.resize_hidden_panes` off only the tabs some client shows are reapplied.
+        let shown_tab_ids = (!self.app.state.resize_hidden_panes)
+            .then(|| viewed_tabs.keys().cloned().collect::<HashSet<String>>());
         for (tab_id, viewers) in viewed_tabs {
             let controller_is_viewing = self
                 .tab_geometry_controllers
@@ -664,6 +671,11 @@ impl HeadlessServer {
         let mut controlled_tabs = self
             .tab_geometry_controllers
             .iter()
+            .filter(|(tab_id, _)| {
+                shown_tab_ids
+                    .as_ref()
+                    .is_none_or(|shown| shown.contains(*tab_id))
+            })
             .filter_map(|(tab_id, &client_id)| {
                 self.app
                     .parse_tab_id(tab_id)
