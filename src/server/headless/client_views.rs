@@ -400,6 +400,42 @@ impl HeadlessServer {
             .collect()
     }
 
+    /// The tabs some active shell client with a writer shows: the filter
+    /// `reapply_controlled_shell_tab_geometry` uses for the tabs it sizes.
+    pub(super) fn shown_shell_tab_ids(&self) -> HashSet<String> {
+        self.clients
+            .iter()
+            .filter(|(_, client)| client.is_active_shell_client() && client.writer.is_some())
+            .filter_map(|(&client_id, _)| self.shell_tab_id_for_client(client_id))
+            .collect()
+    }
+
+    /// With `ui.resize_hidden_panes` off a tab is sized while a client shows it, so a tab that comes
+    /// into view must be sized then. Most requests that show a tab apply geometry themselves, but a
+    /// pane moved into a hidden tab, a tab moved away so that its neighbour takes over, and a worktree
+    /// open that finishes later do not, and a client that visited a tab stays its controller, so a
+    /// claim returns without sizing it. Take this before a request or event that may change what is
+    /// shown and pass it to `size_tabs_that_came_into_view` afterwards. It is `None` with the setting
+    /// on, where every tab is already sized.
+    pub(super) fn shown_tabs_before_change(&self) -> Option<HashSet<String>> {
+        (!self.app.state.resize_hidden_panes).then(|| self.shown_shell_tab_ids())
+    }
+
+    /// Sizes the tabs that are shown now and were not when `shown_before` was taken.
+    pub(super) fn size_tabs_that_came_into_view(
+        &mut self,
+        shown_before: Option<HashSet<String>>,
+        start_pending_agent_resumes: bool,
+    ) -> bool {
+        let Some(shown_before) = shown_before else {
+            return false;
+        };
+        if self.shown_shell_tab_ids() == shown_before {
+            return false;
+        }
+        self.reapply_controlled_shell_tab_geometry(start_pending_agent_resumes)
+    }
+
     pub(super) fn shell_focus_targets(&self) -> Vec<(u64, Option<ShellFocusTarget>)> {
         self.clients
             .iter()
@@ -810,6 +846,9 @@ impl HeadlessServer {
             .map(|client_id| (client_id, target))
     }
 
+    /// Puts a tab back to its controller's size when a direct terminal attach to one of its
+    /// terminals ends. It sizes that tab even while no client shows it and
+    /// `ui.resize_hidden_panes` is off, because it undoes the attach's own resize of that terminal.
     pub(super) fn restore_shell_tab_geometry(
         &mut self,
         client_id: u64,
@@ -825,6 +864,7 @@ impl HeadlessServer {
     ) -> bool {
         let target_before = self.default_shell_target();
         let popup_before = self.app.state.popup_pane.is_some();
+        let shown_before = self.shown_tabs_before_change();
         let method_claims_geometry = Self::public_request_may_change_geometry(&msg.request.method);
         let explicit_public_focus_target = match &msg.request.method {
             api::schema::Method::WorkspaceFocus(params) => self
@@ -914,8 +954,10 @@ impl HeadlessServer {
         {
             self.reconcile_client_shell_locations();
         }
-        let geometry_changed =
+        let geometry_applied =
             method_claims_geometry && self.reapply_controlled_shell_tab_geometry(false);
+        let geometry_changed =
+            geometry_applied || self.size_tabs_that_came_into_view(shown_before, false);
         changed | geometry_changed
     }
 
@@ -926,6 +968,7 @@ impl HeadlessServer {
     ) -> bool {
         let focus_before = self.shell_focus_target(client_id);
         let focused_tabs_before = self.focused_shell_tabs();
+        let shown_before = self.shown_tabs_before_change();
         let method_claims_geometry = Self::shell_endpoint_claims_geometry(&msg.request.method);
         let reconcile = Self::shell_locations_may_need_reconcile(&msg.request.method);
         let all_focus_before = reconcile.then(|| self.shell_focus_targets());
@@ -961,13 +1004,15 @@ impl HeadlessServer {
                     .emit_focus_api_events(target.workspace_index, target.pane_id);
             }
         }
-        let geometry_changed = method_claims_geometry
+        let geometry_applied = method_claims_geometry
             && if reconcile {
                 self.reapply_controlled_shell_tab_geometry(false)
             } else {
                 self.claim_shell_tab_geometry(client_id, false)
                     || self.resize_shell_tab_if_controller(client_id, false)
             };
+        let geometry_changed =
+            geometry_applied || self.size_tabs_that_came_into_view(shown_before, false);
         changed | navigation_changed | geometry_changed
     }
 }

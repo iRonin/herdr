@@ -597,6 +597,7 @@ impl HeadlessServer {
                                 == Some(request_id)
                         })
                     });
+                let shown_before = self.shown_tabs_before_change();
                 let changed = self.app.handle_internal_event_with_render_impact(ev);
                 let api_focus_succeeded = super::client_views::forward_proxied_api_response(
                     focused_worktree_response.take(),
@@ -608,7 +609,9 @@ impl HeadlessServer {
                 } else if api_focus_succeeded {
                     self.focus_all_shell_clients_on_default_target();
                 }
-                changed
+                // The open may have shown a workspace the request-time geometry pass did not see.
+                let geometry_changed = self.size_tabs_that_came_into_view(shown_before, false);
+                changed | geometry_changed
             }
             AppEvent::WorktreeRemoveFinished(result) => {
                 let focus_before = self.shell_focus_targets();
