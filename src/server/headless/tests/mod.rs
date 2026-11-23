@@ -2,6 +2,7 @@ use super::*;
 use crate::test_support::TestTempPath;
 
 mod event_fairness;
+mod hidden_resize;
 mod native_graphics;
 #[path = "pane_move.rs"]
 mod pane_move_tests;

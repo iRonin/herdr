@@ -3587,3 +3587,299 @@ fn mouse_capture_client_keeps_pane_file_hyperlinks_for_the_outer_terminal() {
     );
     cleanup_spawned_herdr(server, base);
 }
+
+/// A shell script that appends one line per SIGWINCH it receives, with the size its terminal had
+/// at that moment. `wait` returns the moment a trapped signal arrives, so none is missed while the
+/// loop sleeps.
+const WINCH_COUNTER_SCRIPT: &str = "#!/bin/sh\nLOG=\"$1\"\ntrap 'echo \"W $(stty size)\" >> \"$LOG\"' WINCH\necho ready >> \"$LOG\"\nwhile :; do sleep 0.1 & wait $!; done\n";
+
+/// A pane running `WINCH_COUNTER_SCRIPT`. Its log is the instrument: one `W` line per resize its
+/// program was told about, which is what makes a shell with a prompt theme grow its memory.
+struct WinchPane {
+    log: PathBuf,
+}
+
+impl WinchPane {
+    fn lines(&self) -> Vec<String> {
+        fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn winches(&self) -> usize {
+        self.lines().iter().filter(|l| l.starts_with("W ")).count()
+    }
+}
+
+fn start_winch_pane(
+    api_socket: &PathBuf,
+    base: &std::path::Path,
+    name: &str,
+    pane_id: &str,
+) -> WinchPane {
+    let script = base.join("winch-counter.sh");
+    fs::write(&script, WINCH_COUNTER_SCRIPT).unwrap();
+    wait_for_pane_shell(
+        api_socket,
+        pane_id,
+        &base.join(format!("{name}-shell-ready")),
+    );
+    let pane = WinchPane {
+        log: base.join(format!("{name}-winch.log")),
+    };
+    send_pane_shell_command(
+        api_socket,
+        pane_id,
+        &format!("exec sh {} {}", script.display(), pane.log.display()),
+    );
+    assert!(
+        wait_until(Duration::from_secs(20), Duration::from_millis(50), || {
+            pane.lines().iter().any(|l| l == "ready")
+        }),
+        "the counter in pane {name} did not start: {:?}",
+        pane.lines()
+    );
+    pane
+}
+
+fn winch_counts(panes: &[&WinchPane; 3]) -> [usize; 3] {
+    [panes[0].winches(), panes[1].winches(), panes[2].winches()]
+}
+
+/// Runs one client against a server with three counting panes (one in the tab the client shows,
+/// one in another tab of that workspace, one in another workspace) and returns, for each event,
+/// how many resizes each pane's program was told about: [shown, hidden tab, hidden workspace].
+fn hidden_pane_resizes_per_event(resize_hidden_panes: bool) -> Vec<(&'static str, [usize; 3])> {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    // A wrapped tab bar, so that adding tabs can give the bar a second row.
+    let server = spawn_server_with_config(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+        &format!(
+            "onboarding = false\n\n[ui]\ntab_bar_wrap = true\nresize_hidden_panes = {resize_hidden_panes}\n"
+        ),
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+    let request = |value: serde_json::Value| send_json_request(&api_socket, &value.to_string());
+    let shown_workspace = request(serde_json::json!({
+        "id": "shown-workspace", "method": "workspace.create",
+        "params": {"cwd": base, "focus": true, "label": "shown-ws"},
+    }));
+    let workspace_id = shown_workspace["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let shown_pane_id = shown_workspace["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let hidden_tab = request(serde_json::json!({
+        "id": "hidden-tab", "method": "tab.create",
+        "params": {"workspace_id": workspace_id, "cwd": base, "focus": false, "label": "hidden-tab"},
+    }));
+    let hidden_tab_id = hidden_tab["result"]["tab"]["tab_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let hidden_tab_pane_id = hidden_tab["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let hidden_workspace = request(serde_json::json!({
+        "id": "hidden-workspace", "method": "workspace.create",
+        "params": {"cwd": base, "focus": false, "label": "hidden-ws"},
+    }));
+    let hidden_workspace_id = hidden_workspace["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let hidden_workspace_pane_id = hidden_workspace["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let shown = start_winch_pane(&api_socket, &base, "shown", &shown_pane_id);
+    let hidden_in_tab = start_winch_pane(&api_socket, &base, "hidden-tab", &hidden_tab_pane_id);
+    let hidden_in_workspace = start_winch_pane(
+        &api_socket,
+        &base,
+        "hidden-workspace",
+        &hidden_workspace_pane_id,
+    );
+    let panes = [&shown, &hidden_in_tab, &hidden_in_workspace];
+    assert_eq!(
+        winch_counts(&panes),
+        [0, 0, 0],
+        "no pane is resized before a client attaches"
+    );
+
+    let client = spawn_client_shell_process(&config_home, &runtime_dir, &api_socket);
+    let master = client._master.as_ref().expect("client PTY");
+    let output = spawn_pty_drain(master.try_clone_reader().unwrap());
+    let mut input = master.take_writer().unwrap();
+    let screen_text = || {
+        let bytes = output
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .bytes
+            .clone();
+        terminal_screen::text(&bytes, 80, 24)
+    };
+
+    let mut events: Vec<(&'static str, [usize; 3])> = Vec::new();
+    let mut before = [0usize; 3];
+    // Waits for the first pane to be told (when `expect_shown`) and then for a second, so that a
+    // resize of a hidden pane has had time to arrive: the zeros below would mean nothing otherwise.
+    let mut record = |event: &'static str, expect_shown: bool, before: &mut [usize; 3]| {
+        if expect_shown {
+            assert!(
+                wait_until(Duration::from_secs(15), Duration::from_millis(50), || {
+                    shown.winches() > before[0]
+                }),
+                "{event}: the shown pane was not resized (counts {:?}, was {before:?})",
+                winch_counts(&panes)
+            );
+        }
+        thread::sleep(Duration::from_millis(1500));
+        let now = winch_counts(&panes);
+        events.push((
+            event,
+            [now[0] - before[0], now[1] - before[1], now[2] - before[2]],
+        ));
+        *before = now;
+    };
+
+    assert!(
+        wait_until(Duration::from_secs(20), Duration::from_millis(50), || {
+            screen_text().contains("shown-ws")
+        }),
+        "the client must show the workspace: {}",
+        screen_text()
+    );
+    record("a client attaches", true, &mut before);
+
+    master
+        .resize(PtySize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    record("the window is resized", true, &mut before);
+
+    // prefix+b collapses the sidebar and again expands it.
+    for event in ["the sidebar is collapsed", "the sidebar is expanded"] {
+        input.write_all(b"\x02").unwrap();
+        input.flush().unwrap();
+        thread::sleep(Duration::from_millis(300));
+        input.write_all(b"b").unwrap();
+        input.flush().unwrap();
+        record(event, true, &mut before);
+    }
+
+    // Hidden tabs with long labels until the wrapped tab bar needs another row, which takes a row
+    // from the pane area of every tab.
+    let mut tabs_made = 0;
+    let mut last_tab_id = String::new();
+    while shown.winches() == before[0] {
+        tabs_made += 1;
+        assert!(tabs_made <= 12, "twelve tabs did not wrap the tab bar");
+        let tab = request(serde_json::json!({
+            "id": format!("wrap-tab-{tabs_made}"), "method": "tab.create",
+            "params": {
+                "workspace_id": workspace_id, "focus": false,
+                "label": format!("wraptab-{tabs_made:02}-long-label"),
+            },
+        }));
+        assert_eq!(tab["result"]["type"], "tab_created", "{tab}");
+        last_tab_id = tab["result"]["tab"]["tab_id"].as_str().unwrap().to_owned();
+        thread::sleep(Duration::from_millis(700));
+    }
+    record("the tab bar gets a second row", true, &mut before);
+
+    // Closing the tab that made the bar wrap takes the row away again. The workspace nobody shows
+    // has a one-row bar, so the pane area is the same everywhere before the tabs are shown below,
+    // and what a shown pane is told is only what the show itself brings.
+    let closed = request(serde_json::json!({
+        "id": "close-wrap-tab", "method": "tab.close", "params": {"tab_id": last_tab_id},
+    }));
+    assert_eq!(closed["result"]["type"], "ok", "{closed}");
+    record("the tab bar loses its second row", true, &mut before);
+
+    let shown_tab = request(serde_json::json!({
+        "id": "show-hidden-tab", "method": "tab.focus", "params": {"tab_id": hidden_tab_id},
+    }));
+    assert_eq!(shown_tab["result"]["type"], "tab_info", "{shown_tab}");
+    record("the hidden tab is shown", false, &mut before);
+
+    let shown_workspace = request(serde_json::json!({
+        "id": "show-hidden-workspace", "method": "workspace.focus",
+        "params": {"workspace_id": hidden_workspace_id},
+    }));
+    assert_eq!(
+        shown_workspace["result"]["type"], "workspace_info",
+        "{shown_workspace}"
+    );
+    record("the hidden workspace is shown", false, &mut before);
+
+    drop(input);
+    drop(client);
+    let _ = send_json_request(
+        &api_socket,
+        r#"{"id":"stop","method":"server.stop","params":{}}"#,
+    );
+    cleanup_spawned_herdr(server, base);
+    events
+}
+
+/// Control: with the setting at its default every pane of every tab and workspace is told about
+/// each change of the client's pane area, and a pane that is shown has nothing left to be told.
+#[test]
+fn on_hidden_panes_are_resized_with_the_shown_one() {
+    let _lock = test_lock();
+    let events = hidden_pane_resizes_per_event(true);
+    assert_eq!(
+        events,
+        vec![
+            ("a client attaches", [1, 1, 1]),
+            ("the window is resized", [1, 1, 1]),
+            ("the sidebar is collapsed", [1, 1, 1]),
+            ("the sidebar is expanded", [1, 1, 1]),
+            ("the tab bar gets a second row", [1, 1, 1]),
+            ("the tab bar loses its second row", [1, 1, 1]),
+            ("the hidden tab is shown", [0, 0, 0]),
+            ("the hidden workspace is shown", [0, 0, 0]),
+        ]
+    );
+}
+
+/// `[ui] resize_hidden_panes = false`: the programs in a tab and a workspace nobody shows are not
+/// signalled when the window, the sidebar or the tab bar changes the pane area. Each is told once
+/// when it is shown, with what it would have been told by then.
+#[test]
+fn off_hidden_panes_are_resized_once_when_they_are_shown() {
+    let _lock = test_lock();
+    let events = hidden_pane_resizes_per_event(false);
+    assert_eq!(
+        events,
+        vec![
+            ("a client attaches", [1, 0, 0]),
+            ("the window is resized", [1, 0, 0]),
+            ("the sidebar is collapsed", [1, 0, 0]),
+            ("the sidebar is expanded", [1, 0, 0]),
+            ("the tab bar gets a second row", [1, 0, 0]),
+            ("the tab bar loses its second row", [1, 0, 0]),
+            ("the hidden tab is shown", [0, 1, 0]),
+            ("the hidden workspace is shown", [0, 0, 1]),
+        ]
+    );
+}
