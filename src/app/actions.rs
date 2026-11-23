@@ -549,9 +549,14 @@ impl AppState {
         terminal_id: &crate::terminal::TerminalId,
         bytes: &[u8],
     ) -> bool {
-        self.terminals
-            .get_mut(terminal_id)
-            .is_some_and(|terminal| terminal.note_forwarded_input(bytes))
+        let Some(terminal) = self.terminals.get_mut(terminal_id) else {
+            return false;
+        };
+        // Input makes the shell the user's again: it is no leftover of an agent that ended.
+        if !bytes.is_empty() && terminal.note_shell_input() {
+            self.session_dirty = true;
+        }
+        terminal.note_forwarded_input(bytes)
     }
 
     pub(crate) fn note_pane_forwarded_key(
@@ -576,9 +581,17 @@ impl AppState {
         encoded: &[u8],
         key: &crate::input::TerminalKey,
     ) -> bool {
-        self.terminals
-            .get_mut(terminal_id)
-            .is_some_and(|terminal| terminal.note_forwarded_key(encoded, key))
+        let Some(terminal) = self.terminals.get_mut(terminal_id) else {
+            return false;
+        };
+        // A key release is not input.
+        if !encoded.is_empty()
+            && key.kind != crossterm::event::KeyEventKind::Release
+            && terminal.note_shell_input()
+        {
+            self.session_dirty = true;
+        }
+        terminal.note_forwarded_key(encoded, key)
     }
 
     pub(crate) fn reset_pane_compact_command_detector(&mut self, ws_idx: usize, pane_id: PaneId) {
@@ -614,6 +627,9 @@ impl AppState {
         bytes: &[u8],
     ) {
         if let Some(terminal) = self.terminals.get_mut(terminal_id) {
+            if !bytes.is_empty() && terminal.note_shell_input() {
+                self.session_dirty = true;
+            }
             terminal.note_forwarded_bracketed_paste(bytes);
         }
     }
@@ -1984,6 +2000,14 @@ impl AppState {
                 self.session_dirty = true;
             }
             let mutation = mutation?;
+            if mutation.agent_released {
+                // The agent ended and its shell is what is left. Tracked whether or not the setting is on, so turning it on
+                // with a reload applies to agents that ended before; a save is owed only when the setting would write it.
+                terminal.note_agent_released();
+                if self.skip_ended_agent_panes_on_restore {
+                    self.session_dirty = true;
+                }
+            }
             let completion_reset = mutation.session_ref_changed
                 || mutation
                     .effective_state_change

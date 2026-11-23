@@ -5,7 +5,15 @@
 //! unchanged `restore`, so everything `restore` indexes by position (the history, `active`, `selected`, `active_tab`) is fixed in
 //! one place.
 
-use super::snapshot::{SessionHistorySnapshot, SessionSnapshot};
+use std::collections::HashSet;
+
+use tracing::{info, warn};
+
+use super::snapshot::{
+    layout_fingerprint, match_history_to_layout, HistoryLayoutMatch, LayoutSnapshot,
+    SessionHistorySnapshot, SessionSnapshot, TabSnapshot, WorkspaceHistorySnapshot,
+    WorkspaceSnapshot,
+};
 
 /// What `prune_ended_agent_panes` left out of the session.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -19,18 +27,298 @@ pub struct DroppedEndedPanes {
 
 /// Whether any pane of the snapshot carries the mark.
 pub fn has_ended_agent_panes(snapshot: &SessionSnapshot) -> bool {
-    let _ = snapshot;
-    false
+    snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.tabs)
+        .flat_map(|tab| tab.panes.values())
+        .any(|pane| pane.agent_ended)
 }
 
 /// Removes every marked pane from the snapshot, and from the history in step with it: the layout of a tab that loses a pane,
 /// the tab that loses all of them, the workspace that loses every tab, and the indices that pointed past them.
+///
+/// A history that does not belong to the saved layout (`match_history_to_layout` says `Mismatch`, or its shape differs) is
+/// dropped whole: it would be ignored by the restore anyway, and screens of another layout must never be shown in a pane. One
+/// that belongs to it is pruned the same way and, when it carried a layout fingerprint, stamped with the fingerprint of the
+/// pruned layout, so the restore still finds it matching. A workspace that loses nothing is left exactly as it was.
 pub fn prune_ended_agent_panes(
     snapshot: &mut SessionSnapshot,
     history: &mut Option<SessionHistorySnapshot>,
 ) -> DroppedEndedPanes {
-    let _ = (snapshot, history);
-    DroppedEndedPanes::default()
+    let mut dropped = DroppedEndedPanes::default();
+    if !has_ended_agent_panes(snapshot) {
+        return dropped;
+    }
+
+    // Decided on the layout as it was saved: the history was written together with it.
+    let history_fits = history.as_ref().is_some_and(|history| {
+        match_history_to_layout(history, snapshot) != HistoryLayoutMatch::Mismatch
+            && history_has_the_shape_of(history, snapshot)
+    });
+    if history.is_some() && !history_fits {
+        warn!("Ignoring pane history without a matching session layout");
+        *history = None;
+    }
+    let had_fingerprint = history
+        .as_ref()
+        .is_some_and(|history| history.layout_fingerprint.is_some());
+    let history_version = history.as_ref().map(|history| history.version);
+    let mut history_workspaces = history.take().map(|history| history.workspaces.into_iter());
+    let mut kept_history_workspaces = Vec::new();
+
+    let old_workspaces = std::mem::take(&mut snapshot.workspaces);
+    let mut workspace_survives = Vec::with_capacity(old_workspaces.len());
+    let mut kept_workspaces = Vec::new();
+    for workspace in old_workspaces {
+        let history_workspace = history_workspaces
+            .as_mut()
+            .and_then(std::iter::Iterator::next);
+        let loses_something = workspace
+            .tabs
+            .iter()
+            .any(|tab| tab.panes.values().any(|pane| pane.agent_ended));
+        if !loses_something {
+            workspace_survives.push(true);
+            kept_workspaces.push(workspace);
+            kept_history_workspaces.extend(history_workspace);
+            continue;
+        }
+        match prune_workspace(workspace, history_workspace, &mut dropped) {
+            (Some(workspace), history_workspace) => {
+                workspace_survives.push(true);
+                kept_workspaces.push(workspace);
+                kept_history_workspaces.extend(history_workspace);
+            }
+            (None, _) => workspace_survives.push(false),
+        }
+    }
+
+    snapshot.workspaces = kept_workspaces;
+    if snapshot.workspaces.is_empty() {
+        snapshot.active = None;
+        snapshot.selected = 0;
+    } else {
+        snapshot.active = snapshot
+            .active
+            .map(|active| remap_index(active, &workspace_survives));
+        snapshot.selected = remap_index(snapshot.selected, &workspace_survives);
+    }
+
+    if let Some(version) = history_version {
+        *history = Some(SessionHistorySnapshot {
+            version,
+            layout_fingerprint: if had_fingerprint {
+                layout_fingerprint(snapshot)
+            } else {
+                None
+            },
+            workspaces: kept_history_workspaces,
+        });
+    }
+    dropped
+}
+
+/// The history has an entry for every workspace and every tab of the snapshot, in the same positions.
+fn history_has_the_shape_of(history: &SessionHistorySnapshot, snapshot: &SessionSnapshot) -> bool {
+    history.workspaces.len() == snapshot.workspaces.len()
+        && history
+            .workspaces
+            .iter()
+            .zip(&snapshot.workspaces)
+            .all(|(history, workspace)| history.tabs.len() == workspace.tabs.len())
+}
+
+/// One workspace that holds a marked pane. Returns it without them, or `None` when no tab is left, with its history.
+fn prune_workspace(
+    mut workspace: WorkspaceSnapshot,
+    history: Option<WorkspaceHistorySnapshot>,
+    dropped: &mut DroppedEndedPanes,
+) -> (Option<WorkspaceSnapshot>, Option<WorkspaceHistorySnapshot>) {
+    // Restore numbers an old file's panes and tabs in layout order. Once a pane or a tab is gone the numbers of those after
+    // it would shift, so every number is written down first.
+    write_down_public_numbers(&mut workspace);
+
+    let workspace_label = workspace.id.clone().unwrap_or_default();
+    let old_tabs = std::mem::take(&mut workspace.tabs);
+    let old_tab_numbers = std::mem::take(&mut workspace.public_tab_numbers);
+    let mut history_tabs = history.map(|history| history.tabs.into_iter());
+    let mut kept_history_tabs = Vec::new();
+    let mut tab_survives = Vec::with_capacity(old_tabs.len());
+    let mut kept_tabs = Vec::new();
+    let mut kept_tab_numbers = Vec::new();
+    let mut dropped_pane_ids: HashSet<u32> = HashSet::new();
+
+    for (tab_index, (mut tab, tab_number)) in old_tabs.into_iter().zip(old_tab_numbers).enumerate()
+    {
+        let history_tab = history_tabs.as_mut().and_then(std::iter::Iterator::next);
+        let mut ended: Vec<u32> = tab
+            .panes
+            .iter()
+            .filter(|(_, pane)| pane.agent_ended)
+            .map(|(id, _)| *id)
+            .collect();
+        ended.sort_unstable();
+        for id in &ended {
+            let pane = &tab.panes[id];
+            info!(
+                event = "persist.restore.skip_ended_pane",
+                workspace = %workspace_label,
+                tab = tab_index,
+                cwd = %pane.cwd.display(),
+                agent_session = pane.agent_session.as_ref().map(|session| session.value.as_str()),
+                "leaving out a pane whose agent ended and left its shell idle"
+            );
+        }
+        dropped.panes += ended.len();
+        let ended: HashSet<u32> = ended.into_iter().collect();
+        dropped_pane_ids.extend(&ended);
+
+        if ended.is_empty() {
+            tab_survives.push(true);
+            kept_tabs.push(tab);
+            kept_tab_numbers.push(tab_number);
+            kept_history_tabs.extend(history_tab);
+            continue;
+        }
+        let Some(layout) = prune_layout(
+            std::mem::replace(&mut tab.layout, LayoutSnapshot::Pane(0)),
+            &ended,
+        ) else {
+            dropped.tabs += 1;
+            tab_survives.push(false);
+            continue;
+        };
+        tab.layout = layout;
+        tab.panes.retain(|id, _| !ended.contains(id));
+        settle_focus(&mut tab, &ended);
+        let mut history_tab = history_tab;
+        if let Some(history_tab) = history_tab.as_mut() {
+            history_tab.panes.retain(|id, _| !ended.contains(id));
+        }
+        tab_survives.push(true);
+        kept_tabs.push(tab);
+        kept_tab_numbers.push(tab_number);
+        kept_history_tabs.extend(history_tab);
+    }
+
+    if kept_tabs.is_empty() {
+        dropped.workspaces += 1;
+        dropped.workspace_ids.extend(workspace.id.clone());
+        return (None, None);
+    }
+    workspace.active_tab = remap_index(workspace.active_tab, &tab_survives);
+    workspace.tabs = kept_tabs;
+    workspace.public_tab_numbers = kept_tab_numbers;
+    workspace
+        .public_pane_numbers
+        .retain(|id, _| !dropped_pane_ids.contains(id));
+    let history = history_tabs.is_some().then(|| WorkspaceHistorySnapshot {
+        tabs: kept_history_tabs,
+    });
+    (Some(workspace), history)
+}
+
+/// Gives every pane and every tab of the workspace the public number restore would give it, and raises the next numbers past
+/// all of them, so that a number that belonged to a pane or a tab that goes is not handed out again.
+fn write_down_public_numbers(workspace: &mut WorkspaceSnapshot) {
+    let mut next_pane_number = workspace
+        .public_pane_numbers
+        .values()
+        .copied()
+        .max()
+        .and_then(|max| max.checked_add(1))
+        .unwrap_or(1)
+        .max(workspace.next_public_pane_number);
+    let pane_numbers =
+        super::restore::migrated_public_pane_numbers_by_old_raw(workspace, &mut next_pane_number);
+    workspace.public_pane_numbers = pane_numbers;
+    workspace.next_public_pane_number = next_pane_number;
+
+    let tab_numbers: Vec<usize> = (0..workspace.tabs.len())
+        .map(|index| {
+            workspace
+                .public_tab_numbers
+                .get(index)
+                .copied()
+                .unwrap_or(index + 1)
+        })
+        .collect();
+    workspace.next_public_tab_number = tab_numbers
+        .iter()
+        .copied()
+        .max()
+        .and_then(|max| max.checked_add(1))
+        .unwrap_or(1)
+        .max(workspace.next_public_tab_number);
+    workspace.public_tab_numbers = tab_numbers;
+}
+
+/// The layout without the panes in `ended`; a split with one side gone becomes the pane that is left.
+fn prune_layout(node: LayoutSnapshot, ended: &HashSet<u32>) -> Option<LayoutSnapshot> {
+    match node {
+        LayoutSnapshot::Pane(id) => (!ended.contains(&id)).then_some(LayoutSnapshot::Pane(id)),
+        LayoutSnapshot::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => match (prune_layout(*first, ended), prune_layout(*second, ended)) {
+            (Some(first), Some(second)) => Some(LayoutSnapshot::Split {
+                direction,
+                ratio,
+                first: Box::new(first),
+                second: Box::new(second),
+            }),
+            (Some(remaining), None) | (None, Some(remaining)) => Some(remaining),
+            (None, None) => None,
+        },
+    }
+}
+
+fn first_pane_in(node: &LayoutSnapshot) -> Option<u32> {
+    match node {
+        LayoutSnapshot::Pane(id) => Some(*id),
+        LayoutSnapshot::Split { first, second, .. } => {
+            first_pane_in(first).or_else(|| first_pane_in(second))
+        }
+    }
+}
+
+/// A focus or root pane that named a pane that went falls to the first pane left, in layout order (what restore does for a
+/// saved id it cannot find), and a zoom on a pane that went is undone.
+fn settle_focus(tab: &mut TabSnapshot, ended: &HashSet<u32>) {
+    let fallback = first_pane_in(&tab.layout);
+    if tab.focused.is_some_and(|id| ended.contains(&id)) {
+        tab.focused = fallback;
+        tab.zoomed = false;
+    }
+    if tab.root_pane.is_some_and(|id| ended.contains(&id)) {
+        tab.root_pane = fallback;
+    }
+}
+
+/// Where the item at `index` is after the items that do not survive are gone: the same item when it survives, otherwise the
+/// nearest survivor before it, otherwise the first one after it. An index past the end is not an item, so it is left for
+/// restore to clamp as it always did.
+fn remap_index(index: usize, survives: &[bool]) -> usize {
+    if index >= survives.len() {
+        return index;
+    }
+    let target = if survives[index] {
+        Some(index)
+    } else {
+        (0..index)
+            .rev()
+            .find(|candidate| survives[*candidate])
+            .or_else(|| (index + 1..survives.len()).find(|candidate| survives[*candidate]))
+    };
+    target.map_or(0, |target| {
+        survives[..target]
+            .iter()
+            .filter(|survives| **survives)
+            .count()
+    })
 }
 
 #[cfg(test)]

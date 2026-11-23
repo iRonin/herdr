@@ -161,13 +161,9 @@ pub(crate) fn public_tab_id_for_number(workspace_id: &str, tab_number: usize) ->
 /// Keeps `generate_workspace_id` from handing out any of `ids` again, for workspaces that are no longer in memory (a restore
 /// that left them out). Their ids may still be named by something saved or typed earlier.
 pub(crate) fn reserve_workspace_id_names<'a>(ids: impl IntoIterator<Item = &'a str>) {
-    let _ = ids.into_iter().count();
-}
-
-pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
-    let Some(next) = workspaces
-        .iter()
-        .filter_map(|workspace| public_workspace_number(&workspace.id))
+    let Some(next) = ids
+        .into_iter()
+        .filter_map(public_workspace_number)
         .max()
         .and_then(|max| u64::try_from(max.checked_add(1)?).ok())
     else {
@@ -186,6 +182,10 @@ pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
             Err(observed) => current = observed,
         }
     }
+}
+
+pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
+    reserve_workspace_id_names(workspaces.iter().map(|workspace| workspace.id.as_str()));
 }
 
 /// A named workspace containing tabs.

@@ -42,13 +42,14 @@ impl App {
         if self.state.workspaces.is_empty() {
             SessionSaveJob::Clear
         } else {
-            let snapshot = crate::persist::capture(
+            let mut snapshot = crate::persist::capture(
                 &self.state.workspaces,
                 &self.state.terminals,
                 &self.terminal_runtimes,
                 self.state.active,
                 self.state.selected,
             );
+            self.annotate_ended_agent_panes(&mut snapshot);
             let history = self.persist_pane_history.then(|| {
                 crate::persist::capture_history(
                     &snapshot,
@@ -81,7 +82,16 @@ impl App {
         now: Instant,
         shell_idle: &dyn Fn(&crate::terminal::TerminalId) -> bool,
     ) {
-        let _ = (snapshot, now, shell_idle);
+        if !self.state.skip_ended_agent_panes_on_restore {
+            return;
+        }
+        crate::persist::annotate_ended_agent_panes(
+            snapshot,
+            &self.state.workspaces,
+            &self.state.terminals,
+            now,
+            shell_idle,
+        );
     }
 
     pub(crate) fn start_background_session_save(&mut self) {
@@ -165,13 +175,14 @@ impl App {
             self.checkpoint_session_before_pane_exit();
             return;
         }
-        let snapshot = crate::persist::capture(
+        let mut snapshot = crate::persist::capture(
             &self.state.workspaces,
             &self.state.terminals,
             &self.terminal_runtimes,
             self.state.active,
             self.state.selected,
         );
+        self.annotate_ended_agent_panes(&mut snapshot);
         // A save thread that has not finished is busy even before it takes the writer: its layout was captured earlier and
         // it will write it over anything written now.
         let background_save_running = self

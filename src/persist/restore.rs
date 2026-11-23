@@ -156,7 +156,7 @@ fn collect_snapshot_ids_inner(node: &LayoutSnapshot, ids: &mut Vec<u32>) {
     }
 }
 
-fn migrated_public_pane_numbers_by_old_raw(
+pub(super) fn migrated_public_pane_numbers_by_old_raw(
     snap: &WorkspaceSnapshot,
     next_public_pane_number: &mut usize,
 ) -> HashMap<u32, usize> {
@@ -600,6 +600,10 @@ fn restore_tab(
         let handoff_closes_with_agent = imported_runtime
             .as_ref()
             .is_some_and(|imported| imported.state.closes_when_resumed_agent_exits);
+        #[cfg(unix)]
+        let handoff_agent_ended = imported_runtime
+            .as_ref()
+            .is_some_and(|imported| imported.state.agent_ended);
         let pending_native_agent_restore = if was_imported {
             None
         } else {
@@ -760,6 +764,11 @@ fn restore_tab(
                 #[cfg(unix)]
                 if handoff_closes_with_agent {
                     terminal.closes_when_resumed_agent_exits = true;
+                }
+                // The old server saw this pane's agent end and its shell is idle: the new server still saves it as a leftover.
+                #[cfg(unix)]
+                if handoff_agent_ended {
+                    terminal.shell_leftover = crate::terminal::state::ShellLeftover::AgentEnded;
                 }
                 panes.insert(*id, PaneState::new(terminal_id.clone()));
                 terminal_runtimes.insert(terminal_id, runtime);

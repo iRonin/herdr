@@ -418,19 +418,70 @@ pub fn annotate_ended_agent_panes(
     now: std::time::Instant,
     shell_idle: &dyn Fn(&crate::terminal::TerminalId) -> bool,
 ) {
-    let _ = (snapshot, workspaces, terminals, now, shell_idle);
+    for (snapshot_workspace, workspace) in snapshot.workspaces.iter_mut().zip(workspaces) {
+        for (snapshot_tab, tab) in snapshot_workspace.tabs.iter_mut().zip(&workspace.tabs) {
+            for pane_id in tab.panes.keys() {
+                let Some(terminal_id) = tab.terminal_id(*pane_id) else {
+                    continue;
+                };
+                let Some(terminal) = terminals.get(terminal_id) else {
+                    continue;
+                };
+                if !terminal.ended_agent_shell_for_save(now, || shell_idle(terminal_id)) {
+                    continue;
+                }
+                if let Some(pane) = snapshot_tab.panes.get_mut(&pane_id.raw()) {
+                    pane.agent_ended = true;
+                }
+            }
+        }
+    }
 }
 
 pub(super) fn layout_fingerprint(snapshot: &SessionSnapshot) -> Option<String> {
     use sha2::{Digest, Sha256};
 
     let mut value = serde_json::to_value(snapshot).ok()?;
+    strip_agent_ended_marks(&mut value);
     // Sets serialize as arrays; normalize their order as well as JSON object keys.
     let mut collapsed: Vec<_> = snapshot.collapsed_space_keys.iter().collect();
     collapsed.sort_unstable();
     value["collapsed_space_keys"] = serde_json::to_value(collapsed).ok()?;
     let bytes = serde_json::to_vec(&value).ok()?;
     Some(format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// Removes every pane's `agent_ended` mark from a serialized snapshot. The mark takes no part in the layout fingerprint: a build
+/// that does not know it ignores it and computes the fingerprint of the file without it, so a fingerprint that included it
+/// would make that build discard the history file the first time it starts after a rollback.
+fn strip_agent_ended_marks(snapshot: &mut serde_json::Value) {
+    let Some(workspaces) = snapshot
+        .get_mut("workspaces")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for workspace in workspaces {
+        let Some(tabs) = workspace
+            .get_mut("tabs")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for tab in tabs {
+            let Some(panes) = tab
+                .get_mut("panes")
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                continue;
+            };
+            for pane in panes.values_mut() {
+                if let Some(pane) = pane.as_object_mut() {
+                    pane.remove("agent_ended");
+                }
+            }
+        }
+    }
 }
 
 /// Why a saved history file may be replayed into the restored panes, or that it may not.

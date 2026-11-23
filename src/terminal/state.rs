@@ -546,16 +546,20 @@ impl TerminalState {
     }
 
     /// An agent that ran in this pane's shell was released: it ended, and its shell is what is left.
-    pub(crate) fn note_agent_released(&mut self) {}
+    pub(crate) fn note_agent_released(&mut self) {
+        self.shell_leftover = ShellLeftover::AgentEnded;
+    }
 
     /// herdr typed a resume command into this pane's shell at `at`.
     pub(crate) fn note_resume_typed(&mut self, at: Instant) {
-        let _ = at;
+        self.shell_leftover = ShellLeftover::ResumeTyped { at };
     }
 
     /// Input reached this pane's shell. Returns true only when it removed a mark, which is when a save is owed.
     pub(crate) fn note_shell_input(&mut self) -> bool {
-        false
+        let had_mark = self.shell_leftover != ShellLeftover::None;
+        self.shell_leftover = ShellLeftover::None;
+        had_mark
     }
 
     /// Whether a save made at `now` marks this pane: its agent ended (or its resume failed, `RESUME_FAILED_GRACE` after
@@ -566,8 +570,14 @@ impl TerminalState {
         now: Instant,
         shell_idle: impl FnOnce() -> bool,
     ) -> bool {
-        let _ = (now, shell_idle);
-        false
+        let due = match self.shell_leftover {
+            ShellLeftover::None => false,
+            ShellLeftover::AgentEnded => true,
+            ShellLeftover::ResumeTyped { at } => {
+                now.saturating_duration_since(at) >= RESUME_FAILED_GRACE
+            }
+        };
+        due && shell_idle()
     }
 
     fn clear_compact_input_state(&mut self) {
