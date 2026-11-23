@@ -11,7 +11,7 @@ mod restore;
 mod snapshot;
 mod writer;
 
-pub use self::ended_panes::{has_ended_agent_panes, prune_ended_agent_panes, DroppedEndedPanes};
+pub use self::ended_panes::{has_ended_agent_panes, prune_ended_agent_panes};
 pub use self::io::{clear_history, load, load_history};
 pub use self::restore::restore;
 pub(crate) use self::restore::restored_worktree_space_membership;

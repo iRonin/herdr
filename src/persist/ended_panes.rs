@@ -213,7 +213,7 @@ fn prune_workspace(
     workspace
         .public_pane_numbers
         .retain(|id, _| !dropped_pane_ids.contains(id));
-    let history = history_tabs.is_some().then(|| WorkspaceHistorySnapshot {
+    let history = history_tabs.is_some().then_some(WorkspaceHistorySnapshot {
         tabs: kept_history_tabs,
     });
     (Some(workspace), history)
