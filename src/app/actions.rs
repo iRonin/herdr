@@ -4586,6 +4586,198 @@ mod tests {
         );
     }
 
+    /// Sends the events of an agent that was found in a pane and then ended: its process is detected, runs, and its exit is
+    /// reported with the shell in front again.
+    fn end_the_agent_in(state: &mut AppState, pane_id: PaneId) {
+        state.handle_app_event(AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: Agent::Pi,
+            observed_at: std::time::Instant::now(),
+        });
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_working: true,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: std::time::Instant::now(),
+        });
+    }
+
+    /// The process-owned exit of a detected agent leaves its shell marked as a leftover. This is the one place herdr learns
+    /// that an agent ended, whatever its binary is called.
+    #[test]
+    fn the_exit_of_a_detected_agent_marks_its_shell_as_a_leftover() {
+        use crate::terminal::state::ShellLeftover;
+        let mut state = app_with_workspaces(&["one"]);
+        let (pane_id, terminal_id) = first_pane_terminal(&state);
+        assert_eq!(
+            state.terminals[&terminal_id].shell_leftover,
+            ShellLeftover::None
+        );
+
+        end_the_agent_in(&mut state, pane_id);
+
+        assert_eq!(
+            state.terminals[&terminal_id].shell_leftover,
+            ShellLeftover::AgentEnded
+        );
+    }
+
+    /// A pane that never held an agent is never a leftover, whatever its process does: this is a user's own shell tabs.
+    #[test]
+    fn a_pane_that_never_held_an_agent_is_never_marked() {
+        use crate::terminal::state::ShellLeftover;
+        let mut state = app_with_workspaces(&["one"]);
+        let (pane_id, terminal_id) = first_pane_terminal(&state);
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: None,
+            state: AgentState::Unknown,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: std::time::Instant::now(),
+        });
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: None,
+            state: AgentState::Unknown,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        assert_eq!(
+            state.terminals[&terminal_id].shell_leftover,
+            ShellLeftover::None
+        );
+    }
+
+    /// With the setting on, an agent that ends owes a save: the saved layout would otherwise lack the mark until some later
+    /// change. With it off nothing is owed, so the setting costs nothing when it is not used.
+    #[test]
+    fn an_agent_that_ends_owes_a_save_only_while_the_setting_is_on() {
+        for (setting, owed) in [(true, true), (false, false)] {
+            let mut state = app_with_workspaces(&["one"]);
+            let (pane_id, _) = first_pane_terminal(&state);
+            state.skip_ended_agent_panes_on_restore = setting;
+            state.handle_app_event(AppEvent::AgentProcessDetected {
+                pane_id,
+                agent: Agent::Pi,
+                observed_at: std::time::Instant::now(),
+            });
+            state.session_dirty = false;
+
+            state.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Pi),
+                state: AgentState::Idle,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: true,
+                observed_at: std::time::Instant::now(),
+            });
+
+            assert_eq!(state.session_dirty, owed, "setting {setting}");
+        }
+    }
+
+    /// Anything typed into the pane makes it the user's shell again. All three ways input reaches a pane clear the mark and owe
+    /// a save, and a key release is not input.
+    #[test]
+    fn input_into_a_leftover_shell_removes_the_mark_and_owes_a_save() {
+        use crate::terminal::state::ShellLeftover;
+        let key = crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let mut release = key.clone();
+        release.kind = crossterm::event::KeyEventKind::Release;
+
+        type Send = fn(&mut AppState, &crate::terminal::TerminalId);
+        let senders: [(&str, Send); 3] = [
+            ("bytes", |state, id| {
+                state.note_terminal_forwarded_input(id, b"ls\r");
+            }),
+            ("key", |state, id| {
+                let key = crate::input::TerminalKey::new(
+                    crossterm::event::KeyCode::Char('a'),
+                    crossterm::event::KeyModifiers::NONE,
+                );
+                state.note_terminal_forwarded_key(id, b"a", &key);
+            }),
+            ("paste", |state, id| {
+                state.note_terminal_forwarded_bracketed_paste(id, b"\x1b[200~ls\x1b[201~");
+            }),
+        ];
+        for (name, send) in senders {
+            let mut state = app_with_workspaces(&["one"]);
+            let (_, terminal_id) = first_pane_terminal(&state);
+            state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .shell_leftover = ShellLeftover::AgentEnded;
+            state.session_dirty = false;
+
+            send(&mut state, &terminal_id);
+
+            assert_eq!(
+                state.terminals[&terminal_id].shell_leftover,
+                ShellLeftover::None,
+                "{name}: the mark survived input"
+            );
+            assert!(state.session_dirty, "{name}: removing the mark owes a save");
+        }
+
+        let mut state = app_with_workspaces(&["one"]);
+        let (_, terminal_id) = first_pane_terminal(&state);
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .shell_leftover = ShellLeftover::AgentEnded;
+        state.session_dirty = false;
+        state.note_terminal_forwarded_key(&terminal_id, b"a", &release);
+        assert_eq!(
+            state.terminals[&terminal_id].shell_leftover,
+            ShellLeftover::AgentEnded,
+            "the release of a key is not input"
+        );
+        assert!(!state.session_dirty);
+    }
+
+    /// Typing into a pane with no mark must not cause a save: input arrives at keyboard speed.
+    #[test]
+    fn input_into_a_pane_without_a_mark_owes_no_save() {
+        let mut state = app_with_workspaces(&["one"]);
+        let (_, terminal_id) = first_pane_terminal(&state);
+        state.session_dirty = false;
+
+        state.note_terminal_forwarded_input(&terminal_id, b"ls\r");
+        state.note_terminal_forwarded_bracketed_paste(&terminal_id, b"\x1b[200~ls\x1b[201~");
+        let key = crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        state.note_terminal_forwarded_key(&terminal_id, b"a", &key);
+
+        assert!(!state.session_dirty);
+    }
+
     #[test]
     fn shell_return_drops_self_reported_agent_and_its_resume() {
         let mut state = app_with_workspaces(&["one"]);

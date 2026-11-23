@@ -158,6 +158,12 @@ pub(crate) fn public_tab_id_for_number(workspace_id: &str, tab_number: usize) ->
     format!("{workspace_id}:t{}", encode_public_number(tab_number))
 }
 
+/// Keeps `generate_workspace_id` from handing out any of `ids` again, for workspaces that are no longer in memory (a restore
+/// that left them out). Their ids may still be named by something saved or typed earlier.
+pub(crate) fn reserve_workspace_id_names<'a>(ids: impl IntoIterator<Item = &'a str>) {
+    let _ = ids.into_iter().count();
+}
+
 pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
     let Some(next) = workspaces
         .iter()
@@ -1575,6 +1581,18 @@ mod tests {
         let generated = generate_workspace_id();
         assert_ne!(generated, "wZ");
         assert!(public_workspace_number(&generated) > public_workspace_number("wZ"));
+    }
+
+    #[test]
+    fn reserving_the_ids_of_workspaces_left_out_of_a_restore_prevents_reuse() {
+        reserve_workspace_id_names(["wZZZ", "w1"]);
+
+        let generated = generate_workspace_id();
+        assert_ne!(generated, "wZZZ");
+        assert!(
+            public_workspace_number(&generated) > public_workspace_number("wZZZ"),
+            "{generated} was issued at or below a reserved id"
+        );
     }
 
     #[test]

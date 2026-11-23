@@ -338,6 +338,39 @@ async fn the_setting_is_read_when_the_command_is_typed_not_when_the_restore_plan
     }
 }
 
+/// Typing the resume command notes when it was typed, so that a later save can tell a resume that never produced an agent (the
+/// command failed at once) from a shell the user uses. A pane that only waits to resume carries nothing yet.
+#[tokio::test]
+async fn typing_the_resume_command_notes_when_it_was_typed_for_the_failed_resume_grace() {
+    use crate::terminal::state::ShellLeftover;
+    let dir = scratch_dir("noted");
+    let (shell, typed) = recording_shell(&dir, "bash");
+    let mut app = test_app();
+    app.state.default_shell = shell.display().to_string();
+    let argv = AGENT_ARGV.iter().map(|part| part.to_string()).collect();
+    let (_pane_id, terminal_id) = pane_waiting_to_resume(&mut app, &dir, argv);
+    assert_eq!(
+        app.state.terminals[&terminal_id].shell_leftover,
+        ShellLeftover::None,
+        "a pane that waits to resume has had nothing typed"
+    );
+
+    let before = Instant::now();
+    assert!(app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true));
+    let after = Instant::now();
+    wait_for_lines(&typed, 1).await;
+
+    match app.state.terminals[&terminal_id].shell_leftover {
+        ShellLeftover::ResumeTyped { at } => assert!(
+            at >= before && at <= after,
+            "the time noted is not the time the command was typed"
+        ),
+        other => panic!("typing the resume command left {other:?}"),
+    }
+    shut_down_runtimes(&mut app);
+    remove_scratch(&dir);
+}
+
 // ---- real shells --------------------------------------------------------------------------------------------------
 
 const REAL_SHELLS: [&str; 5] = ["sh", "dash", "bash", "zsh", "fish"];

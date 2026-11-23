@@ -7338,4 +7338,99 @@ mod tests {
             "custom:pi"
         );
     }
+
+    /// A shell that held an agent which ended is a leftover once it is idle; a shell that never held one is not.
+    #[test]
+    fn a_leftover_shell_is_marked_only_when_an_agent_ended_here_and_the_shell_is_idle() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        assert_eq!(terminal.shell_leftover, ShellLeftover::None);
+        assert!(
+            !terminal.ended_agent_shell_for_save(now, || panic!("a plain shell is never probed")),
+            "a plain shell the user opened must never be marked"
+        );
+
+        terminal.note_agent_released();
+        assert_eq!(terminal.shell_leftover, ShellLeftover::AgentEnded);
+        assert!(terminal.ended_agent_shell_for_save(now, || true));
+        assert!(
+            !terminal.ended_agent_shell_for_save(now, || false),
+            "an ended agent whose shell has something running in it is in use"
+        );
+    }
+
+    /// A resume that was typed and never produced an agent counts only after the grace, and only with an idle shell. The
+    /// agent state herdr holds cannot decide it: a resumed pane is seeded as an idle agent whether or not the agent starts.
+    #[test]
+    fn a_resume_that_never_became_an_agent_is_marked_at_the_grace_and_not_before() {
+        let typed_at = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        assert!(terminal.is_agent_terminal());
+        terminal.note_resume_typed(typed_at);
+        assert_eq!(
+            terminal.shell_leftover,
+            ShellLeftover::ResumeTyped { at: typed_at }
+        );
+
+        let before = typed_at + RESUME_FAILED_GRACE - Duration::from_millis(1);
+        assert!(
+            !terminal.ended_agent_shell_for_save(before, || panic!("not probed before the grace")),
+            "a shell can take half a minute to reach its prompt: idle is no evidence yet"
+        );
+        let due = typed_at + RESUME_FAILED_GRACE;
+        assert!(terminal.ended_agent_shell_for_save(due, || true));
+        assert!(
+            !terminal.ended_agent_shell_for_save(due, || false),
+            "a busy shell after the grace is an agent that runs"
+        );
+        assert!(
+            terminal.ended_agent_shell_for_save(due + Duration::from_secs(3600), || true),
+            "the grace is a lower bound, not a window"
+        );
+    }
+
+    #[test]
+    fn the_grace_is_three_minutes() {
+        assert_eq!(RESUME_FAILED_GRACE, Duration::from_secs(180));
+    }
+
+    #[test]
+    fn an_agent_that_ends_after_a_resume_turns_the_pending_grace_into_ended_at_once() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.note_resume_typed(now);
+        terminal.note_agent_released();
+        assert_eq!(terminal.shell_leftover, ShellLeftover::AgentEnded);
+        assert!(
+            terminal.ended_agent_shell_for_save(now, || true),
+            "an agent that was seen ending needs no grace"
+        );
+    }
+
+    /// Input into the shell removes the mark and says so, so the caller owes a save; input into a shell with no mark says
+    /// nothing, so a keystroke never causes a save.
+    #[test]
+    fn input_removes_the_mark_and_reports_it_only_when_there_was_one() {
+        let mut terminal = test_terminal();
+        assert!(!terminal.note_shell_input(), "no mark: nothing changed");
+        assert_eq!(terminal.shell_leftover, ShellLeftover::None);
+
+        terminal.note_agent_released();
+        assert!(terminal.note_shell_input());
+        assert_eq!(terminal.shell_leftover, ShellLeftover::None);
+        assert!(!terminal.note_shell_input(), "already clear");
+
+        terminal.note_resume_typed(Instant::now());
+        assert!(terminal.note_shell_input());
+        assert_eq!(terminal.shell_leftover, ShellLeftover::None);
+    }
+
+    #[test]
+    fn a_shell_replaced_after_an_exit_is_no_leftover() {
+        let mut terminal = test_terminal();
+        terminal.note_agent_released();
+        terminal.clear_agent_runtime_identity_after_respawn();
+        assert_eq!(terminal.shell_leftover, ShellLeftover::None);
+    }
 }

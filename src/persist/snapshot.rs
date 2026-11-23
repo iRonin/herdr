@@ -713,6 +713,247 @@ mod tests {
         assert_eq!(active_pane.managed_agent_kind.as_deref(), Some("pi"));
     }
 
+    fn mark_every_pane(snapshot: &mut SessionSnapshot) {
+        for workspace in &mut snapshot.workspaces {
+            for tab in &mut workspace.tabs {
+                for pane in tab.panes.values_mut() {
+                    pane.agent_ended = true;
+                }
+            }
+        }
+    }
+
+    /// A save made with the setting off must be byte for byte what it was before the mark existed: the key is never in the file
+    /// unless a pane carries it.
+    #[test]
+    fn a_snapshot_without_marks_serializes_without_the_agent_ended_key() {
+        for fixture in ["current-herdr", "current-herdr-dev", "legacy-pre-tabs-v2"] {
+            let snapshot = parse_snapshot(session_fixture(fixture)).unwrap();
+            assert!(
+                !serde_json::to_string(&snapshot)
+                    .unwrap()
+                    .contains("agent_ended"),
+                "{fixture}"
+            );
+        }
+        let mut state = state_with_workspaces(&["unmarked"]);
+        state.workspaces[0].test_split(Direction::Horizontal);
+        state.ensure_test_terminals();
+        assert!(!serde_json::to_string(&capture_from_state(&state))
+            .unwrap()
+            .contains("agent_ended"));
+
+        let mut marked = parse_snapshot(session_fixture("current-herdr")).unwrap();
+        mark_every_pane(&mut marked);
+        let text = serde_json::to_string(&marked).unwrap();
+        assert!(
+            text.matches("\"agent_ended\":true").count() > 0,
+            "a mark must be written when a pane carries it: {text}"
+        );
+    }
+
+    /// An older build that re-reads a file with the mark, and this build reading a file from a newer one, must not refuse it.
+    #[test]
+    fn a_pane_snapshot_reads_the_mark_and_accepts_keys_it_does_not_know() {
+        let marked: PaneSnapshot =
+            serde_json::from_str(r#"{"cwd":"/a","agent_ended":true,"a_future_field":{"x":1}}"#)
+                .unwrap();
+        assert!(marked.agent_ended);
+        let plain: PaneSnapshot =
+            serde_json::from_str(r#"{"cwd":"/a","a_future_field":[1,2]}"#).unwrap();
+        assert!(!plain.agent_ended);
+    }
+
+    /// An older build ignores the mark and computes the fingerprint of the file without it. If the fingerprint included the
+    /// mark, the first start after a rollback would find a history file whose fingerprint differs and show every pane with an
+    /// empty screen.
+    #[test]
+    fn the_layout_fingerprint_ignores_the_mark_but_not_the_layout() {
+        let mut snapshot = parse_snapshot(session_fixture("current-herdr")).unwrap();
+        let unmarked = layout_fingerprint(&snapshot).unwrap();
+
+        mark_every_pane(&mut snapshot);
+        assert_eq!(
+            layout_fingerprint(&snapshot).as_deref(),
+            Some(unmarked.as_str()),
+            "the mark changed the fingerprint"
+        );
+
+        let tab = &mut snapshot.workspaces[0].tabs[0];
+        let next_id = tab.panes.keys().max().unwrap() + 1;
+        let mut extra = tab.panes.values().next().unwrap().cwd.clone();
+        extra.push("extra");
+        tab.panes.insert(
+            next_id,
+            PaneSnapshot {
+                cwd: extra,
+                label: None,
+                agent_name: None,
+                managed_agent_kind: None,
+                agent_session: None,
+                agent_resume: None,
+                launch_argv: None,
+                agent_ended: true,
+            },
+        );
+        assert_ne!(
+            layout_fingerprint(&snapshot).as_deref(),
+            Some(unmarked.as_str()),
+            "a fingerprint that ignores a new pane would match every history"
+        );
+    }
+
+    /// An older build refuses a snapshot whose version is newer than its own, so the mark must not need a new version.
+    #[test]
+    fn the_snapshot_version_is_still_three() {
+        assert_eq!(SNAPSHOT_VERSION, 3);
+    }
+
+    /// A terminal of the test state whose shell is a leftover of `leftover`.
+    fn state_with_leftovers(
+        names: &[&str],
+        leftovers: &[crate::terminal::state::ShellLeftover],
+    ) -> AppState {
+        let mut state = state_with_workspaces(names);
+        for (workspace, leftover) in state.workspaces.iter().zip(leftovers) {
+            let terminal_id = workspace.tabs[0].panes[&workspace.tabs[0].root_pane]
+                .attached_terminal_id
+                .clone();
+            state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .shell_leftover = *leftover;
+        }
+        state
+    }
+
+    fn annotated(
+        state: &AppState,
+        now: std::time::Instant,
+        shell_idle: &dyn Fn(&crate::terminal::TerminalId) -> bool,
+    ) -> SessionSnapshot {
+        let mut snapshot = capture_from_state(state);
+        annotate_ended_agent_panes(
+            &mut snapshot,
+            &state.workspaces,
+            &state.terminals,
+            now,
+            shell_idle,
+        );
+        snapshot
+    }
+
+    fn marks_by_workspace(snapshot: &SessionSnapshot) -> Vec<bool> {
+        snapshot
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                workspace
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| tab.panes.values())
+                    .any(|pane| pane.agent_ended)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn annotate_marks_only_the_panes_whose_shell_is_a_leftover_and_idle() {
+        use crate::terminal::state::ShellLeftover;
+        let now = std::time::Instant::now();
+        let state = state_with_leftovers(
+            &["ended", "plain", "ended-busy"],
+            &[
+                ShellLeftover::AgentEnded,
+                ShellLeftover::None,
+                ShellLeftover::AgentEnded,
+            ],
+        );
+        let busy = state.workspaces[2].tabs[0].panes[&state.workspaces[2].tabs[0].root_pane]
+            .attached_terminal_id
+            .clone();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let snapshot = annotated(&state, now, &|terminal_id| {
+            asked.borrow_mut().push(terminal_id.clone());
+            *terminal_id != busy
+        });
+
+        assert_eq!(
+            marks_by_workspace(&snapshot),
+            vec![true, false, false],
+            "an ended pane with an idle shell is marked; a plain shell and an ended pane with something running in it are not"
+        );
+        let plain = state.workspaces[1].tabs[0].panes[&state.workspaces[1].tabs[0].root_pane]
+            .attached_terminal_id
+            .clone();
+        assert!(
+            !asked.borrow().contains(&plain),
+            "the process lookup is made only for a pane that can be marked"
+        );
+    }
+
+    #[test]
+    fn annotate_marks_a_failed_resume_only_after_the_grace_and_only_with_an_idle_shell() {
+        use crate::terminal::state::{ShellLeftover, RESUME_FAILED_GRACE};
+        let typed_at = std::time::Instant::now();
+        let mut state =
+            state_with_leftovers(&["resume"], &[ShellLeftover::ResumeTyped { at: typed_at }]);
+        // A pane restored with a resume plan is seeded as an idle agent whether or not the agent ever starts, so the agent
+        // state says nothing about whether one runs.
+        let tab = &state.workspaces[0].tabs[0];
+        let terminal_id = tab.panes[&tab.root_pane].attached_terminal_id.clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Pi),
+                crate::detect::AgentState::Idle,
+            );
+        let idle = |_: &crate::terminal::TerminalId| true;
+        let busy = |_: &crate::terminal::TerminalId| false;
+        let almost = typed_at + RESUME_FAILED_GRACE - std::time::Duration::from_secs(1);
+        let due = typed_at + RESUME_FAILED_GRACE;
+
+        assert_eq!(
+            marks_by_workspace(&annotated(&state, almost, &idle)),
+            vec![false]
+        );
+        assert_eq!(
+            marks_by_workspace(&annotated(&state, due, &idle)),
+            vec![true]
+        );
+        assert_eq!(
+            marks_by_workspace(&annotated(&state, due, &busy)),
+            vec![false],
+            "a resumed pane whose shell is busy (the agent runs, or the shell is still starting) is not a leftover"
+        );
+    }
+
+    /// The mark lands on the pane that holds the terminal, in the right tab and workspace, not on a neighbour.
+    #[test]
+    fn annotate_marks_the_right_pane_in_a_workspace_with_several_tabs_and_splits() {
+        use crate::terminal::state::ShellLeftover;
+        let mut state = state_with_workspaces(&["many"]);
+        let first_root = state.workspaces[0].tabs[0].root_pane;
+        let split = state.workspaces[0].test_split(Direction::Horizontal);
+        state.workspaces[0].test_add_tab(Some("second"));
+        state.ensure_test_terminals();
+        let second_root = state.workspaces[0].tabs[1].root_pane;
+        let target = state.workspaces[0].tabs[0].panes[&split]
+            .attached_terminal_id
+            .clone();
+        state.terminals.get_mut(&target).unwrap().shell_leftover = ShellLeftover::AgentEnded;
+
+        let snapshot = annotated(&state, std::time::Instant::now(), &|_| true);
+
+        let first_tab = &snapshot.workspaces[0].tabs[0].panes;
+        assert!(first_tab[&split.raw()].agent_ended);
+        assert!(!first_tab[&first_root.raw()].agent_ended);
+        assert!(!snapshot.workspaces[0].tabs[1].panes[&second_root.raw()].agent_ended);
+    }
+
     #[test]
     fn layout_fingerprint_survives_json_round_trip() {
         let mut snapshot = parse_snapshot(include_str!(

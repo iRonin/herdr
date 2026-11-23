@@ -2271,6 +2271,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    fn marked_panes(snapshot: &crate::persist::SessionSnapshot) -> usize {
+        snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .flat_map(|tab| tab.panes.values())
+            .filter(|pane| pane.agent_ended)
+            .count()
+    }
+
+    fn app_with_a_leftover_shell(setting: bool) -> App {
+        let mut app = test_app();
+        app.state.workspaces.push(Workspace::test_new("one"));
+        app.state.ensure_test_terminals();
+        app.state.skip_ended_agent_panes_on_restore = setting;
+        let tab = &app.state.workspaces[0].tabs[0];
+        let terminal_id = tab.panes[&tab.root_pane].attached_terminal_id.clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .shell_leftover = crate::terminal::state::ShellLeftover::AgentEnded;
+        app
+    }
+
+    fn capture_of(app: &App) -> crate::persist::SessionSnapshot {
+        crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            app.state.active,
+            app.state.selected,
+        )
+    }
+
+    /// A save with the setting off must not carry the mark even for a pane that is an ended agent's idle shell: nothing in the
+    /// file may change for anyone who did not ask for it.
+    #[test]
+    fn a_save_marks_an_ended_idle_pane_only_while_the_setting_is_on() {
+        for setting in [false, true] {
+            let app = app_with_a_leftover_shell(setting);
+            let mut snapshot = capture_of(&app);
+            app.annotate_ended_agent_panes_with(&mut snapshot, std::time::Instant::now(), &|_| {
+                true
+            });
+            assert_eq!(
+                marked_panes(&snapshot),
+                usize::from(setting),
+                "setting {setting}"
+            );
+        }
+    }
+
+    /// The real idle check looks at the pane's own process. A pane with no running shell has nothing to be idle, so it is never
+    /// marked, whatever herdr thinks the agent in it did.
+    #[test]
+    fn a_pane_with_no_running_shell_is_never_marked_by_the_real_idle_check() {
+        let app = app_with_a_leftover_shell(true);
+        let mut snapshot = capture_of(&app);
+        app.annotate_ended_agent_panes(&mut snapshot);
+        assert_eq!(marked_panes(&snapshot), 0);
+    }
+
     #[test]
     fn app_copies_skip_ended_agent_panes_on_restore_from_config() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2296,7 +2359,7 @@ mod tests {
         assert!(app.state.skip_ended_agent_panes_on_restore);
     }
 
-    /// The setting is read when a resume is typed, so a reload must reach the live state; a bad value turns it off and
+    /// The saves of a running server read the setting, so a reload must reach the live state; a bad value turns it off and
     /// names itself without touching the other settings in the section.
     #[test]
     fn reload_config_updates_skip_ended_agent_panes_on_restore() {

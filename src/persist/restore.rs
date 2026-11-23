@@ -2416,6 +2416,192 @@ mod tests {
         }
     }
 
+    /// The pane's mark crosses a live handoff, so the new server still treats the shell as a leftover. A pane without it adds
+    /// nothing to the state, and state from a server that does not know the field reads as no mark.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_carries_the_ended_mark_and_adds_nothing_without_it() {
+        use crate::terminal::state::ShellLeftover;
+        for marked in [false, true] {
+            let (snapshot, _) = snapshot_with_saved_pane_history();
+            let (events, _events_rx) = mpsc::channel(32);
+            let (workspaces, terminals, runtimes) = restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                4096,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+                events.clone(),
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            let snapshot_now = crate::persist::capture(
+                &workspaces,
+                &terminals,
+                &crate::terminal::TerminalRuntimeRegistry::from(HashMap::new()),
+                Some(0),
+                0,
+            );
+            let pane_id = workspaces[0].tabs[0].panes.keys().next().copied().unwrap();
+            let runtime = runtimes.values().next().unwrap();
+            runtime
+                .pause_handoff_reader(std::time::Duration::from_secs(2))
+                .unwrap();
+            let mut state = runtime.handoff_runtime_state(pane_id.raw());
+            state.agent_ended = marked;
+            let wire = serde_json::to_value(&state).unwrap();
+            assert_eq!(
+                wire.get("agent_ended").is_some(),
+                marked,
+                "the field is on the wire only when it is true: {wire}"
+            );
+            let received: crate::handoff_runtime::HandoffRuntimeState =
+                serde_json::from_value(wire).unwrap();
+            assert_eq!(received.agent_ended, marked);
+
+            let mut imports = HashMap::from([(
+                pane_id.raw(),
+                crate::handoff_runtime::ImportedHandoffRuntime {
+                    master_fd: runtime.duplicate_handoff_fd().unwrap(),
+                    state: received,
+                },
+            )]);
+            let (_, restored_terminals, restored_runtimes) = restore_handoff(
+                &snapshot_now,
+                4096,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                &mut imports,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            )
+            .expect("handoff restore should import the pane");
+            assert_eq!(restored_terminals.len(), 1);
+            assert_eq!(
+                restored_terminals.values().next().unwrap().shell_leftover,
+                if marked {
+                    ShellLeftover::AgentEnded
+                } else {
+                    ShellLeftover::None
+                }
+            );
+            drop(restored_runtimes);
+            drop(runtimes);
+        }
+
+        let old_state = serde_json::json!({
+            "pane_id": 1, "child_pid": 2, "rows": 24, "cols": 80,
+            "cell_width_px": 8, "cell_height_px": 16
+        });
+        let received: crate::handoff_runtime::HandoffRuntimeState =
+            serde_json::from_value(old_state).unwrap();
+        assert!(!received.agent_ended);
+    }
+
+    /// The skip lives in the pass before `restore`, so the setting can be read once at start and a live handoff, which also
+    /// goes through restore code, can never lose a pane: `restore` itself brings back every pane, marked or not.
+    #[tokio::test]
+    async fn restore_itself_brings_back_a_pane_whose_snapshot_carries_the_mark() {
+        let (mut snapshot, _) = snapshot_with_saved_pane_history();
+        for pane in snapshot.workspaces[0].tabs[0].panes.values_mut() {
+            pane.agent_ended = true;
+        }
+        let (events, _events_rx) = mpsc::channel(8);
+
+        let (workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            4096,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(terminals.len(), 1);
+        drop(runtimes);
+    }
+
+    /// Two panes hold the same agent session and only the first is marked. Restore resumes a session once, in the first pane
+    /// that holds it; a marked pane must not take that resume and leave the pane the user still has without one.
+    #[tokio::test]
+    async fn a_marked_pane_does_not_take_the_resume_of_a_session_a_later_pane_holds() {
+        let cwd = std::env::current_dir().unwrap();
+        let session_path = test_session_path("shared-session.jsonl");
+        let pane = |ended: bool| {
+            serde_json::json!({
+                "cwd": cwd,
+                "agent_session": {"source": "herdr:pi", "agent": "pi", "kind": "path", "value": session_path},
+                "agent_ended": ended
+            })
+        };
+        let workspace = |id: &str, raw: u32, ended: bool| {
+            serde_json::json!({
+                "id": id, "identity_cwd": cwd,
+                "tabs": [{"layout": {"Pane": raw}, "panes": {raw.to_string(): pane(ended)},
+                          "zoomed": false, "focused": raw, "root_pane": raw}]
+            })
+        };
+        let build = || -> SessionSnapshot {
+            serde_json::from_value(serde_json::json!({
+                "version": 3, "active": 0, "selected": 0,
+                "workspaces": [workspace("w1", 1, true), workspace("w2", 2, false)]
+            }))
+            .unwrap()
+        };
+        let restore_with_resume = |snapshot: &SessionSnapshot| {
+            let (events, _events_rx) = mpsc::channel(8);
+            restore(
+                snapshot,
+                None,
+                24,
+                80,
+                0,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                true,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            )
+        };
+        let resumed_workspaces = |restored: &RestoredSession| {
+            restored
+                .0
+                .iter()
+                .filter(|workspace| {
+                    let tab = &workspace.tabs[0];
+                    let terminal_id = &tab.panes[&tab.root_pane].attached_terminal_id;
+                    restored.1[terminal_id].pending_agent_resume_plan.is_some()
+                })
+                .map(|workspace| workspace.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Control: restore alone gives the resume to the first pane that holds the session, the marked one.
+        let unpruned = restore_with_resume(&build());
+        assert_eq!(resumed_workspaces(&unpruned), vec!["w1".to_string()]);
+
+        let mut snapshot = build();
+        super::super::prune_ended_agent_panes(&mut snapshot, &mut None);
+        let pruned = restore_with_resume(&snapshot);
+        assert_eq!(pruned.0.len(), 1);
+        assert_eq!(
+            resumed_workspaces(&pruned),
+            vec!["w2".to_string()],
+            "the pane that is left must resume the session"
+        );
+    }
+
     #[tokio::test]
     async fn restore_seeds_saved_pane_history_into_runtime() {
         let (snapshot, history) = snapshot_with_saved_pane_history();
