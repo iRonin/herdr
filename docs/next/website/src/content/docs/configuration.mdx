@@ -686,6 +686,29 @@ With `false`, a tab's panes are resized only while a client shows that tab:
 - The setting is read at startup and on config reload. Switching it back to `true` does not resize anything at that moment. With one client attached, every tab is brought to the current size the next time that client's pane area changes or it switches tab or workspace; with several clients attached, a hidden tab is sized when it is shown, and with the setting on also when a request reapplies the size of the client that last controlled it and when the clients drop to one.
 - A value that is not `true` or `false` makes `herdr config check` report the whole `[ui]` section as invalid: a running server keeps all its current `[ui]` settings, and a server that starts with it uses every `[ui]` default (this one: `true`).
 
+## Leaving out panes whose Agent ended when the session is restored
+
+A pane's program is its shell. When an Agent ends without closing its pane (it quit, crashed, or was killed), the shell stays, and every server restart brings that idle shell back, so such shells pile up. To leave them out of a restore, set:
+
+```toml
+[session]
+skip_ended_agent_panes_on_restore = true
+```
+
+The default is `false`, which changes nothing: every saved pane comes back, and `session.json` never carries the mark described below.
+
+With the setting on:
+
+- Herdr marks a pane in the saved layout when an Agent ran in it, the Agent ended, and the pane's shell is idle at its prompt with nothing running in it. A resume command that Herdr typed after a restart and that never produced an Agent counts the same way, 180 seconds after it was typed (a shell can take a while to start). The mark is written by the saves of a server that runs with the setting on. The end of an Agent is seen the same way whatever its program is called, as long as Herdr detects it (see `agent.pi_program` for Pi under another name).
+- Typing anything into the pane removes the mark: keyboard input, a paste, or text and keys sent with the `herdr pane` commands. The pane is yours again. A plain shell that never held an Agent is never marked, so tabs you opened for your own shell always come back.
+- At the next server start, marked panes are not restored. A tab with no pane left is dropped, and so is a workspace with no tab left. The other panes keep their saved screens (`[experimental] pane_history`), their order, and the tab that was active. The server log names every pane left out, with its directory and its saved Agent session when it has one, which the Agent's own resume command can reopen.
+- The first save after a start that left panes out keeps a copy of the `session.json` it replaces in the `session-backups` folder next to it.
+- A live handoff to a new server never leaves a pane out, and the new server still knows which shells are leftovers.
+- The restore reads the setting once, when the server starts. The saves of a running server follow a config reload.
+- Older Herdr versions ignore the mark and restore every pane.
+- Idle shells that were already in a saved layout before the setting was on carry no mark and come back as before. Herdr does not close them; close them yourself.
+- A value that is not `true` or `false` is reported by `herdr config check`, keeps the setting off, and does not affect other settings.
+
 ## IME cursor tracking
 
 On macOS, AI Agent TUIs that hide the hardware cursor can prevent native input-method candidate windows from following the focused pane. Reveal a cursor anchor for those panes with:
