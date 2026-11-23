@@ -3651,7 +3651,13 @@ fn winch_counts(panes: &[&WinchPane; 3]) -> [usize; 3] {
 /// Runs one client against a server with three counting panes (one in the tab the client shows,
 /// one in another tab of that workspace, one in another workspace) and returns, for each event,
 /// how many resizes each pane's program was told about: [shown, hidden tab, hidden workspace].
-fn hidden_pane_resizes_per_event(resize_hidden_panes: bool) -> Vec<(&'static str, [usize; 3])> {
+/// `expected` holds the counts each event should produce, in the order of the events: the run
+/// waits until every pane has reached them (so a signal that arrives late under load is counted
+/// in its own event) and then keeps watching for signals that should not come.
+fn hidden_pane_resizes_per_event(
+    resize_hidden_panes: bool,
+    expected: &[(&'static str, [usize; 3])],
+) -> Vec<(&'static str, [usize; 3])> {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
@@ -3736,18 +3742,26 @@ fn hidden_pane_resizes_per_event(resize_hidden_panes: bool) -> Vec<(&'static str
 
     let mut events: Vec<(&'static str, [usize; 3])> = Vec::new();
     let mut before = [0usize; 3];
-    // Waits for the first pane to be told (when `expect_shown`) and then for a second, so that a
-    // resize of a hidden pane has had time to arrive: the zeros below would mean nothing otherwise.
-    let mut record = |event: &'static str, expect_shown: bool, before: &mut [usize; 3]| {
-        if expect_shown {
-            assert!(
-                wait_until(Duration::from_secs(15), Duration::from_millis(50), || {
-                    shown.winches() > before[0]
-                }),
-                "{event}: the shown pane was not resized (counts {:?}, was {before:?})",
-                winch_counts(&panes)
-            );
-        }
+    let mut next_event = 0usize;
+    // Waits until every pane has been told what the event should tell it, then watches for 1.5
+    // seconds more for a signal that should not come: the zeros would mean nothing otherwise, and
+    // a fixed sleep alone would count a late signal in the next event.
+    let mut record = |event: &'static str, before: &mut [usize; 3]| {
+        let (expected_event, want) = expected[next_event];
+        next_event += 1;
+        assert_eq!(
+            event, expected_event,
+            "the events and the expected counts differ in order"
+        );
+        let reached = wait_until(Duration::from_secs(15), Duration::from_millis(50), || {
+            let now = winch_counts(&panes);
+            (0..3).all(|pane| now[pane] >= before[pane] + want[pane])
+        });
+        assert!(
+            reached,
+            "{event}: the panes were not told {want:?} within 15 s (counts {:?}, were {before:?})",
+            winch_counts(&panes)
+        );
         thread::sleep(Duration::from_millis(1500));
         let now = winch_counts(&panes);
         events.push((
@@ -3764,7 +3778,7 @@ fn hidden_pane_resizes_per_event(resize_hidden_panes: bool) -> Vec<(&'static str
         "the client must show the workspace: {}",
         screen_text()
     );
-    record("a client attaches", true, &mut before);
+    record("a client attaches", &mut before);
 
     master
         .resize(PtySize {
@@ -3774,7 +3788,7 @@ fn hidden_pane_resizes_per_event(resize_hidden_panes: bool) -> Vec<(&'static str
             pixel_height: 0,
         })
         .unwrap();
-    record("the window is resized", true, &mut before);
+    record("the window is resized", &mut before);
 
     // prefix+b collapses the sidebar and again expands it.
     for event in ["the sidebar is collapsed", "the sidebar is expanded"] {
@@ -3783,15 +3797,14 @@ fn hidden_pane_resizes_per_event(resize_hidden_panes: bool) -> Vec<(&'static str
         thread::sleep(Duration::from_millis(300));
         input.write_all(b"b").unwrap();
         input.flush().unwrap();
-        record(event, true, &mut before);
+        record(event, &mut before);
     }
 
     // Hidden tabs with long labels until the wrapped tab bar needs another row, which takes a row
     // from the pane area of every tab.
-    let mut tabs_made = 0;
-    let mut last_tab_id = String::new();
+    let mut wrap_tab_ids: Vec<String> = Vec::new();
     while shown.winches() == before[0] {
-        tabs_made += 1;
+        let tabs_made = wrap_tab_ids.len() + 1;
         assert!(tabs_made <= 12, "twelve tabs did not wrap the tab bar");
         let tab = request(serde_json::json!({
             "id": format!("wrap-tab-{tabs_made}"), "method": "tab.create",
@@ -3801,25 +3814,28 @@ fn hidden_pane_resizes_per_event(resize_hidden_panes: bool) -> Vec<(&'static str
             },
         }));
         assert_eq!(tab["result"]["type"], "tab_created", "{tab}");
-        last_tab_id = tab["result"]["tab"]["tab_id"].as_str().unwrap().to_owned();
+        wrap_tab_ids.push(tab["result"]["tab"]["tab_id"].as_str().unwrap().to_owned());
         thread::sleep(Duration::from_millis(700));
     }
-    record("the tab bar gets a second row", true, &mut before);
+    record("the tab bar gets a second row", &mut before);
 
-    // Closing the tab that made the bar wrap takes the row away again. The workspace nobody shows
-    // has a one-row bar, so the pane area is the same everywhere before the tabs are shown below,
-    // and what a shown pane is told is only what the show itself brings.
-    let closed = request(serde_json::json!({
-        "id": "close-wrap-tab", "method": "tab.close", "params": {"tab_id": last_tab_id},
-    }));
-    assert_eq!(closed["result"]["type"], "ok", "{closed}");
-    record("the tab bar loses its second row", true, &mut before);
+    // Closing every tab made above takes the row away again (the loop may have made one more than
+    // it needed, if the resize came late). The workspace nobody shows has a one-row bar, so the
+    // pane area is the same everywhere before the tabs are shown below, and what a shown pane is
+    // told is only what the show itself brings.
+    for tab_id in wrap_tab_ids.iter().rev() {
+        let closed = request(serde_json::json!({
+            "id": format!("close-{tab_id}"), "method": "tab.close", "params": {"tab_id": tab_id},
+        }));
+        assert_eq!(closed["result"]["type"], "ok", "{closed}");
+    }
+    record("the tab bar loses its second row", &mut before);
 
     let shown_tab = request(serde_json::json!({
         "id": "show-hidden-tab", "method": "tab.focus", "params": {"tab_id": hidden_tab_id},
     }));
     assert_eq!(shown_tab["result"]["type"], "tab_info", "{shown_tab}");
-    record("the hidden tab is shown", false, &mut before);
+    record("the hidden tab is shown", &mut before);
 
     let shown_workspace = request(serde_json::json!({
         "id": "show-hidden-workspace", "method": "workspace.focus",
@@ -3829,7 +3845,7 @@ fn hidden_pane_resizes_per_event(resize_hidden_panes: bool) -> Vec<(&'static str
         shown_workspace["result"]["type"], "workspace_info",
         "{shown_workspace}"
     );
-    record("the hidden workspace is shown", false, &mut before);
+    record("the hidden workspace is shown", &mut before);
 
     drop(input);
     drop(client);
@@ -3846,20 +3862,17 @@ fn hidden_pane_resizes_per_event(resize_hidden_panes: bool) -> Vec<(&'static str
 #[test]
 fn on_hidden_panes_are_resized_with_the_shown_one() {
     let _lock = test_lock();
-    let events = hidden_pane_resizes_per_event(true);
-    assert_eq!(
-        events,
-        vec![
-            ("a client attaches", [1, 1, 1]),
-            ("the window is resized", [1, 1, 1]),
-            ("the sidebar is collapsed", [1, 1, 1]),
-            ("the sidebar is expanded", [1, 1, 1]),
-            ("the tab bar gets a second row", [1, 1, 1]),
-            ("the tab bar loses its second row", [1, 1, 1]),
-            ("the hidden tab is shown", [0, 0, 0]),
-            ("the hidden workspace is shown", [0, 0, 0]),
-        ]
-    );
+    let expected = vec![
+        ("a client attaches", [1, 1, 1]),
+        ("the window is resized", [1, 1, 1]),
+        ("the sidebar is collapsed", [1, 1, 1]),
+        ("the sidebar is expanded", [1, 1, 1]),
+        ("the tab bar gets a second row", [1, 1, 1]),
+        ("the tab bar loses its second row", [1, 1, 1]),
+        ("the hidden tab is shown", [0, 0, 0]),
+        ("the hidden workspace is shown", [0, 0, 0]),
+    ];
+    assert_eq!(hidden_pane_resizes_per_event(true, &expected), expected);
 }
 
 /// `[ui] resize_hidden_panes = false`: the programs in a tab and a workspace nobody shows are not
@@ -3868,18 +3881,15 @@ fn on_hidden_panes_are_resized_with_the_shown_one() {
 #[test]
 fn off_hidden_panes_are_resized_once_when_they_are_shown() {
     let _lock = test_lock();
-    let events = hidden_pane_resizes_per_event(false);
-    assert_eq!(
-        events,
-        vec![
-            ("a client attaches", [1, 0, 0]),
-            ("the window is resized", [1, 0, 0]),
-            ("the sidebar is collapsed", [1, 0, 0]),
-            ("the sidebar is expanded", [1, 0, 0]),
-            ("the tab bar gets a second row", [1, 0, 0]),
-            ("the tab bar loses its second row", [1, 0, 0]),
-            ("the hidden tab is shown", [0, 1, 0]),
-            ("the hidden workspace is shown", [0, 0, 1]),
-        ]
-    );
+    let expected = vec![
+        ("a client attaches", [1, 0, 0]),
+        ("the window is resized", [1, 0, 0]),
+        ("the sidebar is collapsed", [1, 0, 0]),
+        ("the sidebar is expanded", [1, 0, 0]),
+        ("the tab bar gets a second row", [1, 0, 0]),
+        ("the tab bar loses its second row", [1, 0, 0]),
+        ("the hidden tab is shown", [0, 1, 0]),
+        ("the hidden workspace is shown", [0, 0, 1]),
+    ];
+    assert_eq!(hidden_pane_resizes_per_event(false, &expected), expected);
 }

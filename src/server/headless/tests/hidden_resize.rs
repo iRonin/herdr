@@ -6,7 +6,10 @@
 //! hidden panes at a size no later event can produce, so a zero means "never asked", not "asked
 //! for the size it already had".
 use super::*;
-use crate::api::schema::{Method, Request, TabTarget, WorkspaceTarget};
+use crate::api::schema::{
+    Method, PaneMoveDestination, PaneMoveParams, Request, SplitDirection, TabMoveToWorkspaceParams,
+    TabTarget, WorkspaceTarget, WorktreeOpenParams,
+};
 
 /// Rows and columns every test pane starts with.
 const START_SIZE: (u16, u16) = (24, 80);
@@ -511,8 +514,9 @@ async fn off_a_layout_pass_without_clients_resizes_no_pane() {
     assert_eq!(layout_pass_without_clients(false), NONE);
 }
 
-/// The layout pass for a foreground client that is not a client shell resizes the shown tab and
-/// then every background tab.
+/// `compute_view_internal` resizes the shown tab and then every background tab. The server's
+/// foreground client is always an active client shell, so its own layout pass does not take this
+/// path; the test guards the function for any caller that does.
 fn full_layout_pass(resize_hidden_panes: bool) -> Resizes {
     let (mut server, panes) = hidden_resize_server(resize_hidden_panes);
     let before = panes.total(&server);
@@ -541,4 +545,365 @@ async fn on_a_full_layout_pass_resizes_the_background_tabs() {
 #[tokio::test]
 async fn off_a_full_layout_pass_resizes_only_the_shown_tab() {
     assert_eq!(full_layout_pass(false), Resizes { shown: 1, ..NONE });
+}
+
+// A tab can become shown without a navigation request of its own: a pane moved into it, the tab
+// next to it taking over when the shown tab is moved away, a deferred worktree open that finishes
+// later. With the setting off such a tab is stale unless the server sizes it when it comes into
+// view. Every test below runs the same scenario with the setting on and off and asks the same
+// question of the tab that is shown afterwards: does it have the size its client's pane area
+// produces? With the setting on it always did; with it off it must too.
+
+/// One client attached, then back on the first tab after visiting the hidden tab (so it still
+/// controls that tab), and its pane area changed. With the setting off the hidden tab and the
+/// hidden workspace now have sizes the pane area no longer produces. The size the pane area
+/// produces for a one-pane tab is returned: what the first tab's pane has.
+fn stale_hidden_tabs(resize_hidden_panes: bool) -> (HeadlessServer, Panes, (u16, u16), Receivers) {
+    let (mut server, panes) = hidden_resize_server(resize_hidden_panes);
+    let receivers = attach(&mut server, 1, 100, 30);
+    assert!(server.focus_shell_client_on_tab(1, &panes.hidden_tab_id));
+    assert!(server.claim_shell_tab_geometry(1, false));
+    assert!(server.focus_shell_client_on_tab(1, &panes.shown_tab_id));
+    client_pane_area(&mut server, 1, 60, 16);
+    let expected = panes.sizes(&server)[0];
+    assert_ne!(expected, START_SIZE);
+    if !resize_hidden_panes {
+        let sizes = panes.sizes(&server);
+        assert_ne!(sizes[1], expected, "guard: the hidden tab is stale");
+        assert_ne!(sizes[2], expected, "guard: the hidden workspace is stale");
+        assert_eq!(
+            server.tab_geometry_controllers.get(&panes.hidden_tab_id),
+            Some(&1),
+            "guard: the client still controls the hidden tab it visited"
+        );
+    }
+    (server, panes, expected, receivers)
+}
+
+/// A pane of a tab the client shows fits the pane area its client reported. A tab of one pane has
+/// exactly the size that area gives it (`alone`); a pane that shares its tab with another one is
+/// smaller, and the layout decides by how much, so it only has to fit. A tab nobody showed since
+/// the area changed is bigger than the new area here, so both forms tell it from a sized tab.
+fn assert_shown_pane_fits(
+    server: &HeadlessServer,
+    workspace: usize,
+    pane: crate::layout::PaneId,
+    expected: (u16, u16),
+    alone: bool,
+    what: &str,
+) {
+    let (rows, cols) = server.app.state.workspaces[workspace].test_runtimes[&pane].current_size();
+    if alone {
+        assert_eq!(
+            rows, expected.0,
+            "{what}: the pane has {rows} rows, its client's pane area gives it {}",
+            expected.0
+        );
+    } else {
+        assert!(
+            rows > 0 && rows <= expected.0,
+            "{what}: the pane has {rows} rows, its client's pane area has {}",
+            expected.0
+        );
+    }
+    assert!(
+        cols > 0 && cols <= expected.1,
+        "{what}: the pane has {cols} columns, its client's pane area has {}",
+        expected.1
+    );
+}
+
+fn api_request_with_response(
+    method: Method,
+) -> (
+    crate::api::ApiRequestMessage,
+    std::sync::mpsc::Receiver<String>,
+) {
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    (
+        crate::api::ApiRequestMessage {
+            request: Request {
+                id: "hidden-resize".into(),
+                method,
+            },
+            peer_process: None,
+            respond_to,
+            response_write_complete: None,
+        },
+        response_rx,
+    )
+}
+
+/// `pane.move` with focus brings the hidden tab into view next to the pane that was moved into it.
+fn public_pane_move_into_the_hidden_tab(resize_hidden_panes: bool) {
+    let (mut server, panes, expected, _receivers) = stale_hidden_tabs(resize_hidden_panes);
+    let moved_pane = server.app.public_pane_id(0, panes.shown).unwrap();
+    let hidden_tab_sequence = panes.runtime(&server, 0, panes.hidden_tab).content_seq();
+    let (request, response_rx) = api_request_with_response(Method::PaneMove(PaneMoveParams {
+        pane_id: moved_pane,
+        destination: PaneMoveDestination::Tab {
+            tab_id: panes.hidden_tab_id.clone(),
+            target_pane_id: None,
+            split: SplitDirection::Right,
+            ratio: None,
+        },
+        focus: true,
+    }));
+    server.handle_api_request_with_shutdown_check(request);
+    let response = response_rx.recv().expect("pane move response");
+    assert!(
+        response.contains("\"changed\":true"),
+        "guard: the move happened: {response}"
+    );
+    assert_eq!(
+        server.shell_tab_id_for_client(1).as_deref(),
+        Some(panes.hidden_tab_id.as_str()),
+        "guard: the client shows the tab the pane was moved into"
+    );
+    assert_shown_pane_fits(
+        &server,
+        0,
+        panes.hidden_tab,
+        expected,
+        false,
+        "the tab a pane was moved into",
+    );
+    if resize_hidden_panes {
+        // The setting's default applies no geometry for this request, as upstream does: the tab
+        // was sized already, and the shown-tabs rule must not run with the setting on.
+        assert_eq!(
+            panes.runtime(&server, 0, panes.hidden_tab).content_seq(),
+            hidden_tab_sequence,
+            "with the setting on the move resizes nothing"
+        );
+    }
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn on_a_pane_moved_into_the_hidden_tab_leaves_the_shown_tab_sized() {
+    public_pane_move_into_the_hidden_tab(true);
+}
+
+#[tokio::test]
+async fn off_a_pane_moved_into_the_hidden_tab_leaves_the_shown_tab_sized() {
+    public_pane_move_into_the_hidden_tab(false);
+}
+
+/// The client drags the tab it shows to another workspace; the tab next to it takes over.
+fn client_moves_the_shown_tab_away(resize_hidden_panes: bool) {
+    let (mut server, panes, expected, _receivers) = stale_hidden_tabs(resize_hidden_panes);
+    server.handle_client_shell_api_request(
+        1,
+        api_request(Method::TabMoveToWorkspace(TabMoveToWorkspaceParams {
+            tab_id: panes.shown_tab_id.clone(),
+            workspace_id: panes.hidden_workspace_id.clone(),
+            insert_index: None,
+            focus: false,
+        })),
+    );
+    assert_eq!(
+        server.shell_tab_id_for_client(1).as_deref(),
+        Some(panes.hidden_tab_id.as_str()),
+        "guard: the tab next to the moved one is shown now"
+    );
+    assert_shown_pane_fits(
+        &server,
+        0,
+        panes.hidden_tab,
+        expected,
+        true,
+        "the tab that took over",
+    );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn on_a_tab_moved_away_leaves_its_neighbour_sized() {
+    client_moves_the_shown_tab_away(true);
+}
+
+#[tokio::test]
+async fn off_a_tab_moved_away_leaves_its_neighbour_sized() {
+    client_moves_the_shown_tab_away(false);
+}
+
+/// A worktree open that a client asked for finishes later and shows a tab the client controls.
+fn deferred_navigation_onto_a_controlled_tab(resize_hidden_panes: bool) {
+    let (mut server, panes, expected, _receivers) = stale_hidden_tabs(resize_hidden_panes);
+    let client = server.clients.get_mut(&1).unwrap();
+    client.shell_endpoint_command_in_flight = true;
+    let revision = client.shell_projection_revision;
+    client.shell_endpoint_command_surface_revision = Some(revision);
+    client.shell_deferred_navigation_response = Some(Vec::new());
+    let response = serde_json::json!({
+        "id": "open-worktree",
+        "result": {
+            "type": "worktree_opened",
+            "tab": { "tab_id": panes.hidden_tab_id }
+        }
+    });
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellEndpointResponseChunkReady {
+            client_id: 1,
+            boot_id: server.client_shell_boot_id.clone(),
+            request_id: "open-worktree".into(),
+            final_chunk: true,
+            data: serde_json::to_vec(&response).unwrap(),
+        })
+    );
+    assert_eq!(
+        server.shell_tab_id_for_client(1).as_deref(),
+        Some(panes.hidden_tab_id.as_str()),
+        "guard: the finished open shows the tab"
+    );
+    assert_shown_pane_fits(
+        &server,
+        0,
+        panes.hidden_tab,
+        expected,
+        true,
+        "the tab a finished endpoint open shows",
+    );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn on_a_finished_endpoint_open_leaves_the_tab_it_shows_sized() {
+    deferred_navigation_onto_a_controlled_tab(true);
+}
+
+#[tokio::test]
+async fn off_a_finished_endpoint_open_leaves_the_tab_it_shows_sized() {
+    deferred_navigation_onto_a_controlled_tab(false);
+}
+
+/// A public `worktree.open` with focus on a worktree that is already open finishes later and
+/// shows the workspace that holds it.
+async fn public_worktree_open_shows_the_hidden_workspace(resize_hidden_panes: bool) {
+    let (mut server, panes, expected, _receivers) = stale_hidden_tabs(resize_hidden_panes);
+    let repo = std::env::temp_dir().join(format!(
+        "herdr-hidden-resize-open-{}-{resize_hidden_panes}",
+        std::process::id()
+    ));
+    let checkout = repo.with_extension("checkout");
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--quiet", repo.to_str().unwrap()]);
+    git(&[
+        "-C",
+        repo.to_str().unwrap(),
+        "-c",
+        "user.name=Herdr Test",
+        "-c",
+        "user.email=herdr@example.invalid",
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "initial",
+    ]);
+    git(&[
+        "-C",
+        repo.to_str().unwrap(),
+        "worktree",
+        "add",
+        "--quiet",
+        "-b",
+        "hidden-open",
+        checkout.to_str().unwrap(),
+    ]);
+    // The first workspace is the repository and the hidden workspace is a checkout of it that is
+    // already open. A workspace takes its place from the working directory of its terminals.
+    for (index, path) in [(0, &repo), (1, &checkout)] {
+        server.app.state.workspaces[index].identity_cwd = path.clone();
+        let terminal_ids = server.app.state.workspaces[index]
+            .tabs
+            .iter()
+            .flat_map(|tab| {
+                tab.panes
+                    .values()
+                    .map(|pane| pane.attached_terminal_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for terminal_id in terminal_ids {
+            server
+                .app
+                .state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .cwd = path.clone();
+        }
+    }
+    let source_id = server.app.public_workspace_id(0);
+    let (request, response_rx) =
+        api_request_with_response(Method::WorktreeOpen(WorktreeOpenParams {
+            workspace_id: Some(source_id),
+            branch: Some("hidden-open".into()),
+            focus: true,
+            ..Default::default()
+        }));
+    server.handle_api_request_with_shutdown_check(request);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let event = server.app.event_rx.recv().await.unwrap();
+            let completed = matches!(&event, AppEvent::WorktreeReadFinished(_));
+            server.handle_internal_event_with_forwarding(event);
+            if completed {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the open finishes");
+    let response = response_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("worktree open response");
+    assert!(
+        response.contains("worktree_opened"),
+        "guard: the open succeeded: {response}"
+    );
+    assert_eq!(
+        server.shell_tab_id_for_client(1).as_deref(),
+        server.app.public_tab_id(1, 0).as_deref(),
+        "guard: the client shows the workspace that was already open"
+    );
+    assert_shown_pane_fits(
+        &server,
+        1,
+        panes.hidden_workspace,
+        expected,
+        true,
+        "the workspace a finished open shows",
+    );
+    shutdown_test_runtimes(&mut server);
+    git(&[
+        "-C",
+        repo.to_str().unwrap(),
+        "worktree",
+        "remove",
+        "--force",
+        checkout.to_str().unwrap(),
+    ]);
+    let _ = std::fs::remove_dir_all(repo);
+}
+
+#[tokio::test]
+async fn on_a_finished_public_worktree_open_leaves_the_workspace_it_shows_sized() {
+    public_worktree_open_shows_the_hidden_workspace(true).await;
+}
+
+#[tokio::test]
+async fn off_a_finished_public_worktree_open_leaves_the_workspace_it_shows_sized() {
+    public_worktree_open_shows_the_hidden_workspace(false).await;
 }
