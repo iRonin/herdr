@@ -421,7 +421,9 @@ impl HeadlessServer {
         (!self.app.state.resize_hidden_panes).then(|| self.shown_shell_tab_ids())
     }
 
-    /// Sizes the tabs that are shown now and were not when `shown_before` was taken.
+    /// When the set of shown tabs differs from `shown_before` (a tab came into view, or a tab only left
+    /// it), applies geometry to every tab that is shown now. That does nothing for a tab already at
+    /// its size, so what it changes is the tab that came into view.
     pub(super) fn size_tabs_that_came_into_view(
         &mut self,
         shown_before: Option<HashSet<String>>,
