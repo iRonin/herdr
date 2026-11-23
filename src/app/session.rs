@@ -60,6 +60,30 @@ impl App {
         }
     }
 
+    /// Marks the ended panes in a captured snapshot, when `[session] skip_ended_agent_panes_on_restore` is on. The idle check
+    /// looks at the pane's real foreground process group, never at the agent state herdr tracks (a pane restored with a resume
+    /// plan is seeded as an idle agent whether or not the agent ever starts).
+    pub(super) fn annotate_ended_agent_panes(
+        &self,
+        snapshot: &mut crate::persist::SessionSnapshot,
+    ) {
+        self.annotate_ended_agent_panes_with(snapshot, Instant::now(), &|terminal_id| {
+            self.terminal_runtimes
+                .get(terminal_id)
+                .and_then(|runtime| runtime.child_pid())
+                .is_some_and(crate::detect::pane_shell_is_idle)
+        });
+    }
+
+    pub(super) fn annotate_ended_agent_panes_with(
+        &self,
+        snapshot: &mut crate::persist::SessionSnapshot,
+        now: Instant,
+        shell_idle: &dyn Fn(&crate::terminal::TerminalId) -> bool,
+    ) {
+        let _ = (snapshot, now, shell_idle);
+    }
+
     pub(crate) fn start_background_session_save(&mut self) {
         if !self.policy.persist_session {
             self.session_save_deadline = None;

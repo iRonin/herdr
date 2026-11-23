@@ -1569,6 +1569,7 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            agent_ended: false,
                         },
                     )]),
                     zoomed: false,
@@ -1753,6 +1754,7 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            agent_ended: false,
                         },
                     )]),
                     zoomed: false,
@@ -1835,6 +1837,7 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                agent_ended: false,
                             },
                         ),
                         (
@@ -1847,6 +1850,7 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                agent_ended: false,
                             },
                         ),
                     ]),
@@ -1901,6 +1905,7 @@ mod tests {
                     agent_session: None,
                     agent_resume: None,
                     launch_argv: None,
+                    agent_ended: false,
                 },
             )
         };
@@ -1917,6 +1922,7 @@ mod tests {
             }),
             agent_resume: None,
             launch_argv: None,
+            agent_ended: false,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -2069,6 +2075,7 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            agent_ended: false,
                         },
                     )]),
                     zoomed: false,
@@ -2570,6 +2577,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                agent_ended: false,
             },
         );
         let mut history = SessionHistorySnapshot {
@@ -2696,6 +2704,7 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: Some(launch_argv.clone()),
+                            agent_ended: false,
                         },
                     )]),
                     zoomed: false,

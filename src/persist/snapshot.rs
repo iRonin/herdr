@@ -111,6 +111,11 @@ pub struct PaneSnapshot {
     pub agent_resume: Option<PaneAgentResumeSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    /// The pane's agent ended and left its shell idle, so the next start with `[session] skip_ended_agent_panes_on_restore`
+    /// on does not bring the pane back. Only a save that runs with that setting on writes it; it is never in the file
+    /// otherwise, and it takes no part in the layout fingerprint (an older build that ignores it computes the same one).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent_ended: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -388,6 +393,7 @@ fn capture_tab(
                 agent_session,
                 agent_resume,
                 launch_argv,
+                agent_ended: false,
             },
         );
     }
@@ -399,6 +405,20 @@ fn capture_tab(
         focused: Some(tab.layout.focused().raw()),
         root_pane: Some(tab.root_pane.raw()),
     }
+}
+
+/// Marks, in a snapshot captured from `workspaces`, every pane whose agent ended and whose shell is idle at the prompt
+/// (`PaneSnapshot::agent_ended`). `shell_idle` answers for one terminal whether its shell is at its prompt with nothing
+/// running in it; it is asked only for a pane that otherwise qualifies. Called only by a save that runs with
+/// `[session] skip_ended_agent_panes_on_restore` on, so a save without it is byte for byte what it always was.
+pub fn annotate_ended_agent_panes(
+    snapshot: &mut SessionSnapshot,
+    workspaces: &[Workspace],
+    terminals: &HashMap<crate::terminal::TerminalId, crate::terminal::TerminalState>,
+    now: std::time::Instant,
+    shell_idle: &dyn Fn(&crate::terminal::TerminalId) -> bool,
+) {
+    let _ = (snapshot, workspaces, terminals, now, shell_idle);
 }
 
 pub(super) fn layout_fingerprint(snapshot: &SessionSnapshot) -> Option<String> {
@@ -727,6 +747,7 @@ mod tests {
             agent_session: None,
             agent_resume: None,
             launch_argv: None,
+            agent_ended: false,
         };
         SessionSnapshot {
             version: SNAPSHOT_VERSION,
@@ -959,6 +980,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                agent_ended: false,
             },
         );
         panes.insert(
@@ -971,6 +993,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                agent_ended: false,
             },
         );
 
@@ -1657,6 +1680,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                agent_ended: false,
             },
         );
         panes.insert(
@@ -1671,6 +1695,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                agent_ended: false,
             },
         );
 

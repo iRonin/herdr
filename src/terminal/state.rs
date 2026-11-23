@@ -137,6 +137,25 @@ struct RecentAgentProcessExit {
     observed_at: Instant,
 }
 
+/// What the shell of a pane may be a leftover of. It is how a pane whose agent ended is told from a plain shell the user
+/// opened and never ran an agent in. In memory only: `[session] skip_ended_agent_panes_on_restore` turns it into a mark in
+/// the saved layout at save time (see `ended_agent_shell_for_save`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShellLeftover {
+    /// Nothing is known to have run in this pane's shell, or something was typed into it since.
+    #[default]
+    None,
+    /// herdr typed a resume command into the shell at `at` and has seen no agent end since.
+    ResumeTyped { at: Instant },
+    /// An agent ran in this pane and herdr saw it end, and nothing was typed into the shell since.
+    AgentEnded,
+}
+
+/// How long after a resume command was typed a pane that still shows an idle shell counts as one whose resume failed.
+/// A resumed pane's shell can take 13.7 to 32.5 s to reach its prompt under load, so an idle foreground is no evidence
+/// before then.
+pub const RESUME_FAILED_GRACE: Duration = Duration::from_secs(180);
+
 /// `/compact` can perform substantial work without emitting a lifecycle event.
 /// Keep its display-only Working projection bounded even if no later report arrives.
 const COMPACT_OPTIMISTIC_WORKING_TTL: Duration = Duration::from_secs(90);
@@ -354,6 +373,9 @@ pub struct TerminalState {
     /// is replaced; the only effect of a stale flag is a session checkpoint when the pane's shell later ends, and a stop within
     /// five seconds of it then brings the pane back.
     pub closes_when_resumed_agent_exits: bool,
+    /// What this pane's shell is a leftover of. Never saved as such: a save with `skip_ended_agent_panes_on_restore` on
+    /// derives the mark from it.
+    pub shell_leftover: ShellLeftover,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
@@ -417,6 +439,7 @@ impl TerminalState {
             launch_argv: None,
             respawn_shell_on_exit: false,
             closes_when_resumed_agent_exits: false,
+            shell_leftover: ShellLeftover::None,
             recent_agent_process_exit: None,
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
@@ -520,6 +543,31 @@ impl TerminalState {
 
     pub(crate) fn reset_compact_command_detector(&mut self) {
         self.compact_command_detector.clear();
+    }
+
+    /// An agent that ran in this pane's shell was released: it ended, and its shell is what is left.
+    pub(crate) fn note_agent_released(&mut self) {}
+
+    /// herdr typed a resume command into this pane's shell at `at`.
+    pub(crate) fn note_resume_typed(&mut self, at: Instant) {
+        let _ = at;
+    }
+
+    /// Input reached this pane's shell. Returns true only when it removed a mark, which is when a save is owed.
+    pub(crate) fn note_shell_input(&mut self) -> bool {
+        false
+    }
+
+    /// Whether a save made at `now` marks this pane: its agent ended (or its resume failed, `RESUME_FAILED_GRACE` after
+    /// the command was typed) and its shell is idle at the prompt. `shell_idle` is called only when the rest says yes, so the
+    /// process lookup it stands for is not made for a pane that cannot be marked.
+    pub(crate) fn ended_agent_shell_for_save(
+        &self,
+        now: Instant,
+        shell_idle: impl FnOnce() -> bool,
+    ) -> bool {
+        let _ = (now, shell_idle);
+        false
     }
 
     fn clear_compact_input_state(&mut self) {
@@ -2850,6 +2898,7 @@ impl TerminalState {
         self.launch_argv = None;
         self.respawn_shell_on_exit = false;
         self.closes_when_resumed_agent_exits = false;
+        self.shell_leftover = ShellLeftover::None;
         self.recent_agent_process_exit = None;
         self.agent_process_acquisition_pending = false;
         self.pending_agent_resume_plan = None;

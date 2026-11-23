@@ -34,6 +34,11 @@ pub(crate) struct HandoffRuntimeState {
     /// byte what it was; a receiver that does not know the field reads false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub closes_when_resumed_agent_exits: bool,
+    /// The pane's agent ended and left its shell idle, and `[session] skip_ended_agent_panes_on_restore` was on when the old
+    /// server exported it. The new server keeps the mark, so its saves still mark the pane. Left out of the state when false,
+    /// so the state of a pane without it is byte for byte what it was; a receiver that does not know the field reads false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent_ended: bool,
 }
 
 #[cfg(unix)]
