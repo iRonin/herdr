@@ -3815,7 +3815,11 @@ fn hidden_pane_resizes_per_event(
         }));
         assert_eq!(tab["result"]["type"], "tab_created", "{tab}");
         wrap_tab_ids.push(tab["result"]["tab"]["tab_id"].as_str().unwrap().to_owned());
-        thread::sleep(Duration::from_millis(700));
+        // The next tab only once the shown pane has had time to be told about this one: a tab
+        // that wraps the bar brings a resize, and a late one must not make more tabs than needed.
+        let _ = wait_until(Duration::from_secs(3), Duration::from_millis(50), || {
+            shown.winches() > before[0]
+        });
     }
     record("the tab bar gets a second row", &mut before);
 

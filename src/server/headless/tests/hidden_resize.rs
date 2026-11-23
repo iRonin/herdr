@@ -728,10 +728,10 @@ async fn off_a_tab_moved_away_leaves_its_neighbour_sized() {
     client_moves_the_shown_tab_away(false);
 }
 
-/// A worktree open that a client asked for finishes later and shows a tab the client controls.
-fn deferred_navigation_onto_a_controlled_tab(resize_hidden_panes: bool) {
-    let (mut server, panes, expected, _receivers) = stale_hidden_tabs(resize_hidden_panes);
-    let client = server.clients.get_mut(&1).unwrap();
+/// The end of a worktree open that a client asked for: its response names `tab_id`, and the
+/// client is taken to that tab.
+fn finish_endpoint_open_onto(server: &mut HeadlessServer, client_id: u64, tab_id: &str) {
+    let client = server.clients.get_mut(&client_id).unwrap();
     client.shell_endpoint_command_in_flight = true;
     let revision = client.shell_projection_revision;
     client.shell_endpoint_command_surface_revision = Some(revision);
@@ -740,18 +740,24 @@ fn deferred_navigation_onto_a_controlled_tab(resize_hidden_panes: bool) {
         "id": "open-worktree",
         "result": {
             "type": "worktree_opened",
-            "tab": { "tab_id": panes.hidden_tab_id }
+            "tab": { "tab_id": tab_id }
         }
     });
     assert!(
         server.handle_server_event(ServerEvent::ClientShellEndpointResponseChunkReady {
-            client_id: 1,
+            client_id,
             boot_id: server.client_shell_boot_id.clone(),
             request_id: "open-worktree".into(),
             final_chunk: true,
             data: serde_json::to_vec(&response).unwrap(),
         })
     );
+}
+
+/// A worktree open that a client asked for finishes later and shows a tab the client controls.
+fn deferred_navigation_onto_a_controlled_tab(resize_hidden_panes: bool) {
+    let (mut server, panes, expected, _receivers) = stale_hidden_tabs(resize_hidden_panes);
+    finish_endpoint_open_onto(&mut server, 1, &panes.hidden_tab_id);
     assert_eq!(
         server.shell_tab_id_for_client(1).as_deref(),
         Some(panes.hidden_tab_id.as_str()),
@@ -778,15 +784,88 @@ async fn off_a_finished_endpoint_open_leaves_the_tab_it_shows_sized() {
     deferred_navigation_onto_a_controlled_tab(false);
 }
 
+/// The same with two clients attached. A client's pane area then sizes only the tab it shows, so
+/// the tab client 1 visited earlier is stale even with the setting on, and the end of a deferred
+/// open onto it only claims, as upstream does: the setting's default must leave it alone. With the
+/// setting off the tab that comes into view is sized. The on test pins upstream's behaviour for
+/// the default, stale tab included; a later fix of that behaviour would change it on purpose.
+fn deferred_navigation_onto_a_controlled_tab_with_two_clients(resize_hidden_panes: bool) {
+    let (mut server, panes) = hidden_resize_server(resize_hidden_panes);
+    let (_first_control, _first_render) = attach(&mut server, 1, 100, 30);
+    let (_second_control, _second_render) = attach(&mut server, 2, 70, 20);
+    // Client 1 shows the hidden tab and then the first tab again; it keeps controlling both.
+    assert!(server.focus_shell_client_on_tab(1, &panes.hidden_tab_id));
+    assert!(server.claim_shell_tab_geometry(1, false));
+    assert!(server.focus_shell_client_on_tab(1, &panes.shown_tab_id));
+    assert!(
+        !server.claim_shell_tab_geometry(1, false),
+        "guard: client 1 already controls the first tab"
+    );
+    // With two clients its pane area change sizes only the tab it shows.
+    client_pane_area(&mut server, 1, 60, 16);
+    let expected = panes.sizes(&server)[0];
+    assert_ne!(expected, START_SIZE);
+    assert_ne!(
+        panes.sizes(&server)[1],
+        expected,
+        "guard: the hidden tab is stale, with the setting on too"
+    );
+    assert_eq!(
+        server.tab_geometry_controllers.get(&panes.hidden_tab_id),
+        Some(&1),
+        "guard: client 1 still controls the hidden tab it visited"
+    );
+    let hidden_tab_sequence = panes.runtime(&server, 0, panes.hidden_tab).content_seq();
+
+    finish_endpoint_open_onto(&mut server, 1, &panes.hidden_tab_id);
+    assert_eq!(
+        server.shell_tab_id_for_client(1).as_deref(),
+        Some(panes.hidden_tab_id.as_str()),
+        "guard: the finished open shows the tab"
+    );
+    if resize_hidden_panes {
+        assert_eq!(
+            panes.runtime(&server, 0, panes.hidden_tab).content_seq(),
+            hidden_tab_sequence,
+            "with the setting on the finished open applies no geometry to a tab its client controls"
+        );
+    } else {
+        assert_shown_pane_fits(
+            &server,
+            0,
+            panes.hidden_tab,
+            expected,
+            true,
+            "the tab a finished endpoint open shows, with two clients",
+        );
+    }
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn on_a_finished_endpoint_open_with_two_clients_applies_no_geometry() {
+    deferred_navigation_onto_a_controlled_tab_with_two_clients(true);
+}
+
+#[tokio::test]
+async fn off_a_finished_endpoint_open_with_two_clients_sizes_the_tab_it_shows() {
+    deferred_navigation_onto_a_controlled_tab_with_two_clients(false);
+}
+
 /// A public `worktree.open` with focus on a worktree that is already open finishes later and
 /// shows the workspace that holds it.
 async fn public_worktree_open_shows_the_hidden_workspace(resize_hidden_panes: bool) {
     let (mut server, panes, expected, _receivers) = stale_hidden_tabs(resize_hidden_panes);
-    let repo = std::env::temp_dir().join(format!(
+    // One folder holds the repository and its checkout; it is removed when the test ends, also
+    // when it panics.
+    let root = std::env::temp_dir().join(format!(
         "herdr-hidden-resize-open-{}-{resize_hidden_panes}",
         std::process::id()
     ));
-    let checkout = repo.with_extension("checkout");
+    let repo = root.join("repo");
+    let checkout = root.join("checkout");
+    std::fs::create_dir_all(&root).unwrap();
+    let _root_guard = TestTempPath::owns_root(root, repo.clone());
     let git = |args: &[&str]| {
         let output = std::process::Command::new("git")
             .args(args)
@@ -887,15 +966,6 @@ async fn public_worktree_open_shows_the_hidden_workspace(resize_hidden_panes: bo
         "the workspace a finished open shows",
     );
     shutdown_test_runtimes(&mut server);
-    git(&[
-        "-C",
-        repo.to_str().unwrap(),
-        "worktree",
-        "remove",
-        "--force",
-        checkout.to_str().unwrap(),
-    ]);
-    let _ = std::fs::remove_dir_all(repo);
 }
 
 #[tokio::test]
