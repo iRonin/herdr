@@ -946,7 +946,7 @@ mod tests {
 
     #[test]
     fn annotate_marks_a_failed_resume_only_after_the_grace_and_only_with_an_idle_shell() {
-        use crate::terminal::state::{ShellLeftover, RESUME_FAILED_GRACE};
+        use crate::terminal::state::ShellLeftover;
         let typed_at = std::time::Instant::now();
         let mut state =
             state_with_leftovers(&["resume"], &[ShellLeftover::ResumeTyped { at: typed_at }]);
@@ -964,8 +964,10 @@ mod tests {
             );
         let idle = |_: &crate::terminal::TerminalId| true;
         let busy = |_: &crate::terminal::TerminalId| false;
-        let almost = typed_at + RESUME_FAILED_GRACE - std::time::Duration::from_secs(1);
-        let due = typed_at + RESUME_FAILED_GRACE;
+        // Three minutes written out, not RESUME_FAILED_GRACE: a test that follows the constant passes whatever it is set to.
+        let grace = std::time::Duration::from_secs(180);
+        let almost = typed_at + grace - std::time::Duration::from_secs(1);
+        let due = typed_at + grace;
 
         assert_eq!(
             marks_by_workspace(&annotated(&state, almost, &idle)),

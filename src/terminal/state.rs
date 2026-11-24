@@ -7383,12 +7383,14 @@ mod tests {
             ShellLeftover::ResumeTyped { at: typed_at }
         );
 
-        let before = typed_at + RESUME_FAILED_GRACE - Duration::from_millis(1);
+        // Three minutes written out, not RESUME_FAILED_GRACE: a test that follows the constant passes whatever it is set to.
+        let grace = Duration::from_secs(180);
+        let before = typed_at + grace - Duration::from_millis(1);
         assert!(
             !terminal.ended_agent_shell_for_save(before, || panic!("not probed before the grace")),
             "a shell can take half a minute to reach its prompt: idle is no evidence yet"
         );
-        let due = typed_at + RESUME_FAILED_GRACE;
+        let due = typed_at + grace;
         assert!(terminal.ended_agent_shell_for_save(due, || true));
         assert!(
             !terminal.ended_agent_shell_for_save(due, || false),

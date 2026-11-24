@@ -367,6 +367,15 @@ impl World {
         assert!(sent.get("error").is_none(), "{sent}");
     }
 
+    /// Sends `text` and a line end as ONE text input, with no key press: the only way in is the pane's text input.
+    fn type_line_as_text(&self, pane_id: &str, text: &str) {
+        let sent = self.api(
+            "pane.send_text",
+            serde_json::json!({"pane_id": pane_id, "text": format!("{text}\n")}),
+        );
+        assert!(sent.get("error").is_none(), "{sent}");
+    }
+
     fn pane_text(&self, pane_id: &str) -> String {
         let read = self.api(
             "pane.read",
@@ -684,8 +693,9 @@ fn an_agent_that_ends_with_the_setting_off_leaves_no_mark_and_its_pane_comes_bac
     server.stop(&world);
 }
 
-/// Typing into the shell after its agent ended keeps the pane: the user used the shell, so it is not a leftover. The pane
-/// that was not typed into is left out as before.
+/// Typing into the shell after its agent ended keeps the pane: the user used the shell, so it is not a leftover. The line is
+/// sent as text input alone (no key press), so this fails when text input does not remove the mark. The pane that was not
+/// typed into is left out as before.
 #[test]
 fn typing_into_a_pane_after_its_agent_ended_keeps_the_pane() {
     let world = World::new(&Setup::new(Some(true)));
@@ -696,7 +706,7 @@ fn typing_into_a_pane_after_its_agent_ended_keeps_the_pane() {
     world.wait_for_agents_ended(2);
 
     let alive = world.base.join("ALIVE");
-    world.type_into(
+    world.type_line_as_text(
         &world.pane_id_of("p7"),
         &format!("touch '{}'", alive.display()),
     );
