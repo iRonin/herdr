@@ -7376,9 +7376,18 @@ mod tests {
             !terminal.ended_agent_shell_for_save(|| false),
             "a shell with something running in it is not marked"
         );
+        let asked_again = std::cell::Cell::new(false);
+        assert!(!terminal.ended_agent_shell_for_save(|| {
+            asked_again.set(true);
+            false
+        }));
+        assert!(
+            asked_again.get(),
+            "a refusal must not be remembered, as found idle or as anything else: the shell may reach its prompt later"
+        );
         assert!(
             terminal.ended_agent_shell_for_save(|| true),
-            "a refusal must not be remembered: the shell may reach its prompt later"
+            "a shell that reaches its prompt is marked at the next save"
         );
         assert!(
             terminal
