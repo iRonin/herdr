@@ -7358,10 +7358,13 @@ mod tests {
 
         terminal.note_agent_released();
         assert_eq!(terminal.shell_leftover, ShellLeftover::AgentEnded);
-        assert!(terminal.ended_agent_shell_for_save(|| true));
         assert!(
             !terminal.ended_agent_shell_for_save(|| false),
             "an ended agent whose shell has something running in it is in use"
+        );
+        assert!(
+            terminal.ended_agent_shell_for_save(|| true),
+            "the same shell at its prompt is a leftover"
         );
     }
 
