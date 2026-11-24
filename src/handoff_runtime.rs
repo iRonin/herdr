@@ -29,6 +29,11 @@ pub(crate) struct HandoffRuntimeState {
     pub initial_history_ansi: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_state: Option<crate::terminal::state::HandoffAgentState>,
+    /// The pane's shell was typed `<agent> && exit` (or the shell's spelling of it) by a restart resume, so it ends with its
+    /// agent when the agent ends normally. Left out of the state when false, so the state of a pane without it is byte for
+    /// byte what it was; a receiver that does not know the field reads false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closes_when_resumed_agent_exits: bool,
 }
 
 #[cfg(unix)]

@@ -1465,6 +1465,12 @@
           "type": "integer",
           "default": "100",
           "description": "Milliseconds between automatic agent restores after a server restart. The first agent starts without this delay; 0 disables spacing. Does not delay manual launches or explicit terminal attaches. Restart the server to apply."
+        },
+        {
+          "key": "session.close_pane_when_resumed_agent_exits",
+          "type": "boolean",
+          "default": "false",
+          "description": "Close a pane in which a server restart resumed an agent when that agent ends normally (exit status 0), instead of leaving an idle shell. herdr types `<resume command> && exit` into the pane's shell (`; and exit` for fish); a crash, a kill or a missing command (any other exit status) keeps the pane open. Applies to panes whose shell is sh, dash, bash, zsh or fish; for any other shell the command is typed unchanged, the pane stays open, and the server log names the shell once. Read when each resume command is typed, so a config reload applies to the next resume. A value that is not true or false is reported by herdr config check, keeps the setting off, and does not affect other settings."
         }
       ]
     },

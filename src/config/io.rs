@@ -377,6 +377,13 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
     );
 
     diagnostics.extend(config.theme.diagnostics());
+    diagnostics.extend(
+        config
+            .session
+            .close_pane_when_resumed_agent_exits
+            .problem()
+            .map(str::to_string),
+    );
 
     Ok(LoadedConfig {
         config,
@@ -912,6 +919,106 @@ name = "catppucin"
 
         assert_eq!(loaded.diagnostics.len(), 1);
         assert!(loaded.diagnostics[0].contains("theme.name = \"catppucin\""));
+    }
+
+    /// Runs `check` with HERDR_CONFIG_PATH pointing at a config file with `content`.
+    fn with_config_file(content: Option<&str>, check: impl FnOnce()) {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-config-close-resumed-{}-{stamp}",
+            std::process::id()
+        ));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(content) = content {
+            std::fs::write(&path, content).unwrap();
+        }
+        std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+        check();
+        std::env::remove_var(CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A wrong type for `close_pane_when_resumed_agent_exits` is reported for that key alone, at startup and on a reload.
+    /// Any other wrong type makes the startup load fall back to the defaults for EVERY setting (a parse error).
+    #[test]
+    fn a_bad_close_pane_when_resumed_agent_exits_value_is_reported_without_resetting_other_settings(
+    ) {
+        for bad in ["\"yes\"", "1", "1979-05-27"] {
+            let content = format!("[session]\nclose_pane_when_resumed_agent_exits = {bad}\nstartup_per_agent_delay_ms = 5000\n");
+            with_config_file(Some(&content), || {
+                let startup = Config::load();
+                assert_eq!(
+                    startup.config.session.startup_per_agent_delay_ms, 5000,
+                    "{bad}"
+                );
+                assert!(
+                    !startup
+                        .config
+                        .session
+                        .close_pane_when_resumed_agent_exits
+                        .enabled(),
+                    "{bad}"
+                );
+                assert_eq!(
+                    startup.diagnostics.len(),
+                    1,
+                    "{bad}: {:?}",
+                    startup.diagnostics
+                );
+                assert!(
+                    startup.diagnostics[0].starts_with(
+                        "session.close_pane_when_resumed_agent_exits must be true or false (got "
+                    ),
+                    "{bad}: {:?}",
+                    startup.diagnostics
+                );
+
+                let live = load_live_config().unwrap();
+                assert_eq!(
+                    live.config.session.startup_per_agent_delay_ms, 5000,
+                    "{bad}"
+                );
+                // The startup load reads a TOML date through its key capture, as a string; the live load names it a datetime.
+                // Both report the key and its wrong type, and neither resets anything.
+                if bad != "1979-05-27" {
+                    assert_eq!(live.diagnostics, startup.diagnostics, "{bad}");
+                }
+                assert_eq!(live.diagnostics.len(), 1, "{bad}: {:?}", live.diagnostics);
+                assert!(
+                    live.diagnostics[0].starts_with(
+                        "session.close_pane_when_resumed_agent_exits must be true or false (got "
+                    ),
+                    "{bad}: {:?}",
+                    live.diagnostics
+                );
+                assert!(live.invalid_sections.is_empty(), "{bad}");
+            });
+        }
+
+        with_config_file(
+            Some("[session]\nclose_pane_when_resumed_agent_exits = true\n"),
+            || {
+                let startup = Config::load();
+                assert!(startup
+                    .config
+                    .session
+                    .close_pane_when_resumed_agent_exits
+                    .enabled());
+                assert!(startup.diagnostics.is_empty(), "{:?}", startup.diagnostics);
+                let live = load_live_config().unwrap();
+                assert!(live
+                    .config
+                    .session
+                    .close_pane_when_resumed_agent_exits
+                    .enabled());
+                assert!(live.diagnostics.is_empty(), "{:?}", live.diagnostics);
+            },
+        );
     }
 
     #[test]

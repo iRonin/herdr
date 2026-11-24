@@ -146,6 +146,14 @@ pub struct App {
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     session_writer: Arc<std::sync::Mutex<crate::persist::SessionWriter>>,
     pane_exit_checkpoint_pending: bool,
+    /// The layout a pane-exit checkpoint captured when a background save held the session writer, so that it could not write it.
+    /// Written by `save_session_on_shutdown` while the checkpoint is still pending; see `session.rs`.
+    deferred_checkpoint: Option<crate::persist::SessionSnapshot>,
+    /// Shells for which `close_pane_when_resumed_agent_exits` could not be applied, each named once in the log.
+    unsupported_resume_close_shells_logged: std::collections::HashSet<String>,
+    /// Panes of a resumed agent whose end has already taken its session checkpoint, so that the second place that sees the
+    /// event does not save again after the end of the agent cleared the session.
+    resumed_agent_exit_checkpoints: std::collections::HashSet<crate::layout::PaneId>,
     pub(crate) detached_process_children: Vec<std::process::Child>,
     tab_bar_status_generation: u64,
     tab_bar_datetimes: Vec<tab_bar_status::TabBarDatetimeRuntime>,
@@ -547,6 +555,10 @@ impl App {
             cjk_ime_agents: parse_cjk_ime_agents(&config.experimental.cjk_ime_agents),
             cjk_ime_cursor_shape: config.experimental.cjk_ime_cursor_shape.to_decscusr(),
             kitty_graphics_enabled: config.kitty_graphics_enabled(),
+            close_pane_when_resumed_agent_exits: config
+                .session
+                .close_pane_when_resumed_agent_exits
+                .enabled(),
             default_shell: config.terminal.default_shell.clone(),
             shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
@@ -659,6 +671,9 @@ impl App {
             session_save_thread: None,
             session_writer,
             pane_exit_checkpoint_pending: false,
+            deferred_checkpoint: None,
+            unsupported_resume_close_shells_logged: std::collections::HashSet::new(),
+            resumed_agent_exit_checkpoints: std::collections::HashSet::new(),
             detached_process_children: Vec::new(),
             tab_bar_status_generation: 0,
             tab_bar_datetimes: Vec::new(),
@@ -766,18 +781,26 @@ impl App {
 
         let cwd = self.resolve_new_terminal_cwd(None);
         let preserve_checkpoint = self.pane_exit_checkpoint_pending && !self.state.session_dirty;
+        // Creating the workspace schedules a save, which clears the kept layout together with the pending flag.
+        let kept_checkpoint = if preserve_checkpoint {
+            self.deferred_checkpoint.take()
+        } else {
+            None
+        };
 
         match self.create_workspace_with_options(cwd, true) {
             Ok(_) => {
                 if preserve_checkpoint {
                     // Automatic replacement is part of pane removal, not a new user mutation.
                     self.pane_exit_checkpoint_pending = true;
+                    self.deferred_checkpoint = kept_checkpoint;
                     self.finish_checkpointed_pane_exit();
                 }
                 true
             }
             Err(err) => {
                 tracing::error!(err = %err, "failed to create default workspace");
+                self.deferred_checkpoint = kept_checkpoint;
                 self.state.mode = Mode::Navigate;
                 false
             }
@@ -918,6 +941,11 @@ impl App {
                 self.state.sound = config.ui.sound.clone();
                 self.state.toast_config = config.ui.toast.clone();
             }
+        }
+
+        if !invalid_section("session") {
+            self.state.close_pane_when_resumed_agent_exits =
+                config.session.close_pane_when_resumed_agent_exits.enabled();
         }
 
         if !invalid_section("session")
@@ -1971,6 +1999,86 @@ mod tests {
         let report = app.reload_config();
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
         assert_eq!(app.state.sidebar_agents, previous_agents);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn app_copies_close_pane_when_resumed_agent_exits_from_config() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        assert!(!app.state.close_pane_when_resumed_agent_exits);
+
+        let config: Config =
+            toml::from_str("[session]\nclose_pane_when_resumed_agent_exits = true\n").unwrap();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(
+            &config,
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        assert!(app.state.close_pane_when_resumed_agent_exits);
+    }
+
+    /// The setting is read when a resume is typed, so a reload must reach the live state; a bad value turns it off and
+    /// names itself.
+    #[test]
+    fn reload_config_updates_close_pane_when_resumed_agent_exits() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-close-resumed");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let mut app = test_app();
+        assert!(!app.state.close_pane_when_resumed_agent_exits);
+
+        std::fs::write(
+            &path,
+            "[session]\nclose_pane_when_resumed_agent_exits = true\n",
+        )
+        .unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(app.state.close_pane_when_resumed_agent_exits);
+
+        std::fs::write(
+            &path,
+            "[session]\nclose_pane_when_resumed_agent_exits = \"yes\"\n",
+        )
+        .unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert_eq!(
+            report.diagnostics,
+            vec!["session.close_pane_when_resumed_agent_exits must be true or false (got string); keeping it off".to_string()]
+        );
+        assert!(!app.state.close_pane_when_resumed_agent_exits);
+
+        std::fs::write(
+            &path,
+            "[session]\nclose_pane_when_resumed_agent_exits = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            app.reload_config().status,
+            crate::config::ConfigReloadStatus::Applied
+        );
+        assert!(app.state.close_pane_when_resumed_agent_exits);
+        std::fs::write(
+            &path,
+            "[session]\nclose_pane_when_resumed_agent_exits = false\n",
+        )
+        .unwrap();
+        app.reload_config();
+        assert!(!app.state.close_pane_when_resumed_agent_exits);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

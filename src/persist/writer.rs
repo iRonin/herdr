@@ -58,6 +58,25 @@ impl SessionWriter {
         crate::logging::session_saved(&self.path, snapshot.workspaces.len());
     }
 
+    /// Writes the layout (session.json) only. The pane history file is neither rewritten nor cleared: it keeps what the last
+    /// full save wrote. The restore ignores a history file whose layout fingerprint differs from the saved layout, so a
+    /// history file older than this layout costs the restored panes their saved screens once, never a pane or its session.
+    /// For the session checkpoint of a pane that ends with its resumed agent, which runs on the server loop: the history is the
+    /// expensive part of a save (about 3.3 s of the 3.9 s it takes for 250 panes with 200 KB of history each).
+    pub(crate) fn save_layout_only(&mut self, snapshot: &SessionSnapshot) {
+        let result = self.preserve_unloaded().and_then(|()| {
+            self.preserve_snapshot_history();
+            super::io::save_to_path(&self.path, snapshot)
+        });
+        if let Err(err) = result {
+            crate::logging::session_save_failed(&self.path, &err.to_string());
+            return;
+        }
+        self.protect_unloaded = false;
+        self.preserve_snapshot_history();
+        crate::logging::session_saved(&self.path, snapshot.workspaces.len());
+    }
+
     pub(crate) fn clear(&mut self) {
         let result = self.preserve_unloaded().and_then(|()| {
             self.preserve_snapshot_history();

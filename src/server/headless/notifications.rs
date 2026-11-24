@@ -658,6 +658,12 @@ impl HeadlessServer {
                             .map(|pane| pane.attached_terminal_id.to_string())
                     })
                 });
+                // A pane that ends with its resumed agent takes its session checkpoint now: the exit of the agent published
+                // just below clears the session from the pane, and the layout saved after that would lack it.
+                if matches!(&ev, AppEvent::PaneDied { .. }) {
+                    self.app
+                        .checkpoint_session_before_resumed_agent_pane_exit(pane_id_val);
+                }
                 if matches!(&ev, AppEvent::PaneDied { .. })
                     && !self
                         .app

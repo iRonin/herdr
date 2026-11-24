@@ -14,6 +14,7 @@ impl App {
     pub(super) fn schedule_session_save(&mut self) {
         if self.policy.persist_session {
             self.pane_exit_checkpoint_pending = false;
+            self.deferred_checkpoint = None;
             self.session_save_deadline = Some(Instant::now() + SESSION_SAVE_DEBOUNCE);
         }
     }
@@ -73,6 +74,7 @@ impl App {
 
         let job = self.capture_session_save_job();
         self.pane_exit_checkpoint_pending = false;
+        self.deferred_checkpoint = None;
         self.session_save_deadline = None;
         let writer = self.session_writer.clone();
         match std::thread::Builder::new()
@@ -99,6 +101,7 @@ impl App {
 
         run_session_save_job(self.capture_session_save_job(), &self.session_writer);
         self.pane_exit_checkpoint_pending = false;
+        self.deferred_checkpoint = None;
         self.session_save_deadline = None;
     }
 
@@ -113,6 +116,73 @@ impl App {
         self.state.session_dirty = false;
     }
 
+    /// The checkpoint of a pane that ends with its resumed agent. Same bookkeeping as `checkpoint_session_before_pane_exit`, with
+    /// two differences, both because it runs on the server loop and can run once per agent exit in a burst of them:
+    ///
+    /// - It writes the layout only (`SessionWriter::save_layout_only`). The full save also captures and writes every pane's
+    ///   screen history, which took 3.9 s for 250 panes with 200 KB of history each (about 9 ms without the history). The next
+    ///   debounced autosave rewrites both files; a stop before it restores every pane, and the history file, whose layout
+    ///   fingerprint then no longer matches the saved layout, is ignored once.
+    /// - It never waits for a background save. While one runs (from the start of its thread, before it takes the writer, to its
+    ///   end), the layout that save writes was captured before changes made since and lands after anything written now, so it
+    ///   is no checkpoint of this moment. The checkpoint keeps the layout it just captured instead (`deferred_checkpoint`),
+    ///   which holds those changes and the pane that is ending with the agent session it was resumed from (this exit is what
+    ///   clears that session). `save_session_on_shutdown` writes the kept layout after the running save ends. Anything that
+    ///   clears or sets the pending flag clears or replaces it: an autosave or a full save supersedes it, and a later checkpoint
+    ///   that gets the writer writes a newer layout. A save thread that has finished but is not yet reaped is not busy: its write
+    ///   has landed, and the checkpoint writes the newer layout over it.
+    pub(crate) fn checkpoint_session_layout_before_pane_exit(&mut self) {
+        if !self.policy.persist_session
+            || (self.pane_exit_checkpoint_pending && !self.state.session_dirty)
+        {
+            return;
+        }
+        if self.state.workspaces.is_empty() {
+            self.checkpoint_session_before_pane_exit();
+            return;
+        }
+        let snapshot = crate::persist::capture(
+            &self.state.workspaces,
+            &self.state.terminals,
+            &self.terminal_runtimes,
+            self.state.active,
+            self.state.selected,
+        );
+        // A save thread that has not finished is busy even before it takes the writer: its layout was captured earlier and
+        // it will write it over anything written now.
+        let background_save_running = self
+            .session_save_thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished());
+        let writer = if background_save_running {
+            Err(std::sync::TryLockError::WouldBlock)
+        } else {
+            self.session_writer.try_lock()
+        };
+        match writer {
+            Ok(mut writer) => {
+                writer.save_layout_only(&snapshot);
+                self.deferred_checkpoint = None;
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                tracing::info!(
+                    event = "persist.checkpoint",
+                    subsystem = "persist",
+                    outcome = "background_save_running",
+                    "a background save is writing; the pane-exit checkpoint keeps its layout for the stop"
+                );
+                self.deferred_checkpoint = Some(snapshot);
+            }
+            Err(std::sync::TryLockError::Poisoned(err)) => {
+                tracing::warn!(err = %err, "session writer is poisoned; refusing to modify session");
+                return;
+            }
+        }
+        self.session_save_deadline = None;
+        self.pane_exit_checkpoint_pending = true;
+        self.state.session_dirty = false;
+    }
+
     pub(crate) fn finish_checkpointed_pane_exit(&mut self) {
         if self.pane_exit_checkpoint_pending {
             self.state.session_dirty = false;
@@ -122,10 +192,29 @@ impl App {
 
     pub(crate) fn save_session_on_shutdown(&mut self) {
         if self.pane_exit_checkpoint_pending && !self.state.session_dirty {
+            self.write_deferred_checkpoint();
             self.session_save_deadline = None;
             return;
         }
         self.save_session_now();
+    }
+
+    /// Writes the layout a checkpoint kept because a background save held the writer (see
+    /// `checkpoint_session_layout_before_pane_exit`): waits for that save to end, as upstream's checkpoint always did, then
+    /// writes the layout only. Blocking is fine here, at the stop.
+    fn write_deferred_checkpoint(&mut self) {
+        let Some(snapshot) = self.deferred_checkpoint.take() else {
+            return;
+        };
+        if let Some(thread) = self.session_save_thread.take() {
+            let _ = thread.join();
+        }
+        match self.session_writer.lock() {
+            Ok(mut writer) => writer.save_layout_only(&snapshot),
+            Err(err) => {
+                tracing::warn!(err = %err, "session writer is poisoned; refusing to modify session");
+            }
+        }
     }
 }
 
