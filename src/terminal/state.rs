@@ -7440,6 +7440,43 @@ mod tests {
         assert!(!terminal.note_shell_input(), "already clear");
     }
 
+    /// An agent started in the pane again without anything typed into it (`herdr agent start` writes the launch command straight to
+    /// the pane) makes the shell busy: the detector sees the new agent process, and the pane is no leftover until that agent ends.
+    /// A save that found the shell idle before must not keep marking it while the new agent runs.
+    #[test]
+    fn a_new_agent_detected_in_an_ended_agents_pane_ends_the_leftover_and_the_answer_kept_for_it() {
+        let mut terminal = test_terminal();
+        terminal.note_agent_released();
+        assert!(
+            terminal.ended_agent_shell_for_save(|| true),
+            "a save found the ended agent's shell idle, and that answer is kept"
+        );
+
+        terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+
+        assert_eq!(terminal.shell_leftover, ShellLeftover::None);
+        assert!(
+            !terminal
+                .ended_agent_shell_for_save(|| panic!("a pane with a new agent is never probed")),
+            "the new agent runs in the pane: it must not be marked on the strength of the earlier answer"
+        );
+
+        // When that agent ends, the pane is a leftover again and the earlier answer says nothing about it.
+        terminal.note_agent_released();
+        assert!(
+            !terminal.ended_agent_shell_for_save(|| false),
+            "a shell with something running in it after the second agent ended is not marked"
+        );
+    }
+
+    /// Detecting an agent in a pane that was never a leftover changes nothing about the mark.
+    #[test]
+    fn detecting_an_agent_in_a_pane_with_no_mark_changes_no_mark() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+        assert_eq!(terminal.shell_leftover, ShellLeftover::None);
+    }
+
     #[test]
     fn a_shell_replaced_after_an_exit_is_no_leftover() {
         let mut terminal = test_terminal();

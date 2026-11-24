@@ -23,6 +23,10 @@ const WAIT: Duration = Duration::from_secs(30);
 const ENDS_ON_TRIGGER: &str =
     "printf 'Working...\\n'\nwhile [ ! -e '{TRIGGER}' ]; do sleep 0.05; done\nexit 1";
 
+/// Like `ENDS_ON_TRIGGER`, but a launch made after the file `{TRIGGER}.again` exists stays running: the agent that a second
+/// `agent.start` puts into the pane of an agent that ended.
+const ENDS_ON_TRIGGER_AND_STAYS_WHEN_STARTED_AGAIN: &str = "printf 'Working...\\n'\nif [ -e '{TRIGGER}.again' ]; then sleep 600; fi\nwhile [ ! -e '{TRIGGER}' ]; do sleep 0.05; done\nexit 1";
+
 struct World {
     base: PathBuf,
     config_home: PathBuf,
@@ -778,6 +782,59 @@ fn typing_into_a_pane_after_its_agent_ended_keeps_the_pane() {
         &format!("touch '{}'", alive.display()),
     );
     world.wait_until("the shell to run what was typed", |_| alive.exists());
+    server.stop(&world);
+
+    assert_eq!(
+        world.saved_panes(),
+        vec![
+            ("p7".to_string(), false),
+            ("p8".to_string(), false),
+            ("p9".to_string(), true)
+        ],
+        "{}",
+        world.diagnostics()
+    );
+    let server = world.start();
+    world.wait_until("the panes to be listed", |w| !w.pane_names().is_empty());
+    assert_eq!(
+        world.pane_names(),
+        names(&["p7", "p8"]),
+        "{}",
+        world.diagnostics()
+    );
+    server.stop(&world);
+}
+
+/// `agent.start` (`herdr agent start`) into the pane of an ended agent writes the launch command straight to the pane, so no
+/// typed input passes. A save has already found the shell idle and written the mark; the new agent running there must stop the
+/// marks, or every later save, the one at the stop included, marks a busy pane and the next start leaves it out. The pane that was
+/// left alone is left out as before.
+#[test]
+fn an_agent_started_in_the_pane_of_an_ended_agent_stops_its_marks() {
+    let mut setup = Setup::new(Some(true));
+    setup.agent_body = ENDS_ON_TRIGGER_AND_STAYS_WHEN_STARTED_AGAIN;
+    let world = World::new(&setup);
+    let server = world.start();
+    world.wait_until("both agents to be resumed", |w| w.agent_starts() == 2);
+    world.wait_for_agents_detected(2);
+    world.trigger();
+    world.wait_for_agents_ended(2);
+    world.wait_until("a save to carry the mark of p7", |w| {
+        w.saved_panes().contains(&("p7".to_string(), true))
+    });
+
+    fs::write(world.base.join("TRIGGER.again"), "").unwrap();
+    let started = world.api(
+        "agent.start",
+        serde_json::json!({
+            "name": "again", "kind": "pi", "pane_id": world.pane_id_of("p7"),
+            "args": [], "timeout_ms": 8_000
+        }),
+    );
+    assert_eq!(started["result"]["type"], "agent_started", "{started}");
+    world.wait_until("the detector to recognise the second agent in p7", |w| {
+        w.agent_starts() == 3 && w.agent_changes(&[" agent=Some(Pi) "]) >= 3
+    });
     server.stop(&world);
 
     assert_eq!(

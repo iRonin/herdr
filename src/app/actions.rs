@@ -4727,6 +4727,53 @@ mod tests {
         }
     }
 
+    /// A new agent detected in a pane whose agent ended removes the mark, whatever started it (`herdr agent start` writes the launch
+    /// command straight to the pane, so no typed input passes). With the setting on a save is owed, because the saved layout may
+    /// carry the mark already; with it off nothing is owed. The control: the same detection in a pane with no mark owes nothing, so
+    /// the save is owed by the removed mark and not by the detection.
+    #[test]
+    fn a_new_agent_detected_in_an_ended_agents_pane_removes_the_mark_and_owes_a_save_only_while_the_setting_is_on(
+    ) {
+        use crate::terminal::state::ShellLeftover;
+        for (setting, owed) in [(true, true), (false, false)] {
+            let mut state = app_with_workspaces(&["one"]);
+            state.skip_ended_agent_panes_on_restore = setting;
+            let (pane_id, terminal_id) = first_pane_terminal(&state);
+            let detect = |state: &mut AppState| {
+                state.handle_app_event(AppEvent::AgentProcessDetected {
+                    pane_id,
+                    agent: Agent::Pi,
+                    observed_at: std::time::Instant::now(),
+                });
+            };
+            detect(&mut state);
+            state.session_dirty = false;
+            detect(&mut state);
+            assert!(
+                !state.session_dirty,
+                "control, setting {setting}: a detection in a pane with no mark owes no save"
+            );
+
+            state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .shell_leftover = ShellLeftover::AgentEnded;
+            state.session_dirty = false;
+            detect(&mut state);
+
+            assert_eq!(
+                state.terminals[&terminal_id].shell_leftover,
+                ShellLeftover::None,
+                "setting {setting}: the mark survived a new agent in the pane"
+            );
+            assert_eq!(
+                state.session_dirty, owed,
+                "setting {setting}: a save is owed only while the setting is on"
+            );
+        }
+    }
+
     /// Anything typed into the pane makes it the user's shell again. All three ways input reach a pane clear the mark, and a key
     /// release is not input. A save is owed only while the setting is on: with it off, input must cost what it always did,
     /// because every pane a restart resumed carries a mark the first time anyone types into it.

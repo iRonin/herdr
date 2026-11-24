@@ -3626,6 +3626,70 @@ mod tests {
         assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(root));
     }
 
+    /// `herdr agent start` writes the launch command straight to the pane, so no typed input passes. It is input all the same: an
+    /// agent started in an ended agent's pane makes the shell busy, and the mark goes with it. A start whose input failed delivered
+    /// nothing, so it leaves the mark: the pane is still an ended agent's idle shell.
+    #[tokio::test]
+    async fn an_agent_started_in_an_ended_agents_pane_removes_the_mark_and_a_failed_start_keeps_it()
+    {
+        use crate::terminal::state::ShellLeftover;
+        let mut app = test_app();
+        let workspace = Workspace::test_new("agent-start-ended");
+        let root = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let pane_id = app.pane_info(0, root).unwrap().pane_id;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let (runtime, mut receiver) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+        runtime
+            .try_send_bytes(bytes::Bytes::from_static(b"occupied"))
+            .unwrap();
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .shell_leftover = ShellLeftover::AgentEnded;
+
+        let start = |app: &mut App| -> serde_json::Value {
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: "req_agent_start_ended".into(),
+                method: crate::api::schema::Method::AgentStart(
+                    crate::api::schema::AgentStartParams {
+                        name: "worker".into(),
+                        kind: "pi".into(),
+                        pane_id: pane_id.clone(),
+                        args: Vec::new(),
+                        timeout_ms: Some(4_000),
+                    },
+                ),
+            });
+            serde_json::from_str(&response).unwrap()
+        };
+
+        let failed = start(&mut app);
+        assert_eq!(failed["error"]["code"], "agent_start_input_failed");
+        assert_eq!(
+            app.state.terminals[&terminal_id].shell_leftover,
+            ShellLeftover::AgentEnded,
+            "a start that delivered nothing leaves the pane an ended agent's shell"
+        );
+
+        receiver.try_recv().unwrap();
+        let started = start(&mut app);
+        assert_eq!(started["result"]["type"], "agent_started");
+        assert_eq!(
+            app.state.terminals[&terminal_id].shell_leftover,
+            ShellLeftover::None,
+            "the launch command went into the pane: the mark must go with it"
+        );
+    }
+
     #[tokio::test]
     async fn failed_agent_start_input_rolls_back_and_can_retry() {
         let mut app = test_app();
