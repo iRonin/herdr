@@ -495,6 +495,129 @@ mod tests {
         assert!(!has_ended_agent_panes(&unmarked));
     }
 
+    use super::super::snapshot::{PaneAgentResumeSnapshot, PaneAgentSessionSnapshot};
+
+    /// The saved session of an agent: a pane that still holds one is a pane the next start would resume.
+    fn give_session(snapshot: &mut SessionSnapshot, workspace: usize, tab: usize, id: u32) {
+        snapshot.workspaces[workspace].tabs[tab]
+            .panes
+            .get_mut(&id)
+            .unwrap()
+            .agent_session = Some(PaneAgentSessionSnapshot {
+            source: "herdr:pi".to_string(),
+            agent: "pi".to_string(),
+            kind: crate::agent_resume::AgentSessionRefKind::Path,
+            value: format!("/sessions/{id}.jsonl"),
+        });
+    }
+
+    /// The command a custom reporter gave for resuming: the other way a pane holds on to its agent.
+    fn give_resume(snapshot: &mut SessionSnapshot, workspace: usize, tab: usize, id: u32) {
+        snapshot.workspaces[workspace].tabs[tab]
+            .panes
+            .get_mut(&id)
+            .unwrap()
+            .agent_resume = Some(PaneAgentResumeSnapshot {
+            source: "custom:reporter".to_string(),
+            agent: "pi".to_string(),
+            argv: vec!["agent".to_string(), "--resume".to_string()],
+        });
+    }
+
+    /// A marked pane that still holds an agent session is a resume the next start would make, not a leftover: a failed start
+    /// keeps its session so the next start retries it, and this pass must never turn one resume failure across the fleet into
+    /// every pane gone. Only a mark with nothing to resume is acted on.
+    #[test]
+    fn has_ended_agent_panes_ignores_a_mark_on_a_pane_that_holds_a_session_or_a_resume() {
+        let build = || session(vec![workspace("w1", &[&[plain(1), ended(2)]])], Some(0), 0);
+        let mut with_session = build();
+        give_session(&mut with_session, 0, 0, 2);
+        assert!(!has_ended_agent_panes(&with_session));
+        let mut with_resume = build();
+        give_resume(&mut with_resume, 0, 0, 2);
+        assert!(!has_ended_agent_panes(&with_resume));
+        assert!(has_ended_agent_panes(&build()));
+    }
+
+    #[test]
+    fn a_marked_pane_that_holds_an_agent_session_is_kept_and_the_file_is_left_exactly_as_it_was() {
+        let mut snapshot = session(
+            vec![
+                workspace("w1", &[&[plain(1), ended(2)]]),
+                workspace("w2", &[&[plain(3)]]),
+            ],
+            Some(0),
+            0,
+        );
+        give_session(&mut snapshot, 0, 0, 2);
+        let fingerprint = layout_fingerprint(&snapshot);
+        let mut history = Some(history_of(&snapshot, fingerprint));
+        let before = serde_json::to_string(&snapshot).unwrap();
+        let history_before = serde_json::to_string(history.as_ref().unwrap()).unwrap();
+
+        let dropped = prune_ended_agent_panes(&mut snapshot, &mut history);
+
+        assert_eq!(dropped.panes, 0, "a pane that still holds its session went");
+        assert_eq!(serde_json::to_string(&snapshot).unwrap(), before);
+        assert_eq!(
+            serde_json::to_string(history.as_ref().unwrap()).unwrap(),
+            history_before,
+            "nothing was dropped, so the history is not touched"
+        );
+    }
+
+    #[test]
+    fn a_marked_pane_that_holds_a_reported_resume_is_kept() {
+        let mut snapshot = session(vec![workspace("w1", &[&[plain(1), ended(2)]])], Some(0), 0);
+        give_resume(&mut snapshot, 0, 0, 2);
+
+        let dropped = prune(&mut snapshot);
+
+        assert_eq!(dropped.panes, 0, "a pane that still holds a resume went");
+        assert_eq!(
+            pane_ids(&snapshot.workspaces[0].tabs[0]),
+            HashSet::from([1, 2])
+        );
+    }
+
+    /// The kept pane and the one that goes sit in one tab: only the one with nothing to resume goes, and the layout, focus and
+    /// numbers follow it.
+    #[test]
+    fn a_marked_pane_with_nothing_to_resume_still_goes_beside_a_marked_pane_that_holds_a_session() {
+        let mut snapshot = session(vec![workspace("w1", &[&[ended(1), ended(2)]])], Some(0), 0);
+        give_session(&mut snapshot, 0, 0, 1);
+
+        let dropped = prune(&mut snapshot);
+
+        assert_eq!(dropped.panes, 1);
+        let tab = &snapshot.workspaces[0].tabs[0];
+        assert_eq!(pane_ids(tab), HashSet::from([1]));
+        assert_eq!(layout_ids(&tab.layout), vec![1]);
+        assert_eq!(tab.focused, Some(1));
+    }
+
+    /// A tab whose only marked pane holds a session is not an empty tab and a workspace whose every pane is such a pane is not
+    /// an empty workspace.
+    #[test]
+    fn a_tab_and_a_workspace_whose_marked_panes_all_hold_a_session_stay() {
+        let mut snapshot = session(
+            vec![
+                workspace("w1", &[&[ended(1)], &[ended(2)]]),
+                workspace("w2", &[&[plain(3)]]),
+            ],
+            Some(0),
+            0,
+        );
+        give_session(&mut snapshot, 0, 0, 1);
+        give_session(&mut snapshot, 0, 1, 2);
+
+        let dropped = prune(&mut snapshot);
+
+        assert_eq!(dropped, DroppedEndedPanes::default());
+        assert_eq!(snapshot.workspaces.len(), 2);
+        assert_eq!(snapshot.workspaces[0].tabs.len(), 2);
+    }
+
     /// A user's own shell tabs carry no mark and must come out of the function exactly as they went in, whatever else is
     /// in the session, with the history untouched.
     #[test]

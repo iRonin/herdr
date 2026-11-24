@@ -2540,10 +2540,11 @@ mod tests {
         drop(runtimes);
     }
 
-    /// Two panes hold the same agent session and only the first is marked. Restore resumes a session once, in the first pane
-    /// that holds it; a marked pane must not take that resume and leave the pane the user still has without one.
+    /// Two panes hold the same agent session and only the first is marked. The marked pane still holds the session, so the pass
+    /// leaves it alone and restore gives the resume to it, the first pane that holds the session, as it does without the
+    /// setting: a pane with a session to resume is not a leftover.
     #[tokio::test]
-    async fn a_marked_pane_does_not_take_the_resume_of_a_session_a_later_pane_holds() {
+    async fn a_marked_pane_that_still_holds_a_session_is_kept_and_keeps_its_resume() {
         let cwd = std::env::current_dir().unwrap();
         let session_path = test_session_path("shared-session.jsonl");
         let pane = |ended: bool| {
@@ -2603,11 +2604,15 @@ mod tests {
         let mut snapshot = build();
         super::super::prune_ended_agent_panes(&mut snapshot, &mut None);
         let pruned = restore_with_resume(&snapshot);
-        assert_eq!(pruned.0.len(), 1);
+        assert_eq!(
+            pruned.0.len(),
+            2,
+            "a marked pane that still holds a session to resume was left out"
+        );
         assert_eq!(
             resumed_workspaces(&pruned),
-            vec!["w2".to_string()],
-            "the pane that is left must resume the session"
+            vec!["w1".to_string()],
+            "the marked pane must keep the resume it would have had without the setting"
         );
     }
 

@@ -4719,10 +4719,11 @@ mod tests {
         }
     }
 
-    /// Anything typed into the pane makes it the user's shell again. All three ways input reaches a pane clear the mark and owe
-    /// a save, and a key release is not input.
+    /// Anything typed into the pane makes it the user's shell again. All three ways input reach a pane clear the mark, and a key
+    /// release is not input. A save is owed only while the setting is on: with it off, input must cost what it always did,
+    /// because every pane a restart resumed carries a mark the first time anyone types into it.
     #[test]
-    fn input_into_a_leftover_shell_removes_the_mark_and_owes_a_save() {
+    fn input_into_a_leftover_shell_removes_the_mark_and_owes_a_save_only_while_the_setting_is_on() {
         use crate::terminal::state::ShellLeftover;
         let key = crate::input::TerminalKey::new(
             crossterm::event::KeyCode::Char('a'),
@@ -4747,27 +4748,34 @@ mod tests {
                 state.note_terminal_forwarded_bracketed_paste(id, b"\x1b[200~ls\x1b[201~");
             }),
         ];
-        for (name, send) in senders {
-            let mut state = app_with_workspaces(&["one"]);
-            let (_, terminal_id) = first_pane_terminal(&state);
-            state
-                .terminals
-                .get_mut(&terminal_id)
-                .unwrap()
-                .shell_leftover = ShellLeftover::AgentEnded;
-            state.session_dirty = false;
+        for (setting, owed) in [(true, true), (false, false)] {
+            for (name, send) in senders {
+                let mut state = app_with_workspaces(&["one"]);
+                state.skip_ended_agent_panes_on_restore = setting;
+                let (_, terminal_id) = first_pane_terminal(&state);
+                state
+                    .terminals
+                    .get_mut(&terminal_id)
+                    .unwrap()
+                    .shell_leftover = ShellLeftover::AgentEnded;
+                state.session_dirty = false;
 
-            send(&mut state, &terminal_id);
+                send(&mut state, &terminal_id);
 
-            assert_eq!(
-                state.terminals[&terminal_id].shell_leftover,
-                ShellLeftover::None,
-                "{name}: the mark survived input"
-            );
-            assert!(state.session_dirty, "{name}: removing the mark owes a save");
+                assert_eq!(
+                    state.terminals[&terminal_id].shell_leftover,
+                    ShellLeftover::None,
+                    "{name}, setting {setting}: the mark survived input"
+                );
+                assert_eq!(
+                    state.session_dirty, owed,
+                    "{name}, setting {setting}: a save is owed only while the setting is on"
+                );
+            }
         }
 
         let mut state = app_with_workspaces(&["one"]);
+        state.skip_ended_agent_panes_on_restore = true;
         let (_, terminal_id) = first_pane_terminal(&state);
         state
             .terminals

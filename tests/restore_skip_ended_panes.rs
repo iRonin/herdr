@@ -35,8 +35,8 @@ struct World {
 struct Setup {
     /// The line for `[session]` (`None` leaves the key out).
     setting: Option<bool>,
-    /// Whether `p7` and `p9` hold a resumable agent session.
-    agents: bool,
+    /// The raw ids (7, 8, 9) of the panes that hold a resumable agent session in the hand-written file.
+    sessions: &'static [u32],
     /// The raw ids (7, 8, 9) of panes the hand-written file marks `agent_ended`.
     marked: &'static [u32],
     /// The fake agent's body.
@@ -48,7 +48,7 @@ impl Setup {
     fn new(setting: Option<bool>) -> Self {
         Self {
             setting,
-            agents: true,
+            sessions: &[7, 9],
             marked: &[],
             agent_body: ENDS_ON_TRIGGER,
             pane_history: false,
@@ -130,9 +130,9 @@ impl World {
     }
 
     fn save_session(&self, setup: &Setup) {
-        let pane = |raw: u32, name: &str, agent: bool| {
+        let pane = |raw: u32, name: &str| {
             let mut pane = serde_json::json!({"cwd": self.base.join(name)});
-            if agent && setup.agents {
+            if setup.sessions.contains(&raw) {
                 pane["agent_session"] = serde_json::json!({
                     "source": "herdr:pi", "agent": "pi", "kind": "path",
                     "value": self.base.join(format!("{name}.jsonl"))
@@ -150,10 +150,10 @@ impl World {
                  "tabs": [{
                     "layout": {"Split": {"direction": "Horizontal", "ratio": 0.5,
                                          "first": {"Pane": 7}, "second": {"Pane": 8}}},
-                    "panes": {"7": pane(7, "p7", true), "8": pane(8, "p8", false)},
+                    "panes": {"7": pane(7, "p7"), "8": pane(8, "p8")},
                     "zoomed": false, "focused": 7, "root_pane": 7}]},
                 {"id": "w2", "custom_name": "two", "identity_cwd": self.base.join("p9"),
-                 "tabs": [{"layout": {"Pane": 9}, "panes": {"9": pane(9, "p9", true)},
+                 "tabs": [{"layout": {"Pane": 9}, "panes": {"9": pane(9, "p9")},
                            "zoomed": false, "focused": 9, "root_pane": 9}]}
             ]
         });
@@ -526,13 +526,14 @@ fn names(list: &[&str]) -> Vec<String> {
     list.iter().map(|name| name.to_string()).collect()
 }
 
-/// A file that marks two of its three panes, read with the setting on: the marked panes are not brought back, the tab
-/// that held both a marked and a plain pane keeps the plain one, the workspace whose only pane was marked is gone, no agent is
-/// resumed for a pane that is not there, and the first save keeps the file it replaced.
+/// A file that marks two of its three panes, neither holding an agent session, read with the setting on: the marked panes are
+/// not brought back, the tab that held both a marked and a plain pane keeps the plain one, the workspace whose only pane was
+/// marked is gone, and the first save keeps the file it replaced.
 #[test]
 fn a_start_with_the_setting_on_leaves_out_the_marked_panes_and_keeps_a_copy_of_the_old_file() {
     let setup = Setup {
         marked: &[7, 9],
+        sessions: &[],
         ..Setup::new(Some(true))
     };
     let world = World::new(&setup);
@@ -548,11 +549,6 @@ fn a_start_with_the_setting_on_leaves_out_the_marked_panes_and_keeps_a_copy_of_t
         world.diagnostics()
     );
     assert_eq!(world.workspace_count(), 1);
-    assert_eq!(
-        world.agent_starts(),
-        0,
-        "an agent was resumed for a pane that is not there"
-    );
     server.stop(&world);
 
     assert_eq!(
@@ -575,18 +571,19 @@ fn a_start_with_the_setting_on_leaves_out_the_marked_panes_and_keeps_a_copy_of_t
     );
 }
 
-/// The same file with the setting off or absent: every pane comes back as before, the fake agent is resumed in both agent
-/// panes, nothing is copied aside, and the layout saved at the stop carries no mark anywhere.
+/// The same file with the setting off or absent: every pane comes back as before, nothing is copied aside, and the layout saved
+/// at the stop carries no mark anywhere. The marked panes hold no session, so they are the ones the setting would leave out.
 #[test]
 fn with_the_setting_off_or_absent_every_pane_comes_back_whatever_the_file_says() {
     for setting in [None, Some(false)] {
         let setup = Setup {
             marked: &[7, 9],
+            sessions: &[],
             ..Setup::new(setting)
         };
         let world = World::new(&setup);
         let server = world.start();
-        world.wait_until("both agents to be resumed", |w| w.agent_starts() == 2);
+        world.wait_until("the panes to be listed", |w| w.pane_names().len() == 3);
         assert_eq!(
             world.pane_names(),
             names(&["p7", "p8", "p9"]),
@@ -606,16 +603,91 @@ fn with_the_setting_off_or_absent_every_pane_comes_back_whatever_the_file_says()
 }
 
 /// Nothing marked, the setting on: a plain shell and agent panes alike come back, and nothing is copied aside. This is the
-/// the user's own shell tabs: a pane is never left out for being a shell.
+/// the user's own shell tabs: a pane is never left out for being a shell. And the stop that follows, with both agents running
+/// and detected, marks nothing: a stop that marked the fleet would drop every agent pane at the next start.
 #[test]
-fn a_file_without_marks_restores_every_pane_with_the_setting_on() {
+fn a_file_without_marks_restores_every_pane_with_the_setting_on_and_a_stop_with_running_agents_marks_none(
+) {
     let world = World::new(&Setup::new(Some(true)));
     let server = world.start();
     world.wait_until("both agents to be resumed", |w| w.agent_starts() == 2);
     assert_eq!(world.pane_names(), names(&["p7", "p8", "p9"]));
     assert_eq!(world.workspace_count(), 2);
+    world.wait_for_agents_detected(2);
     server.stop(&world);
     assert!(world.backups().is_empty());
+    assert_eq!(
+        world.saved_panes(),
+        vec![
+            ("p7".to_string(), false),
+            ("p8".to_string(), false),
+            ("p9".to_string(), false)
+        ],
+        "a stop with running agents wrote a mark\n{}",
+        world.diagnostics()
+    );
+
+    let server = world.start();
+    world.wait_until("the panes to be listed", |w| w.pane_names().len() == 3);
+    assert_eq!(world.pane_names(), names(&["p7", "p8", "p9"]));
+    assert_eq!(world.workspace_count(), 2);
+    server.stop(&world);
+}
+
+/// A marked pane that still holds an agent session is a resume the start would make, so it is kept and resumed, while a marked
+/// pane with nothing to resume goes. The file loses something, so the first save keeps a copy of it.
+#[test]
+fn a_marked_pane_that_still_holds_a_session_is_kept_and_resumed_while_a_marked_shell_goes() {
+    let setup = Setup {
+        marked: &[7, 9],
+        sessions: &[9],
+        ..Setup::new(Some(true))
+    };
+    let world = World::new(&setup);
+    let original = fs::read(world.session_file()).unwrap();
+    let server = world.start();
+    world.wait_until("the kept agent pane to be resumed", |w| {
+        w.agent_starts() == 1
+    });
+    assert_eq!(
+        world.pane_names(),
+        names(&["p8", "p9"]),
+        "{}",
+        world.diagnostics()
+    );
+    assert_eq!(world.workspace_count(), 2);
+    server.stop(&world);
+
+    assert_eq!(
+        world.saved_panes(),
+        vec![("p8".to_string(), false), ("p9".to_string(), false)],
+        "the mark of a pane that was kept stays in the file, or the pane that went is still there\n{}",
+        world.diagnostics()
+    );
+    let backups = world.backups();
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(fs::read(&backups[0]).unwrap(), original);
+}
+
+/// Every marked pane holds an agent session, so nothing is left out: every pane comes back, both agents are resumed, and no
+/// copy of the file is made, because the start did not take anything out of it.
+#[test]
+fn a_file_whose_marked_panes_all_hold_a_session_leaves_nothing_out_and_copies_nothing_aside() {
+    let setup = Setup {
+        marked: &[7, 9],
+        sessions: &[7, 9],
+        ..Setup::new(Some(true))
+    };
+    let world = World::new(&setup);
+    let server = world.start();
+    world.wait_until("both agents to be resumed", |w| w.agent_starts() == 2);
+    assert_eq!(world.pane_names(), names(&["p7", "p8", "p9"]));
+    assert_eq!(world.workspace_count(), 2);
+    server.stop(&world);
+    assert!(
+        world.backups().is_empty(),
+        "nothing was left out, so nothing is copied aside"
+    );
 }
 
 /// The whole path: a resumed agent ends and leaves its shell, the server saves the pane marked, and the next start with the
@@ -653,11 +725,6 @@ fn a_pane_whose_agent_ended_is_marked_by_the_server_and_left_out_at_the_next_sta
         world.diagnostics()
     );
     assert_eq!(world.workspace_count(), 1);
-    assert_eq!(
-        world.agent_starts(),
-        2,
-        "an ended agent was resumed again at the next start"
-    );
     server.stop(&world);
 }
 
@@ -775,7 +842,7 @@ fn the_mark_crosses_a_live_handoff_and_no_pane_is_left_out_of_it() {
 #[test]
 fn the_kept_pane_keeps_its_saved_screen_when_marked_panes_are_left_out() {
     let setup = Setup {
-        agents: false,
+        sessions: &[],
         pane_history: true,
         ..Setup::new(Some(true))
     };
