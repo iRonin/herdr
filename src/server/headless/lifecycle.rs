@@ -104,7 +104,7 @@ impl HeadlessServer {
                     .terminals
                     .get(terminal_id)
                     .is_some_and(|terminal| {
-                        terminal.ended_agent_shell_for_save(std::time::Instant::now(), || {
+                        terminal.ended_agent_shell_for_save(|| {
                             runtime
                                 .child_pid()
                                 .is_some_and(crate::detect::pane_shell_is_idle)

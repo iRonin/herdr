@@ -467,9 +467,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # close_pane_when_resumed_agent_exits = false
 
 # Do not bring back, at the next start, a pane whose agent has ended and left its shell idle at the
-# prompt. A pane you typed into afterwards, and a plain shell that never held an agent, come back as
-# before. The first save after a start that drops panes keeps a copy of the old session.json in
-# session-backups. Read when the server starts.
+# prompt. A pane you typed into afterwards, a plain shell that never held an agent, and a pane that
+# still holds an agent session to resume come back as before. The first save after a start that
+# drops panes keeps a copy of the old session.json in session-backups. Read when the server starts.
 # skip_ended_agent_panes_on_restore = false
 
 [remote]

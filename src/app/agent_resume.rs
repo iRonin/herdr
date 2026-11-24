@@ -343,8 +343,6 @@ impl App {
             terminal.pending_agent_resume_plan = None;
             terminal.respawn_shell_on_exit = false;
             terminal.closes_when_resumed_agent_exits = ends_with_agent.is_some();
-            // If no agent ever shows up (the command fails at once), this is how a later save tells the shell is a leftover.
-            terminal.note_resume_typed(Instant::now());
         }
         true
     }

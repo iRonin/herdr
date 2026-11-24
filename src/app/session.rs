@@ -68,7 +68,7 @@ impl App {
         &self,
         snapshot: &mut crate::persist::SessionSnapshot,
     ) {
-        self.annotate_ended_agent_panes_with(snapshot, Instant::now(), &|terminal_id| {
+        self.annotate_ended_agent_panes_with(snapshot, &|terminal_id| {
             self.terminal_runtimes
                 .get(terminal_id)
                 .and_then(|runtime| runtime.child_pid())
@@ -79,7 +79,6 @@ impl App {
     pub(super) fn annotate_ended_agent_panes_with(
         &self,
         snapshot: &mut crate::persist::SessionSnapshot,
-        now: Instant,
         shell_idle: &dyn Fn(&crate::terminal::TerminalId) -> bool,
     ) {
         if !self.state.skip_ended_agent_panes_on_restore {
@@ -89,7 +88,6 @@ impl App {
             snapshot,
             &self.state.workspaces,
             &self.state.terminals,
-            now,
             shell_idle,
         );
     }

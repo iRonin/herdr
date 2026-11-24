@@ -139,22 +139,16 @@ struct RecentAgentProcessExit {
 
 /// What the shell of a pane may be a leftover of. It is how a pane whose agent ended is told from a plain shell the user
 /// opened and never ran an agent in. In memory only: `[session] skip_ended_agent_panes_on_restore` turns it into a mark in
-/// the saved layout at save time (see `ended_agent_shell_for_save`).
+/// the saved layout at save time (see `ended_agent_shell_for_save`). Only an agent herdr saw end sets it. A resume that
+/// never produced an agent does not: that pane keeps its saved session and the next start retries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShellLeftover {
     /// Nothing is known to have run in this pane's shell, or something was typed into it since.
     #[default]
     None,
-    /// herdr typed a resume command into the shell at `at` and has seen no agent end since.
-    ResumeTyped { at: Instant },
     /// An agent ran in this pane and herdr saw it end, and nothing was typed into the shell since.
     AgentEnded,
 }
-
-/// How long after a resume command was typed a pane that still shows an idle shell counts as one whose resume failed.
-/// A resumed pane's shell can take 13.7 to 32.5 s to reach its prompt under load, so an idle foreground is no evidence
-/// before then.
-pub const RESUME_FAILED_GRACE: Duration = Duration::from_secs(180);
 
 /// `/compact` can perform substantial work without emitting a lifecycle event.
 /// Keep its display-only Working projection bounded even if no later report arrives.
@@ -550,11 +544,6 @@ impl TerminalState {
         self.shell_leftover = ShellLeftover::AgentEnded;
     }
 
-    /// herdr typed a resume command into this pane's shell at `at`.
-    pub(crate) fn note_resume_typed(&mut self, at: Instant) {
-        self.shell_leftover = ShellLeftover::ResumeTyped { at };
-    }
-
     /// Input reached this pane's shell. Returns true only when it removed a mark, which is when a save is owed.
     pub(crate) fn note_shell_input(&mut self) -> bool {
         let had_mark = self.shell_leftover != ShellLeftover::None;
@@ -562,22 +551,10 @@ impl TerminalState {
         had_mark
     }
 
-    /// Whether a save made at `now` marks this pane: its agent ended (or its resume failed, `RESUME_FAILED_GRACE` after
-    /// the command was typed) and its shell is idle at the prompt. `shell_idle` is called only when the rest says yes, so the
-    /// process lookup it stands for is not made for a pane that cannot be marked.
-    pub(crate) fn ended_agent_shell_for_save(
-        &self,
-        now: Instant,
-        shell_idle: impl FnOnce() -> bool,
-    ) -> bool {
-        let due = match self.shell_leftover {
-            ShellLeftover::None => false,
-            ShellLeftover::AgentEnded => true,
-            ShellLeftover::ResumeTyped { at } => {
-                now.saturating_duration_since(at) >= RESUME_FAILED_GRACE
-            }
-        };
-        due && shell_idle()
+    /// Whether a save marks this pane: its agent ended and its shell is idle at the prompt. `shell_idle` is called only for a
+    /// pane whose agent ended, so the process lookup it stands for is made for no other pane, however many agents run.
+    pub(crate) fn ended_agent_shell_for_save(&self, shell_idle: impl FnOnce() -> bool) -> bool {
+        self.shell_leftover == ShellLeftover::AgentEnded && shell_idle()
     }
 
     fn clear_compact_input_state(&mut self) {
@@ -7352,71 +7329,33 @@ mod tests {
     /// A shell that held an agent which ended is a leftover once it is idle; a shell that never held one is not.
     #[test]
     fn a_leftover_shell_is_marked_only_when_an_agent_ended_here_and_the_shell_is_idle() {
-        let now = Instant::now();
         let mut terminal = test_terminal();
         assert_eq!(terminal.shell_leftover, ShellLeftover::None);
         assert!(
-            !terminal.ended_agent_shell_for_save(now, || panic!("a plain shell is never probed")),
+            !terminal.ended_agent_shell_for_save(|| panic!("a plain shell is never probed")),
             "a plain shell the user opened must never be marked"
         );
 
         terminal.note_agent_released();
         assert_eq!(terminal.shell_leftover, ShellLeftover::AgentEnded);
-        assert!(terminal.ended_agent_shell_for_save(now, || true));
+        assert!(terminal.ended_agent_shell_for_save(|| true));
         assert!(
-            !terminal.ended_agent_shell_for_save(now, || false),
+            !terminal.ended_agent_shell_for_save(|| false),
             "an ended agent whose shell has something running in it is in use"
         );
     }
 
-    /// A resume that was typed and never produced an agent counts only after the grace, and only with an idle shell. The
-    /// agent state herdr holds cannot decide it: a resumed pane is seeded as an idle agent whether or not the agent starts.
+    /// A pane herdr resumed holds a saved session and the agent state of an idle agent whether or not the agent ever started.
+    /// Neither makes it a leftover: only an agent seen ending does, and a pane that only looks like an agent is never probed.
     #[test]
-    fn a_resume_that_never_became_an_agent_is_marked_at_the_grace_and_not_before() {
-        let typed_at = Instant::now();
+    fn a_pane_that_holds_an_agent_session_is_never_probed_until_its_agent_ends() {
         let mut terminal = test_terminal();
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
         assert!(terminal.is_agent_terminal());
-        terminal.note_resume_typed(typed_at);
-        assert_eq!(
-            terminal.shell_leftover,
-            ShellLeftover::ResumeTyped { at: typed_at }
-        );
-
-        // Three minutes written out, not RESUME_FAILED_GRACE: a test that follows the constant passes whatever it is set to.
-        let grace = Duration::from_secs(180);
-        let before = typed_at + grace - Duration::from_millis(1);
         assert!(
-            !terminal.ended_agent_shell_for_save(before, || panic!("not probed before the grace")),
-            "a shell can take half a minute to reach its prompt: idle is no evidence yet"
-        );
-        let due = typed_at + grace;
-        assert!(terminal.ended_agent_shell_for_save(due, || true));
-        assert!(
-            !terminal.ended_agent_shell_for_save(due, || false),
-            "a busy shell after the grace is an agent that runs"
-        );
-        assert!(
-            terminal.ended_agent_shell_for_save(due + Duration::from_secs(3600), || true),
-            "the grace is a lower bound, not a window"
-        );
-    }
-
-    #[test]
-    fn the_grace_is_three_minutes() {
-        assert_eq!(RESUME_FAILED_GRACE, Duration::from_secs(180));
-    }
-
-    #[test]
-    fn an_agent_that_ends_after_a_resume_turns_the_pending_grace_into_ended_at_once() {
-        let now = Instant::now();
-        let mut terminal = test_terminal();
-        terminal.note_resume_typed(now);
-        terminal.note_agent_released();
-        assert_eq!(terminal.shell_leftover, ShellLeftover::AgentEnded);
-        assert!(
-            terminal.ended_agent_shell_for_save(now, || true),
-            "an agent that was seen ending needs no grace"
+            !terminal
+                .ended_agent_shell_for_save(|| panic!("a running agent's pane is never probed")),
+            "an agent that runs, or is yet to start, is no leftover"
         );
     }
 
@@ -7432,10 +7371,6 @@ mod tests {
         assert!(terminal.note_shell_input());
         assert_eq!(terminal.shell_leftover, ShellLeftover::None);
         assert!(!terminal.note_shell_input(), "already clear");
-
-        terminal.note_resume_typed(Instant::now());
-        assert!(terminal.note_shell_input());
-        assert_eq!(terminal.shell_leftover, ShellLeftover::None);
     }
 
     #[test]

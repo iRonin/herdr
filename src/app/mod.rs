@@ -441,13 +441,14 @@ impl App {
                 false,
             );
         }
-        // With the setting on, panes whose agent ended are left out of this restore. That removes something from the layout
-        // that is saved next, so the first save keeps a copy of the file it replaces, as it does for a session that failed to
-        // load.
-        let leaves_ended_panes_out = config.session.skip_ended_agent_panes_on_restore.enabled()
+        // With the setting on, panes whose agent ended are left out of this restore. A pane that carries the mark and still holds
+        // something to resume stays. When a pane does go, something is removed from the layout that is saved next, so the first
+        // save keeps a copy of the file it replaces, as it does for a session that failed to load.
+        let skips_ended_panes = config.session.skip_ended_agent_panes_on_restore.enabled();
+        let leaves_ended_panes_out = skips_ended_panes
             && snapshot
                 .as_ref()
-                .is_some_and(crate::persist::has_ended_agent_panes);
+                .is_some_and(crate::persist::has_droppable_ended_agent_panes);
         let session_writer = Arc::new(std::sync::Mutex::new(crate::persist::SessionWriter::new(
             (policy.restore_session && snapshot.is_none()) || leaves_ended_panes_out,
         )));
@@ -457,18 +458,21 @@ impl App {
                 .pane_history
                 .then(crate::persist::load_history)
                 .flatten();
-            if leaves_ended_panes_out {
+            if skips_ended_panes {
+                // A file with no mark, or with only marks that stay, comes out as it went in.
                 let dropped = crate::persist::prune_ended_agent_panes(&mut snap, &mut history);
-                // A workspace that went may still be named by something saved or typed earlier: its id is not reissued.
-                crate::workspace::reserve_workspace_id_names(
-                    dropped.workspace_ids.iter().map(String::as_str),
-                );
-                info!(
-                    panes = dropped.panes,
-                    tabs = dropped.tabs,
-                    workspaces = dropped.workspaces,
-                    "left panes whose agent ended out of the restored session"
-                );
+                if dropped.panes > 0 {
+                    // A workspace that went may still be named by something saved or typed earlier: its id is not reissued.
+                    crate::workspace::reserve_workspace_id_names(
+                        dropped.workspace_ids.iter().map(String::as_str),
+                    );
+                    info!(
+                        panes = dropped.panes,
+                        tabs = dropped.tabs,
+                        workspaces = dropped.workspaces,
+                        "left panes whose agent ended out of the restored session"
+                    );
+                }
             }
             let (ws, terminals, terminal_runtimes) = crate::persist::restore(
                 &snap,
@@ -2333,9 +2337,7 @@ mod tests {
         for setting in [false, true] {
             let app = app_with_a_leftover_shell(setting);
             let mut snapshot = capture_of(&app);
-            app.annotate_ended_agent_panes_with(&mut snapshot, std::time::Instant::now(), &|_| {
-                true
-            });
+            app.annotate_ended_agent_panes_with(&mut snapshot, &|_| true);
             assert_eq!(
                 marked_panes(&snapshot),
                 usize::from(setting),

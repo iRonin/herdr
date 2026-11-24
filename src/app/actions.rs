@@ -552,8 +552,12 @@ impl AppState {
         let Some(terminal) = self.terminals.get_mut(terminal_id) else {
             return false;
         };
-        // Input makes the shell the user's again: it is no leftover of an agent that ended.
-        if !bytes.is_empty() && terminal.note_shell_input() {
+        // Input makes the shell the user's again: it is no leftover of an agent that ended. A save is owed for that only while
+        // the setting is on: with it off input must cost what it always did.
+        if !bytes.is_empty()
+            && terminal.note_shell_input()
+            && self.skip_ended_agent_panes_on_restore
+        {
             self.session_dirty = true;
         }
         terminal.note_forwarded_input(bytes)
@@ -584,10 +588,11 @@ impl AppState {
         let Some(terminal) = self.terminals.get_mut(terminal_id) else {
             return false;
         };
-        // A key release is not input.
+        // A key release is not input. As for bytes, a save is owed only while the setting is on.
         if !encoded.is_empty()
             && key.kind != crossterm::event::KeyEventKind::Release
             && terminal.note_shell_input()
+            && self.skip_ended_agent_panes_on_restore
         {
             self.session_dirty = true;
         }
@@ -627,7 +632,10 @@ impl AppState {
         bytes: &[u8],
     ) {
         if let Some(terminal) = self.terminals.get_mut(terminal_id) {
-            if !bytes.is_empty() && terminal.note_shell_input() {
+            if !bytes.is_empty()
+                && terminal.note_shell_input()
+                && self.skip_ended_agent_panes_on_restore
+            {
                 self.session_dirty = true;
             }
             terminal.note_forwarded_bracketed_paste(bytes);

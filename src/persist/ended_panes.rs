@@ -4,13 +4,18 @@
 //! that reads such a file runs `prune_ended_agent_panes` over the loaded snapshot and the loaded pane history, before the
 //! unchanged `restore`, so everything `restore` indexes by position (the history, `active`, `selected`, `active_tab`) is fixed in
 //! one place.
+//!
+//! Only a mark on a pane with nothing to resume is acted on. An agent that ended has already lost its saved session, so such a
+//! pane holds none. A pane that still holds a session or a reported resume command is one the next start would resume: a failed
+//! resume keeps its session so that a later start can retry it, and dropping those panes would turn one failure that hits every
+//! resumed pane at once into every agent pane gone. A mark on one is kept and logged, and the next save no longer writes it.
 
 use std::collections::HashSet;
 
 use tracing::{info, warn};
 
 use super::snapshot::{
-    layout_fingerprint, match_history_to_layout, HistoryLayoutMatch, LayoutSnapshot,
+    layout_fingerprint, match_history_to_layout, HistoryLayoutMatch, LayoutSnapshot, PaneSnapshot,
     SessionHistorySnapshot, SessionSnapshot, TabSnapshot, WorkspaceHistorySnapshot,
     WorkspaceSnapshot,
 };
@@ -25,17 +30,54 @@ pub struct DroppedEndedPanes {
     pub workspace_ids: Vec<String>,
 }
 
-/// Whether any pane of the snapshot carries the mark.
-pub fn has_ended_agent_panes(snapshot: &SessionSnapshot) -> bool {
+/// Whether the pass leaves this pane out: it carries the mark and holds nothing to resume.
+fn is_left_out(pane: &PaneSnapshot) -> bool {
+    pane.agent_ended && pane.agent_session.is_none() && pane.agent_resume.is_none()
+}
+
+/// Whether the pass would leave any pane of the snapshot out. This is what decides whether a start takes something out of the
+/// saved file, and so whether the first save after it keeps a copy of the file it replaces.
+pub fn has_droppable_ended_agent_panes(snapshot: &SessionSnapshot) -> bool {
     snapshot
         .workspaces
         .iter()
         .flat_map(|workspace| &workspace.tabs)
         .flat_map(|tab| tab.panes.values())
-        .any(|pane| pane.agent_ended)
+        .any(is_left_out)
 }
 
-/// Removes every marked pane from the snapshot, and from the history in step with it: the layout of a tab that loses a pane,
+/// Logs, at WARN, every pane that carries the mark and still holds something to resume, because the pass keeps it.
+fn warn_about_marks_that_stay(snapshot: &SessionSnapshot) {
+    for workspace in &snapshot.workspaces {
+        for (tab_index, tab) in workspace.tabs.iter().enumerate() {
+            let tab_number = workspace
+                .public_tab_numbers
+                .get(tab_index)
+                .copied()
+                .unwrap_or(tab_index + 1);
+            let mut kept: Vec<(&u32, &PaneSnapshot)> = tab
+                .panes
+                .iter()
+                .filter(|(_, pane)| pane.agent_ended && !is_left_out(pane))
+                .collect();
+            kept.sort_unstable_by_key(|(id, _)| **id);
+            for (_, pane) in kept {
+                warn!(
+                    event = "persist.restore.keep_marked_pane",
+                    workspace = workspace.id.as_deref().unwrap_or_default(),
+                    workspace_name = workspace.custom_name.as_deref(),
+                    tab = tab_number,
+                    cwd = %pane.cwd.display(),
+                    agent_session = pane.agent_session.as_ref().map(|session| session.value.as_str()),
+                    agent_resume = pane.agent_resume.as_ref().map(|resume| resume.argv.join(" ")),
+                    "keeping a pane marked as an ended agent's shell: it still holds an agent to resume"
+                );
+            }
+        }
+    }
+}
+
+/// Removes every pane that carries the mark and holds nothing to resume from the snapshot, and from the history in step with it: the layout of a tab that loses a pane,
 /// the tab that loses all of them, the workspace that loses every tab, and the indices that pointed past them.
 ///
 /// A history that does not belong to the saved layout (`match_history_to_layout` says `Mismatch`, or its shape differs) is
@@ -47,7 +89,8 @@ pub fn prune_ended_agent_panes(
     history: &mut Option<SessionHistorySnapshot>,
 ) -> DroppedEndedPanes {
     let mut dropped = DroppedEndedPanes::default();
-    if !has_ended_agent_panes(snapshot) {
+    warn_about_marks_that_stay(snapshot);
+    if !has_droppable_ended_agent_panes(snapshot) {
         return dropped;
     }
 
@@ -77,7 +120,7 @@ pub fn prune_ended_agent_panes(
         let loses_something = workspace
             .tabs
             .iter()
-            .any(|tab| tab.panes.values().any(|pane| pane.agent_ended));
+            .any(|tab| tab.panes.values().any(is_left_out));
         if !loses_something {
             workspace_survives.push(true);
             kept_workspaces.push(workspace);
@@ -149,13 +192,12 @@ fn prune_workspace(
     let mut kept_tab_numbers = Vec::new();
     let mut dropped_pane_ids: HashSet<u32> = HashSet::new();
 
-    for (tab_index, (mut tab, tab_number)) in old_tabs.into_iter().zip(old_tab_numbers).enumerate()
-    {
+    for (mut tab, tab_number) in old_tabs.into_iter().zip(old_tab_numbers) {
         let history_tab = history_tabs.as_mut().and_then(std::iter::Iterator::next);
         let mut ended: Vec<u32> = tab
             .panes
             .iter()
-            .filter(|(_, pane)| pane.agent_ended)
+            .filter(|(_, pane)| is_left_out(pane))
             .map(|(id, _)| *id)
             .collect();
         ended.sort_unstable();
@@ -164,9 +206,11 @@ fn prune_workspace(
             info!(
                 event = "persist.restore.skip_ended_pane",
                 workspace = %workspace_label,
-                tab = tab_index,
+                workspace_name = workspace.custom_name.as_deref(),
+                tab = tab_number,
                 cwd = %pane.cwd.display(),
                 agent_session = pane.agent_session.as_ref().map(|session| session.value.as_str()),
+                agent_resume = pane.agent_resume.as_ref().map(|resume| resume.argv.join(" ")),
                 "leaving out a pane whose agent ended and left its shell idle"
             );
         }
@@ -474,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn has_ended_agent_panes_sees_a_mark_anywhere_in_the_snapshot() {
+    fn has_droppable_ended_agent_panes_sees_a_mark_anywhere_in_the_snapshot() {
         let marked = session(
             vec![
                 workspace("w1", &[&[plain(1)]]),
@@ -483,7 +527,7 @@ mod tests {
             Some(0),
             0,
         );
-        assert!(has_ended_agent_panes(&marked));
+        assert!(has_droppable_ended_agent_panes(&marked));
         let unmarked = session(
             vec![
                 workspace("w1", &[&[plain(1)]]),
@@ -492,7 +536,7 @@ mod tests {
             Some(0),
             0,
         );
-        assert!(!has_ended_agent_panes(&unmarked));
+        assert!(!has_droppable_ended_agent_panes(&unmarked));
     }
 
     use super::super::snapshot::{PaneAgentResumeSnapshot, PaneAgentSessionSnapshot};
@@ -528,15 +572,15 @@ mod tests {
     /// keeps its session so the next start retries it, and this pass must never turn one resume failure across the fleet into
     /// every pane gone. Only a mark with nothing to resume is acted on.
     #[test]
-    fn has_ended_agent_panes_ignores_a_mark_on_a_pane_that_holds_a_session_or_a_resume() {
+    fn has_droppable_ended_agent_panes_ignores_a_mark_on_a_pane_that_holds_a_session_or_a_resume() {
         let build = || session(vec![workspace("w1", &[&[plain(1), ended(2)]])], Some(0), 0);
         let mut with_session = build();
         give_session(&mut with_session, 0, 0, 2);
-        assert!(!has_ended_agent_panes(&with_session));
+        assert!(!has_droppable_ended_agent_panes(&with_session));
         let mut with_resume = build();
         give_resume(&mut with_resume, 0, 0, 2);
-        assert!(!has_ended_agent_panes(&with_resume));
-        assert!(has_ended_agent_panes(&build()));
+        assert!(!has_droppable_ended_agent_panes(&with_resume));
+        assert!(has_droppable_ended_agent_panes(&build()));
     }
 
     #[test]

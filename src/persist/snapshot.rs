@@ -415,7 +415,6 @@ pub fn annotate_ended_agent_panes(
     snapshot: &mut SessionSnapshot,
     workspaces: &[Workspace],
     terminals: &HashMap<crate::terminal::TerminalId, crate::terminal::TerminalState>,
-    now: std::time::Instant,
     shell_idle: &dyn Fn(&crate::terminal::TerminalId) -> bool,
 ) {
     for (snapshot_workspace, workspace) in snapshot.workspaces.iter_mut().zip(workspaces) {
@@ -427,7 +426,7 @@ pub fn annotate_ended_agent_panes(
                 let Some(terminal) = terminals.get(terminal_id) else {
                     continue;
                 };
-                if !terminal.ended_agent_shell_for_save(now, || shell_idle(terminal_id)) {
+                if !terminal.ended_agent_shell_for_save(|| shell_idle(terminal_id)) {
                     continue;
                 }
                 if let Some(pane) = snapshot_tab.panes.get_mut(&pane_id.raw()) {
@@ -881,7 +880,6 @@ mod tests {
 
     fn annotated(
         state: &AppState,
-        now: std::time::Instant,
         shell_idle: &dyn Fn(&crate::terminal::TerminalId) -> bool,
     ) -> SessionSnapshot {
         let mut snapshot = capture_from_state(state);
@@ -889,7 +887,6 @@ mod tests {
             &mut snapshot,
             &state.workspaces,
             &state.terminals,
-            now,
             shell_idle,
         );
         snapshot
@@ -912,75 +909,50 @@ mod tests {
     #[test]
     fn annotate_marks_only_the_panes_whose_shell_is_a_leftover_and_idle() {
         use crate::terminal::state::ShellLeftover;
-        let now = std::time::Instant::now();
-        let state = state_with_leftovers(
-            &["ended", "plain", "ended-busy"],
+        let mut state = state_with_leftovers(
+            &["ended", "plain", "ended-busy", "running"],
             &[
                 ShellLeftover::AgentEnded,
                 ShellLeftover::None,
                 ShellLeftover::AgentEnded,
+                ShellLeftover::None,
             ],
         );
-        let busy = state.workspaces[2].tabs[0].panes[&state.workspaces[2].tabs[0].root_pane]
-            .attached_terminal_id
-            .clone();
+        let terminal_of = |state: &AppState, index: usize| {
+            state.workspaces[index].tabs[0].panes[&state.workspaces[index].tabs[0].root_pane]
+                .attached_terminal_id
+                .clone()
+        };
+        let busy = terminal_of(&state, 2);
+        // A pane whose agent runs is the common one on a server: it must cost a save nothing.
+        let running = terminal_of(&state, 3);
+        state
+            .terminals
+            .get_mut(&running)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Pi),
+                crate::detect::AgentState::Working,
+            );
         let asked = std::cell::RefCell::new(Vec::new());
-        let snapshot = annotated(&state, now, &|terminal_id| {
+        let snapshot = annotated(&state, &|terminal_id| {
             asked.borrow_mut().push(terminal_id.clone());
             *terminal_id != busy
         });
 
         assert_eq!(
             marks_by_workspace(&snapshot),
-            vec![true, false, false],
-            "an ended pane with an idle shell is marked; a plain shell and an ended pane with something running in it are not"
+            vec![true, false, false, false],
+            "an ended pane with an idle shell is marked; a plain shell, a running agent and an ended pane with something running in it are not"
         );
-        let plain = state.workspaces[1].tabs[0].panes[&state.workspaces[1].tabs[0].root_pane]
-            .attached_terminal_id
-            .clone();
+        let plain = terminal_of(&state, 1);
         assert!(
             !asked.borrow().contains(&plain),
-            "the process lookup is made only for a pane that can be marked"
+            "the process lookup is made only for a pane whose agent ended"
         );
-    }
-
-    #[test]
-    fn annotate_marks_a_failed_resume_only_after_the_grace_and_only_with_an_idle_shell() {
-        use crate::terminal::state::ShellLeftover;
-        let typed_at = std::time::Instant::now();
-        let mut state =
-            state_with_leftovers(&["resume"], &[ShellLeftover::ResumeTyped { at: typed_at }]);
-        // A pane restored with a resume plan is seeded as an idle agent whether or not the agent ever starts, so the agent
-        // state says nothing about whether one runs.
-        let tab = &state.workspaces[0].tabs[0];
-        let terminal_id = tab.panes[&tab.root_pane].attached_terminal_id.clone();
-        state
-            .terminals
-            .get_mut(&terminal_id)
-            .unwrap()
-            .set_detected_state(
-                Some(crate::detect::Agent::Pi),
-                crate::detect::AgentState::Idle,
-            );
-        let idle = |_: &crate::terminal::TerminalId| true;
-        let busy = |_: &crate::terminal::TerminalId| false;
-        // Three minutes written out, not RESUME_FAILED_GRACE: a test that follows the constant passes whatever it is set to.
-        let grace = std::time::Duration::from_secs(180);
-        let almost = typed_at + grace - std::time::Duration::from_secs(1);
-        let due = typed_at + grace;
-
-        assert_eq!(
-            marks_by_workspace(&annotated(&state, almost, &idle)),
-            vec![false]
-        );
-        assert_eq!(
-            marks_by_workspace(&annotated(&state, due, &idle)),
-            vec![true]
-        );
-        assert_eq!(
-            marks_by_workspace(&annotated(&state, due, &busy)),
-            vec![false],
-            "a resumed pane whose shell is busy (the agent runs, or the shell is still starting) is not a leftover"
+        assert!(
+            !asked.borrow().contains(&running),
+            "the process lookup is made for a pane whose agent runs"
         );
     }
 
@@ -999,7 +971,7 @@ mod tests {
             .clone();
         state.terminals.get_mut(&target).unwrap().shell_leftover = ShellLeftover::AgentEnded;
 
-        let snapshot = annotated(&state, std::time::Instant::now(), &|_| true);
+        let snapshot = annotated(&state, &|_| true);
 
         let first_tab = &snapshot.workspaces[0].tabs[0].panes;
         assert!(first_tab[&split.raw()].agent_ended);
