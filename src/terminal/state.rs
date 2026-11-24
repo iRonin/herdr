@@ -370,6 +370,10 @@ pub struct TerminalState {
     /// What this pane's shell is a leftover of. Never saved as such: a save with `skip_ended_agent_panes_on_restore` on
     /// derives the mark from it.
     pub shell_leftover: ShellLeftover,
+    /// A save found the shell of a pane marked `AgentEnded` idle, and nothing has been typed into it or ended in it since: the
+    /// answer is kept so the process lookup is not repeated at every save. An atomic because a save reads the state through a
+    /// shared reference.
+    ended_shell_found_idle: std::sync::atomic::AtomicBool,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
@@ -434,6 +438,7 @@ impl TerminalState {
             respawn_shell_on_exit: false,
             closes_when_resumed_agent_exits: false,
             shell_leftover: ShellLeftover::None,
+            ended_shell_found_idle: std::sync::atomic::AtomicBool::new(false),
             recent_agent_process_exit: None,
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
@@ -542,6 +547,8 @@ impl TerminalState {
     /// An agent that ran in this pane's shell was released: it ended, and its shell is what is left.
     pub(crate) fn note_agent_released(&mut self) {
         self.shell_leftover = ShellLeftover::AgentEnded;
+        // What a save found about the shell before this agent ended says nothing about the shell now.
+        *self.ended_shell_found_idle.get_mut() = false;
     }
 
     /// Input reached this pane's shell. Returns true only when it removed a mark, which is when a save is owed.
@@ -552,9 +559,22 @@ impl TerminalState {
     }
 
     /// Whether a save marks this pane: its agent ended and its shell is idle at the prompt. `shell_idle` is called only for a
-    /// pane whose agent ended, so the process lookup it stands for is made for no other pane, however many agents run.
+    /// pane whose agent ended, so the process lookup it stands for is made for no other pane, however many agents run. A shell
+    /// found idle stays idle until something is typed into it, and typing removes the mark, so that answer is kept until another
+    /// agent ends in the pane and `shell_idle` is not asked again. A refusal is not kept: the shell may reach its prompt later.
     pub(crate) fn ended_agent_shell_for_save(&self, shell_idle: impl FnOnce() -> bool) -> bool {
-        self.shell_leftover == ShellLeftover::AgentEnded && shell_idle()
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.shell_leftover != ShellLeftover::AgentEnded {
+            return false;
+        }
+        if self.ended_shell_found_idle.load(Relaxed) {
+            return true;
+        }
+        let idle = shell_idle();
+        if idle {
+            self.ended_shell_found_idle.store(true, Relaxed);
+        }
+        idle
     }
 
     fn clear_compact_input_state(&mut self) {
