@@ -400,13 +400,15 @@ async fn the_pane_exit_checkpoint_marks_an_ended_agents_idle_shell_only_while_th
             .get(&terminal_id)
             .and_then(|runtime| runtime.child_pid())
             .expect("the pane's shell runs");
+        // Waits with a blocking sleep: the test holds the config environment lock for its whole run, and a guard may not be
+        // held across an await. The shell is a separate process, so nothing here needs the runtime to make progress.
         let deadline = Instant::now() + WAIT;
         while !(ran.exists() && crate::detect::pane_shell_is_idle(child_pid)) {
             assert!(
                 Instant::now() < deadline,
                 "the shell never came back to its prompt"
             );
-            sleep(Duration::from_millis(20)).await;
+            std::thread::sleep(Duration::from_millis(20));
         }
         app.state
             .terminals

@@ -7345,6 +7345,41 @@ mod tests {
         );
     }
 
+    /// The process lookup is the costly part of marking (about a quarter of a millisecond a pane, measured), and it is made at every
+    /// save. A shell found idle stays idle until something is typed into it, and typing removes the mark, so one positive answer
+    /// holds until the next time an agent ends in the pane. A refusal is never remembered: the shell may reach its prompt later.
+    #[test]
+    fn an_ended_agents_shell_found_idle_is_not_probed_again_until_another_agent_ends() {
+        let mut terminal = test_terminal();
+        terminal.note_agent_released();
+        assert!(
+            !terminal.ended_agent_shell_for_save(|| false),
+            "a shell with something running in it is not marked"
+        );
+        assert!(
+            terminal.ended_agent_shell_for_save(|| true),
+            "a refusal must not be remembered: the shell may reach its prompt later"
+        );
+        assert!(
+            terminal
+                .ended_agent_shell_for_save(|| panic!("a shell found idle is asked about once")),
+            "a shell found idle and not typed into since stays marked"
+        );
+
+        assert!(terminal.note_shell_input());
+        assert!(
+            !terminal
+                .ended_agent_shell_for_save(|| panic!("a pane without a mark is never probed")),
+            "typing removes the mark"
+        );
+
+        terminal.note_agent_released();
+        assert!(
+            !terminal.ended_agent_shell_for_save(|| false),
+            "the answer about the earlier agent says nothing about the shell after the next one ended"
+        );
+    }
+
     /// A pane herdr resumed holds a saved session and the agent state of an idle agent whether or not the agent ever started.
     /// Neither makes it a leftover: only an agent seen ending does, and a pane that only looks like an agent is never probed.
     #[test]

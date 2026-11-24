@@ -956,6 +956,40 @@ mod tests {
         );
     }
 
+    /// A save asks the process table about an ended agent's shell once, not at every save while nothing is typed into it: a server
+    /// with a hundred such panes would otherwise pay for a hundred lookups on its loop at every save. The mark is the same at every
+    /// save.
+    #[test]
+    fn annotate_asks_about_an_ended_shell_once_across_saves() {
+        use crate::terminal::state::ShellLeftover;
+        let state = state_with_leftovers(
+            &["ended-a", "ended-b"],
+            &[ShellLeftover::AgentEnded, ShellLeftover::AgentEnded],
+        );
+        let asked = std::cell::Cell::new(0usize);
+        let first = annotated(&state, &|_| {
+            asked.set(asked.get() + 1);
+            true
+        });
+        assert_eq!(asked.get(), 2, "the first save asks about each ended shell");
+        let second = annotated(&state, &|_| {
+            asked.set(asked.get() + 1);
+            true
+        });
+        let third = annotated(&state, &|_| {
+            asked.set(asked.get() + 1);
+            true
+        });
+        assert_eq!(
+            asked.get(),
+            2,
+            "a later save asks nothing about a shell found idle"
+        );
+        assert_eq!(marks_by_workspace(&first), vec![true, true]);
+        assert_eq!(marks_by_workspace(&second), vec![true, true]);
+        assert_eq!(marks_by_workspace(&third), vec![true, true]);
+    }
+
     /// The mark lands on the pane that holds the terminal, in the right tab and workspace, not on a neighbour.
     #[test]
     fn annotate_marks_the_right_pane_in_a_workspace_with_several_tabs_and_splits() {
