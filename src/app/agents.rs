@@ -226,6 +226,9 @@ impl App {
         if let Some(session) = persisted_agent_session {
             terminal.set_managed_agent_launch_session(session);
         }
+        // The launch command went into the pane without passing a typed-input path. It is input all the same: the shell is no
+        // longer an ended agent's idle shell. The session is marked dirty below whether or not the setting is on.
+        terminal.note_shell_input();
         self.state.mark_session_dirty();
         self.schedule_session_save();
 

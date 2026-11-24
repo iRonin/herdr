@@ -2001,10 +2001,20 @@ impl AppState {
             let had_display_projection = terminal.optimistic_working_deadline().is_some()
                 && terminal.state != AgentState::Working;
             let resume_revision = terminal.reported_resume_revision();
+            let had_leftover_mark =
+                terminal.shell_leftover != crate::terminal::state::ShellLeftover::None;
             let mutation = update(terminal);
             terminal.reconcile_reported_resume();
             // Resume-only changes return no mutation but must still be saved.
             if terminal.reported_resume_revision() != resume_revision {
+                self.session_dirty = true;
+            }
+            // An update that removed the mark (a new agent process was detected in the pane) owes a save the way input does, and
+            // only while the setting would have written the mark: the saved layout may carry it already.
+            if had_leftover_mark
+                && terminal.shell_leftover == crate::terminal::state::ShellLeftover::None
+                && self.skip_ended_agent_panes_on_restore
+            {
                 self.session_dirty = true;
             }
             let mutation = mutation?;

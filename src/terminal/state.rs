@@ -143,10 +143,10 @@ struct RecentAgentProcessExit {
 /// never produced an agent does not: that pane keeps its saved session and the next start retries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShellLeftover {
-    /// Nothing is known to have run in this pane's shell, or something was typed into it since.
+    /// Nothing is known to have run in this pane's shell, or something was typed into it or an agent started in it since.
     #[default]
     None,
-    /// An agent ran in this pane and herdr saw it end, and nothing was typed into the shell since.
+    /// An agent ran in this pane and herdr saw it end, and since then nothing was typed into the shell and no agent started in it.
     AgentEnded,
 }
 
@@ -370,8 +370,8 @@ pub struct TerminalState {
     /// What this pane's shell is a leftover of. Never saved as such: a save with `skip_ended_agent_panes_on_restore` on
     /// derives the mark from it.
     pub shell_leftover: ShellLeftover,
-    /// A save found the shell of a pane marked `AgentEnded` idle, and nothing has been typed into it or ended in it since: the
-    /// answer is kept so the process lookup is not repeated at every save. An atomic because a save reads the state through a
+    /// A save found the shell of a pane marked `AgentEnded` idle, and no input has reached it and no agent has started or ended in
+    /// it since: the answer is kept so the process lookup is not repeated at every save. An atomic because a save reads the state through a
     /// shared reference.
     ended_shell_found_idle: std::sync::atomic::AtomicBool,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
@@ -560,8 +560,10 @@ impl TerminalState {
 
     /// Whether a save marks this pane: its agent ended and its shell is idle at the prompt. `shell_idle` is called only for a
     /// pane whose agent ended, so the process lookup it stands for is made for no other pane, however many agents run. A shell
-    /// found idle stays idle until something is typed into it, and typing removes the mark, so that answer is kept until another
-    /// agent ends in the pane and `shell_idle` is not asked again. A refusal is not kept: the shell may reach its prompt later.
+    /// found idle stays idle until input reaches it or an agent starts or ends in it. Input removes the mark, and so does a new
+    /// agent process detected in the pane (an agent can start without any input passing, as `herdr agent start` does), so that
+    /// answer is kept until another agent ends in the pane and `shell_idle` is not asked again. A refusal is not kept: the shell
+    /// may reach its prompt later.
     pub(crate) fn ended_agent_shell_for_save(&self, shell_idle: impl FnOnce() -> bool) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         if self.shell_leftover != ShellLeftover::AgentEnded {
@@ -600,6 +602,10 @@ impl TerminalState {
         agent: Agent,
         now: Instant,
     ) -> TerminalStateMutation {
+        // A new agent process in the pane means its shell is in use again, and it may have started without any input passing
+        // (`herdr agent start` writes the launch command straight to the pane). When this agent ends, `note_agent_released`
+        // marks the pane again.
+        self.shell_leftover = ShellLeftover::None;
         let starts_acquisition = !self
             .should_ignore_detected_state_under_full_lifecycle_hook(Some(agent), false)
             && !self.detected_state_observed_before_release_suppression(Some(agent), now);
@@ -7369,8 +7375,9 @@ mod tests {
     }
 
     /// The process lookup is the costly part of marking (about a quarter of a millisecond a pane, measured), and it is made at every
-    /// save. A shell found idle stays idle until something is typed into it, and typing removes the mark, so one positive answer
-    /// holds until the next time an agent ends in the pane. A refusal is never remembered: the shell may reach its prompt later.
+    /// save. A shell found idle stays idle until input reaches it or an agent starts or ends in it, and input and a new agent
+    /// remove the mark, so one positive answer holds until the next time an agent ends in the pane. A refusal is never remembered:
+    /// the shell may reach its prompt later.
     #[test]
     fn an_ended_agents_shell_found_idle_is_not_probed_again_until_another_agent_ends() {
         let mut terminal = test_terminal();
