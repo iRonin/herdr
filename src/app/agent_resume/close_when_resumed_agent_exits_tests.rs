@@ -337,6 +337,103 @@ async fn the_setting_is_read_when_the_command_is_typed_not_when_the_restore_plan
     }
 }
 
+/// Typing the resume command marks nothing. A resume that failed keeps its saved session and the next start retries it, so a
+/// pane whose resume did not produce an agent is no leftover; only an agent that ran and ended is one.
+#[tokio::test]
+async fn typing_the_resume_command_leaves_the_pane_unmarked() {
+    use crate::terminal::state::ShellLeftover;
+    let dir = scratch_dir("noted");
+    let (shell, typed) = recording_shell(&dir, "bash");
+    let mut app = test_app();
+    app.state.default_shell = shell.display().to_string();
+    let argv = AGENT_ARGV.iter().map(|part| part.to_string()).collect();
+    let (_pane_id, terminal_id) = pane_waiting_to_resume(&mut app, &dir, argv);
+    assert_eq!(
+        app.state.terminals[&terminal_id].shell_leftover,
+        ShellLeftover::None,
+        "a pane that waits to resume has had nothing typed"
+    );
+
+    assert!(app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true));
+    wait_for_lines(&typed, 1).await;
+
+    assert_eq!(
+        app.state.terminals[&terminal_id].shell_leftover,
+        ShellLeftover::None,
+        "typing the resume command marked the pane before any agent ran or ended"
+    );
+    shut_down_runtimes(&mut app);
+    remove_scratch(&dir);
+}
+
+/// The checkpoint taken before a pane exits writes the layout too, and it marks an ended agent's idle shell exactly as a full
+/// save does, only while the setting is on. (A pane it failed to mark would only be kept at the next start, so this is the test
+/// that the checkpoint is not a save that forgets the setting.) A real shell runs the resume command, so the idle check is the
+/// real one.
+#[tokio::test]
+async fn the_pane_exit_checkpoint_marks_an_ended_agents_idle_shell_only_while_the_setting_is_on() {
+    use crate::terminal::state::ShellLeftover;
+    let _guard = crate::config::test_config_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for setting in [true, false] {
+        let config_home = scratch_dir("checkpoint-mark");
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        let dir = scratch_dir("checkpoint-mark-cwd");
+        let ran = dir.join("ran");
+        let mut app = test_app();
+        app.policy.persist_session = true;
+        app.state.default_shell = "/bin/sh".to_string();
+        app.state.skip_ended_agent_panes_on_restore = setting;
+        let (_pane_id, terminal_id) = pane_waiting_to_resume(
+            &mut app,
+            &dir,
+            vec!["touch".to_string(), ran.display().to_string()],
+        );
+        assert!(app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true));
+
+        // The typed command ran, and the shell is back at its prompt with nothing running in front of it.
+        let child_pid = app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .and_then(|runtime| runtime.child_pid())
+            .expect("the pane's shell runs");
+        // Waits with a blocking sleep: the test holds the config environment lock for its whole run, and a guard may not be
+        // held across an await. The shell is a separate process, so nothing here needs the runtime to make progress.
+        let deadline = Instant::now() + WAIT;
+        while !(ran.exists() && crate::detect::pane_shell_is_idle(child_pid)) {
+            assert!(
+                Instant::now() < deadline,
+                "the shell never came back to its prompt"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .shell_leftover = ShellLeftover::AgentEnded;
+
+        app.checkpoint_session_layout_before_pane_exit();
+
+        let snapshot = crate::persist::load().expect("the checkpoint wrote a layout");
+        let marked = snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .flat_map(|tab| tab.panes.values())
+            .filter(|pane| pane.agent_ended)
+            .count();
+        assert_eq!(marked, usize::from(setting), "setting {setting}");
+
+        shut_down_runtimes(&mut app);
+        remove_scratch(&dir);
+        remove_scratch(&config_home);
+    }
+    std::env::remove_var("XDG_CONFIG_HOME");
+}
+
 // ---- real shells --------------------------------------------------------------------------------------------------
 
 const REAL_SHELLS: [&str; 5] = ["sh", "dash", "bash", "zsh", "fish"];

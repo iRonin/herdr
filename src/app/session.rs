@@ -42,13 +42,14 @@ impl App {
         if self.state.workspaces.is_empty() {
             SessionSaveJob::Clear
         } else {
-            let snapshot = crate::persist::capture(
+            let mut snapshot = crate::persist::capture(
                 &self.state.workspaces,
                 &self.state.terminals,
                 &self.terminal_runtimes,
                 self.state.active,
                 self.state.selected,
             );
+            self.annotate_ended_agent_panes(&mut snapshot);
             let history = self.persist_pane_history.then(|| {
                 crate::persist::capture_history(
                     &snapshot,
@@ -58,6 +59,37 @@ impl App {
             });
             SessionSaveJob::Save { snapshot, history }
         }
+    }
+
+    /// Marks the ended panes in a captured snapshot, when `[session] skip_ended_agent_panes_on_restore` is on. The idle check
+    /// looks at the pane's real foreground process group, never at the agent state herdr tracks (a pane restored with a resume
+    /// plan is seeded as an idle agent whether or not the agent ever starts).
+    pub(super) fn annotate_ended_agent_panes(
+        &self,
+        snapshot: &mut crate::persist::SessionSnapshot,
+    ) {
+        self.annotate_ended_agent_panes_with(snapshot, &|terminal_id| {
+            self.terminal_runtimes
+                .get(terminal_id)
+                .and_then(|runtime| runtime.child_pid())
+                .is_some_and(crate::detect::pane_shell_is_idle)
+        });
+    }
+
+    pub(super) fn annotate_ended_agent_panes_with(
+        &self,
+        snapshot: &mut crate::persist::SessionSnapshot,
+        shell_idle: &dyn Fn(&crate::terminal::TerminalId) -> bool,
+    ) {
+        if !self.state.skip_ended_agent_panes_on_restore {
+            return;
+        }
+        crate::persist::annotate_ended_agent_panes(
+            snapshot,
+            &self.state.workspaces,
+            &self.state.terminals,
+            shell_idle,
+        );
     }
 
     pub(crate) fn start_background_session_save(&mut self) {
@@ -141,13 +173,14 @@ impl App {
             self.checkpoint_session_before_pane_exit();
             return;
         }
-        let snapshot = crate::persist::capture(
+        let mut snapshot = crate::persist::capture(
             &self.state.workspaces,
             &self.state.terminals,
             &self.terminal_runtimes,
             self.state.active,
             self.state.selected,
         );
+        self.annotate_ended_agent_panes(&mut snapshot);
         // A save thread that has not finished is busy even before it takes the writer: its layout was captured earlier and
         // it will write it over anything written now.
         let background_save_running = self

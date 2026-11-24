@@ -95,6 +95,21 @@ impl HeadlessServer {
                 .terminals
                 .get(terminal_id)
                 .is_some_and(|terminal| terminal.closes_when_resumed_agent_exits);
+            // Only with the setting on, the way a save writes it: a pane that is an ended agent's idle shell stays one on the new
+            // server. Nothing is added to the state of any other pane.
+            handoff_runtime.agent_ended = self.app.state.skip_ended_agent_panes_on_restore
+                && self
+                    .app
+                    .state
+                    .terminals
+                    .get(terminal_id)
+                    .is_some_and(|terminal| {
+                        terminal.ended_agent_shell_for_save(|| {
+                            runtime
+                                .child_pid()
+                                .is_some_and(crate::detect::pane_shell_is_idle)
+                        })
+                    });
             let has_agent_session = self
                 .app
                 .state

@@ -121,6 +121,19 @@ struct RecentAgentProcessExit {
     observed_at: Instant,
 }
 
+/// What the shell of a pane may be a leftover of. It is how a pane whose agent ended is told from a plain shell the user
+/// opened and never ran an agent in. In memory only: `[session] skip_ended_agent_panes_on_restore` turns it into a mark in
+/// the saved layout at save time (see `ended_agent_shell_for_save`). Only an agent herdr saw end sets it. A resume that
+/// never produced an agent does not: that pane keeps its saved session and the next start retries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShellLeftover {
+    /// Nothing is known to have run in this pane's shell, or something was typed into it or an agent started in it since.
+    #[default]
+    None,
+    /// An agent ran in this pane and herdr saw it end, and since then nothing was typed into the shell and no agent started in it.
+    AgentEnded,
+}
+
 /// `/compact` can perform substantial work without emitting a lifecycle event.
 /// Keep its display-only Working projection bounded even if no later report arrives.
 const COMPACT_OPTIMISTIC_WORKING_TTL: Duration = Duration::from_secs(90);
@@ -338,6 +351,13 @@ pub struct TerminalState {
     /// is replaced; the only effect of a stale flag is a session checkpoint when the pane's shell later ends, and a stop within
     /// five seconds of it then brings the pane back.
     pub closes_when_resumed_agent_exits: bool,
+    /// What this pane's shell is a leftover of. Never saved as such: a save with `skip_ended_agent_panes_on_restore` on
+    /// derives the mark from it.
+    pub shell_leftover: ShellLeftover,
+    /// A save found the shell of a pane marked `AgentEnded` idle, and no input has reached it and no agent has started or ended in
+    /// it since: the answer is kept so the process lookup is not repeated at every save. An atomic because a save reads the state through a
+    /// shared reference.
+    ended_shell_found_idle: std::sync::atomic::AtomicBool,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
@@ -382,6 +402,8 @@ impl TerminalState {
             launch_argv: None,
             respawn_shell_on_exit: false,
             closes_when_resumed_agent_exits: false,
+            shell_leftover: ShellLeftover::None,
+            ended_shell_found_idle: std::sync::atomic::AtomicBool::new(false),
             recent_agent_process_exit: None,
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
@@ -484,6 +506,41 @@ impl TerminalState {
         self.compact_command_detector.clear();
     }
 
+    /// An agent that ran in this pane's shell was released: it ended, and its shell is what is left.
+    pub(crate) fn note_agent_released(&mut self) {
+        self.shell_leftover = ShellLeftover::AgentEnded;
+        // What a save found about the shell before this agent ended says nothing about the shell now.
+        *self.ended_shell_found_idle.get_mut() = false;
+    }
+
+    /// Input reached this pane's shell. Returns true only when it removed a mark, which is when a save is owed.
+    pub(crate) fn note_shell_input(&mut self) -> bool {
+        let had_mark = self.shell_leftover != ShellLeftover::None;
+        self.shell_leftover = ShellLeftover::None;
+        had_mark
+    }
+
+    /// Whether a save marks this pane: its agent ended and its shell is idle at the prompt. `shell_idle` is called only for a
+    /// pane whose agent ended, so the process lookup it stands for is made for no other pane, however many agents run. A shell
+    /// found idle stays idle until input reaches it or an agent starts or ends in it. Input removes the mark, and so does a new
+    /// agent process detected in the pane (an agent can start without any input passing, as `herdr agent start` does), so that
+    /// answer is kept until another agent ends in the pane and `shell_idle` is not asked again. A refusal is not kept: the shell
+    /// may reach its prompt later.
+    pub(crate) fn ended_agent_shell_for_save(&self, shell_idle: impl FnOnce() -> bool) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.shell_leftover != ShellLeftover::AgentEnded {
+            return false;
+        }
+        if self.ended_shell_found_idle.load(Relaxed) {
+            return true;
+        }
+        let idle = shell_idle();
+        if idle {
+            self.ended_shell_found_idle.store(true, Relaxed);
+        }
+        idle
+    }
+
     fn clear_compact_input_state(&mut self) {
         self.optimistic_working_until = None;
         self.compact_command_detector.clear();
@@ -507,6 +564,10 @@ impl TerminalState {
         agent: Agent,
         now: Instant,
     ) -> TerminalStateMutation {
+        // A new agent process in the pane means its shell is in use again, and it may have started without any input passing
+        // (`herdr agent start` writes the launch command straight to the pane). When this agent ends, `note_agent_released`
+        // marks the pane again.
+        self.shell_leftover = ShellLeftover::None;
         let starts_acquisition = !self
             .should_ignore_detected_state_under_full_lifecycle_hook(Some(agent), false)
             && !self.detected_state_observed_before_release_suppression(Some(agent), now);
@@ -2644,6 +2705,7 @@ impl TerminalState {
         self.launch_argv = None;
         self.respawn_shell_on_exit = false;
         self.closes_when_resumed_agent_exits = false;
+        self.shell_leftover = ShellLeftover::None;
         self.recent_agent_process_exit = None;
         self.agent_process_acquisition_pending = false;
         self.pending_agent_resume_plan = None;
@@ -6919,5 +6981,145 @@ mod tests {
             terminal.hook_authority.as_ref().unwrap().source,
             "custom:pi"
         );
+    }
+
+    /// A shell that held an agent which ended is a leftover once it is idle; a shell that never held one is not.
+    #[test]
+    fn a_leftover_shell_is_marked_only_when_an_agent_ended_here_and_the_shell_is_idle() {
+        let mut terminal = test_terminal();
+        assert_eq!(terminal.shell_leftover, ShellLeftover::None);
+        assert!(
+            !terminal.ended_agent_shell_for_save(|| panic!("a plain shell is never probed")),
+            "a plain shell the user opened must never be marked"
+        );
+
+        terminal.note_agent_released();
+        assert_eq!(terminal.shell_leftover, ShellLeftover::AgentEnded);
+        assert!(
+            !terminal.ended_agent_shell_for_save(|| false),
+            "an ended agent whose shell has something running in it is in use"
+        );
+        assert!(
+            terminal.ended_agent_shell_for_save(|| true),
+            "the same shell at its prompt is a leftover"
+        );
+    }
+
+    /// The process lookup is the costly part of marking (about a quarter of a millisecond a pane, measured), and it is made at every
+    /// save. A shell found idle stays idle until input reaches it or an agent starts or ends in it, and input and a new agent
+    /// remove the mark, so one positive answer holds until the next time an agent ends in the pane. A refusal is never remembered:
+    /// the shell may reach its prompt later.
+    #[test]
+    fn an_ended_agents_shell_found_idle_is_not_probed_again_until_another_agent_ends() {
+        let mut terminal = test_terminal();
+        terminal.note_agent_released();
+        assert!(
+            !terminal.ended_agent_shell_for_save(|| false),
+            "a shell with something running in it is not marked"
+        );
+        let asked_again = std::cell::Cell::new(false);
+        assert!(!terminal.ended_agent_shell_for_save(|| {
+            asked_again.set(true);
+            false
+        }));
+        assert!(
+            asked_again.get(),
+            "a refusal must not be remembered, as found idle or as anything else: the shell may reach its prompt later"
+        );
+        assert!(
+            terminal.ended_agent_shell_for_save(|| true),
+            "a shell that reaches its prompt is marked at the next save"
+        );
+        assert!(
+            terminal
+                .ended_agent_shell_for_save(|| panic!("a shell found idle is asked about once")),
+            "a shell found idle and not typed into since stays marked"
+        );
+
+        assert!(terminal.note_shell_input());
+        assert!(
+            !terminal
+                .ended_agent_shell_for_save(|| panic!("a pane without a mark is never probed")),
+            "typing removes the mark"
+        );
+
+        terminal.note_agent_released();
+        assert!(
+            !terminal.ended_agent_shell_for_save(|| false),
+            "the answer about the earlier agent says nothing about the shell after the next one ended"
+        );
+    }
+
+    /// A pane herdr resumed holds a saved session and the agent state of an idle agent whether or not the agent ever started.
+    /// Neither makes it a leftover: only an agent seen ending does, and a pane that only looks like an agent is never probed.
+    #[test]
+    fn a_pane_that_holds_an_agent_session_is_never_probed_until_its_agent_ends() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        assert!(terminal.is_agent_terminal());
+        assert!(
+            !terminal
+                .ended_agent_shell_for_save(|| panic!("a running agent's pane is never probed")),
+            "an agent that runs, or is yet to start, is no leftover"
+        );
+    }
+
+    /// Input into the shell removes the mark and says so, so the caller owes a save; input into a shell with no mark says
+    /// nothing, so a keystroke never causes a save.
+    #[test]
+    fn input_removes_the_mark_and_reports_it_only_when_there_was_one() {
+        let mut terminal = test_terminal();
+        assert!(!terminal.note_shell_input(), "no mark: nothing changed");
+        assert_eq!(terminal.shell_leftover, ShellLeftover::None);
+
+        terminal.note_agent_released();
+        assert!(terminal.note_shell_input());
+        assert_eq!(terminal.shell_leftover, ShellLeftover::None);
+        assert!(!terminal.note_shell_input(), "already clear");
+    }
+
+    /// An agent started in the pane again without anything typed into it (`herdr agent start` writes the launch command straight to
+    /// the pane) makes the shell busy: the detector sees the new agent process, and the pane is no leftover until that agent ends.
+    /// A save that found the shell idle before must not keep marking it while the new agent runs.
+    #[test]
+    fn a_new_agent_detected_in_an_ended_agents_pane_ends_the_leftover_and_the_answer_kept_for_it() {
+        let mut terminal = test_terminal();
+        terminal.note_agent_released();
+        assert!(
+            terminal.ended_agent_shell_for_save(|| true),
+            "a save found the ended agent's shell idle, and that answer is kept"
+        );
+
+        terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+
+        assert_eq!(terminal.shell_leftover, ShellLeftover::None);
+        assert!(
+            !terminal
+                .ended_agent_shell_for_save(|| panic!("a pane with a new agent is never probed")),
+            "the new agent runs in the pane: it must not be marked on the strength of the earlier answer"
+        );
+
+        // When that agent ends, the pane is a leftover again and the earlier answer says nothing about it.
+        terminal.note_agent_released();
+        assert!(
+            !terminal.ended_agent_shell_for_save(|| false),
+            "a shell with something running in it after the second agent ended is not marked"
+        );
+    }
+
+    /// Detecting an agent in a pane that was never a leftover changes nothing about the mark.
+    #[test]
+    fn detecting_an_agent_in_a_pane_with_no_mark_changes_no_mark() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+        assert_eq!(terminal.shell_leftover, ShellLeftover::None);
+    }
+
+    #[test]
+    fn a_shell_replaced_after_an_exit_is_no_leftover() {
+        let mut terminal = test_terminal();
+        terminal.note_agent_released();
+        terminal.clear_agent_runtime_identity_after_respawn();
+        assert_eq!(terminal.shell_leftover, ShellLeftover::None);
     }
 }

@@ -2317,6 +2317,7 @@ impl PaneRuntime {
             initial_history_ansi: None,
             agent_state: None,
             closes_when_resumed_agent_exits: false,
+            agent_ended: false,
         }
     }
 
@@ -2529,6 +2530,7 @@ impl PaneRuntime {
             initial_history_ansi,
             agent_state: _,
             closes_when_resumed_agent_exits: _,
+            agent_ended: _,
         } = state;
         let pane_id = PaneId::from_raw(pane_id);
         use std::os::fd::FromRawFd;

@@ -323,6 +323,10 @@ pub struct SessionConfig {
     /// leaving an idle shell. Default: false (as upstream). A crash, a signal or a shell herdr does not know keeps the pane.
     /// A bad value is reported by `herdr config check` and keeps the other settings.
     pub close_pane_when_resumed_agent_exits: crate::agent_resume::CloseResumedPane,
+    /// A restore does not bring back a pane whose agent ended and left its shell idle at the prompt. Default: false (as
+    /// upstream: every saved pane comes back). Read once, when the server starts and restores its session; the saves a running
+    /// server makes follow the live value. A bad value is reported by `herdr config check` and keeps the other settings.
+    pub skip_ended_agent_panes_on_restore: crate::agent_resume::SkipEndedPanes,
 }
 
 impl Default for SessionConfig {
@@ -331,6 +335,7 @@ impl Default for SessionConfig {
             resume_agents_on_restore: true,
             startup_per_agent_delay_ms: 100,
             close_pane_when_resumed_agent_exits: crate::agent_resume::CloseResumedPane::default(),
+            skip_ended_agent_panes_on_restore: crate::agent_resume::SkipEndedPanes::default(),
         }
     }
 }
@@ -1573,6 +1578,81 @@ startup_per_agent_delay_ms = 0
             assert_eq!(
                 diagnostics[0],
                 format!("session.close_pane_when_resumed_agent_exits must be true or false (got {type_name}); keeping it off"),
+                "{value}"
+            );
+            // `config_diagnostic_summary` words its notice from these phrases: a bad value for this one key must not
+            // claim that the defaults are in use.
+            assert!(
+                !diagnostics[0].contains("using defaults"),
+                "{diagnostics:?}"
+            );
+            assert!(
+                !diagnostics[0].contains("keeping current config"),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_ended_agent_panes_on_restore_defaults_off_as_upstream_and_parses() {
+        let default_config: Config = toml::from_str("").unwrap();
+        assert!(!default_config
+            .session
+            .skip_ended_agent_panes_on_restore
+            .enabled());
+        assert_eq!(
+            default_config
+                .session
+                .skip_ended_agent_panes_on_restore
+                .problem(),
+            None
+        );
+        assert!(!Config::default()
+            .session
+            .skip_ended_agent_panes_on_restore
+            .enabled());
+
+        for (value, enabled) in [("true", true), ("false", false)] {
+            let config: Config = toml::from_str(&format!(
+                "[session]\nskip_ended_agent_panes_on_restore = {value}\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                config.session.skip_ended_agent_panes_on_restore.enabled(),
+                enabled,
+                "{value}"
+            );
+            assert!(config.collect_diagnostics().is_empty(), "{value}");
+        }
+    }
+
+    /// A wrong type for the key is that key's problem alone. If it were a parse error, herdr would fall back to the defaults
+    /// for every setting in the file.
+    #[test]
+    fn a_bad_skip_ended_agent_panes_on_restore_value_parses_off_and_is_reported_as_a_diagnostic() {
+        for (value, type_name) in [
+            ("\"yes\"", "string"),
+            ("1", "integer"),
+            ("0", "integer"),
+            ("2.5", "float"),
+            ("[true]", "array"),
+            // A datetime and an inline table reach the type as a map, not as a scalar.
+            ("1979-05-27", "datetime"),
+            ("{ enabled = true }", "table"),
+        ] {
+            let toml = format!("[session]\nskip_ended_agent_panes_on_restore = {value}\nstartup_per_agent_delay_ms = 5000\n");
+            let config: Config = toml::from_str(&toml)
+                .unwrap_or_else(|err| panic!("{value} must not fail the whole config: {err}"));
+            assert!(
+                !config.session.skip_ended_agent_panes_on_restore.enabled(),
+                "{value}"
+            );
+            assert_eq!(config.session.startup_per_agent_delay_ms, 5000, "{value}");
+            let diagnostics = config.collect_diagnostics();
+            assert_eq!(diagnostics.len(), 1, "{value}: {diagnostics:?}");
+            assert_eq!(
+                diagnostics[0],
+                format!("session.skip_ended_agent_panes_on_restore must be true or false (got {type_name}); keeping it off"),
                 "{value}"
             );
             // `config_diagnostic_summary` words its notice from these phrases: a bad value for this one key must not

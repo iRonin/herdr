@@ -427,15 +427,39 @@ impl App {
                 false,
             );
         }
+        // With the setting on, panes whose agent ended are left out of this restore. A pane that carries the mark and still holds
+        // something to resume stays. When a pane does go, something is removed from the layout that is saved next, so the first
+        // save keeps a copy of the file it replaces, as it does for a session that failed to load.
+        let skips_ended_panes = config.session.skip_ended_agent_panes_on_restore.enabled();
+        let leaves_ended_panes_out = skips_ended_panes
+            && snapshot
+                .as_ref()
+                .is_some_and(crate::persist::has_droppable_ended_agent_panes);
         let session_writer = Arc::new(std::sync::Mutex::new(crate::persist::SessionWriter::new(
-            policy.restore_session && snapshot.is_none(),
+            (policy.restore_session && snapshot.is_none()) || leaves_ended_panes_out,
         )));
-        let (workspaces, active, selected) = if let Some(snap) = snapshot {
-            let history = config
+        let (workspaces, active, selected) = if let Some(mut snap) = snapshot {
+            let mut history = config
                 .experimental
                 .pane_history
                 .then(crate::persist::load_history)
                 .flatten();
+            if skips_ended_panes {
+                // A file with no mark, or with only marks that stay, comes out as it went in.
+                let dropped = crate::persist::prune_ended_agent_panes(&mut snap, &mut history);
+                if dropped.panes > 0 {
+                    // A workspace that went may still be named by something saved or typed earlier: its id is not reissued.
+                    crate::workspace::reserve_workspace_id_names(
+                        dropped.workspace_ids.iter().map(String::as_str),
+                    );
+                    info!(
+                        panes = dropped.panes,
+                        tabs = dropped.tabs,
+                        workspaces = dropped.workspaces,
+                        "left panes whose agent ended out of the restored session"
+                    );
+                }
+            }
             let (ws, terminals, terminal_runtimes) = crate::persist::restore(
                 &snap,
                 history.as_ref(),
@@ -558,6 +582,10 @@ impl App {
             close_pane_when_resumed_agent_exits: config
                 .session
                 .close_pane_when_resumed_agent_exits
+                .enabled(),
+            skip_ended_agent_panes_on_restore: config
+                .session
+                .skip_ended_agent_panes_on_restore
                 .enabled(),
             default_shell: config.terminal.default_shell.clone(),
             shell_mode: config.terminal.shell_mode,
@@ -946,6 +974,8 @@ impl App {
         if !invalid_section("session") {
             self.state.close_pane_when_resumed_agent_exits =
                 config.session.close_pane_when_resumed_agent_exits.enabled();
+            self.state.skip_ended_agent_panes_on_restore =
+                config.session.skip_ended_agent_panes_on_restore.enabled();
         }
 
         if !invalid_section("session")
@@ -2084,6 +2114,147 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    fn marked_panes(snapshot: &crate::persist::SessionSnapshot) -> usize {
+        snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .flat_map(|tab| tab.panes.values())
+            .filter(|pane| pane.agent_ended)
+            .count()
+    }
+
+    fn app_with_a_leftover_shell(setting: bool) -> App {
+        let mut app = test_app();
+        app.state.workspaces.push(Workspace::test_new("one"));
+        app.state.ensure_test_terminals();
+        app.state.skip_ended_agent_panes_on_restore = setting;
+        let tab = &app.state.workspaces[0].tabs[0];
+        let terminal_id = tab.panes[&tab.root_pane].attached_terminal_id.clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .shell_leftover = crate::terminal::state::ShellLeftover::AgentEnded;
+        app
+    }
+
+    fn capture_of(app: &App) -> crate::persist::SessionSnapshot {
+        crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            app.state.active,
+            app.state.selected,
+        )
+    }
+
+    /// A save with the setting off must not carry the mark even for a pane that is an ended agent's idle shell: nothing in the
+    /// file may change for anyone who did not ask for it.
+    #[test]
+    fn a_save_marks_an_ended_idle_pane_only_while_the_setting_is_on() {
+        for setting in [false, true] {
+            let app = app_with_a_leftover_shell(setting);
+            let mut snapshot = capture_of(&app);
+            app.annotate_ended_agent_panes_with(&mut snapshot, &|_| true);
+            assert_eq!(
+                marked_panes(&snapshot),
+                usize::from(setting),
+                "setting {setting}"
+            );
+        }
+    }
+
+    /// The real idle check looks at the pane's own process. A pane with no running shell has nothing to be idle, so it is never
+    /// marked, whatever herdr thinks the agent in it did.
+    #[test]
+    fn a_pane_with_no_running_shell_is_never_marked_by_the_real_idle_check() {
+        let app = app_with_a_leftover_shell(true);
+        let mut snapshot = capture_of(&app);
+        app.annotate_ended_agent_panes(&mut snapshot);
+        assert_eq!(marked_panes(&snapshot), 0);
+    }
+
+    #[test]
+    fn app_copies_skip_ended_agent_panes_on_restore_from_config() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        assert!(!app.state.skip_ended_agent_panes_on_restore);
+
+        let config: Config =
+            toml::from_str("[session]\nskip_ended_agent_panes_on_restore = true\n").unwrap();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(
+            &config,
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        assert!(app.state.skip_ended_agent_panes_on_restore);
+    }
+
+    /// The saves of a running server read the setting, so a reload must reach the live state; a bad value turns it off and
+    /// names itself without touching the other settings in the section.
+    #[test]
+    fn reload_config_updates_skip_ended_agent_panes_on_restore() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-skip-ended");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let mut app = test_app();
+        assert!(!app.state.skip_ended_agent_panes_on_restore);
+
+        std::fs::write(
+            &path,
+            "[session]\nskip_ended_agent_panes_on_restore = true\n",
+        )
+        .unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(app.state.skip_ended_agent_panes_on_restore);
+
+        std::fs::write(
+            &path,
+            "[session]\nskip_ended_agent_panes_on_restore = \"yes\"\n",
+        )
+        .unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert_eq!(
+            report.diagnostics,
+            vec!["session.skip_ended_agent_panes_on_restore must be true or false (got string); keeping it off".to_string()]
+        );
+        assert!(!app.state.skip_ended_agent_panes_on_restore);
+
+        std::fs::write(
+            &path,
+            "[session]\nskip_ended_agent_panes_on_restore = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            app.reload_config().status,
+            crate::config::ConfigReloadStatus::Applied
+        );
+        assert!(app.state.skip_ended_agent_panes_on_restore);
+        std::fs::write(
+            &path,
+            "[session]\nskip_ended_agent_panes_on_restore = false\n",
+        )
+        .unwrap();
+        app.reload_config();
+        assert!(!app.state.skip_ended_agent_panes_on_restore);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn reload_config_invalid_sidebar_bounds_keeps_previous_ui_and_returns_partial() {
         let _guard = config_env_lock().lock().unwrap();
@@ -3117,6 +3288,70 @@ mod tests {
         assert_eq!(response["error"]["code"], "agent_pane_unavailable");
         assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 1);
         assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(root));
+    }
+
+    /// `herdr agent start` writes the launch command straight to the pane, so no typed input passes. It is input all the same: an
+    /// agent started in an ended agent's pane makes the shell busy, and the mark goes with it. A start whose input failed delivered
+    /// nothing, so it leaves the mark: the pane is still an ended agent's idle shell.
+    #[tokio::test]
+    async fn an_agent_started_in_an_ended_agents_pane_removes_the_mark_and_a_failed_start_keeps_it()
+    {
+        use crate::terminal::state::ShellLeftover;
+        let mut app = test_app();
+        let workspace = Workspace::test_new("agent-start-ended");
+        let root = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let pane_id = app.pane_info(0, root).unwrap().pane_id;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let (runtime, mut receiver) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+        runtime
+            .try_send_bytes(bytes::Bytes::from_static(b"occupied"))
+            .unwrap();
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .shell_leftover = ShellLeftover::AgentEnded;
+
+        let start = |app: &mut App| -> serde_json::Value {
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: "req_agent_start_ended".into(),
+                method: crate::api::schema::Method::AgentStart(
+                    crate::api::schema::AgentStartParams {
+                        name: "worker".into(),
+                        kind: "pi".into(),
+                        pane_id: pane_id.clone(),
+                        args: Vec::new(),
+                        timeout_ms: Some(4_000),
+                    },
+                ),
+            });
+            serde_json::from_str(&response).unwrap()
+        };
+
+        let failed = start(&mut app);
+        assert_eq!(failed["error"]["code"], "agent_start_input_failed");
+        assert_eq!(
+            app.state.terminals[&terminal_id].shell_leftover,
+            ShellLeftover::AgentEnded,
+            "a start that delivered nothing leaves the pane an ended agent's shell"
+        );
+
+        receiver.try_recv().unwrap();
+        let started = start(&mut app);
+        assert_eq!(started["result"]["type"], "agent_started");
+        assert_eq!(
+            app.state.terminals[&terminal_id].shell_leftover,
+            ShellLeftover::None,
+            "the launch command went into the pane: the mark must go with it"
+        );
     }
 
     #[tokio::test]

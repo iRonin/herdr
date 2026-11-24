@@ -849,6 +849,9 @@ pub struct AppState {
     pub kitty_graphics_enabled: bool,
     /// `[session] close_pane_when_resumed_agent_exits`, read when a restart resume is typed into a pane's shell.
     pub close_pane_when_resumed_agent_exits: bool,
+    /// `[session] skip_ended_agent_panes_on_restore`, read when the session is saved: a pane whose agent ended and left its shell
+    /// idle is then saved with a mark that the next restore honours.
+    pub skip_ended_agent_panes_on_restore: bool,
     pub default_shell: String,
     pub shell_mode: crate::config::ShellModeConfig,
     pub new_terminal_cwd: NewTerminalCwdConfig,
@@ -1123,6 +1126,7 @@ impl AppState {
             cjk_ime_cursor_shape: 2, // steady_block
             kitty_graphics_enabled: false,
             close_pane_when_resumed_agent_exits: false,
+            skip_ended_agent_panes_on_restore: false,
             default_shell: String::new(),
             shell_mode: crate::config::ShellModeConfig::Auto,
             new_terminal_cwd: NewTerminalCwdConfig::Follow,

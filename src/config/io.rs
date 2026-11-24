@@ -384,6 +384,13 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
             .problem()
             .map(str::to_string),
     );
+    diagnostics.extend(
+        config
+            .session
+            .skip_ended_agent_panes_on_restore
+            .problem()
+            .map(str::to_string),
+    );
 
     Ok(LoadedConfig {
         config,
@@ -1015,6 +1022,84 @@ name = "catppucin"
                     .config
                     .session
                     .close_pane_when_resumed_agent_exits
+                    .enabled());
+                assert!(live.diagnostics.is_empty(), "{:?}", live.diagnostics);
+            },
+        );
+    }
+
+    /// A wrong type for `skip_ended_agent_panes_on_restore` is reported for that key alone, at startup and on a reload.
+    /// Any other wrong type makes the startup load fall back to the defaults for EVERY setting (a parse error).
+    #[test]
+    fn a_bad_skip_ended_agent_panes_on_restore_value_is_reported_without_resetting_other_settings()
+    {
+        for bad in ["\"yes\"", "1", "1979-05-27"] {
+            let content = format!("[session]\nskip_ended_agent_panes_on_restore = {bad}\nstartup_per_agent_delay_ms = 5000\n");
+            with_config_file(Some(&content), || {
+                let startup = Config::load();
+                assert_eq!(
+                    startup.config.session.startup_per_agent_delay_ms, 5000,
+                    "{bad}"
+                );
+                assert!(
+                    !startup
+                        .config
+                        .session
+                        .skip_ended_agent_panes_on_restore
+                        .enabled(),
+                    "{bad}"
+                );
+                assert_eq!(
+                    startup.diagnostics.len(),
+                    1,
+                    "{bad}: {:?}",
+                    startup.diagnostics
+                );
+                assert!(
+                    startup.diagnostics[0].starts_with(
+                        "session.skip_ended_agent_panes_on_restore must be true or false (got "
+                    ),
+                    "{bad}: {:?}",
+                    startup.diagnostics
+                );
+
+                let live = load_live_config().unwrap();
+                assert_eq!(
+                    live.config.session.startup_per_agent_delay_ms, 5000,
+                    "{bad}"
+                );
+                // The startup load reads a TOML date through its key capture, as a string; the live load names it a datetime.
+                // Both report the key and its wrong type, and neither resets anything.
+                if bad != "1979-05-27" {
+                    assert_eq!(live.diagnostics, startup.diagnostics, "{bad}");
+                }
+                assert_eq!(live.diagnostics.len(), 1, "{bad}: {:?}", live.diagnostics);
+                assert!(
+                    live.diagnostics[0].starts_with(
+                        "session.skip_ended_agent_panes_on_restore must be true or false (got "
+                    ),
+                    "{bad}: {:?}",
+                    live.diagnostics
+                );
+                assert!(live.invalid_sections.is_empty(), "{bad}");
+            });
+        }
+
+        with_config_file(
+            Some("[session]\nskip_ended_agent_panes_on_restore = true\n"),
+            || {
+                let startup = Config::load();
+                assert!(startup
+                    .config
+                    .session
+                    .skip_ended_agent_panes_on_restore
+                    .enabled());
+                assert!(startup.diagnostics.is_empty(), "{:?}", startup.diagnostics);
+                let live = load_live_config().unwrap();
+                assert!(live
+                    .config
+                    .session
+                    .skip_ended_agent_panes_on_restore
                     .enabled());
                 assert!(live.diagnostics.is_empty(), "{:?}", live.diagnostics);
             },

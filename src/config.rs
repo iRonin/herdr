@@ -129,6 +129,12 @@ impl Config {
                     .problem()
                     .map(str::to_string),
             )
+            .chain(
+                self.session
+                    .skip_ended_agent_panes_on_restore
+                    .problem()
+                    .map(str::to_string),
+            )
             .collect()
     }
 
