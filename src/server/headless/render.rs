@@ -458,7 +458,9 @@ impl HeadlessServer {
         if render_targets.is_empty() {
             let (cols, rows) = self.effective_size;
             let area = Rect::new(0, 0, cols, rows);
-            let resize_panes = self.app.state.view.pane_infos.is_empty();
+            // With `ui.resize_hidden_panes` off no pane is resized while no client shows any tab.
+            let resize_panes =
+                self.app.state.view.pane_infos.is_empty() && self.app.state.resize_hidden_panes;
             if resize_panes {
                 crate::ui::compute_view_with_runtime_registry(
                     &mut self.app.state,

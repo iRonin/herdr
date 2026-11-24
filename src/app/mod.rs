@@ -539,6 +539,7 @@ impl App {
             pane_outer_borders: config.ui.pane_outer_borders,
             pane_scrollbars: config.ui.pane_scrollbars,
             pane_gaps: config.ui.pane_gaps,
+            resize_hidden_panes: config.ui.resize_hidden_panes,
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
             tab_bar_right: Vec::new(),
             tab_bar_right_separator: String::new(),
@@ -904,6 +905,7 @@ impl App {
                 self.state.pane_outer_borders = config.ui.pane_outer_borders;
                 self.state.pane_scrollbars = config.ui.pane_scrollbars;
                 self.state.pane_gaps = config.ui.pane_gaps;
+                self.state.resize_hidden_panes = config.ui.resize_hidden_panes;
                 self.state.show_agent_labels_on_pane_borders =
                     config.ui.show_agent_labels_on_pane_borders;
                 self.configure_tab_bar_status(
@@ -1971,6 +1973,52 @@ mod tests {
         let report = app.reload_config();
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
         assert_eq!(app.state.sidebar_agents, previous_agents);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The setting is read at start and again on every reload, in both directions: switching it back to
+    /// `true` must bring the live state back to upstream's behaviour, and a `[ui]` section that does not
+    /// parse keeps what was running instead of silently flipping it.
+    #[test]
+    fn reload_config_updates_resize_hidden_panes() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-resize-hidden-panes");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[ui]\nresize_hidden_panes = false\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        // Control: the default is upstream's behaviour, so the assertions below cannot pass by accident.
+        assert!(app.state.resize_hidden_panes);
+
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(!app.state.resize_hidden_panes);
+
+        std::fs::write(&path, "[ui]\nresize_hidden_panes = \"no\"\n").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(
+            !app.state.resize_hidden_panes,
+            "an invalid [ui] section keeps the running value"
+        );
+
+        std::fs::write(&path, "[ui]\nresize_hidden_panes = true\n").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(app.state.resize_hidden_panes);
+
+        std::fs::write(&path, "[ui]\nresize_hidden_panes = false\n").unwrap();
+        app.reload_config();
+        assert!(!app.state.resize_hidden_panes);
+        std::fs::write(&path, "").unwrap();
+        app.reload_config();
+        assert!(
+            app.state.resize_hidden_panes,
+            "removing the key goes back to the default, which is upstream's behaviour"
+        );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

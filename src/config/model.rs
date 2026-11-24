@@ -984,6 +984,11 @@ pub struct UiConfig {
     pub hide_tab_bar_when_single_tab: bool,
     /// Desktop tab row placement. Default: top.
     pub tab_bar_position: TabBarPositionConfig,
+    /// Resize the panes of tabs and workspaces no client is showing whenever a client's pane
+    /// area changes, so a background agent already has the right width when its tab is shown.
+    /// `false` resizes a tab only while a client shows it and once more when it is shown again.
+    /// Default: true, which is upstream's behaviour.
+    pub resize_hidden_panes: bool,
     /// Ordered entries shown at the right edge of the desktop tab row. Empty by default.
     pub tab_bar_right: Vec<TabBarRightEntryConfig>,
     /// Text inserted between visible right-side tab bar entries. Default: one space.
@@ -1220,6 +1225,7 @@ impl Default for UiConfig {
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
             tab_bar_position: TabBarPositionConfig::Top,
+            resize_hidden_panes: true,
             tab_bar_right: Vec::new(),
             tab_bar_right_separator: " ".into(),
             window_title: super::window_title::default_window_title(),
@@ -1591,6 +1597,19 @@ prompt_new_tab_name = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.prompt_new_tab_name);
+    }
+
+    #[test]
+    fn resize_hidden_panes_defaults_on_and_parses() {
+        let default_config = Config::default();
+        assert!(default_config.ui.resize_hidden_panes);
+
+        let toml = r#"
+[ui]
+resize_hidden_panes = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.ui.resize_hidden_panes);
     }
 
     #[test]

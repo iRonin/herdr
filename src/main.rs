@@ -318,6 +318,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Desktop tab row placement: "top" or "bottom".
 # tab_bar_position = "top"
 
+# Resize the panes of tabs and workspaces nobody is showing whenever the window
+# changes size, so a background agent already has the right width. false resizes a
+# tab only while a client shows it, and once more when it is shown again.
+# resize_hidden_panes = true
+
 # Ordered status entries at the right edge of the desktop tab bar.
 # Supported types: zoom, hostname, datetime, text, and command.
 # Hostname, datetime, and command entries resolve on the Herdr server.
