@@ -2825,12 +2825,12 @@ impl HeadlessServer {
                 }) && deferred_tab_id
                     .as_deref()
                     .is_some_and(|tab_id| self.focus_shell_client_on_tab(client_id, tab_id));
-                // A client that visited the tab before is still its controller, so with
-                // `ui.resize_hidden_panes` off the claim alone would leave a tab that was
-                // stale while hidden at that size.
+                // A client that visited the tab before is still its controller, so where a tab is
+                // sized for the client that shows it only (`ui.resize_hidden_panes` off, or several
+                // clients) the claim alone would leave a tab that was stale while hidden at that size.
                 let geometry_changed = navigation_changed
                     && (self.claim_shell_tab_geometry(client_id, false)
-                        || (!self.app.state.resize_hidden_panes
+                        || (self.sizes_only_shown_tabs()
                             && self.resize_shell_tab_if_controller(client_id, false)));
                 if navigation_changed {
                     self.reconcile_client_shell_locations();
