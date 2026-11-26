@@ -549,25 +549,93 @@ async fn off_a_full_layout_pass_resizes_only_the_shown_tab() {
 
 // A tab can become shown without a navigation request of its own: a pane moved into it, the tab
 // next to it taking over when the shown tab is moved away, a deferred worktree open that finishes
-// later. With the setting off such a tab is stale unless the server sizes it when it comes into
-// view. Every test below runs the same scenario with the setting on and off and asks the same
+// later. Such a tab is stale unless the server sizes it when it comes into view. That happens
+// with the setting off, where a tab is sized only while it is shown, and also with the setting on
+// when two clients are attached: a client's pane area change then sizes only the tab that client
+// shows, so a tab it visited earlier is stale although the setting is on. Every test below runs
+// the same scenario with the setting on and off, with one client and with two, and asks the same
 // question of the tab that is shown afterwards: does it have the size its client's pane area
-// produces? With the setting on it always did; with it off it must too.
+// produces? The one case that must stay as it always was is the setting on with one client: every
+// tab is sized already there, so no request resizes a tab that comes into view (`UNTOUCHED_SIZE`).
 
-/// One client attached, then back on the first tab after visiting the hidden tab (so it still
-/// controls that tab), and its pane area changed. With the setting off the hidden tab and the
-/// hidden workspace now have sizes the pane area no longer produces. The size the pane area
+/// The size the pane of a tab that comes into view is put at, with the setting on and one client,
+/// to tell "no request resized it" from "it already had the right size": no pane area produces it.
+const UNTOUCHED_SIZE: (u16, u16) = (13, 37);
+
+type Fixture = (HeadlessServer, Panes, (u16, u16), Vec<Receivers>);
+
+/// With the setting on and one client every tab is sized already: the case upstream's behaviour
+/// covers, which a request that shows a tab must leave exactly as it is.
+fn upstream_single_client_case(resize_hidden_panes: bool, clients: usize) -> bool {
+    resize_hidden_panes && clients == 1
+}
+
+/// Puts the pane of the tab that is about to come into view at `UNTOUCHED_SIZE` in the case
+/// above, so that a resize of it is visible.
+fn mark_untouched_in_single_client_case(
+    server: &HeadlessServer,
+    panes: &Panes,
+    resize_hidden_panes: bool,
+    clients: usize,
+    workspace: usize,
+    pane: crate::layout::PaneId,
+) {
+    if !upstream_single_client_case(resize_hidden_panes, clients) {
+        return;
+    }
+    let runtime = panes.runtime(server, workspace, pane);
+    runtime.resize(UNTOUCHED_SIZE.0, UNTOUCHED_SIZE.1, 0, 0);
+    assert_eq!(
+        runtime.current_size(),
+        UNTOUCHED_SIZE,
+        "instrument: the pane is at the size no request should change"
+    );
+}
+
+/// Asks of the tab that came into view: with the setting on and one client it was not touched;
+/// in every other case it has the size its client's pane area produces.
+#[allow(clippy::too_many_arguments)]
+fn assert_came_into_view_sized(
+    server: &HeadlessServer,
+    panes: &Panes,
+    resize_hidden_panes: bool,
+    clients: usize,
+    workspace: usize,
+    pane: crate::layout::PaneId,
+    expected: (u16, u16),
+    alone: bool,
+    what: &str,
+) {
+    if upstream_single_client_case(resize_hidden_panes, clients) {
+        assert_eq!(
+            panes.runtime(server, workspace, pane).current_size(),
+            UNTOUCHED_SIZE,
+            "{what}: with the setting on and one client no request resizes it, as upstream"
+        );
+    } else {
+        assert_shown_pane_fits(server, workspace, pane, expected, alone, what);
+    }
+}
+
+/// One client (or two) attached, then client 1 back on the first tab after visiting the hidden tab
+/// (so it still controls that tab), and its pane area changed. The hidden tab and the hidden
+/// workspace now have sizes the pane area no longer produces: with the setting off, and with two
+/// clients also with the setting on, because a pane area change then sizes only the tab its client
+/// shows. With one client and the setting on every tab follows the area. The size the pane area
 /// produces for a one-pane tab is returned: what the first tab's pane has.
-fn stale_hidden_tabs(resize_hidden_panes: bool) -> (HeadlessServer, Panes, (u16, u16), Receivers) {
+fn stale_hidden_tabs_with(resize_hidden_panes: bool, clients: usize) -> Fixture {
     let (mut server, panes) = hidden_resize_server(resize_hidden_panes);
-    let receivers = attach(&mut server, 1, 100, 30);
+    let mut receivers = vec![attach(&mut server, 1, 100, 30)];
+    if clients == 2 {
+        receivers.push(attach(&mut server, 2, 70, 20));
+    }
     assert!(server.focus_shell_client_on_tab(1, &panes.hidden_tab_id));
     assert!(server.claim_shell_tab_geometry(1, false));
     assert!(server.focus_shell_client_on_tab(1, &panes.shown_tab_id));
     client_pane_area(&mut server, 1, 60, 16);
     let expected = panes.sizes(&server)[0];
     assert_ne!(expected, START_SIZE);
-    if !resize_hidden_panes {
+    if !resize_hidden_panes || clients == 2 {
         let sizes = panes.sizes(&server);
         assert_ne!(sizes[1], expected, "guard: the hidden tab is stale");
         assert_ne!(sizes[2], expected, "guard: the hidden workspace is stale");
@@ -635,10 +703,18 @@ fn api_request_with_response(
 }
 
 /// `pane.move` with focus brings the hidden tab into view next to the pane that was moved into it.
-fn public_pane_move_into_the_hidden_tab(resize_hidden_panes: bool) {
-    let (mut server, panes, expected, _receivers) = stale_hidden_tabs(resize_hidden_panes);
+fn public_pane_move_into_the_hidden_tab(resize_hidden_panes: bool, clients: usize) {
+    let (mut server, panes, expected, _receivers) =
+        stale_hidden_tabs_with(resize_hidden_panes, clients);
+    mark_untouched_in_single_client_case(
+        &server,
+        &panes,
+        resize_hidden_panes,
+        clients,
+        0,
+        panes.hidden_tab,
+    );
     let moved_pane = server.app.public_pane_id(0, panes.shown).unwrap();
-    let hidden_tab_sequence = panes.runtime(&server, 0, panes.hidden_tab).content_seq();
     let (request, response_rx) = api_request_with_response(Method::PaneMove(PaneMoveParams {
         pane_id: moved_pane,
         destination: PaneMoveDestination::Tab {
@@ -660,39 +736,52 @@ fn public_pane_move_into_the_hidden_tab(resize_hidden_panes: bool) {
         Some(panes.hidden_tab_id.as_str()),
         "guard: the client shows the tab the pane was moved into"
     );
-    assert_shown_pane_fits(
+    assert_came_into_view_sized(
         &server,
+        &panes,
+        resize_hidden_panes,
+        clients,
         0,
         panes.hidden_tab,
         expected,
         false,
         "the tab a pane was moved into",
     );
-    if resize_hidden_panes {
-        // The setting's default applies no geometry for this request, as upstream does: the tab
-        // was sized already, and the shown-tabs rule must not run with the setting on.
-        assert_eq!(
-            panes.runtime(&server, 0, panes.hidden_tab).content_seq(),
-            hidden_tab_sequence,
-            "with the setting on the move resizes nothing"
-        );
-    }
     shutdown_test_runtimes(&mut server);
 }
 
 #[tokio::test]
 async fn on_a_pane_moved_into_the_hidden_tab_leaves_the_shown_tab_sized() {
-    public_pane_move_into_the_hidden_tab(true);
+    public_pane_move_into_the_hidden_tab(true, 1);
 }
 
 #[tokio::test]
 async fn off_a_pane_moved_into_the_hidden_tab_leaves_the_shown_tab_sized() {
-    public_pane_move_into_the_hidden_tab(false);
+    public_pane_move_into_the_hidden_tab(false, 1);
+}
+
+#[tokio::test]
+async fn on_a_pane_moved_into_the_hidden_tab_with_two_clients_sizes_the_shown_tab() {
+    public_pane_move_into_the_hidden_tab(true, 2);
+}
+
+#[tokio::test]
+async fn off_a_pane_moved_into_the_hidden_tab_with_two_clients_sizes_the_shown_tab() {
+    public_pane_move_into_the_hidden_tab(false, 2);
 }
 
 /// The client drags the tab it shows to another workspace; the tab next to it takes over.
-fn client_moves_the_shown_tab_away(resize_hidden_panes: bool) {
-    let (mut server, panes, expected, _receivers) = stale_hidden_tabs(resize_hidden_panes);
+fn client_moves_the_shown_tab_away(resize_hidden_panes: bool, clients: usize) {
+    let (mut server, panes, expected, _receivers) =
+        stale_hidden_tabs_with(resize_hidden_panes, clients);
+    mark_untouched_in_single_client_case(
+        &server,
+        &panes,
+        resize_hidden_panes,
+        clients,
+        0,
+        panes.hidden_tab,
+    );
     server.handle_client_shell_api_request(
         1,
         api_request(Method::TabMoveToWorkspace(TabMoveToWorkspaceParams {
@@ -707,8 +796,11 @@ fn client_moves_the_shown_tab_away(resize_hidden_panes: bool) {
         Some(panes.hidden_tab_id.as_str()),
         "guard: the tab next to the moved one is shown now"
     );
-    assert_shown_pane_fits(
+    assert_came_into_view_sized(
         &server,
+        &panes,
+        resize_hidden_panes,
+        clients,
         0,
         panes.hidden_tab,
         expected,
@@ -720,12 +812,22 @@ fn client_moves_the_shown_tab_away(resize_hidden_panes: bool) {
 
 #[tokio::test]
 async fn on_a_tab_moved_away_leaves_its_neighbour_sized() {
-    client_moves_the_shown_tab_away(true);
+    client_moves_the_shown_tab_away(true, 1);
 }
 
 #[tokio::test]
 async fn off_a_tab_moved_away_leaves_its_neighbour_sized() {
-    client_moves_the_shown_tab_away(false);
+    client_moves_the_shown_tab_away(false, 1);
+}
+
+#[tokio::test]
+async fn on_a_tab_moved_away_with_two_clients_sizes_its_neighbour() {
+    client_moves_the_shown_tab_away(true, 2);
+}
+
+#[tokio::test]
+async fn off_a_tab_moved_away_with_two_clients_sizes_its_neighbour() {
+    client_moves_the_shown_tab_away(false, 2);
 }
 
 /// The end of a worktree open that a client asked for: its response names `tab_id`, and the
@@ -755,16 +857,30 @@ fn finish_endpoint_open_onto(server: &mut HeadlessServer, client_id: u64, tab_id
 }
 
 /// A worktree open that a client asked for finishes later and shows a tab the client controls.
-fn deferred_navigation_onto_a_controlled_tab(resize_hidden_panes: bool) {
-    let (mut server, panes, expected, _receivers) = stale_hidden_tabs(resize_hidden_panes);
+/// With two clients a client's pane area change sizes only the tab it shows, so that tab is stale
+/// with the setting on too, and the end of the open must size it.
+fn deferred_navigation_onto_a_controlled_tab(resize_hidden_panes: bool, clients: usize) {
+    let (mut server, panes, expected, _receivers) =
+        stale_hidden_tabs_with(resize_hidden_panes, clients);
+    mark_untouched_in_single_client_case(
+        &server,
+        &panes,
+        resize_hidden_panes,
+        clients,
+        0,
+        panes.hidden_tab,
+    );
     finish_endpoint_open_onto(&mut server, 1, &panes.hidden_tab_id);
     assert_eq!(
         server.shell_tab_id_for_client(1).as_deref(),
         Some(panes.hidden_tab_id.as_str()),
         "guard: the finished open shows the tab"
     );
-    assert_shown_pane_fits(
+    assert_came_into_view_sized(
         &server,
+        &panes,
+        resize_hidden_panes,
+        clients,
         0,
         panes.hidden_tab,
         expected,
@@ -776,90 +892,36 @@ fn deferred_navigation_onto_a_controlled_tab(resize_hidden_panes: bool) {
 
 #[tokio::test]
 async fn on_a_finished_endpoint_open_leaves_the_tab_it_shows_sized() {
-    deferred_navigation_onto_a_controlled_tab(true);
+    deferred_navigation_onto_a_controlled_tab(true, 1);
 }
 
 #[tokio::test]
 async fn off_a_finished_endpoint_open_leaves_the_tab_it_shows_sized() {
-    deferred_navigation_onto_a_controlled_tab(false);
-}
-
-/// The same with two clients attached. A client's pane area then sizes only the tab it shows, so
-/// the tab client 1 visited earlier is stale even with the setting on, and the end of a deferred
-/// open onto it only claims, as upstream does: the setting's default must leave it alone. With the
-/// setting off the tab that comes into view is sized. The on test pins upstream's behaviour for
-/// the default, stale tab included; a later fix of that behaviour would change it on purpose.
-fn deferred_navigation_onto_a_controlled_tab_with_two_clients(resize_hidden_panes: bool) {
-    let (mut server, panes) = hidden_resize_server(resize_hidden_panes);
-    let (_first_control, _first_render) = attach(&mut server, 1, 100, 30);
-    let (_second_control, _second_render) = attach(&mut server, 2, 70, 20);
-    // Client 1 shows the hidden tab and then the first tab again; it keeps controlling both.
-    assert!(server.focus_shell_client_on_tab(1, &panes.hidden_tab_id));
-    assert!(server.claim_shell_tab_geometry(1, false));
-    assert!(server.focus_shell_client_on_tab(1, &panes.shown_tab_id));
-    assert!(
-        !server.claim_shell_tab_geometry(1, false),
-        "guard: client 1 already controls the first tab"
-    );
-    // With two clients its pane area change sizes only the tab it shows.
-    client_pane_area(&mut server, 1, 60, 16);
-    let expected = panes.sizes(&server)[0];
-    assert_ne!(expected, START_SIZE);
-    assert_ne!(
-        panes.sizes(&server)[1],
-        expected,
-        "guard: the hidden tab is stale, with the setting on too"
-    );
-    assert_eq!(
-        server.tab_geometry_controllers.get(&panes.hidden_tab_id),
-        Some(&1),
-        "guard: client 1 still controls the hidden tab it visited"
-    );
-    let hidden_tab_sequence = panes.runtime(&server, 0, panes.hidden_tab).content_seq();
-
-    finish_endpoint_open_onto(&mut server, 1, &panes.hidden_tab_id);
-    assert_eq!(
-        server.shell_tab_id_for_client(1).as_deref(),
-        Some(panes.hidden_tab_id.as_str()),
-        "guard: the finished open shows the tab"
-    );
-    if resize_hidden_panes {
-        assert_eq!(
-            panes.runtime(&server, 0, panes.hidden_tab).content_seq(),
-            hidden_tab_sequence,
-            "with the setting on the finished open applies no geometry to a tab its client controls"
-        );
-    } else {
-        assert_shown_pane_fits(
-            &server,
-            0,
-            panes.hidden_tab,
-            expected,
-            true,
-            "the tab a finished endpoint open shows, with two clients",
-        );
-    }
-    shutdown_test_runtimes(&mut server);
+    deferred_navigation_onto_a_controlled_tab(false, 1);
 }
 
 #[tokio::test]
-async fn on_a_finished_endpoint_open_with_two_clients_applies_no_geometry() {
-    deferred_navigation_onto_a_controlled_tab_with_two_clients(true);
+async fn on_a_finished_endpoint_open_with_two_clients_sizes_the_tab_it_shows() {
+    deferred_navigation_onto_a_controlled_tab(true, 2);
 }
 
 #[tokio::test]
 async fn off_a_finished_endpoint_open_with_two_clients_sizes_the_tab_it_shows() {
-    deferred_navigation_onto_a_controlled_tab_with_two_clients(false);
+    deferred_navigation_onto_a_controlled_tab(false, 2);
 }
 
 /// A public `worktree.open` with focus on a worktree that is already open finishes later and
 /// shows the workspace that holds it.
-async fn public_worktree_open_shows_the_hidden_workspace(resize_hidden_panes: bool) {
-    let (mut server, panes, expected, _receivers) = stale_hidden_tabs(resize_hidden_panes);
+async fn public_worktree_open_shows_the_hidden_workspace(
+    resize_hidden_panes: bool,
+    clients: usize,
+) {
+    let (mut server, panes, expected, _receivers) =
+        stale_hidden_tabs_with(resize_hidden_panes, clients);
     // One folder holds the repository and its checkout; it is removed when the test ends, also
     // when it panics.
     let root = std::env::temp_dir().join(format!(
-        "herdr-hidden-resize-open-{}-{resize_hidden_panes}",
+        "herdr-hidden-resize-open-{}-{resize_hidden_panes}-{clients}",
         std::process::id()
     ));
     let repo = root.join("repo");
@@ -933,6 +995,17 @@ async fn public_worktree_open_shows_the_hidden_workspace(resize_hidden_panes: bo
             ..Default::default()
         }));
     server.handle_api_request_with_shutdown_check(request);
+    // The request itself runs a geometry pass (a worktree open may change geometry), which with the
+    // setting on and one client sizes every tab. The pane is put at the size no request should
+    // change only after it, so what is asserted is the end of the open.
+    mark_untouched_in_single_client_case(
+        &server,
+        &panes,
+        resize_hidden_panes,
+        clients,
+        1,
+        panes.hidden_workspace,
+    );
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let event = server.app.event_rx.recv().await.unwrap();
@@ -957,8 +1030,11 @@ async fn public_worktree_open_shows_the_hidden_workspace(resize_hidden_panes: bo
         server.app.public_tab_id(1, 0).as_deref(),
         "guard: the client shows the workspace that was already open"
     );
-    assert_shown_pane_fits(
+    assert_came_into_view_sized(
         &server,
+        &panes,
+        resize_hidden_panes,
+        clients,
         1,
         panes.hidden_workspace,
         expected,
@@ -970,10 +1046,20 @@ async fn public_worktree_open_shows_the_hidden_workspace(resize_hidden_panes: bo
 
 #[tokio::test]
 async fn on_a_finished_public_worktree_open_leaves_the_workspace_it_shows_sized() {
-    public_worktree_open_shows_the_hidden_workspace(true).await;
+    public_worktree_open_shows_the_hidden_workspace(true, 1).await;
 }
 
 #[tokio::test]
 async fn off_a_finished_public_worktree_open_leaves_the_workspace_it_shows_sized() {
-    public_worktree_open_shows_the_hidden_workspace(false).await;
+    public_worktree_open_shows_the_hidden_workspace(false, 1).await;
+}
+
+#[tokio::test]
+async fn on_a_finished_public_worktree_open_with_two_clients_sizes_the_workspace_it_shows() {
+    public_worktree_open_shows_the_hidden_workspace(true, 2).await;
+}
+
+#[tokio::test]
+async fn off_a_finished_public_worktree_open_with_two_clients_sizes_the_workspace_it_shows() {
+    public_worktree_open_shows_the_hidden_workspace(false, 2).await;
 }
