@@ -410,15 +410,25 @@ impl HeadlessServer {
             .collect()
     }
 
-    /// With `ui.resize_hidden_panes` off a tab is sized while a client shows it, so a tab that comes
-    /// into view must be sized then. Most requests that show a tab apply geometry themselves, but a
-    /// pane moved into a hidden tab and a worktree open that finishes later do not, and a client
-    /// that visited a tab stays its controller, so a claim returns without sizing it. Take this
-    /// before a request or event that may change what is shown and pass it to
-    /// `size_tabs_that_came_into_view` afterwards. It is `None` with the setting on, where every tab
-    /// is already sized.
+    /// Whether a tab is sized for the client that shows it only. One client with
+    /// `ui.resize_hidden_panes` on sizes every tab, so a tab nobody shows already has the right size
+    /// when it comes into view. With the setting off, and with any other number of clients (a
+    /// client's pane area change then sizes only the tab that client shows), a tab that was hidden
+    /// can be at a stale size when it comes into view.
+    pub(super) fn sizes_only_shown_tabs(&self) -> bool {
+        !(self.app_client_count() == 1 && self.app.state.resize_hidden_panes)
+    }
+
+    /// Where a tab is sized for the client that shows it only (`sizes_only_shown_tabs`), a tab that
+    /// comes into view must be sized then. Most requests that show a tab apply geometry themselves,
+    /// but a pane moved into a hidden tab and a worktree open that finishes later do not, and a
+    /// client that visited a tab stays its controller, so a claim returns without sizing it. Take
+    /// this before a request or event that may change what is shown and pass it to
+    /// `size_tabs_that_came_into_view` afterwards. It is `None` with the setting on and one client,
+    /// where every tab is already sized.
     pub(super) fn shown_tabs_before_change(&self) -> Option<HashSet<String>> {
-        (!self.app.state.resize_hidden_panes).then(|| self.shown_shell_tab_ids())
+        self.sizes_only_shown_tabs()
+            .then(|| self.shown_shell_tab_ids())
     }
 
     /// When the set of shown tabs differs from `shown_before` (a tab came into view, or a tab only left
@@ -618,7 +628,7 @@ impl HeadlessServer {
         // A lone client sizes every tab, so a tab nobody shows already has the right size when it is
         // shown. With `ui.resize_hidden_panes` off only the tab that is shown is sized, as with
         // several clients; a tab nobody shows is sized when it is shown again.
-        if self.app_client_count() == 1 && self.app.state.resize_hidden_panes {
+        if !self.sizes_only_shown_tabs() {
             for (workspace_index, workspace) in self.app.state.workspaces.iter().enumerate() {
                 for tab_index in 0..workspace.tabs.len() {
                     crate::ui::resize_tab_surface(
