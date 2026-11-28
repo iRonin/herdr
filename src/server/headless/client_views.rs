@@ -259,6 +259,7 @@ impl HeadlessServer {
                 | Method::PaneInputSet(_)
                 | Method::PaneLinkActivate(_)
                 | Method::PaneLinkResolve(_)
+                | Method::PaneMove(_)
                 | Method::PaneRename(_)
                 | Method::PaneResize(_)
                 | Method::PaneScroll(_)
@@ -295,6 +296,7 @@ impl HeadlessServer {
                 | Method::PaneEditScrollback(_)
                 | Method::PaneFocus(_)
                 | Method::PaneFocusDirection(_)
+                | Method::PaneMove(_)
                 | Method::PaneResize(_)
                 | Method::PaneSplit(_)
                 | Method::PaneSwap(_)
@@ -420,20 +422,21 @@ impl HeadlessServer {
     }
 
     /// Where a tab is sized for the client that shows it only (`sizes_only_shown_tabs`), a tab that
-    /// comes into view must be sized then. Most requests that show a tab apply geometry themselves,
-    /// but a pane moved into a hidden tab and a worktree open that finishes later do not, and a
-    /// client that visited a tab stays its controller, so a claim returns without sizing it. Take
-    /// this before a request or event that may change what is shown and pass it to
-    /// `size_tabs_that_came_into_view` afterwards. It is `None` with the setting on and one client,
-    /// where every tab is already sized.
+    /// comes into view must be sized then. Most requests that show a tab apply geometry themselves
+    /// (a pane move included), but a worktree open that finishes later does not, and a client that
+    /// visited a tab stays its controller, so a claim returns without sizing it. Take this before a
+    /// request or event that may change what is shown and pass it to `size_tabs_that_came_into_view`
+    /// afterwards. It is `None` with the setting on and one client, where every tab is already sized.
     pub(super) fn shown_tabs_before_change(&self) -> Option<HashSet<String>> {
         self.sizes_only_shown_tabs()
             .then(|| self.shown_shell_tab_ids())
     }
 
     /// When the set of shown tabs differs from `shown_before` (a tab came into view, or a tab only left
-    /// it), applies geometry to every tab that is shown now. That does nothing for a tab already at
-    /// its size, so what it changes is the tab that came into view.
+    /// it), reapplies the controlled geometry. With the setting off that sizes every tab some client
+    /// shows; with it on (several clients) it sizes every tab a client controls, hidden ones included,
+    /// as any request in the lists above does. That does nothing for a tab already at its size, so
+    /// what it changes is the tab that came into view.
     pub(super) fn size_tabs_that_came_into_view(
         &mut self,
         shown_before: Option<HashSet<String>>,

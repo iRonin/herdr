@@ -563,7 +563,8 @@ async fn off_a_full_layout_pass_resizes_only_the_shown_tab() {
 // the same scenario with the setting on and off, with one client and with two, and asks the same
 // question of the tab that is shown afterwards: does it have the size its client's pane area
 // produces? The one case that must stay as it always was is the setting on with one client: every
-// tab is sized already there, so no request resizes a tab that comes into view (`UNTOUCHED_SIZE`).
+// tab is sized already there, so no request resizes a tab that comes into view (`UNTOUCHED_SIZE`),
+// except a pane move, which changes the layout of the tabs it touches and sizes them in every case.
 
 /// The size the pane of a tab that comes into view is put at, with the setting on and one client,
 /// to tell "no request resized it" from "it already had the right size": no pane area produces it.
@@ -572,7 +573,10 @@ const UNTOUCHED_SIZE: (u16, u16) = (13, 37);
 type Fixture = (HeadlessServer, Panes, (u16, u16), Vec<Receivers>);
 
 /// With the setting on and one client every tab is sized already: the case upstream's behaviour
-/// covers, which a request that shows a tab must leave exactly as it is.
+/// covers, which a request that shows a tab must leave exactly as it is. A pane move is the one
+/// request that is not left alone there: it changes the layout of the tabs it touches (the pane
+/// move tests below do not use this case's `UNTOUCHED_SIZE` pin, they check the sizes the layout
+/// gives).
 fn upstream_single_client_case(resize_hidden_panes: bool, clients: usize) -> bool {
     resize_hidden_panes && clients == 1
 }
@@ -642,7 +646,17 @@ fn stale_hidden_tabs_with(resize_hidden_panes: bool, clients: usize) -> Fixture 
     client_pane_area(&mut server, 1, 60, 16);
     let expected = panes.sizes(&server)[0];
     assert_ne!(expected, START_SIZE);
-    if !resize_hidden_panes || clients == 2 {
+    if upstream_single_client_case(resize_hidden_panes, clients) {
+        let sizes = panes.sizes(&server);
+        assert_eq!(
+            sizes[1], expected,
+            "guard: with the setting on and one client the hidden tab is sized already"
+        );
+        assert_eq!(
+            sizes[2], expected,
+            "guard: with the setting on and one client the hidden workspace is sized already"
+        );
+    } else {
         let sizes = panes.sizes(&server);
         assert_ne!(sizes[1], expected, "guard: the hidden tab is stale");
         assert_ne!(sizes[2], expected, "guard: the hidden workspace is stale");
@@ -742,22 +756,55 @@ fn public_pane_move_into_the_hidden_tab(resize_hidden_panes: bool, clients: usiz
         Some(panes.hidden_tab_id.as_str()),
         "guard: the client shows the tab the pane was moved into"
     );
-    assert_came_into_view_sized(
-        &server,
+    assert_pane_move_sized(
+        &mut server,
         &panes,
-        resize_hidden_panes,
-        clients,
-        0,
-        panes.hidden_tab,
         expected,
-        false,
+        upstream_single_client_case(resize_hidden_panes, clients),
         "the tab a pane was moved into",
     );
     shutdown_test_runtimes(&mut server);
 }
 
+/// After a pane moved into the shown tab the tab is sized for its new layout, in every case, one client
+/// with the setting on included: the pane that was there is sized (`marked` when it was put at
+/// `UNTOUCHED_SIZE` first, which only the setting on with one client does; the check that it left that
+/// size means nothing otherwise), and a later geometry pass changes no pane of the tab. That is what a
+/// move that applies no geometry cannot give: the panes keep the sizes of the layout before the move.
+/// The last check is a third line of defence: the reapply it runs covers the tab in every case, so the
+/// two checks before it fail first when the move applied nothing.
+fn assert_pane_move_sized(
+    server: &mut HeadlessServer,
+    panes: &Panes,
+    expected: (u16, u16),
+    marked: bool,
+    what: &str,
+) {
+    assert_shown_pane_fits(server, 0, panes.hidden_tab, expected, false, what);
+    if marked {
+        assert_ne!(
+            panes.runtime(server, 0, panes.hidden_tab).current_size(),
+            UNTOUCHED_SIZE,
+            "{what}: the pane that was there is still at the size no pane area produces: nothing sized it"
+        );
+    }
+    let before = [
+        panes.runtime(server, 0, panes.shown).current_size(),
+        panes.runtime(server, 0, panes.hidden_tab).current_size(),
+    ];
+    server.reapply_controlled_shell_tab_geometry(false);
+    let after = [
+        panes.runtime(server, 0, panes.shown).current_size(),
+        panes.runtime(server, 0, panes.hidden_tab).current_size(),
+    ];
+    assert_eq!(
+        before, after,
+        "{what}: the request left the tab at sizes a later geometry pass changes"
+    );
+}
+
 #[tokio::test]
-async fn on_a_pane_moved_into_the_hidden_tab_leaves_the_shown_tab_sized() {
+async fn on_a_pane_moved_into_the_hidden_tab_sizes_the_shown_tab() {
     public_pane_move_into_the_hidden_tab(true, 1);
 }
 
@@ -774,6 +821,183 @@ async fn on_a_pane_moved_into_the_hidden_tab_with_two_clients_sizes_the_shown_ta
 #[tokio::test]
 async fn off_a_pane_moved_into_the_hidden_tab_with_two_clients_sizes_the_shown_tab() {
     public_pane_move_into_the_hidden_tab(false, 2);
+}
+
+/// A client moves a pane into the hidden tab through its own endpoint (a drag, a menu), with focus.
+fn client_moves_a_pane_into_the_hidden_tab(resize_hidden_panes: bool, clients: usize) {
+    let (mut server, panes, expected, _receivers) =
+        stale_hidden_tabs_with(resize_hidden_panes, clients);
+    mark_untouched_in_single_client_case(
+        &server,
+        &panes,
+        resize_hidden_panes,
+        clients,
+        0,
+        panes.hidden_tab,
+    );
+    let moved_pane = server.app.public_pane_id(0, panes.shown).unwrap();
+    server.handle_client_shell_api_request(
+        1,
+        api_request(Method::PaneMove(PaneMoveParams {
+            pane_id: moved_pane,
+            destination: PaneMoveDestination::Tab {
+                tab_id: panes.hidden_tab_id.clone(),
+                target_pane_id: None,
+                split: SplitDirection::Right,
+                ratio: None,
+            },
+            focus: true,
+        })),
+    );
+    assert_eq!(
+        server.shell_tab_id_for_client(1).as_deref(),
+        Some(panes.hidden_tab_id.as_str()),
+        "guard: the client shows the tab the pane was moved into"
+    );
+    assert_pane_move_sized(
+        &mut server,
+        &panes,
+        expected,
+        upstream_single_client_case(resize_hidden_panes, clients),
+        "the tab a client moved a pane into",
+    );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn on_a_pane_moved_by_a_client_into_the_hidden_tab_sizes_the_shown_tab() {
+    client_moves_a_pane_into_the_hidden_tab(true, 1);
+}
+
+#[tokio::test]
+async fn off_a_pane_moved_by_a_client_into_the_hidden_tab_sizes_the_shown_tab() {
+    client_moves_a_pane_into_the_hidden_tab(false, 1);
+}
+
+#[tokio::test]
+async fn on_a_pane_moved_by_a_client_into_the_hidden_tab_with_two_clients_sizes_the_shown_tab() {
+    client_moves_a_pane_into_the_hidden_tab(true, 2);
+}
+
+#[tokio::test]
+async fn off_a_pane_moved_by_a_client_into_the_hidden_tab_with_two_clients_sizes_the_shown_tab() {
+    client_moves_a_pane_into_the_hidden_tab(false, 2);
+}
+
+/// A second pane in the shown tab, as a `pane.split` makes it, and the tab sized for two panes, as the
+/// request does (a split is in the list of requests that apply geometry): the shown pane has half
+/// the columns it has alone. No shell is spawned: the new pane gets a test runtime.
+fn split_the_shown_tab(server: &mut HeadlessServer) -> crate::layout::PaneId {
+    let workspace = &mut server.app.state.workspaces[0];
+    let new_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+    workspace.insert_test_runtime(
+        new_pane,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(START_SIZE.1, START_SIZE.0, b""),
+    );
+    server.app.state.ensure_test_terminals();
+    server.reapply_controlled_shell_tab_geometry(false);
+    new_pane
+}
+
+/// The pane left behind: the shown tab has two panes, one is moved to the hidden tab WITHOUT focus,
+/// and the pane that stays is alone again, so it must have the size its client's pane area gives a
+/// tab of one pane, exactly. That is the shape #5000's later reporters describe (the panes left in
+/// the source tab). The client keeps showing the tab, so the move changes no set of shown tabs and
+/// no other rule sizes it: only the move's own geometry does. `through_client` sends the move through
+/// the client's own endpoint instead of the public socket.
+fn pane_moved_out_without_focus_leaves_the_pane_behind_sized(
+    resize_hidden_panes: bool,
+    clients: usize,
+    through_client: bool,
+) {
+    let (mut server, panes, expected, _receivers) =
+        stale_hidden_tabs_with(resize_hidden_panes, clients);
+    let moved = split_the_shown_tab(&mut server);
+    let before = panes.runtime(&server, 0, panes.shown).current_size();
+    assert_ne!(
+        before, expected,
+        "guard: the split left the pane at the size of a tab of two panes, not of one"
+    );
+    let moved_pane = server.app.public_pane_id(0, moved).unwrap();
+    let method = Method::PaneMove(PaneMoveParams {
+        pane_id: moved_pane,
+        destination: PaneMoveDestination::Tab {
+            tab_id: panes.hidden_tab_id.clone(),
+            target_pane_id: None,
+            split: SplitDirection::Right,
+            ratio: None,
+        },
+        focus: false,
+    });
+    if through_client {
+        server.handle_client_shell_api_request(1, api_request(method));
+    } else {
+        let (request, response_rx) = api_request_with_response(method);
+        server.handle_api_request_with_shutdown_check(request);
+        let response = response_rx.recv().expect("pane move response");
+        assert!(
+            response.contains("\"changed\":true"),
+            "guard: the move happened: {response}"
+        );
+    }
+    assert_eq!(
+        server.app.state.workspaces[0].tabs[0].layout.pane_ids(),
+        vec![panes.shown],
+        "guard: the pane the move left behind is alone in the tab again"
+    );
+    assert_eq!(
+        server.shell_tab_id_for_client(1).as_deref(),
+        Some(panes.shown_tab_id.as_str()),
+        "guard: the client still shows the tab the pane left (no focus)"
+    );
+    assert_eq!(
+        panes.runtime(&server, 0, panes.shown).current_size(),
+        expected,
+        "the pane left behind keeps the size of the layout before the move (it was {before:?})"
+    );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn on_a_pane_moved_out_without_focus_leaves_the_pane_behind_sized() {
+    pane_moved_out_without_focus_leaves_the_pane_behind_sized(true, 1, false);
+}
+
+#[tokio::test]
+async fn off_a_pane_moved_out_without_focus_leaves_the_pane_behind_sized() {
+    pane_moved_out_without_focus_leaves_the_pane_behind_sized(false, 1, false);
+}
+
+#[tokio::test]
+async fn on_a_pane_moved_out_without_focus_with_two_clients_leaves_the_pane_behind_sized() {
+    pane_moved_out_without_focus_leaves_the_pane_behind_sized(true, 2, false);
+}
+
+#[tokio::test]
+async fn off_a_pane_moved_out_without_focus_with_two_clients_leaves_the_pane_behind_sized() {
+    pane_moved_out_without_focus_leaves_the_pane_behind_sized(false, 2, false);
+}
+
+#[tokio::test]
+async fn on_a_pane_moved_out_by_a_client_without_focus_leaves_the_pane_behind_sized() {
+    pane_moved_out_without_focus_leaves_the_pane_behind_sized(true, 1, true);
+}
+
+#[tokio::test]
+async fn off_a_pane_moved_out_by_a_client_without_focus_leaves_the_pane_behind_sized() {
+    pane_moved_out_without_focus_leaves_the_pane_behind_sized(false, 1, true);
+}
+
+#[tokio::test]
+async fn on_a_pane_moved_out_by_a_client_without_focus_with_two_clients_leaves_the_pane_behind_sized(
+) {
+    pane_moved_out_without_focus_leaves_the_pane_behind_sized(true, 2, true);
+}
+
+#[tokio::test]
+async fn off_a_pane_moved_out_by_a_client_without_focus_with_two_clients_leaves_the_pane_behind_sized(
+) {
+    pane_moved_out_without_focus_leaves_the_pane_behind_sized(false, 2, true);
 }
 
 /// The end of a worktree open that a client asked for: its response names `tab_id`, and the
@@ -837,7 +1061,7 @@ fn deferred_navigation_onto_a_controlled_tab(resize_hidden_panes: bool, clients:
 }
 
 #[tokio::test]
-async fn on_a_finished_endpoint_open_leaves_the_tab_it_shows_sized() {
+async fn on_a_finished_endpoint_open_applies_no_geometry_to_the_tab_it_shows() {
     deferred_navigation_onto_a_controlled_tab(true, 1);
 }
 
@@ -991,7 +1215,7 @@ async fn public_worktree_open_shows_the_hidden_workspace(
 }
 
 #[tokio::test]
-async fn on_a_finished_public_worktree_open_leaves_the_workspace_it_shows_sized() {
+async fn on_a_finished_public_worktree_open_applies_no_geometry_to_the_workspace_it_shows() {
     public_worktree_open_shows_the_hidden_workspace(true, 1).await;
 }
 
